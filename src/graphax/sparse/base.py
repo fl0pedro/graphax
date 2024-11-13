@@ -2,7 +2,7 @@
 Sparse base implementation
 """
 import copy
-from typing import Callable, Sequence, Generator, Any
+from typing import Callable, Sequence, Generator, Any, Generic, TypeVar
 from abc import ABC, abstractmethod
 import jax
 import jax.lax as lax
@@ -15,6 +15,8 @@ from chex import Array
 
 from .utils import eye_like_copy, eye_like
 from dataclasses import dataclass
+
+T = TypeVar("T")
 
 # NOTE: a val_dim of None means that we have a possible replication of the tensor
 #   along the respective dimension `d.size` times to manage broadcasting
@@ -43,7 +45,7 @@ class SparseDimension:
 Dimension = DenseDimension | SparseDimension
 
 
-class SparseBase(ABC):
+class SparseBase(ABC, Generic[T]):
     """
     The `SparseTensor object enables` the representation of sparse tensors
     that if out_dims or primal_dims is empty, this implies a scalar dependent or
@@ -54,6 +56,7 @@ class SparseBase(ABC):
     out_dims: tuple[Dimension]
     primal_dims: tuple[Dimension]  # input dimensions
     shape: tuple[int]  # True shape of the tensor
+    val: T
     pre_transforms: tuple[Callable]
     post_transforms: tuple[Callable]
 
@@ -63,6 +66,7 @@ class SparseBase(ABC):
     def __init__(self,
                  out_dims: Sequence[Dimension],
                  primal_dims: Sequence[Dimension],
+                 val: T,
                  pre_transforms: Sequence[Callable] = None,
                  post_transforms: Sequence[Callable] = None) -> None:
 
@@ -78,6 +82,8 @@ class SparseBase(ABC):
         self.primal_shape = [d.size for d in primal_dims]
 
         self.shape = tuple(self.out_shape + self.primal_shape)
+
+        self.val = val
 
         self.pre_transforms = tuple(pre_transforms)
         self.post_transforms = tuple(post_transforms)

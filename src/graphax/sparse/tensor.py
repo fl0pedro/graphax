@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 from base import SparseBase, SparseDimension, DenseDimension, Dimension
 
-class SparseTensor(SparseBase):
+class SparseTensor(SparseBase[Array]):
     """
     The `SparseTensor object enables` the representation of sparse tensors
     that if out_dims or primal_dims is empty, this implies a scalar dependent or
@@ -25,17 +25,6 @@ class SparseTensor(SparseBase):
     everything becomes trivial and the `val` field contains the value of the
     singleton partial
     """
-    val: Array
-
-    def __init__(self,
-                 out_dims: Sequence[Dimension],
-                 primal_dims: Sequence[Dimension],
-                 val: Array,
-                 pre_transforms: Sequence[Callable] = None,
-                 post_transforms: Sequence[Callable] = None) -> None:
-        super().__init__(out_dims, primal_dims, pre_transforms, post_transforms)
-        self.val = val
-
     def __add__(self, _tensor: Any):
         return _add(self, _tensor)
 
