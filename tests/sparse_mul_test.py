@@ -284,7 +284,7 @@ class TestBroadcastMul(unittest.TestCase):
                         [SparseDimension(2, 4, 0, 0), DenseDimension(3, 5, 2)], x)
         sty = SparseTensor([DenseDimension(0, 4, 0), SparseDimension(1, 5, 1, 3), ], 
                         [DenseDimension(2, 2, 2), SparseDimension(3, 5, 1, 1)], y)
-        
+
         stres = stx * sty
         
         iota = jnp.eye(5)
@@ -335,6 +335,7 @@ class TestBroadcastMul(unittest.TestCase):
                         [SparseDimension(2, 3, 0, 0), SparseDimension(3, 5, 1, 1)], x)
         sty = SparseTensor([SparseDimension(0, 3, 0, 2), SparseDimension(1, 5, 1, 3)], 
                         [SparseDimension(2, 3, 0, 0), SparseDimension(3, 5, 1, 1)], y)
+        print(x.shape, stx.dense(jnp.array([])), stx.dense(jnp.array([])).shape, y.shape, sty.dense(jnp.array([])), sty.dense(jnp.array([])).shape, sep='\n\n')
         stres = stx * sty
                 
         iota = jnp.eye(15)
