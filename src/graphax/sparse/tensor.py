@@ -100,6 +100,9 @@ class SparseTensor(SparseBase[Array]):
         val = self.val if val is None else val
         return SparseTensor(out_dims, primal_dims, val, self.pre_transforms, self.post_transforms)
 
+    def assert_value_consistency(self):
+        pass # not currently implemented
+
 
 def sparse_tensor_zeros_like(st: SparseTensor) -> SparseTensor:
     """
@@ -203,8 +206,8 @@ def _mul(lhs: SparseTensor, rhs: SparseTensor) -> SparseTensor:
     Returns:
         SparseTensor: The resulting `SparseTensor` object.
     """
-    lhs._assert_sparse_tensor_consistency()
-    rhs._assert_sparse_tensor_consistency()
+    lhs.assert_sparse_object_consistency()
+    rhs.assert_sparse_object_consistency()
 
     l = len(lhs.out_dims)
     r = len(rhs.out_dims)
@@ -223,7 +226,7 @@ def _mul(lhs: SparseTensor, rhs: SparseTensor) -> SparseTensor:
     else:
         res = _mixed_mul(_lhs, _rhs)
 
-    res._assert_sparse_tensor_consistency()
+    res.assert_sparse_object_consistency()
     return res
 
 
@@ -241,15 +244,15 @@ def _add(lhs: SparseTensor, rhs: SparseTensor) -> SparseTensor:
     Returns:
         SparseTensor: The resulting `SparseTensor` object.
     """
-    lhs._assert_sparse_tensor_consistency()
-    rhs._assert_sparse_tensor_consistency()
+    lhs.assert_sparse_object_consistency()
+    rhs.assert_sparse_object_consistency()
 
     assert lhs.shape == rhs.shape, \
         f"{lhs.shape} and {rhs.shape} not compatible for addition!"
 
     res = _sparse_add(lhs, rhs)
 
-    res._assert_sparse_tensor_consistency()
+    res.assert_sparse_object_consistency()
     return res
 
 

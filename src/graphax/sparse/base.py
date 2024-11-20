@@ -75,6 +75,17 @@ class SparseBase(ABC, Generic[T]):
         if post_transforms is None:
             post_transforms = []
 
+        self.val = val
+        if isinstance(val, Array):
+            val.shape = val.shape
+        else:
+            # TODO We have to somehow multiply this to the shape
+            ndim = val[0].ndim
+            assert all(x.ndim == ndim for x in val), \
+                "Dimensions of val tensors are inconsistent"
+            jnp.array([x.shape for x in val]).sum(axis=0)
+
+
         self.out_dims = out_dims if isinstance(out_dims, tuple) else tuple(out_dims)
         self.primal_dims = primal_dims if isinstance(primal_dims, tuple) else tuple(primal_dims)
 
@@ -83,12 +94,10 @@ class SparseBase(ABC, Generic[T]):
 
         self.shape = tuple(self.out_shape + self.primal_shape)
 
-        self.val = val
-
         self.pre_transforms = tuple(pre_transforms)
         self.post_transforms = tuple(post_transforms)
 
-        self._assert_sparse_tensor_consistency()
+        self.assert_sparse_object_consistency()
 
     def __repr__(self) -> str:
         def map_str(a: Sequence) -> Generator:
@@ -120,7 +129,7 @@ class SparseBase(ABC, Generic[T]):
 )"""
 
     @abstractmethod
-    def __add__(self, _tensor: Any):
+    def __add__(self, tensor: Any):
         ...
 
     @abstractmethod
@@ -135,56 +144,37 @@ class SparseBase(ABC, Generic[T]):
     def copy(self):
         ...
 
-    def _assert_value_consistency(self) -> None:
-        self._assert_value_consistency(self)
-
     @abstractmethod
-    @staticmethod
-    def _assert_value_consistency(s: Any) -> None:
-        if not issubclass(s, SparseBase):
-            raise TypeError("Not a Sparse object")
+    def assert_value_consistency(self) -> None:
         ...
 
-    def _assert_sparse_tensor_consistency(self) -> None:
-        self._assert_sparse_tensor_consistency(self)
-
-    @staticmethod
-    def _assert_sparse_tensor_consistency(s: Any) -> None:
+    def assert_sparse_object_consistency(self) -> None:
         """
-        Function that validates the consistency of a `SparseTensor` object,
+        Function that validates the consistency of a `SparseBase` object,
         i.e. checks if the `val` property has the correct shape and if the dimensions
         are ordered correctly and sizes match the shape of `val`.
-
-        Args:
-            s (SparseTensor): SparseTensor object we want to validate.
-
-        Returns:
-            bool: True if the `SparseTensor` object is consistent.
         """
-
-        if not issubclass(s, SparseBase):
-            raise TypeError("Not a Sparse object")
 
         # Check if d.size matches val.shape[d.val_dim] for all d
         matching_sparse_sizes = all(
-            d.size == s.val.shape[d.val_dim]
+            d.size == self.val.shape[d.val_dim]
             or d.size == 1
             if isinstance(d, SparseDimension)
                and d.val_dim is not None else True
-            for d in s.out_dims + s.primal_dims
+            for d in self.out_dims + self.primal_dims
         )
 
         matching_dense_sizes = all(
-            d.size == s.val.shape[d.val_dim]
+            d.size == self.val.shape[d.val_dim]
             if isinstance(d, DenseDimension)
                and d.val_dim is not None else True
-            for d in s.out_dims + s.primal_dims
+            for d in self.out_dims + self.primal_dims
         )
 
         matching_sizes = matching_sparse_sizes or matching_dense_sizes
 
-        unique_out_dims = [d.val_dim for d in s.out_dims if d.val_dim is not None]
-        unique_primal_dims = [d.val_dim for d in s.primal_dims if d.val_dim is not None]
+        unique_out_dims = [d.val_dim for d in self.out_dims if d.val_dim is not None]
+        unique_primal_dims = [d.val_dim for d in self.primal_dims if d.val_dim is not None]
 
         is_uniqe_out_dims = len(unique_out_dims) == len(set(unique_out_dims))
         is_uniqe_primal_dims = len(unique_primal_dims) == len(set(unique_primal_dims))
@@ -192,21 +182,28 @@ class SparseBase(ABC, Generic[T]):
 
         # Check if IDs in out_dims and primal_dims match their index positions
         matching_id = all(
-            od.id == i and pd.id == i + len(s.out_dims)
-            for i, (od, pd) in enumerate(zip(s.out_dims, s.primal_dims))
+            od.id == i and pd.id == i + len(self.out_dims)
+            for i, (od, pd) in enumerate(zip(self.out_dims, self.primal_dims))
         )
 
         # Check sparse dimension pairing consistency
         matching_sparse_ids = all(
-            s.primal_dims[d.other_id - len(s.out_dims)].other_id == d.id
+            self.primal_dims[d.other_id - len(self.out_dims)].other_id == d.id
             if isinstance(d, SparseDimension) else True
-            for d in s.out_dims
+            for d in self.out_dims
         )
 
         assert (matching_sizes
                 and has_uniqe_dims
                 and matching_id
                 and matching_sparse_ids
-                ), f"{s} is not self-consistent!"
+                ), f"{self} is not consistent!"
 
-        s._assert_value_consistency()
+        self.assert_value_consistency()
+
+    def _assert_equal_shape(self, tensor: Array) -> None:
+        self.assert_sparse_object_consistency()
+        tensor.assert_sparse_object_consistency()
+
+        assert self.shape == tensor.shape, \
+            f"{self.shape} and {tensor.shape} not compatible for addition!"
