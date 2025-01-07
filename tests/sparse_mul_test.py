@@ -19,6 +19,9 @@ class TestBroadcastMul(unittest.TestCase):
         stx = SparseTensor([DenseDimension(0, 4, 0)], [DenseDimension(1, 3, 1)], x)
         sty = SparseTensor([DenseDimension(0, 3, 0)], [DenseDimension(1, 2, 1)], y)
         stres = stx * sty
+        iota = jnp.eye(5)
+        print(stx, sty)
+        print(stx.dense(iota), sty.dense(iota), sep='\n')
         
         self.assertTrue(jnp.allclose(res, stres.val))
 
@@ -33,7 +36,9 @@ class TestBroadcastMul(unittest.TestCase):
         sty = SparseTensor([SparseDimension(0, 4, 0, 1)], [SparseDimension(1, 4, 0, 0)], y)
         stres = stx * sty
         
-        iota = jnp.eye(4)
+        iota = jnp.eye(5)
+        print(stx, sty)
+        print(stx.dense(iota), sty.dense(iota), sep='\n')
         self.assertTrue(jnp.allclose(res, stres.dense(iota)))
 
     def test_simple_sparse_dense(self):
@@ -47,7 +52,9 @@ class TestBroadcastMul(unittest.TestCase):
         sty = SparseTensor([DenseDimension(0, 4, 0)], [DenseDimension(1, 3, 1)], y)
         stres = stx * sty
         
-        iota = jnp.eye(4)
+        iota = jnp.eye(5)
+        print(stx, sty)
+        print(stx.dense(iota), sty.dense(iota), sep='\n')
         
         self.assertTrue(jnp.allclose(res, stres.dense(iota)))
 
@@ -57,12 +64,14 @@ class TestBroadcastMul(unittest.TestCase):
         x = jrand.normal(xkey, (3, 4))
         y = jrand.normal(ykey, (4,))
         res = x @ jnp.diag(y)
+
+        iota = jnp.eye(4)
         
         stx = SparseTensor([DenseDimension(0, 3, 0)], [DenseDimension(1, 4, 1)], x)
         sty = SparseTensor([SparseDimension(0, 4, 0, 1)], [SparseDimension(1, 4, 0, 0)], y)
+        print(stx, sty)
+        print(stx.dense(iota), sty.dense(iota))
         stres = stx * sty
-        
-        iota = jnp.eye(4)
 
         self.assertTrue(jnp.allclose(res, stres.dense(iota)))
     
@@ -71,14 +80,16 @@ class TestBroadcastMul(unittest.TestCase):
         _y = jnp.eye(3)
 
         res = _x @ _y
+
+        iota = jnp.eye(5)
             
         stx = SparseTensor([SparseDimension(0, 3, None, 1)], 
                         [SparseDimension(1, 3, None, 0)], None)
         sty = SparseTensor([SparseDimension(0, 3, None, 1)], 
                         [SparseDimension(1, 3, None, 0)], None)
+        print(stx, sty)
+        print(stx.dense(iota), sty.dense(iota))
         stres = stx * sty
-                
-        iota = jnp.eye(5)
             
         self.assertTrue(jnp.allclose(res, stres.dense(iota)))
         
@@ -88,14 +99,16 @@ class TestBroadcastMul(unittest.TestCase):
         _y = jnp.eye(3)
 
         res = _x @ _y
+
+        iota = jnp.eye(5)
             
         stx = SparseTensor([DenseDimension(0, 3, 0)], 
                         [DenseDimension(1, 3, 1)], _x)
         sty = SparseTensor([SparseDimension(0, 3, None, 1)], 
                         [SparseDimension(1, 3, None, 0)], None)
+        print(stx, sty)
+        print(stx.dense(iota), sty.dense(iota))
         stres = stx * sty
-                
-        iota = jnp.eye(5)
             
         self.assertTrue(jnp.allclose(res, stres.dense(iota)))
         
@@ -105,14 +118,16 @@ class TestBroadcastMul(unittest.TestCase):
         _y = jrand.normal(key, (3, 3))
 
         res = _x @ _y
+
+        iota = jnp.eye(5)
             
         stx = SparseTensor([SparseDimension(0, 3, None, 1)], 
                         [SparseDimension(1, 3, None, 0)], None)
         sty = SparseTensor([DenseDimension(0, 3, 1)], 
                         [DenseDimension(1, 3, 0)], _y)
+        print(stx, sty)
+        print(stx.dense(iota), sty.dense(iota))
         stres = stx * sty
-                
-        iota = jnp.eye(5)
             
         self.assertTrue(jnp.allclose(res, stres.dense(iota)))
 
@@ -163,9 +178,11 @@ class TestBroadcastMul(unittest.TestCase):
                         [SparseDimension(2, 5, 1, 1)], x)
         sty = SparseTensor([SparseDimension(0, 5, 0, 2)], 
                         [DenseDimension(1, 2, 1), SparseDimension(2, 5, 0, 0)], y)
-        stres = stx * sty 
+        stres = stx * sty
         
         iota = jnp.eye(5)
+        print(stx, sty)
+        print(stx.dense(iota), sty.dense(iota), sep='\n')
         
         self.assertTrue(jnp.allclose(res, stres.dense(iota)))
 
@@ -188,6 +205,8 @@ class TestBroadcastMul(unittest.TestCase):
         stres = stx * sty
         
         iota = jnp.eye(5)
+        print(stx, sty)
+        print(stx.dense(iota), sty.dense(iota), sep='\n')
 
         self.assertTrue(jnp.allclose(res, stres.dense(iota)))
 

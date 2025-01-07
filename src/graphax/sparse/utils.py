@@ -121,6 +121,7 @@ def eye_like_copy(shape: Sequence[int], out_len: int, iota: jnp.ndarray) -> jnp.
                         sub_iota = lax.slice(iota, (0, 0), (o, o))
                         kronecker = sub_iota.reshape(_shape)
                 val *= kronecker # NOTE: This thing is crazy expensive to compute and not always necessary?
+                # look at `np.diagflat()`
         return val
     
     

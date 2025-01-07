@@ -13,14 +13,14 @@ from jax.tree_util import register_pytree_node_class
 from chex import Array
 
 from .utils import eye_like_copy, eye_like
-from dataclasses import dataclass
+from dataclasses import dataclass, KW_ONLY
 
 
 # NOTE: a val_dim of None means that we have a possible replication of the tensor
 #   along the respective dimension `d.size` times to manage broadcasting
 #   operations such as broadcasted additions or multiplications.
 # TODO: what do we do when we have a tensor that consists only of DenseDimensions
-#   with val_dim=None?
+#   with val_dim=None? <- all ones no?
 @dataclass
 class DenseDimension:
     id: int
