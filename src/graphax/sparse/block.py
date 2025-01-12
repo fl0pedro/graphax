@@ -41,6 +41,7 @@ class BlockSparseTensor:
     blocks: MultiSparseDimensionBlocks | Array | None
     pre_transforms: Sequence[Callable] 
     post_transforms: Sequence[Callable]
+    elementary_block_idx: int
 
     def __init__(self,
                  out_dims: Sequence[Dimension],
@@ -77,6 +78,8 @@ class BlockSparseTensor:
         assert checked_max_val != -1 and checked_max_val <= blocks.ndim, \
             "Value dimensions should include all till the maximum (<= max block dimension)"
         block_shape = blocks.shape[checked_max_val+1:]
+
+        self.elementary_block_idx = checked_max_val+1
         self.primal_shape = [
             x.size if isinstance(x, DenseDimension)
             else x.size*block_shape[x.val_axis]
@@ -136,10 +139,14 @@ class BlockSparseTensor:
                 "Must be able to return a valid Array, not a Sequence"
             return self.blocks
         else:
-            res = jnp.zeros(self.shape)
+            res = np.zeros(self.shape)
             if isinstance(self.blocks, Array):
-
-                pass
+                # THIS IS HARD CODED AND BAD
+                offset = self.blocks.shape[self.elementary_block_idx]
+                # jax.scan loop, rollout length, if elemnts = 100 ~ pick 10
+                for i, elem in np.ndenumerate(self.blocks):
+                    index = jnp.array(i[1:]) + jnp.array([i[0]*offset] * (len(i)-1))
+                    res[*index] = elem
             else:
                 # this is no longer of type Sequence but rather MultiSparseDimensionBlocks
                 # use get_ienumerated_blocks
@@ -148,6 +155,7 @@ class BlockSparseTensor:
                 # pointer = (0,) * self.blocks.ndim
                 for i, block in get_ienumerated_blocks(self.blocks):
                     pass
+            return res
 
 
     def __add__(self, other):
@@ -156,7 +164,9 @@ class BlockSparseTensor:
             if other.blocks is None:
                 pass
             elif isinstance(self.blocks, Array) and isinstance(other.blocks, Array):
-                pass
+                if self.shape == other.shape and self.primal_dims == other.primal_dims and self.out_dims == other.out_dims:
+                    self.blocks += other.blocks
+                    return self
             elif all(b1.shape == b2.shape for b1, b2 in zip(self.blocks, other.blocks)):
                 pass
         elif isinstance(other, SparseTensor):
@@ -174,7 +184,13 @@ class BlockSparseTensor:
             elif other.blocks is None:
                 return copy.copy(self)
             elif isinstance(self.blocks, Array) and isinstance(other.blocks, Array):
-                pass
+                if self.shape == other.shape == (self.shape[0],)*len(self.shape) \
+                        and self.primal_dims == other.primal_dims \
+                        and self.out_dims == other.out_dims:
+                    new_blocks = []
+                    for i in np.ndindex(self.blocks.shape[:self.elementary_block_idx]):
+                        new_blocks.append(self.blocks[i]@other.blocks[i])
+                    return jnp.array(new_blocks)
             elif all(b1.shape == b2.shape for b1, b2 in zip(self.blocks, other.blocks)):
                 pass
         elif isinstance(other, SparseTensor):
