@@ -1022,7 +1022,7 @@ def _pure_dot_product_mul(lhs: SparseTensor, rhs: SparseTensor) -> SparseTensor:
     i = 0
     for d in rhs.primal_dims:
         if d.val_dim is not None:
-            new_primal_dims.append(DenseDimension(d.id-r+l, d.size, l+i))   
+            new_primal_dims.append(DenseDimension(d.id-r+l, d.size, l+i))
             i += 1
         else:
             new_primal_dims.append(DenseDimension(d.id-r+l, d.size, None))
