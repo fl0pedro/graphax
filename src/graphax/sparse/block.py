@@ -157,12 +157,45 @@ class BlockSparseTensor:
         else:
             res = jnp.zeros(self.shape)
             if isinstance(self.blocks, Array):
-                # THIS IS HARD CODED AND BAD
-                offset = self.blocks.shape[self.elementary_block_idx]
-                # jax.scan loop, rollout length, if elemnts = 100 ~ pick 10
-                for i, elem in np.ndenumerate(self.blocks):
-                    index = jnp.array(i[1:]) + jnp.array([i[0]*offset] * (len(i)-1))
-                    res = res.at[*index].set(elem)
+                # _dense_array(self.blocks, self.primal_dims + self.out_dims, self.shape)
+                res = jnp.zeros(self.shape)
+                index = jnp.zeros(self.elementary_block_idx + 1)
+                index_offset = index.copy()
+                dim_pointer = self.elementary_block_idx
+                dims = self.primal_dims + self.out_dims
+                non_block_shape = self.blocks.shape[:self.elementary_block_idx]
+                non_block_size = reduce(operator.mul, non_block_shape)
+                non_block_ndim = len(non_block_shape)
+
+                # the shape for each dimensions regarding one block
+                block_shape_per_dim = jnp.array([
+                    self.block_shape[dim.val_dim]
+                    if dim.val_dim is not None else 1
+                    for dim in self.primal_dims + self.out_dims
+                ])
+
+                assert reduce(operator.mul, block_shape_per_dim) == self.block_size, \
+                        "block_shape_per_dim should of the same size as blocks"
+
+                # def dense_step(carry, index):
+                #     res = carry
+                #     # this only works for arrays, for list of arrays the blocks could be different sizes
+                #     # as such the index_offset should be accounted for in carry
+                #     scaled_index = index * block_shape_per_dim
+                #     reshaped_block = self.blocks[tuple(index)].reshape(block_shape_per_dim)
+                #     res = lax.dynamic_update_slice(res, reshaped_block, scaled_index)
+                #     return res, None
+
+                indices = jnp.indices(non_block_shape).transpose(*range(1, non_block_ndim + 1), 0)
+                flattened_indices = indices.reshape(non_block_size, non_block_ndim)
+                for index in flattened_indices:
+                    # this only works for arrays, for list of arrays the blocks could be different sizes
+                    # as such the index_offset should be accounted for in carry
+                    scaled_index = index * block_shape_per_dim
+                    reshaped_block = self.blocks[*index].reshape(block_shape_per_dim)
+                    res = lax.dynamic_update_slice(res, reshaped_block, scaled_index)
+                # res, _ = lax.scan(dense_step, res, flattened_indices)
+
             else:
                 # this is no longer of type Sequence but rather MultiSparseDimensionBlocks
                 # use get_ienumerated_blocks
