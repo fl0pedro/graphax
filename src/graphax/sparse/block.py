@@ -11,6 +11,7 @@ import operator
 from dataclasses import dataclass, KW_ONLY
 import copy
 from functools import reduce
+import numpy as np
 
 # TODO: make parent class, or inherit sparse tensor ??
 
@@ -67,6 +68,16 @@ class BlockSparseTensor:
         assert all(b1.ndim == b2.ndim for b1, b2 in zip(blocks, blocks[1:])), \
             "Block dimensions should all be equal"
 
+        for x in primal_dims:
+            if x.val_axis is None:
+                x.val_axis = 0
+        for x in out_dims:
+            if x.val_axis is None:
+                x.val_axis = 1
+
+        assert all(b1.ndim == b2.ndim for b1, b2 in zip(blocks, blocks[1:])), \
+            "Block dimensions should all be equal"
+
         self.out_dims = out_dims if isinstance(out_dims, tuple) else tuple(out_dims)
         self.primal_dims = primal_dims if isinstance(primal_dims, tuple) else tuple(primal_dims)
 
@@ -82,17 +93,17 @@ class BlockSparseTensor:
         self.block_shape = blocks.shape[checked_max_val+1:]
         self.block_size = reduce(operator.mul, self.block_shape)
 
-        self.elementary_block_idx = checked_max_val
-        self.primal_shape = tuple(
-            dim.size * self.block_shape[dim.val_axis]
-            if dim.val_axis is not None else dim.size
-            for dim in primal_dims
-        )
-        self.out_shape = tuple(
-            dim.size * self.block_shape[dim.val_axis]
-            if dim.val_axis is not None else dim.size
-            for dim in out_dims
-        )
+        self.elementary_block_idx = checked_max_val+1
+        self.primal_shape = [
+            x.size if isinstance(x, DenseDimension)
+            else x.size*self.block_shape[x.val_axis]
+            for x in primal_dims
+        ]
+        self.out_shape = [
+            x.size if isinstance(x, DenseDimension)
+            else x.size*self.block_shape[x.val_axis]
+            for x in out_dims
+        ]
 
         # self.out_shape = get_block_shape(out_dims)
         # self.primal_shape = get_block_shape(primal_dims)
@@ -146,36 +157,12 @@ class BlockSparseTensor:
         else:
             res = jnp.zeros(self.shape)
             if isinstance(self.blocks, Array):
-                # _dense_array(self.blocks, self.primal_dims + self.out_dims, self.shape)
-                index = jnp.zeros(self.elementary_block_idx + 1)
-                index_offset = index.copy()
-                dim_pointer = self.elementary_block_idx
-                dims = self.primal_dims + self.out_dims
-                non_block_dims = self.blocks.shape[:self.elementary_block_idx + 1]
-                val_size = reduce(operator.mul, non_block_dims)
-
-                # the shape for each dimensions regarding one block
-                block_shape_per_dim = jnp.array([
-                    self.block_shape[dim.val_dim]
-                    if dim.val_dim is not None else 1
-                    for dim in self.primal_dims + self.out_dims
-                ])
-
-                assert reduce(operator.mul, block_shape_per_dim) == self.block_size, \
-                        "block_shape_per_dim should of the same size as blocks"
-
-                def dense_step(_, index):
-                    # this only works for arrays, for list of arrays the blocks could be different sizes
-                    # as such the index_offset should be accounted for in carry
-                    scaled_index = index * block_shape_per_dim
-                    block_slice = slice(scaled_index, scaled_index + block_shape_per_dim)
-                    reshaped_block = self.blocks[index].reshape(block_shape_per_dim)
-                    res.at[block_slice].set(reshaped_block)
-                    return (None, None), None
-
-                indices = jnp.indices(self.shape).transpose(*range(1, self.ndim + 1), 0)
-                flattened_indices = indices.reshape(self.size, self.ndim)
-                lax.scan(dense_step, None, flattened_indices)
+                # THIS IS HARD CODED AND BAD
+                offset = self.blocks.shape[self.elementary_block_idx]
+                # jax.scan loop, rollout length, if elemnts = 100 ~ pick 10
+                for i, elem in np.ndenumerate(self.blocks):
+                    index = jnp.array(i[1:]) + jnp.array([i[0]*offset] * (len(i)-1))
+                    res = res.at[*index].set(elem)
             else:
                 # this is no longer of type Sequence but rather MultiSparseDimensionBlocks
                 # use get_ienumerated_blocks
@@ -233,8 +220,8 @@ class BlockSparseTensor:
                         and self.primal_dims == other.primal_dims \
                         and self.out_dims == other.out_dims:
 
-                    non_block_shape = self.blocks.shape[:self.elementary_block_idx + 1]
-                    non_block_size = reduce(lambda a, b: a * b, non_block_shape)
+                    non_block_shape = self.blocks.shape[:self.elementary_block_idx]
+                    non_block_size = reduce(operator.mul, non_block_shape)
 
                     block_mul = jit(jax.vmap(lambda a,b: a@b, in_axes=(0, 0)))
 
