@@ -140,7 +140,7 @@ class BlockSparseTensor:
         multiline_pre_transform = multiline_seq(self.pre_transforms, '[]')
         multiline_post_transform = multiline_seq(self.post_transforms, '[]')
 
-        return f"""SparseTensor(
+        return f"""BlockSparseTensor(
     shape = ({str_out_shape} | {str_primal_shape}),
     out_dims = {multiline_out_dims},
     primal_dims = {multiline_primal_dims},
@@ -256,10 +256,9 @@ class BlockSparseTensor:
                     non_block_shape = self.blocks.shape[:self.elementary_block_idx]
                     non_block_size = reduce(operator.mul, non_block_shape)
 
-                    block_mul = jit(jax.vmap(lambda a,b: a@b, in_axes=(0, 0)))
+                    block_mul = jax.vmap(lambda a,b: a@b, in_axes=(0, 0))
 
                     def flatten_blocks(blocks):
-                        #
                         # if len(self.block_shape) <= 2:
                         #     extra_dims = [1] * self.block_shape
                         # else:
@@ -267,6 +266,9 @@ class BlockSparseTensor:
                         extra_dims = [1]*max(2-len(self.block_shape),0)
                         return blocks.reshape((non_block_size, *self.block_shape, *extra_dims))
 
+                    # try lax.scan or fori_loop
+                    # check how vmap applies mat mul operations via jaxpr
+                    # pmap on CPU
                     new_blocks = block_mul(
                         flatten_blocks(self.blocks),
                         flatten_blocks(other.blocks)
