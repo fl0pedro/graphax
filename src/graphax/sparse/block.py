@@ -314,7 +314,7 @@ def _mul(rhs, lhs):
     else:
         raise TypeError("Expected to add with type BlockSparseTensor, SparseTensor, or Array")
 
-# @partial(jit, static_argnames=('rhs', 'lhs'))
+@partial(jit, static_argnames=('rhs', 'lhs'))
 def _matmul(rhs, lhs):
     # TODO assert something
     if isinstance(lhs, BlockSparseTensor):
@@ -338,19 +338,19 @@ def _matmul(rhs, lhs):
 
                 # use @pmap decorator on functions to be parallalized on cpu
 
-                # naive (remove jit)
-                new_blocks = jnp.empty_like(flattened_rhs_blocks)
-
-                for i in range(non_block_size):
-                    new_blocks = new_blocks.at[i].set(flattened_rhs_blocks[i] @ flattened_lhs_blocks[i])
-
-                # # vmap
-                # block_mul = jax.vmap(lambda a, b: a @ b, in_axes=(0, 0))
+                # # naive (remove jit)
+                # new_blocks = jnp.empty_like(flattened_rhs_blocks)
                 #
-                # new_blocks = block_mul(
-                #     flatten_blocks(rhs.blocks),
-                #     flatten_blocks(lhs.blocks)
-                # )
+                # for i in range(non_block_size):
+                #     new_blocks = new_blocks.at[i].set(flattened_rhs_blocks[i] @ flattened_lhs_blocks[i])
+
+                # vmap
+                block_mul = jax.vmap(lambda a, b: a @ b, in_axes=(0, 0))
+
+                new_blocks = block_mul(
+                    flatten_blocks(rhs.blocks),
+                    flatten_blocks(lhs.blocks)
+                )
                 #
                 # # fori_loop
                 # new_blocks = jnp.empty_like(flattened_rhs_blocks)
