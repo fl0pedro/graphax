@@ -349,26 +349,32 @@ def _matmul(rhs, lhs):
                 #     )
                 #
                 # new_blocks = _calc(rhs.blocks, lhs.blocks)
-
-                # fori_loop
-                @jax.pmap
-                def _calc(flattened_rhs_blocks, flattened_lhs_blocks, non_block_size):
-                    new_blocks = jnp.empty_like(flattened_rhs_blocks)
-
-                    def body_fun(i, new_blocks):
-                        new_blocks = new_blocks.at[i].set(flattened_rhs_blocks[i] @ flattened_lhs_blocks[i])
-                        return new_blocks
-
-                    return lax.fori_loop(0, non_block_size, body_fun, new_blocks, unroll=len(flattened_rhs_blocks) // 10)
-
-                new_blocks = _calc(flattened_rhs_blocks, flattened_lhs_blocks, non_block_size)
-
-                # # scan
-                # def scan_fn(carry, x):
-                #     a, b = x
-                #     return carry, a @ b
                 #
-                # _, new_blocks = lax.scan(scan_fn, None, (flattened_rhs_blocks, flattened_lhs_blocks), unroll=len(flattened_rhs_blocks) // 10)
+                # # fori_loop
+                # @jax.pmap
+                # def _calc(flattened_rhs_blocks, flattened_lhs_blocks, non_block_size):
+                #     new_blocks = jnp.empty_like(flattened_rhs_blocks)
+                #
+                #     def body_fun(i, new_blocks):
+                #         new_blocks = new_blocks.at[i].set(flattened_rhs_blocks[i] @ flattened_lhs_blocks[i])
+                #         return new_blocks
+                #
+                #     return lax.fori_loop(0, non_block_size, body_fun, new_blocks, unroll=len(flattened_rhs_blocks) // 10)
+                #
+                # new_blocks = _calc(flattened_rhs_blocks, flattened_lhs_blocks, non_block_size)
+
+                # scan
+                @jax.pmap
+                def _calc(flattened_rhs_blocks, flattened_lhs_blocks):
+                    def scan_fn(carry, x):
+                        a, b = x
+                        return carry, a @ b
+
+                    _, new_blocks = lax.scan(scan_fn, None, (flattened_rhs_blocks, flattened_lhs_blocks), unroll=len(flattened_rhs_blocks) // 10)
+
+                    return new_blocks
+
+                new_blocks = _calc(flattened_rhs_blocks, flattened_lhs_blocks)
 
                 return BlockSparseTensor(rhs.primal_dims, lhs.out_dims, new_blocks)
         elif all(b1.shape == b2.shape for b1, b2 in zip(rhs.blocks, lhs.blocks)):
