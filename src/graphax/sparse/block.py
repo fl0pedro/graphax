@@ -329,23 +329,19 @@ def _matmul(rhs, lhs):
                 non_block_shape = rhs.blocks.shape[:rhs.elementary_block_idx]
                 non_block_size = reduce(operator.mul, non_block_shape)
 
-                block_mul = jax.vmap(lambda a, b: a @ b, in_axes=(0, 0))
-
                 def flatten_blocks(blocks):
-                    # if len(self.block_shape) <= 2:
-                    #     extra_dims = [1] * self.block_shape
-                    # else:
-                    #     extra_dims = []
                     extra_dims = [1] * max(2 - len(rhs.block_shape), 0)
                     return blocks.reshape((non_block_size, *rhs.block_shape, *extra_dims))
 
-                # try lax.scan or fori_loop
-                # check how vmap applies mat mul operations via jaxpr
-                # pmap on CPU
-                new_blocks = block_mul(
-                    flatten_blocks(rhs.blocks),
-                    flatten_blocks(lhs.blocks)
-                )
+                flattened_rhs_blocks = flatten_blocks(rhs.blocks)
+                flattened_lhs_blocks = flatten_blocks(lhs.blocks)
+
+                def scan_fn(carry, x):
+                    a, b = x
+                    result = a @ b  # Matrix multiplication
+                    return carry, result
+
+                _, new_blocks = lax.scan(scan_fn, None, (flattened_rhs_blocks, flattened_lhs_blocks))
 
                 return BlockSparseTensor(rhs.primal_dims, lhs.out_dims, new_blocks)
         elif all(b1.shape == b2.shape for b1, b2 in zip(rhs.blocks, lhs.blocks)):
