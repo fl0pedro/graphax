@@ -10,7 +10,7 @@ from .tensor import SparseTensor
 import operator
 from dataclasses import dataclass, KW_ONLY
 import copy
-from functools import reduce
+from functools import reduce, partial
 import numpy as np
 
 # TODO: make parent class, or inherit sparse tensor ??
@@ -207,82 +207,14 @@ class BlockSparseTensor:
             return res
 
 
-    def __add__(self, other):
-        assert self.shape == other.shape, "Tensors must be of equal shape"
-        if isinstance(other, BlockSparseTensor):
-            if other.blocks is None:
-                pass
-            elif isinstance(self.blocks, Array) and isinstance(other.blocks, Array):
-                if self.shape == other.shape and self.primal_dims == other.primal_dims and self.out_dims == other.out_dims:
-                    return BlockSparseTensor(self.primal_dims, self.out_dims, self.blocks + other.blocks)
-            elif all(b1.shape == b2.shape for b1, b2 in zip(self.blocks, other.blocks)):
-                pass
-        elif isinstance(other, SparseTensor):
-            pass
-        elif isinstance(other, Array):
-            self.dense() + other
-        else:
-            raise TypeError("Expected to add with type BlockSparseTensor, SparseTensor, or Array")
+    def __add__(lhs, rhs):
+        _add(lhs, rhs)
 
-    def __mul__(self, other):
-        assert self.shape == other.shape, "Tensors must be of equal shape"
-        if isinstance(other, BlockSparseTensor):
-            if other.blocks is None:
-                pass
-            elif isinstance(self.blocks, Array) and isinstance(other.blocks, Array):
-                if self.shape == other.shape and self.primal_dims == other.primal_dims and self.out_dims == other.out_dims:
-                    return BlockSparseTensor(self.primal_dims, self.out_dims, self.blocks * other.blocks)
-            elif all(b1.shape == b2.shape for b1, b2 in zip(self.blocks, other.blocks)):
-                pass
-        elif isinstance(other, SparseTensor):
-            pass
-        elif isinstance(other, Array):
-            self.dense() + other
-        else:
-            raise TypeError("Expected to add with type BlockSparseTensor, SparseTensor, or Array")
+    def __mul__(lhs, rhs):
+        _mul(lhs, rhs)
 
-    def __matmul__(self, other):
-        # TODO assert something
-        if isinstance(other, BlockSparseTensor):
-            if self.blocks is None:
-                return copy.copy(other)
-            elif other.blocks is None:
-                return copy.copy(self)
-            elif isinstance(self.blocks, Array) and isinstance(other.blocks, Array):
-                if self.out_shape == other.primal_shape \
-                        and self.primal_dims == other.primal_dims \
-                        and self.out_dims == other.out_dims:
-
-                    non_block_shape = self.blocks.shape[:self.elementary_block_idx]
-                    non_block_size = reduce(operator.mul, non_block_shape)
-
-                    block_mul = jax.vmap(lambda a,b: a@b, in_axes=(0, 0))
-
-                    def flatten_blocks(blocks):
-                        # if len(self.block_shape) <= 2:
-                        #     extra_dims = [1] * self.block_shape
-                        # else:
-                        #     extra_dims = []
-                        extra_dims = [1]*max(2-len(self.block_shape),0)
-                        return blocks.reshape((non_block_size, *self.block_shape, *extra_dims))
-
-                    # try lax.scan or fori_loop
-                    # check how vmap applies mat mul operations via jaxpr
-                    # pmap on CPU
-                    new_blocks = block_mul(
-                        flatten_blocks(self.blocks),
-                        flatten_blocks(other.blocks)
-                    )
-
-                    return BlockSparseTensor(self.primal_dims, other.out_dims, new_blocks)
-            elif all(b1.shape == b2.shape for b1, b2 in zip(self.blocks, other.blocks)):
-                pass
-        elif isinstance(other, SparseTensor):
-            pass
-        elif isinstance(other, Array): # TODO: Fix default check
-            self.dense() @ other
-        else:
-            raise TypeError("Expected to add with type BlockSparseTensor, SparseTensor, or Array")
+    def __matmul__(lhs, rhs):
+        _matmul(lhs, rhs)
 
 def get_ienumerated_blocks(seq: Sequence, cur_idx: list[int] = None) -> Iterable[tuple[list[int], Array]]:
     if cur_idx is None:
@@ -345,3 +277,82 @@ def _dense_array(blocks, sparse_dims, shape):
     (dense_result, _), _ = lax.scan(dense_step, (dense_result, initial_idx), blocks)
 
     return dense_result
+
+@partial(jit, static_argnums=0)
+def _add(rhs, lhs):
+    assert lhs.shape == rhs.shape, "Tensors must be of equal shape"
+    if isinstance(rhs, BlockSparseTensor):
+        if rhs.blocks is None:
+            pass
+        elif isinstance(lhs.blocks, Array) and isinstance(rhs.blocks, Array):
+            if lhs.shape == rhs.shape and lhs.primal_dims == rhs.primal_dims and lhs.out_dims == rhs.out_dims:
+                return BlockSparseTensor(lhs.primal_dims, lhs.out_dims, lhs.blocks + rhs.blocks)
+        elif all(b1.shape == b2.shape for b1, b2 in zip(lhs.blocks, rhs.blocks)):
+            pass
+    elif isinstance(rhs, SparseTensor):
+        pass
+    elif isinstance(rhs, Array):
+        lhs.dense() + rhs
+    else:
+        raise TypeError("Expected to add with type BlockSparseTensor, SparseTensor, or Array")
+
+@partial(jit, static_argnums=0)
+def _mul(rhs, lhs):
+    assert rhs.shape == lhs.shape, "Tensors must be of equal shape"
+    if isinstance(lhs, BlockSparseTensor):
+        if lhs.blocks is None:
+            pass
+        elif isinstance(rhs.blocks, Array) and isinstance(lhs.blocks, Array):
+            if rhs.shape == lhs.shape and rhs.primal_dims == lhs.primal_dims and rhs.out_dims == lhs.out_dims:
+                return BlockSparseTensor(rhs.primal_dims, rhs.out_dims, rhs.blocks * lhs.blocks)
+        elif all(b1.shape == b2.shape for b1, b2 in zip(rhs.blocks, lhs.blocks)):
+            pass
+    elif isinstance(lhs, SparseTensor):
+        pass
+    elif isinstance(lhs, Array):
+        rhs.dense() + lhs
+    else:
+        raise TypeError("Expected to add with type BlockSparseTensor, SparseTensor, or Array")
+
+@partial(jit, static_argnums=0)
+def _matmul(rhs, lhs):
+    # TODO assert something
+    if isinstance(lhs, BlockSparseTensor):
+        if rhs.blocks is None:
+            return copy.copy(lhs)
+        elif lhs.blocks is None:
+            return copy.copy(rhs)
+        elif isinstance(rhs.blocks, Array) and isinstance(lhs.blocks, Array):
+            if rhs.out_shape == lhs.primal_shape \
+                    and rhs.primal_dims == lhs.primal_dims \
+                    and rhs.out_dims == lhs.out_dims:
+                non_block_shape = rhs.blocks.shape[:rhs.elementary_block_idx]
+                non_block_size = reduce(operator.mul, non_block_shape)
+
+                block_mul = jax.vmap(lambda a, b: a @ b, in_axes=(0, 0))
+
+                def flatten_blocks(blocks):
+                    # if len(self.block_shape) <= 2:
+                    #     extra_dims = [1] * self.block_shape
+                    # else:
+                    #     extra_dims = []
+                    extra_dims = [1] * max(2 - len(rhs.block_shape), 0)
+                    return blocks.reshape((non_block_size, *rhs.block_shape, *extra_dims))
+
+                # try lax.scan or fori_loop
+                # check how vmap applies mat mul operations via jaxpr
+                # pmap on CPU
+                new_blocks = block_mul(
+                    flatten_blocks(rhs.blocks),
+                    flatten_blocks(lhs.blocks)
+                )
+
+                return BlockSparseTensor(rhs.primal_dims, lhs.out_dims, new_blocks)
+        elif all(b1.shape == b2.shape for b1, b2 in zip(rhs.blocks, lhs.blocks)):
+            pass
+    elif isinstance(lhs, SparseTensor):
+        pass
+    elif isinstance(lhs, Array):  # TODO: Fix default check
+        rhs.dense() @ lhs
+    else:
+        raise TypeError("Expected to add with type BlockSparseTensor, SparseTensor, or Array")
