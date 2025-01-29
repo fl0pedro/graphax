@@ -344,23 +344,23 @@ def _matmul(rhs, lhs):
                 # for i in range(non_block_size):
                 #     new_blocks = new_blocks.at[i].set(flattened_rhs_blocks[i] @ flattened_lhs_blocks[i])
 
-                # vmap
-                block_mul = jax.vmap(lambda a, b: a @ b, in_axes=(0, 0))
+                # # vmap
+                # block_mul = jax.vmap(lambda a, b: a @ b, in_axes=(0, 0))
+                #
+                # new_blocks = block_mul(
+                #     flatten_blocks(rhs.blocks),
+                #     flatten_blocks(lhs.blocks)
+                # )
 
-                new_blocks = block_mul(
-                    flatten_blocks(rhs.blocks),
-                    flatten_blocks(lhs.blocks)
-                )
-                #
-                # # fori_loop
-                # new_blocks = jnp.empty_like(flattened_rhs_blocks)
-                #
-                # def body_fun(i, new_blocks):
-                #     new_blocks = new_blocks.at[i].set(flattened_rhs_blocks[i] @ flattened_lhs_blocks[i])
-                #     return new_blocks
-                #
-                # new_blocks = lax.fori_loop(0, non_block_size, body_fun, new_blocks)
-                #
+                # fori_loop
+                new_blocks = jnp.empty_like(flattened_rhs_blocks)
+
+                def body_fun(i, new_blocks):
+                    new_blocks = new_blocks.at[i].set(flattened_rhs_blocks[i] @ flattened_lhs_blocks[i])
+                    return new_blocks
+
+                new_blocks = lax.fori_loop(0, non_block_size, body_fun, new_blocks)
+
                 # # scan
                 # def scan_fn(carry, x):
                 #     a, b = x
