@@ -338,14 +338,18 @@ def _matmul(rhs, lhs):
 
                 # use @pmap decorator on functions to be parallalized on cpu
 
-                # # vmap
-                # block_mul = jax.vmap(lambda a, b: a @ b, in_axes=(0, 0))
-                #
-                # new_blocks = block_mul(
-                #     flatten_blocks(rhs.blocks),
-                #     flatten_blocks(lhs.blocks)
-                # )
-                #
+                # vmap
+                @jax.pmap
+                def _calc(rb, lb):
+                    block_mul = jax.vmap(lambda a, b: a @ b, in_axes=(0, 0))
+
+                    return block_mul(
+                        flatten_blocks(rb),
+                        flatten_blocks(lb)
+                    )
+
+                new_blocks = _calc(rhs.blocks, lhs.blocks)
+
                 # # fori_loop
                 # new_blocks = jnp.empty_like(flattened_rhs_blocks)
                 #
@@ -354,13 +358,13 @@ def _matmul(rhs, lhs):
                 #     return new_blocks
                 #
                 # new_blocks = lax.fori_loop(0, non_block_size, body_fun, new_blocks, unroll=len(flattened_rhs_blocks) // 10)
-
-                # scan
-                def scan_fn(carry, x):
-                    a, b = x
-                    return carry, a @ b
-
-                _, new_blocks = lax.scan(scan_fn, None, (flattened_rhs_blocks, flattened_lhs_blocks), unroll=len(flattened_rhs_blocks) // 10)
+                #
+                # # scan
+                # def scan_fn(carry, x):
+                #     a, b = x
+                #     return carry, a @ b
+                #
+                # _, new_blocks = lax.scan(scan_fn, None, (flattened_rhs_blocks, flattened_lhs_blocks), unroll=len(flattened_rhs_blocks) // 10)
 
                 return BlockSparseTensor(rhs.primal_dims, lhs.out_dims, new_blocks)
         elif all(b1.shape == b2.shape for b1, b2 in zip(rhs.blocks, lhs.blocks)):
