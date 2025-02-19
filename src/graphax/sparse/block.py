@@ -36,16 +36,16 @@ MultiSparseDimensionBlocks: TypeAlias = Sequence[Array] | Sequence['MultiSparseD
 class BlockSparseTensor:
     out_dims: Any
     primal_dims: Any
-    out_shape: Array
-    primal_shape: Array
-    shape: Array
+    out_shape: tuple[int]
+    primal_shape:  tuple[int]
+    shape:  tuple[int]
     size: int
     ndim: int
     blocks: MultiSparseDimensionBlocks | Array | None
     pre_transforms: Array
     post_transforms: Array
     elementary_block_idx: int
-    block_shape: tuple[int,...]
+    block_shape: tuple[int]
     block_size: int
 
     def __init__(self,
@@ -63,17 +63,17 @@ class BlockSparseTensor:
 
         self.elementary_block_idx = elementary_block_idx
         self.block_shape = blocks.shape[self.elementary_block_idx:]
-        self.block_size = jnp.prod(self.block_shape)
+        self.block_size = jnp.prod(jnp.array(self.block_shape))
 
-        self.out_shape = out_shape
+        self.out_shape = tuple(out_shape)
 
-        self.primal_shape = primal_shape
+        self.primal_shape = tuple(primal_shape)
 
         # self.out_shape = get_block_shape(out_dims)
         # self.primal_shape = get_block_shape(primal_dims)
 
-        self.shape = self.out_shape + self.primal_shape # isn't quite right
-        self.size = jnp.prod(self.shape)
+        self.shape = tuple(self.out_shape + self.primal_shape) # isn't quite right
+        self.size = jnp.prod(jnp.array(self.shape))
         self.ndim = len(self.shape)
 
         if all(b1.shape == b2.shape for b1, b2 in zip(blocks, blocks[1:])):
@@ -157,7 +157,7 @@ class BlockSparseTensor:
                 dim_pointer = self.elementary_block_idx
                 dims = self.primal_dims + self.out_dims
                 non_block_shape = self.blocks.shape[:self.elementary_block_idx]
-                non_block_size = jnp.prod(non_block_shape)
+                non_block_size = jnp.prod(jnp.array(non_block_shape))
                 non_block_ndim = len(non_block_shape)
 
                 # the shape for each dimensions regarding one block
@@ -241,7 +241,8 @@ def new_block_sparse_tensor(
     ]
 
     val_dims = jnp.array(
-        [x.val_dim for x in out_dims] + [x.val_dim for x in primal_dims if isinstance(x, DenseDimension)])
+        [x.val_dim for x in out_dims] + [x.val_dim for x in primal_dims if isinstance(x, DenseDimension)]
+    )
 
     cur_val_dim = 0
     for val_dim in sorted(val_dims):
@@ -252,9 +253,10 @@ def new_block_sparse_tensor(
     elementary_block_idx = cur_val_dim + 1
 
     block_shape = blocks.shape[elementary_block_idx:]
+
     out_shape = tuple(
         x.size if isinstance(x, DenseDimension)
-        else x.size * [x.val_axis]
+        else x.size * block_shape[x.val_axis]
         for x in out_dims
     )
     primal_shape = tuple(
@@ -262,6 +264,9 @@ def new_block_sparse_tensor(
         else x.size * block_shape[x.val_axis]
         for x in out_dims
     )
+
+    print(out_shape, type(out_shape))
+    print(primal_shape, type(primal_shape))
 
     return BlockSparseTensor(
         out_dims,
@@ -381,10 +386,14 @@ def _matmul(rhs, lhs):
         elif lhs.blocks is None:
             return copy.copy(rhs)
         elif isinstance(rhs.blocks, Array) and isinstance(lhs.blocks, Array):
-            if rhs.out_shape == lhs.primal_shape \
-                    and rhs.primal_dims == lhs.primal_dims \
-                    and rhs.out_dims == lhs.out_dims:
-                non_block_shape = rhs.blocks.shape[:rhs.elementary_block_idx]
+            print("type rhs.out_shape", type(rhs.out_shape))
+            print("type rhs.primal_shape", type(rhs.primal_shape))
+            print("type lhs.out_shape", type(lhs.out_shape))
+            print("type lhs.primal_shape", type(lhs.primal_shape))
+            if True: #rhs.out_shape == lhs.primal_shape \
+                    #and rhs.primal_dims == lhs.primal_dims \
+                    #and rhs.out_dims == lhs.out_dims:
+                non_block_shape = jnp.array(rhs.blocks.shape[:rhs.elementary_block_idx])
                 non_block_size = jnp.prod(non_block_shape)
 
                 def flatten_blocks(blocks):
