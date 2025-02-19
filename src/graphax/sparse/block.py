@@ -1,4 +1,4 @@
-from typing import Any, Callable, Sequence, Generator, TypeAlias, Iterable
+from typing import Any, Callable, Sequence, Generator, TypeAlias, Iterable, NamedTuple
 
 # import numpy as np
 from chex import Array
@@ -15,23 +15,19 @@ import numpy as np
 
 # TODO: make parent class, or inherit sparse tensor ??
 
-@dataclass
-class DenseDimension:
+class DenseDimension(NamedTuple):
     id: int
     size: int
     val_dim: int | None
-    _: KW_ONLY
     val_axis: int = None
 
 # val_axes: These are two axis of the blocks that we would like to apply the diagonal on.
 #   By default pick the first two (0, 1) as the axis). TODO: make negatives work like indeces
-@dataclass
-class SparseDimension:
+class SparseDimension(NamedTuple):
     id: int
     size: int
     val_dim: int
     other_id: int
-    _: KW_ONLY
     val_axis: int = None
 
 Dimension = DenseDimension | SparseDimension
@@ -56,54 +52,23 @@ class BlockSparseTensor:
     def __init__(self,
                  out_dims: Sequence[Dimension],
                  primal_dims: Sequence[Dimension],
+                 out_shape: Sequence[int],
+                 primal_shape: Sequence[int],
                  blocks: MultiSparseDimensionBlocks | Array | None,
-                 pre_transforms: Sequence[Callable] = None,
-                 post_transforms: Sequence[Callable] = None) -> None:
-
-        if pre_transforms is None:
-            pre_transforms = []
-        if post_transforms is None:
-            post_transforms = []
-
-        assert all(b1.ndim == b2.ndim for b1, b2 in zip(blocks, blocks[1:])), \
-            "Block dimensions should all be equal"
-
-        for x in primal_dims:
-            if x.val_axis is None:
-                x.val_axis = 0
-        for x in out_dims:
-            if x.val_axis is None:
-                x.val_axis = 1
-
-        assert all(b1.ndim == b2.ndim for b1, b2 in zip(blocks, blocks[1:])), \
-            "Block dimensions should all be equal"
+                 elementary_block_idx: int,
+                 pre_transforms: Sequence[Callable],
+                 post_transforms: Sequence[Callable]) -> None:
 
         self.out_dims = out_dims if isinstance(out_dims, tuple) else tuple(out_dims)
         self.primal_dims = primal_dims if isinstance(primal_dims, tuple) else tuple(primal_dims)
 
-
-        val_dims = [x.val_dim for x in out_dims] + [x.val_dim for x in primal_dims if isinstance(x, DenseDimension)]
-
-        if not isinstance(blocks, Array):
-            raise NotImplementedError("MultiSparseDimensionBlocks is WIP")
-
-        checked_max_val = reduce(lambda a,b: b if a+1==b else -1, sorted(val_dims))
-        assert checked_max_val != -1 and checked_max_val <= blocks.ndim, \
-            "Value dimensions should include all till the maximum (<= max block dimension)"
-        self.block_shape = blocks.shape[checked_max_val+1:]
+        self.elementary_block_idx = elementary_block_idx
+        self.block_shape = blocks.shape[self.elementary_block_idx:]
         self.block_size = reduce(operator.mul, self.block_shape)
 
-        self.elementary_block_idx = checked_max_val+1
-        self.primal_shape = [
-            x.size if isinstance(x, DenseDimension)
-            else x.size*self.block_shape[x.val_axis]
-            for x in primal_dims
-        ]
-        self.out_shape = [
-            x.size if isinstance(x, DenseDimension)
-            else x.size*self.block_shape[x.val_axis]
-            for x in out_dims
-        ]
+        self.out_shape = out_shape
+
+        self.primal_shape = primal_shape
 
         # self.out_shape = get_block_shape(out_dims)
         # self.primal_shape = get_block_shape(primal_dims)
@@ -145,6 +110,7 @@ class BlockSparseTensor:
     out_dims = {multiline_out_dims},
     primal_dims = {multiline_primal_dims},
     blocks = {self.blocks},
+    elementary_block_idx = {self.elementary_block_idx},
     pre_transforms = {multiline_pre_transform},
     post_transforms = {multiline_post_transform}
 )"""
@@ -208,13 +174,76 @@ class BlockSparseTensor:
 
 
     def __add__(lhs, rhs):
-        _add(lhs, rhs)
+        return _add(lhs, rhs)
 
     def __mul__(lhs, rhs):
-        _mul(lhs, rhs)
+        return _mul(lhs, rhs)
 
     def __matmul__(lhs, rhs):
-        _matmul(lhs, rhs)
+        return _matmul(lhs, rhs)
+
+
+def new_block_sparse_tensor(
+    out_dims: Sequence[Dimension],
+    primal_dims: Sequence[Dimension],
+    blocks: MultiSparseDimensionBlocks | Array | None,
+    pre_transforms: Sequence[Callable] = None,
+    post_transforms: Sequence[Callable] = None
+) -> BlockSparseTensor:
+
+    if pre_transforms is None:
+        pre_transforms = []
+    if post_transforms is None:
+        post_transforms = []
+
+    assert all(b1.ndim == b2.ndim for b1, b2 in zip(blocks, blocks[1:])), \
+        "Block dimensions should all be equal"
+
+    if not isinstance(blocks, Array):
+        raise NotImplementedError("MultiSparseDimensionBlocks is WIP")
+
+    out_dims = [
+        x if not None
+        else x._replace(val_axis=1)
+        for x in out_dims
+    ]
+    primal_dims = [
+        x if not None
+        else x._replace(val_axis=0)
+        for x in primal_dims
+    ]
+
+    val_dims = jnp.array(
+        [x.val_dim for x in out_dims] + [x.val_dim for x in primal_dims if isinstance(x, DenseDimension)])
+
+    checked_max_val = reduce(lambda a, b: b if a + 1 == b else -1, sorted(val_dims))
+    assert checked_max_val != -1 and checked_max_val <= blocks.ndim, \
+        "Value dimensions should include all till the maximum (<= max block dimension)"
+
+    elementary_block_idx = checked_max_val + 1
+
+    block_shape = blocks.shape[elementary_block_idx:]
+    out_shape = tuple(
+        x.size if isinstance(x, DenseDimension)
+        else x.size * [x.val_axis]
+        for x in out_dims
+    )
+    primal_shape = tuple(
+        x.size if isinstance(x, DenseDimension)
+        else x.size * block_shape[x.val_axis]
+        for x in out_dims
+    )
+
+    return BlockSparseTensor(
+        out_dims,
+        primal_dims,
+        out_shape,
+        primal_shape,
+        blocks,
+        elementary_block_idx,
+        pre_transforms,
+        post_transforms
+    )
 
 def get_ienumerated_blocks(seq: Sequence, cur_idx: list[int] = None) -> Iterable[tuple[list[int], Array]]:
     if cur_idx is None:
@@ -278,7 +307,7 @@ def _dense_array(blocks, sparse_dims, shape):
 
     return dense_result
 
-@partial(jit, static_argnames=('rhs', 'lhs'))
+# @partial(jit, static_argnames=('rhs', 'lhs'))
 def _add(rhs, lhs):
     assert lhs.shape == rhs.shape, "Tensors must be of equal shape"
     if isinstance(rhs, BlockSparseTensor):
@@ -286,7 +315,7 @@ def _add(rhs, lhs):
             pass
         elif isinstance(lhs.blocks, Array) and isinstance(rhs.blocks, Array):
             if lhs.shape == rhs.shape and lhs.primal_dims == rhs.primal_dims and lhs.out_dims == rhs.out_dims:
-                return BlockSparseTensor(lhs.primal_dims, lhs.out_dims, lhs.blocks + rhs.blocks)
+                return BlockSparseTensor(lhs.primal_dims, lhs.out_dims, lhs.blocks + rhs.blocks, lhs.elementary_block_idx)
         elif all(b1.shape == b2.shape for b1, b2 in zip(lhs.blocks, rhs.blocks)):
             pass
     elif isinstance(rhs, SparseTensor):
@@ -296,7 +325,7 @@ def _add(rhs, lhs):
     else:
         raise TypeError("Expected to add with type BlockSparseTensor, SparseTensor, or Array")
 
-@partial(jit, static_argnames=('rhs', 'lhs'))
+# @partial(jit, static_argnames=('rhs', 'lhs'))
 def _mul(rhs, lhs):
     assert rhs.shape == lhs.shape, "Tensors must be of equal shape"
     if isinstance(lhs, BlockSparseTensor):
@@ -304,7 +333,7 @@ def _mul(rhs, lhs):
             pass
         elif isinstance(rhs.blocks, Array) and isinstance(lhs.blocks, Array):
             if rhs.shape == lhs.shape and rhs.primal_dims == lhs.primal_dims and rhs.out_dims == lhs.out_dims:
-                return BlockSparseTensor(rhs.primal_dims, rhs.out_dims, rhs.blocks * lhs.blocks)
+                return BlockSparseTensor(rhs.primal_dims, rhs.out_dims, rhs.blocks * lhs.blocks, rhs.elementary_block_idx)
         elif all(b1.shape == b2.shape for b1, b2 in zip(rhs.blocks, lhs.blocks)):
             pass
     elif isinstance(lhs, SparseTensor):
@@ -314,7 +343,7 @@ def _mul(rhs, lhs):
     else:
         raise TypeError("Expected to add with type BlockSparseTensor, SparseTensor, or Array")
 
-@partial(jit, static_argnames=('rhs', 'lhs'))
+# @partial(jit, static_argnames=('rhs', 'lhs'))
 def _matmul(rhs, lhs):
     # TODO assert something
     if isinstance(lhs, BlockSparseTensor):
@@ -333,50 +362,20 @@ def _matmul(rhs, lhs):
                     extra_dims = [1] * max(2 - len(rhs.block_shape), 0)
                     return blocks.reshape((non_block_size, *rhs.block_shape, *extra_dims))
 
-                flattened_rhs_blocks = flatten_blocks(rhs.blocks)
-                flattened_lhs_blocks = flatten_blocks(lhs.blocks)
+                def _calc(rb, lb):
+                    block_mul = jax.vmap(lambda a, b: a @ b, in_axes=(0, 0))
 
-                # use @pmap decorator on functions to be parallalized on cpu
-                #
-                # # vmap
-                # @jax.pmap
-                # def _calc(rb, lb):
-                #     block_mul = jax.vmap(lambda a, b: a @ b, in_axes=(0, 0))
-                #
-                #     return block_mul(
-                #         flatten_blocks(rb),
-                #         flatten_blocks(lb)
-                #     )
-                #
-                # new_blocks = _calc(rhs.blocks, lhs.blocks)
-                #
-                # # fori_loop
-                # @jax.pmap
-                # def _calc(flattened_rhs_blocks, flattened_lhs_blocks, non_block_size):
-                #     new_blocks = jnp.empty_like(flattened_rhs_blocks)
-                #
-                #     def body_fun(i, new_blocks):
-                #         new_blocks = new_blocks.at[i].set(flattened_rhs_blocks[i] @ flattened_lhs_blocks[i])
-                #         return new_blocks
-                #
-                #     return lax.fori_loop(0, non_block_size, body_fun, new_blocks, unroll=len(flattened_rhs_blocks) // 10)
-                #
-                # new_blocks = _calc(flattened_rhs_blocks, flattened_lhs_blocks, non_block_size)
+                    return block_mul(
+                        flatten_blocks(rb),
+                        flatten_blocks(lb)
+                    )
 
-                # scan
-                @jax.pmap
-                def _calc(flattened_rhs_blocks, flattened_lhs_blocks):
-                    def scan_fn(carry, x):
-                        a, b = x
-                        return carry, a @ b
-
-                    _, new_blocks = lax.scan(scan_fn, None, (flattened_rhs_blocks, flattened_lhs_blocks), unroll=len(flattened_rhs_blocks) // 10)
-
-                    return new_blocks
-
-                new_blocks = _calc(flattened_rhs_blocks, flattened_lhs_blocks)
-
-                return BlockSparseTensor(rhs.primal_dims, lhs.out_dims, new_blocks)
+                new_blocks = _calc(rhs.blocks, lhs.blocks)
+                print("mat mul res:", new_blocks)
+                # rhs.elementary_block_idx may not be general
+                blocksparse_tensor = BlockSparseTensor(rhs.primal_dims, lhs.out_dims, new_blocks, rhs.elementary_block_idx)
+                print("obj", blocksparse_tensor)
+                return blocksparse_tensor
         elif all(b1.shape == b2.shape for b1, b2 in zip(rhs.blocks, lhs.blocks)):
             pass
     elif isinstance(lhs, SparseTensor):
