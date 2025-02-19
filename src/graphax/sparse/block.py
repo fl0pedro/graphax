@@ -10,8 +10,8 @@ from .tensor import SparseTensor
 import operator
 from dataclasses import dataclass, KW_ONLY
 import copy
+from functools import reduce, partial
 import numpy as np
-from functools import reduce
 
 # TODO: make parent class, or inherit sparse tensor ??
 
@@ -63,9 +63,7 @@ class BlockSparseTensor:
         self.primal_dims = primal_dims if isinstance(primal_dims, tuple) else tuple(primal_dims)
 
         self.elementary_block_idx = elementary_block_idx
-        print(blocks)
         self.block_shape = blocks.shape[self.elementary_block_idx:]
-        print(self.block_shape)
         self.block_size = reduce(operator.mul, self.block_shape)
 
         self.out_shape = tuple(out_shape)
@@ -76,7 +74,6 @@ class BlockSparseTensor:
         # self.primal_shape = get_block_shape(primal_dims)
 
         self.shape = tuple(self.out_shape + self.primal_shape) # isn't quite right
-        print(self.shape)
         self.size = reduce(operator.mul, self.shape)
         self.ndim = len(self.shape)
 
@@ -84,7 +81,6 @@ class BlockSparseTensor:
 
         self.pre_transforms = pre_transforms
         self.post_transforms = post_transforms
-        print(self)
 
     def __repr__(self) -> str:
         def map_str(a: Sequence) -> Generator:
@@ -115,34 +111,6 @@ class BlockSparseTensor:
     pre_transforms = {multiline_pre_transform},
     post_transforms = {multiline_post_transform}
 )"""
-
-    # @property
-    # def out_shape(self):
-    #     return tuple(self.out_shape)
-    # @out_shape.setter
-    # def out_shape(self, value):
-    #     self.out_shape = jnp.array(value)
-    #
-    # @property
-    # def primal_shape(self):
-    #     return tuple(self.primal_shape)
-    # @primal_shape.setter
-    # def primal_shape(self, value):
-    #     self.primal_shape = jnp.array(value)
-    #
-    # @property
-    # def shape(self):
-    #     return tuple(self.shape)
-    # @shape.setter
-    # def shape(self, value):
-    #     self.shape = jnp.array(value)
-    #
-    # @property
-    # def block_shape(self):
-    #     return tuple(self.block_shape)
-    # @block_shape.setter
-    # def block_shape(self, value):
-    #     self.block_shape = jnp.array(value)
 
     def dense(self):
         if all(isinstance(d, DenseDimension) for d in self.out_dims + self.primal_dims):
@@ -247,8 +215,6 @@ def new_block_sparse_tensor(
         + [x.val_dim for x in primal_dims]
     )
 
-    print(sorted_val_dims)
-
     assert all(a+1 == b for a, b in zip(sorted_val_dims, sorted_val_dims[1:])), \
         "Value dimensions should be continuous"
 
@@ -266,9 +232,6 @@ def new_block_sparse_tensor(
         else x.size * block_shape[x.val_axis]
         for x in out_dims
     )
-
-    print(out_shape, type(out_shape))
-    print(primal_shape, type(primal_shape))
 
     if all(b1.shape == b2.shape for b1, b2 in zip(blocks, blocks[1:])):
         blocks = jnp.array(blocks)
@@ -386,7 +349,6 @@ def _mul(rhs, lhs):
 
 # @partial(jit, static_argnames=('rhs', 'lhs'))
 def _matmul(rhs, lhs):
-    print("mat mul")
     # TODO assert something
     if isinstance(lhs, BlockSparseTensor):
         if rhs.blocks is None:
@@ -395,15 +357,14 @@ def _matmul(rhs, lhs):
             return copy.copy(rhs)
         elif isinstance(rhs.blocks, Array) and isinstance(lhs.blocks, Array):
             print()
-            if True: #rhs.out_shape == lhs.primal_shape \
-                    #and rhs.primal_dims == lhs.primal_dims \
-                    #and rhs.out_dims == lhs.out_dims:
+            if rhs.out_shape == lhs.primal_shape \
+                    and rhs.primal_dims == lhs.primal_dims \
+                    and rhs.out_dims == lhs.out_dims:
                 non_block_shape = tuple(rhs.blocks.shape[:rhs.elementary_block_idx])
                 non_block_size = reduce(operator.mul, non_block_shape)
 
                 def flatten_blocks(blocks):
                     extra_dims = [1] * max(2 - len(rhs.block_shape), 0)
-                    print(non_block_shape, rhs.block_shape, extra_dims)
                     return blocks.reshape((non_block_size, *rhs.block_shape, *extra_dims))
 
                 def _calc(rb, lb):
