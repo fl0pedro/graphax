@@ -52,23 +52,18 @@ class BlockSparseTensor:
     def __init__(self,
                  out_dims: Sequence[Dimension],
                  primal_dims: Sequence[Dimension],
-                 out_shape: Sequence[int],
-                 primal_shape: Sequence[int],
                  blocks: MultiSparseDimensionBlocks | Array | None,
-                 elementary_block_idx: int,
-                 pre_transforms: Sequence[Callable],
-                 post_transforms: Sequence[Callable]) -> None:
+                 pre_transforms: Sequence[Callable] = None,
+                 post_transforms: Sequence[Callable] = None) -> None:
+
+        self.elementary_block_idx, self.out_shape, self.primal_shape = \
+            _init(out_dims, primal_dims, blocks, pre_transforms, post_transforms)
 
         self.out_dims = out_dims if isinstance(out_dims, tuple) else tuple(out_dims)
         self.primal_dims = primal_dims if isinstance(primal_dims, tuple) else tuple(primal_dims)
 
-        self.elementary_block_idx = elementary_block_idx
         self.block_shape = blocks.shape[self.elementary_block_idx:]
         self.block_size = reduce(operator.mul, self.block_shape)
-
-        self.out_shape = out_shape
-
-        self.primal_shape = primal_shape
 
         # self.out_shape = get_block_shape(out_dims)
         # self.primal_shape = get_block_shape(primal_dims)
@@ -183,13 +178,13 @@ class BlockSparseTensor:
         return _matmul(lhs, rhs)
 
 
-def new_block_sparse_tensor(
+def _init(
     out_dims: Sequence[Dimension],
     primal_dims: Sequence[Dimension],
     blocks: MultiSparseDimensionBlocks | Array | None,
     pre_transforms: Sequence[Callable] = None,
     post_transforms: Sequence[Callable] = None
-) -> BlockSparseTensor:
+) -> tuple:
 
     if pre_transforms is None:
         pre_transforms = []
@@ -234,15 +229,10 @@ def new_block_sparse_tensor(
         for x in out_dims
     )
 
-    return BlockSparseTensor(
-        out_dims,
-        primal_dims,
+    return (
         out_shape,
         primal_shape,
-        blocks,
         elementary_block_idx,
-        pre_transforms,
-        post_transforms
     )
 
 def get_ienumerated_blocks(seq: Sequence, cur_idx: list[int] = None) -> Iterable[tuple[list[int], Array]]:
