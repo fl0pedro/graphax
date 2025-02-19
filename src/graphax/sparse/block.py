@@ -10,7 +10,6 @@ from .tensor import SparseTensor
 import operator
 from dataclasses import dataclass, KW_ONLY
 import copy
-from functools import reduce, partial
 import numpy as np
 
 # TODO: make parent class, or inherit sparse tensor ??
@@ -37,14 +36,14 @@ MultiSparseDimensionBlocks: TypeAlias = Sequence[Array] | Sequence['MultiSparseD
 class BlockSparseTensor:
     out_dims: Any
     primal_dims: Any
-    out_shape: tuple[int]
-    primal_shape: tuple[int]
-    shape: tuple[int]
+    out_shape: Array
+    primal_shape: Array
+    shape: Array
     size: int
     ndim: int
     blocks: MultiSparseDimensionBlocks | Array | None
-    pre_transforms: tuple[Callable]
-    post_transforms: tuple[Callable]
+    pre_transforms: Array
+    post_transforms: Array
     elementary_block_idx: int
     block_shape: tuple[int,...]
     block_size: int
@@ -64,7 +63,7 @@ class BlockSparseTensor:
 
         self.elementary_block_idx = elementary_block_idx
         self.block_shape = blocks.shape[self.elementary_block_idx:]
-        self.block_size = reduce(operator.mul, self.block_shape)
+        self.block_size = jnp.prod(self.block_shape)
 
         self.out_shape = out_shape
 
@@ -73,8 +72,8 @@ class BlockSparseTensor:
         # self.out_shape = get_block_shape(out_dims)
         # self.primal_shape = get_block_shape(primal_dims)
 
-        self.shape = tuple(self.out_shape + self.primal_shape) # isn't quite right
-        self.size = reduce(operator.mul, self.shape)
+        self.shape = self.out_shape + self.primal_shape # isn't quite right
+        self.size = jnp.prod(self.shape)
         self.ndim = len(self.shape)
 
         if all(b1.shape == b2.shape for b1, b2 in zip(blocks, blocks[1:])):
@@ -115,6 +114,34 @@ class BlockSparseTensor:
     post_transforms = {multiline_post_transform}
 )"""
 
+    # @property
+    # def out_shape(self):
+    #     return tuple(self.out_shape)
+    # @out_shape.setter
+    # def out_shape(self, value):
+    #     self.out_shape = jnp.array(value)
+    #
+    # @property
+    # def primal_shape(self):
+    #     return tuple(self.primal_shape)
+    # @primal_shape.setter
+    # def primal_shape(self, value):
+    #     self.primal_shape = jnp.array(value)
+    #
+    # @property
+    # def shape(self):
+    #     return tuple(self.shape)
+    # @shape.setter
+    # def shape(self, value):
+    #     self.shape = jnp.array(value)
+    #
+    # @property
+    # def block_shape(self):
+    #     return tuple(self.block_shape)
+    # @block_shape.setter
+    # def block_shape(self, value):
+    #     self.block_shape = jnp.array(value)
+
     def dense(self):
         if all(isinstance(d, DenseDimension) for d in self.out_dims + self.primal_dims):
             assert isinstance(self.blocks, Array), \
@@ -130,7 +157,7 @@ class BlockSparseTensor:
                 dim_pointer = self.elementary_block_idx
                 dims = self.primal_dims + self.out_dims
                 non_block_shape = self.blocks.shape[:self.elementary_block_idx]
-                non_block_size = reduce(operator.mul, non_block_shape)
+                non_block_size = jnp.prod(non_block_shape)
                 non_block_ndim = len(non_block_shape)
 
                 # the shape for each dimensions regarding one block
@@ -140,7 +167,7 @@ class BlockSparseTensor:
                     for dim in self.primal_dims + self.out_dims
                 ])
 
-                assert reduce(operator.mul, block_shape_per_dim) == self.block_size, \
+                assert jnp.prod(block_shape_per_dim) == self.block_size, \
                         "block_shape_per_dim should of the same size as blocks"
 
                 # def dense_step(carry, index):
@@ -216,11 +243,13 @@ def new_block_sparse_tensor(
     val_dims = jnp.array(
         [x.val_dim for x in out_dims] + [x.val_dim for x in primal_dims if isinstance(x, DenseDimension)])
 
-    checked_max_val = reduce(lambda a, b: b if a + 1 == b else -1, sorted(val_dims))
-    assert checked_max_val != -1 and checked_max_val <= blocks.ndim, \
-        "Value dimensions should include all till the maximum (<= max block dimension)"
+    cur_val_dim = 0
+    for val_dim in sorted(val_dims):
+        if val_dim is not None:
+            assert val_dim == cur_val_dim, "Value dimensions should be continuous"
+            cur_val_dim += 1
 
-    elementary_block_idx = checked_max_val + 1
+    elementary_block_idx = cur_val_dim + 1
 
     block_shape = blocks.shape[elementary_block_idx:]
     out_shape = tuple(
@@ -356,7 +385,7 @@ def _matmul(rhs, lhs):
                     and rhs.primal_dims == lhs.primal_dims \
                     and rhs.out_dims == lhs.out_dims:
                 non_block_shape = rhs.blocks.shape[:rhs.elementary_block_idx]
-                non_block_size = reduce(operator.mul, non_block_shape)
+                non_block_size = jnp.prod(non_block_shape)
 
                 def flatten_blocks(blocks):
                     extra_dims = [1] * max(2 - len(rhs.block_shape), 0)
