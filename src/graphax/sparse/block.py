@@ -297,9 +297,6 @@ def _dense_array(blocks, sparse_dims, shape):
         start, end = get_indices(idx, jnp.array(block.shape))
 
         slices = tuple(slice(start, end) for start, end in zip(start, end))
-        print(block)
-        print(slices)
-        print(dense.at[*slices].get())
         dense = dense.at[slices].set(block)
         new_idx = jnp.where(sparse_val_dims == -1, idx, idx + sparse_sizes)
 
@@ -356,7 +353,6 @@ def _matmul(rhs, lhs):
         elif lhs.blocks is None:
             return copy.copy(rhs)
         elif isinstance(rhs.blocks, Array) and isinstance(lhs.blocks, Array):
-            print()
             if rhs.out_shape == lhs.primal_shape \
                     and rhs.primal_dims == lhs.primal_dims \
                     and rhs.out_dims == lhs.out_dims:
@@ -376,10 +372,8 @@ def _matmul(rhs, lhs):
                     )
 
                 new_blocks = _calc(rhs.blocks, lhs.blocks)
-                print("mat mul res:", new_blocks)
                 # rhs.elementary_block_idx may not be general
                 blocksparse_tensor = BlockSparseTensor(rhs.primal_dims, lhs.out_dims, rhs.primal_shape, lhs.out_shape, new_blocks, rhs.elementary_block_idx)
-                print("obj", blocksparse_tensor)
                 return blocksparse_tensor
         elif all(b1.shape == b2.shape for b1, b2 in zip(rhs.blocks, lhs.blocks)):
             pass
