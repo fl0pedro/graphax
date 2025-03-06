@@ -390,22 +390,22 @@ def _matmul(rhs, lhs):
                 #     return new_blocks
                 #
                 # new_blocks = lax.fori_loop(0, non_block_size, _calc, new_blocks, unroll=len(flattened_rhs_blocks) // 10)
-
-                # scan
-                def _calc(carry, x):
-                    a, b = x
-                    return carry, a @ b
-
-                _, new_blocks = lax.scan(_calc, None, (flattened_rhs_blocks, flattened_lhs_blocks), unroll=len(flattened_rhs_blocks) // 10)
-
-                # # pmap
-                # block_mul_pmap = jax.pmap(lambda a, b: a @ b)
                 #
-                # num_devices = jax.device_count()
-                # split_rhs = jnp.array_split(flattened_rhs_blocks, num_devices, axis=0)
-                # split_lhs = jnp.array_split(flattened_lhs_blocks, num_devices, axis=0)
+                # # scan
+                # def _calc(carry, x):
+                #     a, b = x
+                #     return carry, a @ b
                 #
-                # new_blocks = jnp.concatenate(block_mul_pmap(jnp.stack(split_rhs), jnp.stack(split_lhs)), axis=0)
+                # _, new_blocks = lax.scan(_calc, None, (flattened_rhs_blocks, flattened_lhs_blocks), unroll=len(flattened_rhs_blocks) // 10)
+
+                # pmap
+                block_mul_pmap = jax.pmap(lambda a, b: a @ b)
+
+                num_devices = jax.device_count()
+                split_rhs = jnp.vsplit(flattened_rhs_blocks, num_devices)
+                split_lhs = jnp.vsplit(flattened_lhs_blocks, num_devices)
+
+                new_blocks = jnp.concatenate(block_mul_pmap(jnp.stack(split_rhs), jnp.stack(split_lhs)))
 
                 # rhs.elementary_block_idx may not be general
                 blocksparse_tensor = BlockSparseTensor(rhs.primal_dims, lhs.out_dims, rhs.primal_shape, lhs.out_shape, new_blocks, rhs.elementary_block_idx)
