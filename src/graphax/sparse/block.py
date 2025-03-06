@@ -396,7 +396,7 @@ def _matmul(rhs, lhs):
                     a, b = x
                     return carry, a @ b
 
-                _, new_blocks = lax.scan(_calc, None, (flattened_rhs_blocks, flattened_lhs_blocks))#, unroll=len(flattened_rhs_blocks) // 10)
+                _, new_blocks = lax.scan(_calc, None, (flattened_rhs_blocks, flattened_lhs_blocks), unroll=len(flattened_rhs_blocks) // 10)
 
                 # # pmap
                 # block_mul_pmap = jax.pmap(lambda a, b: a @ b)
