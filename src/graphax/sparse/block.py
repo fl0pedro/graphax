@@ -373,24 +373,24 @@ def _matmul(rhs, lhs):
                 #
                 # for i in range(non_block_size):
                 #     new_blocks = new_blocks.at[i].set(flattened_rhs_blocks[i] @ flattened_lhs_blocks[i])
-
-                # vmap
-                block_mul = jax.vmap(lambda a, b: a @ b, in_axes=(0, 0))
-
-                new_blocks = block_mul(
-                    flattened_rhs_blocks,
-                    flattened_lhs_blocks
-                )
-
-                # # fori_loop
-                # new_blocks = jnp.empty_like(flattened_rhs_blocks)
                 #
-                # def _calc(i, new_blocks):
-                #     new_blocks = new_blocks.at[i].set(flattened_rhs_blocks[i] @ flattened_lhs_blocks[i])
-                #     return new_blocks
+                # # vmap
+                # block_mul = jax.vmap(lambda a, b: a @ b, in_axes=(0, 0))
                 #
-                # new_blocks = lax.fori_loop(0, non_block_size, _calc, new_blocks, unroll=len(flattened_rhs_blocks) // 10)
-                #
+                # new_blocks = block_mul(
+                #     flattened_rhs_blocks,
+                #     flattened_lhs_blocks
+                # )
+
+                # fori_loop
+                new_blocks = jnp.empty_like(flattened_rhs_blocks)
+
+                def _calc(i, new_blocks):
+                    new_blocks = new_blocks.at[i].set(flattened_rhs_blocks[i] @ flattened_lhs_blocks[i])
+                    return new_blocks
+
+                new_blocks = lax.fori_loop(0, non_block_size, _calc, new_blocks)#, unroll=len(flattened_rhs_blocks) // 10)
+
                 # # scan
                 # def _calc(carry, x):
                 #     a, b = x
