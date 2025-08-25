@@ -308,7 +308,6 @@ def _dense_array(blocks, sparse_dims, shape):
 
     return dense_result
 
-# @partial(jit, static_argnames=('rhs', 'lhs'))
 def _add(rhs, lhs):
     assert lhs.shape == rhs.shape, "Tensors must be of equal shape"
     if isinstance(rhs, BlockSparseTensor):
@@ -326,7 +325,6 @@ def _add(rhs, lhs):
     else:
         raise TypeError("Expected to add with type BlockSparseTensor, SparseTensor, or Array")
 
-# @partial(jit, static_argnames=('rhs', 'lhs'))
 def _mul(rhs, lhs):
     assert rhs.shape == lhs.shape, "Tensors must be of equal shape"
     if isinstance(lhs, BlockSparseTensor):
@@ -344,7 +342,6 @@ def _mul(rhs, lhs):
     else:
         raise TypeError("Expected to add with type BlockSparseTensor, SparseTensor, or Array")
 
-# @partial(jit, static_argnames=('rhs', 'lhs'))
 def _matmul(rhs, lhs):
     # TODO assert something
     if isinstance(lhs, BlockSparseTensor):
@@ -366,47 +363,11 @@ def _matmul(rhs, lhs):
                 flattened_rhs_blocks = flatten_blocks(rhs.blocks)
                 flattened_lhs_blocks = flatten_blocks(lhs.blocks)
 
-                # use @pmap decorator on functions to be parallalized on cpu
+                new_blocks = jnp.empty_like(flattened_rhs_blocks)
 
-                # # naive (remove jit)
-                # new_blocks = jnp.empty_like(flattened_rhs_blocks)
-                #
-                # for i in range(non_block_size):
-                #     new_blocks = new_blocks.at[i].set(flattened_rhs_blocks[i] @ flattened_lhs_blocks[i])
-                #
-                # # vmap
-                # block_mul = jax.vmap(lambda a, b: a @ b, in_axes=(0, 0))
-                #
-                # new_blocks = block_mul(
-                #     flattened_rhs_blocks,
-                #     flattened_lhs_blocks
-                # )
-                #
-                # # fori_loop
-                # new_blocks = jnp.empty_like(flattened_rhs_blocks)
-                #
-                # def _calc(i, new_blocks):
-                #     new_blocks = new_blocks.at[i].set(flattened_rhs_blocks[i] @ flattened_lhs_blocks[i])
-                #     return new_blocks
-                #
-                # new_blocks = lax.fori_loop(0, non_block_size, _calc, new_blocks, unroll=len(flattened_rhs_blocks) // 10)
-                #
-                # # scan
-                # def _calc(carry, x):
-                #     a, b = x
-                #     return carry, a @ b
-                #
-                # _, new_blocks = lax.scan(_calc, None, (flattened_rhs_blocks, flattened_lhs_blocks), unroll=len(flattened_rhs_blocks) // 10)
-
-                # pmap
-                block_mul_pmap = jax.pmap(lambda a, b: a @ b)
-
-                num_devices = jax.device_count()
-                split_rhs = jnp.vsplit(flattened_rhs_blocks, num_devices)
-                split_lhs = jnp.vsplit(flattened_lhs_blocks, num_devices)
-
-                new_blocks = jnp.concatenate(block_mul_pmap(jnp.stack(split_rhs), jnp.stack(split_lhs)))
-
+                for i in range(non_block_size):
+                    new_blocks = new_blocks.at[i].set(flattened_rhs_blocks[i] @ flattened_lhs_blocks[i])
+              
                 # rhs.elementary_block_idx may not be general
                 blocksparse_tensor = BlockSparseTensor(rhs.primal_dims, lhs.out_dims, rhs.primal_shape, lhs.out_shape, new_blocks, rhs.elementary_block_idx)
                 return blocksparse_tensor
