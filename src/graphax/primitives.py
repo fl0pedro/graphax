@@ -9,7 +9,7 @@ import jax.lax as lax
 import jax.numpy as jnp
 
 import jax._src.core as core
-from jax._src.pjit import pjit_p
+from jax._src.pjit import jit_p
 
 from .sparse.tensor import (SparseTensor, DenseDimension, SparseDimension, 
                             _swap_back_axes, _materialize_dimensions)
@@ -581,7 +581,7 @@ def pjit_elemental_rule(primals, jaxpr, in_shardings, out_shardings, in_layouts,
     # print("### pjit outs", outs)
     # print("### pjit elementals", elementals)
     # print("### pjit jaxpr", jaxpr)
-    outputs = pjit_p.bind(*primals,
+    outputs = jit_p.bind(*primals,
                         jaxpr=jaxpr,
                         in_shardings=(*in_shardings,),
                         out_shardings=(*out_shardings,),
@@ -596,7 +596,7 @@ def pjit_elemental_rule(primals, jaxpr, in_shardings, out_shardings, in_layouts,
     out_primals = outputs
     return out_primals, []
 
-elemental_rules[pjit_p] = pjit_elemental_rule
+elemental_rules[jit_p] = pjit_elemental_rule
 
 
 # Should work for high-dimensional stuff
