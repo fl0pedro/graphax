@@ -19,7 +19,7 @@ class DenseDimension(NamedTuple):
     id: int
     size: int
     val_dim: int | None
-    val_axis: int = None
+    #val_axis: int = None
 
 # val_axes: These are two axis of the blocks that we would like to apply the diagonal on.
 #   By default pick the first two (0, 1) as the axis). TODO: make negatives work like indeces
@@ -28,7 +28,10 @@ class SparseDimension(NamedTuple):
     size: int
     val_dim: int
     other_id: int
-    val_axis: int = None
+    #val_axis: int = None
+
+# TODO TODO TODO TODO TODO, the new idea is to setup Sparse dim, such that if two different val_dims are set for a pair,
+# then its sparse block...
 
 Dimension = DenseDimension | SparseDimension
 
@@ -227,24 +230,21 @@ def new_block_sparse_tensor(
     if post_transforms is None:
         post_transforms = []
 
-    sorted_val_dims = sorted(
-        [d.val_dim for d in out_dims if isinstance(d, DenseDimension)]
-        + [d.val_dim for d in primal_dims]
-    )
-    n = len(sorted_val_dims)
+    n = sum(isinstance(d, SparseDimension) for d in out_dims)
+    assert n == sum(isinstance(d, SparseDimension) for d in primal_dims)
 
-    assert all(d == i for d, i in zip(sorted_val_dims, list(range(n)))), \
-        "Value dimensions should be continuous"
+    #assert all(d == i for d, i in zip(sorted_val_dims, list(range(n)))), \
+    #    "Value dimensions should be continuous"
     
     #print(sorted_val_dims)
     #print(
     #    {d.val_axis for d in out_dims if isinstance(d, DenseDimension)} 
     #    | {d.val_axis for d in primal_dims}
     #)
-    assert n == len(
-            {d.val_axis for d in out_dims if isinstance(d, DenseDimension)} 
-            | {d.val_axis for d in primal_dims}
-        ), "Value axis should be unique"
+    #assert n == len(
+    #        {d.val_axis for d in out_dims if isinstance(d, DenseDimension)} 
+    #        | {d.val_axis for d in primal_dims}
+    #    ), "Value axis should be unique"
 
     # TODO add checks between primal and out dims.
 
@@ -258,12 +258,12 @@ def new_block_sparse_tensor(
 
         out_shape = tuple(
             x.size if isinstance(x, DenseDimension)
-            else x.size * block_shape[x.val_axis]
+            else x.size * block_shape[x.val_dim]
             for x in out_dims
         )
         primal_shape = tuple(
             x.size if isinstance(x, DenseDimension)
-            else x.size * block_shape[x.val_axis]
+            else x.size * block_shape[x.val_dim]
             for x in primal_dims
         )
         #print(out_shape, primal_shape)
