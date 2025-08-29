@@ -32,8 +32,11 @@ class SparseDimension(NamedTuple):
 
 Dimension = DenseDimension | SparseDimension
 
+# find a better name for this.
 MultiSparseDimensionBlocks: TypeAlias = Sequence[Array] | Sequence['MultiSparseDimensionBlocks']
 
+# TODO (somewhere) blocks of blocks with neighbors can be combined to one block
+# I believe that tensors with d diagonal then there will be 2d blocks maximum (the rest can be merged into individual blocks)
 class BlockSparseTensor:
     out_dims: Any
     primal_dims: Any
@@ -106,11 +109,25 @@ class BlockSparseTensor:
     shape = ({str_out_shape} | {str_primal_shape}),
     out_dims = {multiline_out_dims},
     primal_dims = {multiline_primal_dims},
-    blocks = {self.blocks},
+    blocks = Array(shape={self.blocks.shape}, dtype={self.blocks.dtype}),
     elementary_block_idx = {self.elementary_block_idx},
     pre_transforms = {multiline_pre_transform},
     post_transforms = {multiline_post_transform}
 )"""
+
+    def transpose(self):
+        return BlockSparseTensor(
+            self.primal_dims,
+            self.out_dims,
+            self.primal_shape,
+            self.out_shape,
+            self.blocks,
+            self.elementary_block_idx
+        )
+
+    @property
+    def T(self):
+        return self.transpose()
 
     def dense(self):
         if all(isinstance(d, DenseDimension) for d in self.out_dims + self.primal_dims):
@@ -132,11 +149,14 @@ class BlockSparseTensor:
 
                 # the shape for each dimensions regarding one block
                 block_shape_per_dim = tuple(
-                    self.block_shape[dim.val_dim]
-                    if dim.val_dim is not None else 1
+                    self.block_shape[dim.val_axis]
+                    if dim.val_axis is not None else 1
                     for dim in self.primal_dims + self.out_dims
                 )
 
+                #print([d.val_axis for d in self.primal_dims + self.out_dims])
+                #print(block_shape_per_dim)
+                #print(self.block_size)
                 assert reduce(operator.mul, block_shape_per_dim) == self.block_size, \
                         "block_shape_per_dim should of the same size as blocks"
 
@@ -151,9 +171,12 @@ class BlockSparseTensor:
 
                 indices = jnp.indices(non_block_shape).transpose(*range(1, non_block_ndim + 1), 0)
                 flattened_indices = indices.reshape(non_block_size, non_block_ndim)
+                #print(flattened_indices)
+                #print(jnp.array(block_shape_per_dim))
                 for index in flattened_indices:
                     # this only works for arrays, for list of arrays the blocks could be different sizes
                     # as such the index_offset should be accounted for in carry
+                    #print(index)
                     scaled_index = index * jnp.array(block_shape_per_dim)
                     reshaped_block = self.blocks[*index].reshape(block_shape_per_dim)
                     res = lax.dynamic_update_slice(res, reshaped_block, scaled_index)
@@ -179,6 +202,17 @@ class BlockSparseTensor:
     def __matmul__(lhs, rhs):
         return _matmul(lhs, rhs)
 
+def has_equal_depth(node: MultiSparseDimensionBlocks, depth=0):
+    if isinstance(node, Array):
+        return True, depth
+    else:
+        equality, depth = zip(*[has_equal_depth(child, depth+1) for child in node])
+        local_equality = all(d == depth[0] for d in depth)
+        return all(equality) and local_equality, max(depth)
+
+# TODO, this will be quite complex...
+def has_equal_shapes(node: MultiSparseDimensionBlocks, dims = Sequence[Dimension], shape=None): 
+    ...
 
 def new_block_sparse_tensor(
     out_dims: Sequence[Dimension],
@@ -193,50 +227,50 @@ def new_block_sparse_tensor(
     if post_transforms is None:
         post_transforms = []
 
-    assert all(b1.ndim == b2.ndim for b1, b2 in zip(blocks, blocks[1:])), \
-        "Block dimensions should all be equal"
-
-    if not isinstance(blocks, Array):
-        raise NotImplementedError("MultiSparseDimensionBlocks is WIP")
-
-    out_dims = [
-        x if not None
-        else x._replace(val_axis=1)
-        for x in out_dims
-    ]
-    primal_dims = [
-        x if not None
-        else x._replace(val_axis=0)
-        for x in primal_dims
-    ]
-
     sorted_val_dims = sorted(
-        [x.val_dim for x in out_dims if isinstance(x, DenseDimension)]
-        + [x.val_dim for x in primal_dims]
+        [d.val_dim for d in out_dims if isinstance(d, DenseDimension)]
+        + [d.val_dim for d in primal_dims]
     )
+    n = len(sorted_val_dims)
 
-    assert all(a+1 == b for a, b in zip(sorted_val_dims, sorted_val_dims[1:])), \
+    assert all(d == i for d, i in zip(sorted_val_dims, list(range(n)))), \
         "Value dimensions should be continuous"
+    
+    #print(sorted_val_dims)
+    #print(
+    #    {d.val_axis for d in out_dims if isinstance(d, DenseDimension)} 
+    #    | {d.val_axis for d in primal_dims}
+    #)
+    assert n == len(
+            {d.val_axis for d in out_dims if isinstance(d, DenseDimension)} 
+            | {d.val_axis for d in primal_dims}
+        ), "Value axis should be unique"
 
-    elementary_block_idx = sorted_val_dims[-1] + 1
+    # TODO add checks between primal and out dims.
 
-    block_shape = blocks.shape[elementary_block_idx:]
+    if isinstance(blocks, Array):
+        assert blocks.ndim > n
+        block_shape = blocks.shape[n:]
+        # TODO add ones for non mentioned areas
 
-    out_shape = tuple(
-        x.size if isinstance(x, DenseDimension)
-        else x.size * block_shape[x.val_axis]
-        for x in out_dims
-    )
-    primal_shape = tuple(
-        x.size if isinstance(x, DenseDimension)
-        else x.size * block_shape[x.val_axis]
-        for x in out_dims
-    )
+        #print(blocks.shape)
+        #print(block_shape)
 
-    if all(b1.shape == b2.shape for b1, b2 in zip(blocks, blocks[1:])):
-        blocks = jnp.array(blocks)
+        out_shape = tuple(
+            x.size if isinstance(x, DenseDimension)
+            else x.size * block_shape[x.val_axis]
+            for x in out_dims
+        )
+        primal_shape = tuple(
+            x.size if isinstance(x, DenseDimension)
+            else x.size * block_shape[x.val_axis]
+            for x in primal_dims
+        )
+        #print(out_shape, primal_shape)
     else:
-        blocks = blocks
+        raise TypeError("blocks as MultiSparseDimensionBlocks is not yet implemented")
+        assert has_equal_depth(blocks) == (True, n)
+        
 
     return BlockSparseTensor(
         out_dims,
@@ -244,7 +278,7 @@ def new_block_sparse_tensor(
         out_shape,
         primal_shape,
         blocks,
-        elementary_block_idx,
+        n,
         pre_transforms,
         post_transforms
     )
@@ -297,9 +331,9 @@ def _dense_array(blocks, sparse_dims, shape):
         start, end = get_indices(idx, jnp.array(block.shape))
 
         slices = tuple(slice(start, end) for start, end in zip(start, end))
-        print(block)
-        print(slices)
-        print(dense.at[*slices].get())
+        #print(block)
+        #print(slices)
+        #print(dense.at[*slices].get())
         dense = dense.at[slices].set(block)
         new_idx = jnp.where(sparse_val_dims == -1, idx, idx + sparse_sizes)
 
@@ -356,10 +390,11 @@ def _matmul(rhs, lhs):
         elif lhs.blocks is None:
             return copy.copy(rhs)
         elif isinstance(rhs.blocks, Array) and isinstance(lhs.blocks, Array):
-            print()
+            print("matmul")
             if rhs.out_shape == lhs.primal_shape \
                     and rhs.primal_dims == lhs.primal_dims \
                     and rhs.out_dims == lhs.out_dims:
+                print("in the if")
                 non_block_shape = tuple(rhs.blocks.shape[:rhs.elementary_block_idx])
                 non_block_size = reduce(operator.mul, non_block_shape)
 
@@ -376,16 +411,14 @@ def _matmul(rhs, lhs):
                     )
 
                 new_blocks = _calc(rhs.blocks, lhs.blocks)
-                print("mat mul res:", new_blocks)
                 # rhs.elementary_block_idx may not be general
                 blocksparse_tensor = BlockSparseTensor(rhs.primal_dims, lhs.out_dims, rhs.primal_shape, lhs.out_shape, new_blocks, rhs.elementary_block_idx)
-                print("obj", blocksparse_tensor)
                 return blocksparse_tensor
         elif all(b1.shape == b2.shape for b1, b2 in zip(rhs.blocks, lhs.blocks)):
             pass
     elif isinstance(lhs, SparseTensor):
         pass
     elif isinstance(lhs, Array):  # TODO: Fix default check
-        rhs.dense() @ lhs
+        return rhs.dense() @ lhs
     else:
         raise TypeError("Expected to add with type BlockSparseTensor, SparseTensor, or Array")
