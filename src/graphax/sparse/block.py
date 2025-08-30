@@ -28,6 +28,7 @@ class SparseDimension(NamedTuple):
     size: int
     val_dim: int
     other_id: int
+    block_size: int = None
     #val_axis: int = None
 
 # TODO TODO TODO TODO TODO, the new idea is to setup Sparse dim, such that if two different val_dims are set for a pair,
@@ -54,6 +55,7 @@ class BlockSparseTensor:
     elementary_block_idx: int
     block_shape: tuple[int, ...]
     block_size: int
+    _sparse_dim_order: list[tuple[int, int]]
 
     def __init__(self,
                  out_dims: Sequence[Dimension],
@@ -88,6 +90,8 @@ class BlockSparseTensor:
         self.pre_transforms = pre_transforms
         self.post_transforms = post_transforms
 
+        self._sparse_dim_order = [(d.id, d.other_id) for d in self.out_dims if isinstance(d, SparseDimension)] # may not be necessary to include, but must be mentioned in the docs
+
     def __repr__(self) -> str:
         def map_str(a: Sequence) -> Generator:
             return (str(s) for s in a)
@@ -119,9 +123,27 @@ class BlockSparseTensor:
 )"""
 
     def transpose(self):
+        out_dims = [
+            d._replace(
+                id=d.id - len(self.out_dims),
+                other_id=d.other_id + len(self.primal_dims),
+            )
+            if isinstance(d,SparseDimension)
+            else d._replace(id=d.id - len(self.out_dims))
+            for d in self.primal_dims
+        ]
+        primal_dims = [
+            d._replace(
+                id=d.id + len(self.primal_dims),
+                other_id=d.other_id - len(self.out_dims),
+            )
+            if isinstance(d, SparseDimension) 
+            else d._replace(id=d.id + len(self.primal_dims))
+            for d in self.out_dims
+        ]
         return BlockSparseTensor(
-            self.primal_dims,
-            self.out_dims,
+            out_dims,
+            primal_dims,
             self.primal_shape,
             self.out_shape,
             self.blocks,
