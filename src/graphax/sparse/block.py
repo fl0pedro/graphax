@@ -34,6 +34,7 @@ class SparseDimension(NamedTuple):
 # TODO TODO TODO TODO TODO, the new idea is to setup Sparse dim, such that if two different val_dims are set for a pair,
 # then its sparse block...
 
+
 Dimension = DenseDimension | SparseDimension
 
 # find a better name for this.
