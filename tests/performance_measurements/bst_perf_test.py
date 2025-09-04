@@ -16,7 +16,7 @@ import time
 import threading
 from jax import lax
 
-MAX_MEMORY = int(os.environ.get("MAX_MEMORY", np.inf))
+MAX_MEMORY = int(os.environ.get("MAX_MEMORY", 1 << 30)) // 32
 
 def profile_jax(fn, *args, device=None, warmup=True, poll_ms=0, **kwargs):
     if device is None:
@@ -135,18 +135,12 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     print(block_nums, block_size)
 
     res.setdefault(block_nums, {})
-    res[block_nums].setdefault(block_size, {
-        "2d, 1c, 1s": [],
-        "3d, 1c, 1s": [],
-        "3d, 2c, 1s": [],
-        "4d, 1c, 1s": [],
-        "4d, 1c, 2s": []
-    })
+    res[block_nums].setdefault(block_size, {})
 
     k1, k2 = jrand.split(jrand.PRNGKey(i), 2)
 
     # 2D
-    test(
+    res["2d, 1c, 1s"] = test(
         (block_nums, block_size, block_size), 
         k1, k2, 
         (
@@ -159,7 +153,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
 
     # 3D - 1
-    test(
+    res["3d, 1c, 1s"] = test(
         (block_nums, block_size, block_size, block_size),
         k1, k2,
         (
@@ -178,7 +172,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
     
     # 3D - 2
-    test(
+    res["3d, 2c, 1s"] = test(
         (block_nums, block_size, block_size, block_size),
         k1, k2,
         (
@@ -197,7 +191,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
     
     # 4D - 1
-    test(
+    res["4d, 1c, 1s"] = test(
         (block_nums, block_size, block_size, block_size, block_size),
         k1, k2,
         (
@@ -220,7 +214,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
 
     # 4D - 2
-    test(
+    res["4d, 1c, 2s"] = test(
         (block_nums, block_nums, block_size, block_size, block_size, block_size),
         k1, k2,
         (
