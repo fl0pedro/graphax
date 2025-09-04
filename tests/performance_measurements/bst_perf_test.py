@@ -140,7 +140,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     k1, k2 = jrand.split(jrand.PRNGKey(i), 2)
 
     # 2D
-    res["2d, 1c, 1s"] = test(
+    res[block_nums][block_size]["2d, 1c, 1s"] = test(
         (block_nums, block_size, block_size), 
         k1, k2, 
         (
@@ -153,7 +153,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
 
     # 3D - 1
-    res["3d, 1c, 1s"] = test(
+    res[block_nums][block_size]["3d, 1c, 1s"] = test(
         (block_nums, block_size, block_size, block_size),
         k1, k2,
         (
@@ -172,7 +172,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
     
     # 3D - 2
-    res["3d, 2c, 1s"] = test(
+    res[block_nums][block_size]["3d, 2c, 1s"] = test(
         (block_nums, block_size, block_size, block_size),
         k1, k2,
         (
@@ -191,7 +191,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
     
     # 4D - 1
-    res["4d, 1c, 1s"] = test(
+    res[block_nums][block_size]["4d, 1c, 1s"] = test(
         (block_nums, block_size, block_size, block_size, block_size),
         k1, k2,
         (
@@ -214,7 +214,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
 
     # 4D - 2
-    res["4d, 1c, 2s"] = test(
+    res[block_nums][block_size]["4d, 1c, 2s"] = test(
         (block_nums, block_nums, block_size, block_size, block_size, block_size),
         k1, k2,
         (
