@@ -1,3 +1,5 @@
+import json
+import os
 from jax import tree_util
 from itertools import product
 from jax import jit, make_jaxpr
@@ -8,11 +10,13 @@ from matplotlib import pyplot as plt
 from tqdm import tqdm
 import numpy as np
 from functools import reduce
-import operator
+from operator import mul
 import jax
 import time
 import threading
 from jax import lax
+
+MAX_MEMORY = int(os.environ.get("MAX_MEMORY", np.inf))
 
 def profile_jax(fn, *args, device=None, warmup=True, poll_ms=0, **kwargs):
     if device is None:
@@ -79,12 +83,57 @@ def unflatten_block_sparse_tensor(aux_data, children):
 
 tree_util.register_pytree_node(BlockSparseTensor, flatten_block_sparse_tensor, unflatten_block_sparse_tensor)
 
-
 jit_matmul = jit(lambda a, b: a @ b)
+
+def test(size, k1, k2, stx_dims, sty_dims):
+    res = {}
+    memory = reduce(mul, size)
+    if memory <= MAX_MEMORY:
+        stx = new_block_sparse_tensor(*stx_dims, jrand.normal(k1, size))
+        sty = new_block_sparse_tensor(*sty_dims, jrand.normal(k2, size))
+    else:
+        return res
+    
+    new_size = [
+        d.size*d.block_size
+        if isinstance(d, SparseDimension)
+        else d.size
+        for d in stx.out_dims+sty.primal_dims
+    ]
+
+    memory += reduce(mul, new_size)
+    if memory <= MAX_MEMORY:
+        res["sparse"] = []
+        for _ in range(20):
+            t, r = profile_jax(jit_matmul, stx, sty, poll_ms=1)
+            res["sparse"].append(r)
+    else:
+        return res
+
+    memory += stx.size + sty.size
+    if memory <= MAX_MEMORY:
+        x = stx.dense()
+        y = sty.dense()
+    else:
+        return res
+    
+    memory += t.size
+    if memory <= MAX_MEMORY:
+        res["dense"] = []
+        for _ in range(20):
+            _, r = profile_jax(jit_matmul, x, y, poll_ms=1)
+            res["dense"].append(r)
+    else:
+        return res
+    
+    return r, r
+
 range_ = [(i%9+1)*10**(i//9) for i in range(100)]
 res = {}
 
 for i, (block_nums, block_size) in enumerate(product(range_, range_)):
+    print(block_nums, block_size)
+
     res.setdefault(block_nums, {})
     res[block_nums].setdefault(block_size, {
         "2d, 1c, 1s": [],
@@ -97,102 +146,100 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     k1, k2 = jrand.split(jrand.PRNGKey(i), 2)
 
     # 2D
-    x = jrand.normal(k1, (block_nums, block_size, block_size))
-    y = jrand.normal(k2, (block_nums, block_size, block_size))
+    test(
+        (block_nums, block_size, block_size), 
+        k1, k2, 
+        (
+            [SparseDimension(0, block_nums, 0, 1, block_size)], 
+            [SparseDimension(1, block_nums, 1, 0, block_size)] 
+        ), (
+            [SparseDimension(0, block_nums, 0, 1, block_size)], 
+            [SparseDimension(1, block_nums, 1, 0, block_size)] 
+        )
+    )
 
-    stx = new_block_sparse_tensor(
-        [SparseDimension(0, block_nums, 0, 1, block_size)], 
-        [SparseDimension(1, block_nums, 1, 0, block_size)], 
-        x)
-    sty = new_block_sparse_tensor(
-        [SparseDimension(0, block_nums, 0, 1, block_size)], 
-        [SparseDimension(1, block_nums, 1, 0, block_size)], 
-        y)
-    
-    for _ in range(20):
-        _, r = profile_jax(jit_matmul, stx, sty, warmup=True, poll_ms=1)
-        res[block_nums][block_size]["2d, 1c, 1s"].append(r)
-        
-
-    # 3D
-    x = jrand.normal(k1, (block_nums, block_size, block_size, block_size))
-    y = jrand.normal(k2, (block_nums, block_size, block_size, block_size))
-
-    stx = new_block_sparse_tensor(
-        [SparseDimension(0, block_nums, 0, 1, block_size)], 
-        [
-            SparseDimension(1, block_nums, 1, 0, block_size),
-            DenseDimension(2, block_size, 2)
-        ], 
-        x)
-    sty = new_block_sparse_tensor(
-        [
-            SparseDimension(0, block_nums, 0, 2, block_size),
-            DenseDimension(1, block_size, 1)
-        ], 
-        [SparseDimension(2, block_nums, 2, 0, block_size)], 
-        y)
-    
     # 3D - 1
-    for _ in range(20):
-        _, r = profile_jax(jit_matmul, stx, sty, warmup=True, poll_ms=1)
-        res[block_nums][block_size]["3d, 1c, 1s"].append(r)
-
-    # 3D - 2
-    for _ in range(20):
-        _, r = profile_jax(jit_matmul, sty, stx, warmup=True, poll_ms=1)
-        res[block_nums][block_size]["3d, 2c, 1s"].append(r)
-
-    # 4D - 1
-    x = jrand.normal(k1, (block_nums, block_size, block_size, block_size, block_size))
-    y = jrand.normal(k2, (block_nums, block_size, block_size, block_size, block_size))
-
-    stx = new_block_sparse_tensor(
-        [
-            SparseDimension(0, block_nums, 0, 2, block_size),
-            DenseDimension(1, block_size, 1)
-        ], [
-            SparseDimension(2, block_nums, 2, 0, block_size),
-            DenseDimension(3, block_size, 3)
-        ], 
-        x)
-    sty = new_block_sparse_tensor(
-        [
-            SparseDimension(0, block_nums, 0, 2, block_size),
-            DenseDimension(1, block_size, 1)
-        ], [
-            SparseDimension(2, block_nums, 2, 0, block_size),
-            DenseDimension(3, block_size, 3)
-        ], 
-        y)
+    test(
+        (block_nums, block_size, block_size, block_size),
+        k1, k2,
+        (
+            [
+                SparseDimension(0, block_nums, 0, 2, block_size),
+                DenseDimension(1, block_size, 1)
+            ], 
+            [SparseDimension(2, block_nums, 2, 0, block_size)]
+        ),(
+            [SparseDimension(0, block_nums, 0, 1, block_size)], 
+            [
+                SparseDimension(1, block_nums, 1, 0, block_size),
+                DenseDimension(2, block_size, 2)
+            ] 
+        )
+    )
     
-    for _ in range(20):
-        _, r = profile_jax(jit_matmul, stx, sty, warmup=True, poll_ms=1)
-        res[block_nums][block_size]["4d, 1c, 1s"].append(r)
+    # 3D - 2
+    test(
+        (block_nums, block_size, block_size, block_size),
+        k1, k2,
+        (
+            [SparseDimension(0, block_nums, 0, 1, block_size)], 
+            [
+                SparseDimension(1, block_nums, 1, 0, block_size),
+                DenseDimension(2, block_size, 2)
+            ] 
+        ),(
+            [
+                SparseDimension(0, block_nums, 0, 2, block_size),
+                DenseDimension(1, block_size, 1)
+            ], 
+            [SparseDimension(2, block_nums, 2, 0, block_size)]
+        )
+    )
+    
+    # 4D - 1
+    test(
+        (block_nums, block_size, block_size, block_size, block_size),
+        k1, k2,
+        (
+            [
+                SparseDimension(0, block_nums, 0, 2, block_size),
+                DenseDimension(1, block_size, 1)
+            ], [
+                SparseDimension(2, block_nums, 2, 0, block_size),
+                DenseDimension(3, block_size, 3)
+            ] 
+        ), (
+            [
+                SparseDimension(0, block_nums, 0, 2, block_size),
+                DenseDimension(1, block_size, 1)
+            ], [
+                SparseDimension(2, block_nums, 2, 0, block_size),
+                DenseDimension(3, block_size, 3)
+            ] 
+        )
+    )
 
     # 4D - 2
-    x = jrand.normal(k1, (block_nums, block_nums, block_size, block_size, block_size))
-    y = jrand.normal(k2, (block_nums, block_nums, block_size, block_size, block_size))
+    test(
+        (block_nums, block_nums, block_size, block_size, block_size, block_size),
+        k1, k2,
+        (
+            [
+                SparseDimension(0, block_nums, 0, 2, block_size),
+                SparseDimension(1, block_nums, 1, 3, block_size)
+            ], [
+                SparseDimension(2, block_nums, 2, 0, block_size),
+                SparseDimension(3, block_nums, 3, 1, block_size)
+            ], 
+        ), (
+            [
+                SparseDimension(0, block_nums, 0, 2, block_size),
+                SparseDimension(1, block_nums, 1, 3, block_size)
+            ], [
+                SparseDimension(2, block_nums, 2, 0, block_size),
+                SparseDimension(3, block_nums, 3, 1, block_size)
+            ], 
+        ))
 
-    stx = new_block_sparse_tensor(
-        [
-            SparseDimension(0, block_nums, 0, 2, block_size),
-            SparseDimension(1, block_nums, 1, 3, block_size)
-        ], [
-            SparseDimension(2, block_nums, 2, 0, block_size),
-            SparseDimension(3, block_nums, 3, 1, block_size)
-        ], 
-        x)
-    sty = new_block_sparse_tensor(
-        [
-            SparseDimension(0, block_nums, 0, 2, block_size),
-            SparseDimension(1, block_nums, 1, 3, block_size)
-        ], [
-            SparseDimension(2, block_nums, 2, 0, block_size),
-            SparseDimension(3, block_nums, 3, 1, block_size)
-        ], 
-        y)
-    
-    for _ in range(20):
-        _, r = profile_jax(jit_matmul, stx, sty, warmup=True, poll_ms=1)
-        res[block_nums][block_size]["4d, 1c, 2s"].append(r)
+    with open("res.json", "w") as f:
+        json.dump(res, f)
