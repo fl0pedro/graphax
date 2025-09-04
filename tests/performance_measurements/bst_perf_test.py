@@ -123,10 +123,8 @@ def test(size, k1, k2, stx_dims, sty_dims):
         for _ in range(20):
             _, r = profile_jax(jit_matmul, x, y, poll_ms=1)
             res["dense"].append(r)
-    else:
-        return res
     
-    return r, r
+    return res
 
 range_ = [(i%9+1)*10**(i//9) for i in range(100)]
 res = {}
