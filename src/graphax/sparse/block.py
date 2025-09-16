@@ -348,24 +348,24 @@ def _matmul(rhs, lhs):
             if rhs.out_shape == lhs.primal_shape and lhs.sparse_dims == rhs.sparse_dims:
                 out_dims = [
                     d._replace(val_dim=i) 
-                    for i, d in enumerate(lhs.out_dims)
+                    for i, d in enumerate(rhs.out_dims)
                 ]
                 
                 primal_dims = [
                     d._replace(
-                        id=d.id - len(rhs.out_dims) + len(lhs.out_dims),
-                        val_dim=i+len(lhs.out_dims)
+                        id=d.id - len(lhs.out_dims) + len(rhs.out_dims),
+                        val_dim=i+len(rhs.out_dims)
                     )
-                    for i, d in enumerate(rhs.primal_dims)
+                    for i, d in enumerate(lhs.primal_dims)
                 ]
                 
                 return BlockSparseTensor(
                     out_dims,
                     primal_dims,
-                    lhs.out_shape,
-                    rhs.primal_shape,
-                    lax.dot_general(lhs.blocks, rhs.blocks, (([x.val_dim + lhs.sparse_dims for x in lhs.primal_dims], [x.val_dim + rhs.sparse_dims for x in rhs.out_dims]), (list(range(lhs.sparse_dims)),)*2)),
-                    lhs.sparse_dims
+                    rhs.out_shape,
+                    lhs.primal_shape,
+                    lax.dot_general(rhs.blocks, lhs.blocks, (([x.val_dim + rhs.sparse_dims for x in rhs.primal_dims], [x.val_dim + lhs.sparse_dims for x in lhs.out_dims]), (list(range(rhs.sparse_dims)),)*2)),
+                    rhs.sparse_dims
                 )
         elif all(b1.shape == b2.shape for b1, b2 in zip(rhs.blocks, lhs.blocks)):
             pass
