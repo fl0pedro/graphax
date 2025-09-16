@@ -1,9 +1,19 @@
 [project]
 name = "graphax"
-version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
-requires-python = ">=3.13"
+version = "0.0.1"
+description = "Graphax is an Automatic Differentiation interpreter written in JAX."
+authors = [
+    { name = "Jamie Lohoff", email = "jamie.lohoff@gmail.com" },
+    { name = "Florian Assmuth", email = "florianassmuth@gmail.com" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+license = { text = "MIT" } # Or other license information
+readme = "README.rst" # Path to your README file
+requires-python = ">=3.12" # Minimum Python versio
 dependencies = [
     "chex>=0.1.90",
     "equinox>=0.13.0",
