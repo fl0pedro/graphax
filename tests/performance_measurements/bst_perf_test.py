@@ -16,7 +16,7 @@ import time
 import threading
 from jax import lax
 
-MAX_MEMORY = int(os.environ.get("MAX_MEMORY", 1 << 30)) // 32
+MAX_MEMORY = int(os.environ.get("MAX_MEMORY", 9216000000))
 
 def profile_jax(fn, *args, device=None, warmup=True, poll_ms=0, **kwargs):
     if device is None:
