@@ -16,7 +16,7 @@ from torchvision import datasets, transforms
 
 import graphax as gx
 
-from _transformer import (multihead_attention_block, glorot, gelu,
+from tests.examples._transformer import (multihead_attention_block, glorot, gelu,
                         make_positional_encoding, softmax_ce_loss,
                         make_weights)   
 
@@ -35,10 +35,10 @@ transform = transforms.Compose([transforms.ToTensor(),
                                 transforms.Normalize((0.5, 0.5, 0.5), 
                                                     (0.5, 0.5, 0.5))])
 
-trainset = datasets.CIFAR10(root='./data', train=True, transform=transform)
+trainset = datasets.CIFAR10(root="./data", train=True, transform=transform)
 trainloader = DataLoader(trainset, batch_size=batchsize, shuffle=True)
 
-testset = datasets.CIFAR10(root='./data', train=False, transform=transform)
+testset = datasets.CIFAR10(root="./data", train=False, transform=transform)
 testloader = DataLoader(testset, batch_size=batchsize, shuffle=False)
 
 key = jrand.PRNGKey(42)
@@ -144,12 +144,6 @@ one_hot_labels = jnn.one_hot(labels, 10)
 xs = subdivide(batch)
 argnums = range(2, len(weights) + 2)
 
-# print(jax.make_jaxpr(batched_model)(xs, one_hot_labels, *weights))
-
-#print(jax.make_jaxpr(gx.jacve(batched_model, order="rev", argnums=argnums))(xs, one_hot_labels, *weights))
-# bxh
-# print(jax.make_jaxpr(jax.jacrev(batched_model, argnums=argnums))(xs, one_hot_labels, *weights))
-# bfv
 
 ### Training loop
 st = time.time()

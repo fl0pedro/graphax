@@ -1,49 +1,48 @@
-.. These are examples of badges you might want to add to your README:
-   please update the URLs accordingly
+.. figure:: GraphaxLogo.png
+   :alt: Graphax
 
-    .. image:: https://api.cirrus-ci.com/github/<USER>/graphax.svg?branch=main
-        :alt: Built Status
-        :target: https://cirrus-ci.com/github/<USER>/graphax
-    .. image:: https://readthedocs.org/projects/graphax/badge/?version=latest
-        :alt: ReadTheDocs
-        :target: https://graphax.readthedocs.io/en/stable/
-    .. image:: https://img.shields.io/coveralls/github/<USER>/graphax/main.svg
-        :alt: Coveralls
-        :target: https://coveralls.io/r/<USER>/graphax
-    .. image:: https://img.shields.io/pypi/v/graphax.svg
-        :alt: PyPI-Server
-        :target: https://pypi.org/project/graphax/
-    .. image:: https://img.shields.io/conda/vn/conda-forge/graphax.svg
-        :alt: Conda-Forge
-        :target: https://anaconda.org/conda-forge/graphax
-    .. image:: https://pepy.tech/badge/graphax/month
-        :alt: Monthly Downloads
-        :target: https://pepy.tech/project/graphax
-    .. image:: https://img.shields.io/twitter/url/http/shields.io.svg?style=social&label=Twitter
-        :alt: Twitter
-        :target: https://twitter.com/graphax
+   alt text
 
-.. image:: https://img.shields.io/badge/-PyScaffold-005CA0?logo=pyscaffold
-    :alt: Project generated with PyScaffold
-    :target: https://pyscaffold.org/
-
-|
-
-=======
-graphax
+Graphax
 =======
 
+This package contains the implementation of the sparse cross-country
+elimination method for Automatic Differentiation (AD).
 
-    Add a short description here!
+What the hell is Cross-Country Elimination?
+-------------------------------------------
 
+Cross-country elimination is a automatic differentiation (AD) technique
+that enables AD algorithm design with respect to relevant quantities
+such as computational and memory cost. It allows for the design of
+tailored AD algorithms for a given function we wish to differentiate.
+``AlphaGrad`` is an example of automated AD algorithm discovery using
+Reinforcement Learning.
 
-A longer description of your project goes here...
+Another nice feature of cross-country elimination is that it can exploit
+the inherent static sparsity structure of Jacobians.
 
+Installation
+------------
 
-.. _pyscaffold-notes:
+The package requires has the following dependencies: - jax - numpy -
+scipy - matplotlib The package itself is to be installed by running
+``pip install -e .`` in the root directory.
 
-Note
-====
+Usage
+-----
 
-This project has been set up using PyScaffold 4.3.1. For details and usage
-information on PyScaffold see https://pyscaffold.org/.
+The package exposes a primitive called ``jacve`` which is the equivalent
+of ``jax.jacfwd`` and ``jax.jacrev``. It provides an additional keyword
+``order`` which is used to pass the elimination order for cross-country
+elimination. It has two default modes ``fwd`` and ``rev`` which
+implement forward-mode and reverse-mode AD. It is fully compatible with
+``jax.jit``, ``jax.vmap`` and even ``jax.jacfwd`` and ``jax.jacrev``.
+Example use that enables the use cross country elimination:
+``graphax.jacve(f, order=[1,3,2,4], argnums=(0,1,2,3))(1., 1., 2., 7.)``.
+
+Projects using Graphax
+----------------------
+
+-  AlphaGrad
+-  Synaptax
