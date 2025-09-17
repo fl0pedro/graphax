@@ -1,3 +1,8 @@
+[build-system]
+# AVOID CHANGING REQUIRES: IT WILL BE UPDATED BY PYSCAFFOLD!
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "graphax"
 version = "0.0.1"
@@ -13,25 +18,9 @@ classifiers = [
 ]
 license = { text = "MIT" } # Or other license information
 readme = "README.rst" # Path to your README file
-requires-python = ">=3.12" # Minimum Python versio
+requires-python = ">=3.12" # Minimum Python version
 dependencies = [
-    "chex>=0.1.90",
-    "equinox>=0.13.0",
-    "jax>=0.7.1",
-    "jaxlib>=0.7.1",
-    "matplotlib>=3.10.5",
-    "numpy>=2.3.2",
-    "pytest>=8.4.1",
-    "pytest-cov>=6.2.1",
-    "scipy>=1.16.1",
-    "seaborn>=0.13.2",
-    "tqdm>=4.67.1",
+    "numpy",
+    "jax>=0.5.0",
+    "jaxlib>=0.5.0"
 ]
-
-[tool.uv.workspace]
-members = [
-    ".",
-]
-
-[dependency-groups]
-dev = []

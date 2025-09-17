@@ -1,6 +1,6 @@
 import functools as ft
 from functools import wraps
-from typing import Any, Callable, Union, Sequence
+from typing import Any, Callable, Dict, Union, Sequence
 
 import jax
 import jax.tree_util as jtu
@@ -9,8 +9,6 @@ from equinox import is_array
 from equinox._filters import combine, partition, is_inexact_array
 from equinox._module import Module, Partial, module_update_wrapper
 from equinox._custom_types import sentinel
-from equinox._deprecate import deprecated_0_10
-from equinox._doc_utils import doc_remove_args
 from equinox import filter_make_jaxpr
 
 from .core import vertex_elimination_jaxpr
@@ -18,7 +16,7 @@ from .core import vertex_elimination_jaxpr
 
 class _JacveWrapper(Module):
     _fun: Callable
-    _gradkwargs: dict[str, Any]
+    _gradkwargs: Dict[str, Any]
     
     @property
     def __wrapped__(self):
@@ -43,7 +41,6 @@ class _JacveWrapper(Module):
         return Partial(self, instance)
 
 
-@doc_remove_args("gradkwargs")
 def filter_jacve(
     fun=sentinel, **gradkwargs
 ) -> Callable:
@@ -54,8 +51,6 @@ def filter_jacve(
     if fun is sentinel:
         return ft.partial(filter_jacve, **gradkwargs)
 
-    deprecated_0_10(gradkwargs, "arg")
-    deprecated_0_10(gradkwargs, "filter_spec")
     argnums = gradkwargs.pop("argnums", None)
     if argnums is not None:
         raise ValueError(
@@ -72,7 +67,7 @@ def eqx_jacve(fun: Callable,
             order: Union[Sequence[int], str], 
             argnums: Sequence[int] = (0,),
             count_ops: bool = False,
-            dense_representation: bool = True) -> Callable:
+            sparse_representation: bool = False) -> Callable:
     @wraps(fun)
     def wrapped(*args, **kwargs):
         # TODO Make repackaging work properly with one input value only
@@ -94,7 +89,7 @@ def eqx_jacve(fun: Callable,
                                         *_args, 
                                         argnums=argnums,
                                         count_ops=count_ops,
-                                        dense_representation=dense_representation)
+                                        sparse_representation=sparse_representation)
         if count_ops: 
             out, op_counts = out
             out_tree = jtu.tree_structure(tuple(closed_jaxpr.jaxpr.outvars))
