@@ -186,7 +186,7 @@ def test(size, k1, k2, stx_dims, sty_dims):
         res["dense"]["measured"] = []
         for _ in range(20):
             _, r = profile_jax(jit_matmul, x, y, poll_ms=1)
-            res["dense"]["measured"].append(r)
+            res["dense"].append(r)
     
     return res
 
