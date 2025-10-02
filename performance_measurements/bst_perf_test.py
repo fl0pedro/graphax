@@ -1,5 +1,7 @@
 import json
+from block import _dense
 import os
+from matplotlib import colormaps
 from jax import tree_util
 from itertools import product
 from jax import jit, make_jaxpr
@@ -12,6 +14,7 @@ import numpy as np
 from functools import reduce
 from operator import mul
 import jax
+import jax.numpy as jnp
 import time
 import threading
 from jax import lax
@@ -84,49 +87,110 @@ def unflatten_block_sparse_tensor(aux_data, children):
 tree_util.register_pytree_node(BlockSparseTensor, flatten_block_sparse_tensor, unflatten_block_sparse_tensor)
 
 jit_matmul = jit(lambda a, b: a @ b)
+jit_dot = jit(lax.dot, static_argnames=["dimension_numbers"])
+
+def matshow3d(a, ax = None):
+    if ax is None:
+        ax = plt.figure().add_subplot(projection='3d')
+    
+    ax.voxels(a, facecolors=colormaps["viridis"](a), shade=False)
+    
+    ax.set_aspect("equal")
+    
+    x=jnp.arange(a.shape[0])
+    y=jnp.arange(a.shape[1])
+    z=jnp.arange(a.shape[2])
+    
+    ax.set_xticks(x+0.5)
+    ax.set_yticks(y+0.5)
+    ax.set_zticks(z+0.5)
+    
+    ax.set_xticklabels(x)
+    ax.set_yticklabels(y)
+    ax.set_zticklabels(z)
+
+    ax.grid(False)
+
+def matshowXd(t):
+    match t.ndim:
+        case 1:
+            plt.matshow(t[:, None])
+        case 2:
+            plt.matshow(t)
+        case 3:
+            matshow3d(t)
+        case 4:
+            fig, ax = plt.subplots(len(t), subplot_kw=dict(projection="3d"))
+            print(type(ax))
+            for i in range(len(t)):
+                if not isinstance(ax, np.array):
+                    ax = np.array([ax])
+                matshow3d(t[i], ax)
+        case _:
+            raise ValueError("`t` must be a tensor of dimension 4 or less")
+
+def _test(size, k1, k2, stx_dims, sty_dims):
+    stx = new_block_sparse_tensor(*stx_dims, jrand.normal(k1, size))
+    sty = new_block_sparse_tensor(*sty_dims, jrand.normal(k2, size))
+#    print(
+#        f"({", ".join([str(i) for i in stx.out_shape])} | "
+#        f"{", ".join([str(i) for i in stx.primal_shape])}) @ "
+#        f"({", ".join([str(i) for i in sty.out_shape])} | "
+#        f"{", ".join([str(i) for i in sty.primal_shape])})"
+#    )
+    
+    x = stx.dense()
+    y = sty.dense()
+
+    print(json.dumps(jit_matmul.lower(stx, sty).cost_analysis(), indent=4))
+    print(json.dumps(jit_dot.lower(x, y, dimension_numbers=((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))).cost_analysis(), indent=4))
+    print("---")
+
+    a = jit_matmul(stx, sty)
+    b = jit_dot(x, y, dimension_numbers=((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ())))
+
+    print(jnp.linalg.norm(jnp.abs(a.dense()-b)))
+
+    assert a.shape == a.dense().shape, f"{a.shape=} is not equal to {a.dense().shape=}"
+    assert a.shape == b.shape, f"{a.shape=} is not equal to {b.shape}"
+    assert jnp.allclose(a.dense(), b, 1e2, 1e3), f"tensor a is not equal to b, with a normed delta of {jnp.linalg.norm(jnp.abs(a-b))}"
+
+jit_dense = jit(_dense)
+def get_dense_expansion_bytes(stx, sty):
+    bytes_x = jit_dense.lower(stx).cost_analysis["bytes accessed"] 
+    bytes_y = jit_dense.lower(sty).cost_analysis["bytes accessed"]
+    return bytes_x + bytes_y
 
 def test(size, k1, k2, stx_dims, sty_dims):
     res = {}
-    memory = reduce(mul, size)
-    if memory <= MAX_MEMORY:
-        stx = new_block_sparse_tensor(*stx_dims, jrand.normal(k1, size))
-        sty = new_block_sparse_tensor(*sty_dims, jrand.normal(k2, size))
-    else:
-        return res
-    
-    new_size = [
-        d.size*d.block_size
-        if isinstance(d, SparseDimension)
-        else d.size
-        for d in stx.out_dims+sty.primal_dims
-    ]
+    stx = new_block_sparse_tensor(*stx_dims, jrand.normal(k1, size))
+    sty = new_block_sparse_tensor(*sty_dims, jrand.normal(k2, size))
 
-    memory += reduce(mul, new_size)
-    if memory <= MAX_MEMORY:
-        res["sparse"] = []
+    res["sparse"]["estimate"] = jit_matmul.lower(stx, sty).cost_analysis()
+    if res["sparse"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
+        res["sparse"]["measured"] = []
         for _ in range(20):
             t, r = profile_jax(jit_matmul, stx, sty, poll_ms=1)
-            res["sparse"].append(r)
+            res["sparse"]["measured"].append(r)
     else:
         return res
 
-    memory += stx.size + sty.size
-    if memory <= MAX_MEMORY:
+    if get_dense_expansion_bytes(stx, sty) <= MAX_MEMORY:
         x = stx.dense()
         y = sty.dense()
     else:
         return res
     
-    memory += t.size
-    if memory <= MAX_MEMORY:
-        res["dense"] = []
+    res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))).cost_analysis()
+    if res["dense"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
+        res["dense"]["measured"] = []
         for _ in range(20):
             _, r = profile_jax(jit_matmul, x, y, poll_ms=1)
-            res["dense"].append(r)
+            res["dense"]["measured"].append(r)
     
     return res
 
-range_ = [(i%9+1)*10**(i//9) for i in range(100)]
+range_ = [(i%9+1)*10**(i//9) for i in range(10)]
 res = {}
 
 for i, (block_nums, block_size) in enumerate(product(range_, range_)):
@@ -138,6 +202,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     k1, k2 = jrand.split(jrand.PRNGKey(i), 2)
 
     # 2D
+    print("2D")
     res[block_nums][block_size]["2d, 1c, 1s"] = test(
         (block_nums, block_size, block_size), 
         k1, k2, 
@@ -151,6 +216,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
 
     # 3D - 1
+    print("3D - 1")
     res[block_nums][block_size]["3d, 1c, 1s"] = test(
         (block_nums, block_size, block_size, block_size),
         k1, k2,
@@ -170,6 +236,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
     
     # 3D - 2
+    print("3D - 2")
     res[block_nums][block_size]["3d, 2c, 1s"] = test(
         (block_nums, block_size, block_size, block_size),
         k1, k2,
@@ -189,6 +256,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
     
     # 4D - 1
+    print("4D - 1")
     res[block_nums][block_size]["4d, 1c, 1s"] = test(
         (block_nums, block_size, block_size, block_size, block_size),
         k1, k2,
@@ -212,6 +280,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
 
     # 4D - 2
+    print("4D - 2")
     res[block_nums][block_size]["4d, 1c, 2s"] = test(
         (block_nums, block_nums, block_size, block_size, block_size, block_size),
         k1, k2,
@@ -232,6 +301,5 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
                 SparseDimension(3, block_nums, 3, 1, block_size)
             ], 
         ))
-
     with open("res.json", "w") as f:
         json.dump(res, f)
