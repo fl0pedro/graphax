@@ -188,7 +188,7 @@ def test(size, k1, k2, stx_dims, sty_dims):
     dnums = ((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))
     res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=dnums).cost_analysis()
 
-    print(jax.make_jaxpr(jit_dot)(x, y, dimension_numbers=dnums))
+    print(jax.make_jaxpr(jit_dot, static_argnums=[2])(x, y, dimension_numbers=dnums))
     #if res["dense"]["estimate"] is not None \
     #        and res["dense"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
     #    res["dense"]["measured"] = []
@@ -198,7 +198,7 @@ def test(size, k1, k2, stx_dims, sty_dims):
     
     return res
 
-range_ = [(i%9+1)*10**(i//9) for i in range(100)]
+range_ = [(i%9+1)*10**(i//9) for i in range(28)]
 res = {}
 
 for i, (block_nums, block_size) in enumerate(product(range_, range_)):
