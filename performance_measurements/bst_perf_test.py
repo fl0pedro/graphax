@@ -179,8 +179,8 @@ def test(size, k1, k2, stx_dims, sty_dims):
     except Exception:
         return res
 
-    print(json.dumps(res["sparse"]["estimate"], indent=4))
-    print(jax.make_jaxpr(jit_matmul)(stx,sty))
+    #print(json.dumps(res["sparse"]["estimate"], indent=4))
+    #print(jax.make_jaxpr(jit_matmul)(stx,sty))
     #if res["sparse"]["estimate"] is not None \
     #        and res["sparse"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
     #    res["sparse"]["measured"] = []
@@ -208,8 +208,8 @@ def test(size, k1, k2, stx_dims, sty_dims):
     except Exception:
         return res
 
-    print(json.dumps(res["dense"]["estimate"], indent=4))
-    print(jax.make_jaxpr(partial(jit_dot, dimension_numbers=dnums))(x, y))
+    #print(json.dumps(res["dense"]["estimate"], indent=4))
+    #print(jax.make_jaxpr(partial(jit_dot, dimension_numbers=dnums))(x, y))
     #if res["dense"]["estimate"] is not None \
     #        and res["dense"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
     #    res["dense"]["measured"] = []
@@ -224,7 +224,7 @@ range_ = [(i%9+1)*10**(i//9) for i in range(19)] + [2**i for i in range(8)]
 res = {}
 
 for i, (block_nums, block_size) in enumerate(product(range_, range_)):
-    print(block_nums, block_size)
+    print(f"{block_nums=}, {block_size=}")
 
     res.setdefault(block_nums, {})
     res[block_nums].setdefault(block_size, {})
@@ -232,7 +232,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     k1, k2 = jrand.split(jrand.PRNGKey(i), 2)
 
     # 2D
-    print("2D")
+    print("2D, 1 contraction, 1 sparse dim")
     res[block_nums][block_size]["2d, 1c, 1s"] = test(
         (block_nums, block_size, block_size), 
         k1, k2, 
@@ -246,7 +246,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
 
     # 3D - 1
-    print("3D - 1")
+    print("3D, 1 contraction, 1 sparse dim")
     res[block_nums][block_size]["3d, 1c, 1s"] = test(
         (block_nums, block_size, block_size, block_size),
         k1, k2,
@@ -266,7 +266,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
     
     # 3D - 2
-    print("3D - 2")
+    print("3D, 2 contractions, 1 sparse dim")
     res[block_nums][block_size]["3d, 2c, 1s"] = test(
         (block_nums, block_size, block_size, block_size),
         k1, k2,
@@ -286,7 +286,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
     
     # 4D - 1
-    print("4D - 1")
+    print("4D, 1 contraction, 1 sparse dim")
     res[block_nums][block_size]["4d, 1c, 1s"] = test(
         (block_nums, block_size, block_size, block_size, block_size),
         k1, k2,
@@ -310,7 +310,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
 
     # 4D - 2
-    print("4D - 2")
+    print("4D, 1 contraction, 2 sparse dim")
     res[block_nums][block_size]["4d, 1c, 2s"] = test(
         (block_nums, block_nums, block_size, block_size, block_size, block_size),
         k1, k2,
