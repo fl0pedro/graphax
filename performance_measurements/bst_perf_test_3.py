@@ -330,7 +330,7 @@ def _calc(i, block_nums, block_size):
 #            #    else:
 #            #        res[bn][bs].update(re[bn][bs])
 
-for i, (bn, bs) in enumerate(product(range_, range_)):
+for i, (bn, bs) in tqdm(enumerate(product(range_, range_)), total=len(range_)**2):
     _calc(i, bn, bs)
 
 with open("res.json", "w") as f:
