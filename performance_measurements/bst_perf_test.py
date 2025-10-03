@@ -330,7 +330,6 @@ pool = multiprocessing.Pool(26)
 res = {}
 i = 0
 for re in tqdm(pool.imap_unordered(_timedout_calc, enumerate(product(range_, range_))), total=len(range_)**2):
-    print(re)
     for bn in re.keys():
         if bn not in res:
             res.update(re)
