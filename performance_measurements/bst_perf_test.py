@@ -209,9 +209,7 @@ def test(size, k1, k2, stx_dims, sty_dims):
     
     return res
 
-range_ = [(i%9+1)*10**(i//9) for i in range(19)] + [2**i for i in range(1, 8)]
-res = {}
-
+range_ = [(i%9+1)*10**(i//9) for i in range(28)] + [2**i for i in range(1, 10)]
 def _timedout_calc(x):
     signal.alarm(10)
     try:
@@ -220,6 +218,7 @@ def _timedout_calc(x):
         return dict()
 
 def _calc(x):
+    res = {}
     i, bs = x
     block_nums, block_size = bs
     res.setdefault(block_nums, {})
@@ -325,12 +324,24 @@ def _calc(x):
 
     return res
 
+
 pool = multiprocessing.Pool(26)
 
 res = {}
+i = 0
 for re in tqdm(pool.imap_unordered(_timedout_calc, enumerate(product(range_, range_))), total=len(range_)**2):
-    res.update(re)
+    print(re)
+    for bn in re.keys():
+        if bn not in res:
+            res.update(re)
+        else:
+            for bs in re[bn].keys():
+                if bs not in res:
+                    res[bn].update(re[bn])
+                else:
+                    res[bn][bs].update(re[bn][bs])
 
+print(json.dumps(res, indent=4))
 with open("res.json", "w") as f:
     json.dump(res, f)
 
