@@ -1,4 +1,5 @@
 import json
+from functools import partial
 import os
 from matplotlib import colormaps
 from jax import tree_util
@@ -177,7 +178,7 @@ def test(size, k1, k2, stx_dims, sty_dims):
     #        res["sparse"]["measured"].append(r)
     #else:
     #    return res
-
+    
     if get_dense_expansion_bytes(stx, sty) <= MAX_MEMORY:
         x = stx.dense()
         y = sty.dense()
@@ -188,7 +189,7 @@ def test(size, k1, k2, stx_dims, sty_dims):
     dnums = ((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))
     res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=dnums).cost_analysis()
 
-    print(jax.make_jaxpr(jit_dot, static_argnums=[2])(x, y, dimension_numbers=dnums))
+    print(jax.make_jaxpr(partial(jit_dot, dimension_numbers=dnums))(x, y))
     #if res["dense"]["estimate"] is not None \
     #        and res["dense"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
     #    res["dense"]["measured"] = []
@@ -196,6 +197,7 @@ def test(size, k1, k2, stx_dims, sty_dims):
     #        _, r = profile_jax(jit_dot, x, y, dimension_numbers=dnums, poll_ms=1)
     #        res["dense"].append(r)
     
+    print("")
     return res
 
 range_ = [(i%9+1)*10**(i//9) for i in range(28)]
