@@ -334,11 +334,12 @@ for re in tqdm(pool.imap_unordered(_timedout_calc, enumerate(product(range_, ran
         if bn not in res:
             res.update(re)
         else:
-            for bs in re[bn].keys():
-                if bs not in res:
-                    res[bn].update(re[bn])
-                else:
-                    res[bn][bs].update(re[bn][bs])
+            res[bn].update(re[bn])
+            #for bs in re[bn].keys():
+            #    if bs not in res:
+            #        res[bn].update(re[bn])
+            #    else:
+            #        res[bn][bs].update(re[bn][bs])
 
 with open("res.json", "w") as f:
     json.dump(res, f)
