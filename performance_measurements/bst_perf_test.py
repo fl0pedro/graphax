@@ -175,11 +175,7 @@ def test(size, k1, k2, stx_dims, sty_dims):
     sty = new_block_sparse_tensor(*sty_dims, jrand.normal(k2, size))
 
     res["sparse"] = dict()
-    signal.alarm(10)
-    try:
-        res["sparse"]["estimate"] = jit_matmul.lower(stx, sty).cost_analysis()
-    except Exception:
-        return res
+    res["sparse"]["estimate"] = jit_matmul.lower(stx, sty).cost_analysis()
 
     #print(json.dumps(res["sparse"]["estimate"], indent=4))
     #print(jax.make_jaxpr(jit_matmul)(stx,sty))
@@ -193,22 +189,14 @@ def test(size, k1, k2, stx_dims, sty_dims):
     #    return res
     
     #if get_dense_expansion_bytes(stx, sty) <= MAX_MEMORY:
-    signal.alarm(10)
-    try:
-        x = stx.dense()
-        y = sty.dense()
-    except Exception:
-        return res
+    x = stx.dense()
+    y = sty.dense()
     #else:
     #    return res
     
     res["dense"] = dict()
     dnums = ((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))
-    signal.alarm(10)
-    try:
-        res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=dnums).cost_analysis()
-    except Exception:
-        return res
+    res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=dnums).cost_analysis()
 
     #print(json.dumps(res["dense"]["estimate"], indent=4))
     #print(jax.make_jaxpr(partial(jit_dot, dimension_numbers=dnums))(x, y))
@@ -223,6 +211,13 @@ def test(size, k1, k2, stx_dims, sty_dims):
 
 range_ = [(i%9+1)*10**(i//9) for i in range(19)] + [2**i for i in range(1, 8)]
 res = {}
+
+def _timedout_calc(x):
+    signal.alarm(10)
+    try:
+        return _calc(x)
+    except Exception:
+        return dict()
 
 def _calc(x):
     i, bs = x
@@ -333,10 +328,11 @@ def _calc(x):
 pool = multiprocessing.Pool(26)
 
 res = {}
-for re in tqdm(pool.imap(_calc, enumerate(product(range_, range_))), total=len(range_)**2):
+for re in tqdm(pool.imap_unordered(_timedout_calc, enumerate(product(range_, range_))), total=len(range_)**2):
     res.update(re)
 
 with open("res.json", "w") as f:
     json.dump(res, f)
+
 #for i, (block_nums, block_size) in enumerate(r):
 #    _calc(i, block_nums, block_size)
