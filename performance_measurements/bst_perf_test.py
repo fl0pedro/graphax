@@ -173,7 +173,7 @@ def test(size, k1, k2, stx_dims, sty_dims):
     sty = new_block_sparse_tensor(*sty_dims, jrand.normal(k2, size))
 
     res["sparse"] = dict()
-    signal.alarm(60)
+    signal.alarm(10)
     try:
         res["sparse"]["estimate"] = jit_matmul.lower(stx, sty).cost_analysis()
     except Exception:
@@ -191,7 +191,7 @@ def test(size, k1, k2, stx_dims, sty_dims):
     #    return res
     
     #if get_dense_expansion_bytes(stx, sty) <= MAX_MEMORY:
-    signal.alarm(60)
+    signal.alarm(10)
     try:
         x = stx.dense()
         y = sty.dense()
@@ -202,7 +202,7 @@ def test(size, k1, k2, stx_dims, sty_dims):
     
     res["dense"] = dict()
     dnums = ((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))
-    signal.alarm(60)
+    signal.alarm(10)
     try:
         res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=dnums).cost_analysis()
     except Exception:
