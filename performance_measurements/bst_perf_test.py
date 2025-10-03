@@ -209,7 +209,7 @@ def test(size, k1, k2, stx_dims, sty_dims):
     
     return res
 
-range_ = [(i%9+1)*10**(i//9) for i in range(4)] + [2**i for i in range(1, 4)]
+range_ = set([(i%9+1)*10**(i//9) for i in range(19)] + [2**i for i in range(8)])
 def _timedout_calc(x):
     signal.alarm(10)
     try:
