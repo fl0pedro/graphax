@@ -156,8 +156,8 @@ def _test(size, k1, k2, stx_dims, sty_dims):
 
 jit_dense = jit(_dense)
 def get_dense_expansion_bytes(stx, sty):
-    bytes_x = jit_dense.lower(stx).cost_analysis["bytes accessed"] 
-    bytes_y = jit_dense.lower(sty).cost_analysis["bytes accessed"]
+    bytes_x = jit_dense.lower(stx).cost_analysis()["bytes accessed"] 
+    bytes_y = jit_dense.lower(sty).cost_analysis()["bytes accessed"]
     return bytes_x + bytes_y
 
 def test(size, k1, k2, stx_dims, sty_dims):
