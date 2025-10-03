@@ -22,7 +22,7 @@ import time
 import threading
 from jax import lax
 
-MAX_MEMORY = int(os.environ.get("MAX_MEMORY", 9216000000))
+MAX_MEMORY = int(os.environ.get("MAX_MEMORY", 500000))
 
 def profile_jax(fn, *args, device=None, warmup=True, poll_ms=0, **kwargs):
     if device is None:
@@ -169,24 +169,21 @@ def handler(signum, frame):
 
 signal.signal(signal.SIGALRM, handler)
 
-def test(size, k1, k2, stx_dims, sty_dims):
+res = {}
+
+def test(size, k1, k2, stx_dims, sty_dims, key):
     res = {}
     stx = new_block_sparse_tensor(*stx_dims, jrand.normal(k1, size))
     sty = new_block_sparse_tensor(*sty_dims, jrand.normal(k2, size))
 
-    res["sparse"] = dict()
-    res["sparse"]["estimate"] = jit_matmul.lower(stx, sty).cost_analysis()
+    #res["sparse"]["estimate"] = jit_matmul.lower(stx, sty).cost_analysis()
 
     #print(json.dumps(res["sparse"]["estimate"], indent=4))
     #print(jax.make_jaxpr(jit_matmul)(stx,sty))
-    #if res["sparse"]["estimate"] is not None \
-    #        and res["sparse"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
-    #    res["sparse"]["measured"] = []
-    #    for _ in range(20):
-    #        _, r = profile_jax(jit_matmul, stx, sty, poll_ms=1)
-    #        res["sparse"]["measured"].append(r)
-    #else:
-    #    return res
+    res["sparse"] = []
+    for _ in range(20):
+        _, r = profile_jax(jit_matmul, stx, sty, poll_ms=1)
+        res["sparse"].append(r)
     
     #if get_dense_expansion_bytes(stx, sty) <= MAX_MEMORY:
     x = stx.dense()
@@ -194,22 +191,19 @@ def test(size, k1, k2, stx_dims, sty_dims):
     #else:
     #    return res
     
-    res["dense"] = dict()
     dnums = ((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))
-    res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=dnums).cost_analysis()
+    #res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=dnums).cost_analysis()
 
     #print(json.dumps(res["dense"]["estimate"], indent=4))
     #print(jax.make_jaxpr(partial(jit_dot, dimension_numbers=dnums))(x, y))
-    #if res["dense"]["estimate"] is not None \
-    #        and res["dense"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
-    #    res["dense"]["measured"] = []
-    #    for _ in range(20):
-    #        _, r = profile_jax(jit_dot, x, y, dimension_numbers=dnums, poll_ms=1)
-    #        res["dense"].append(r)
+    res["dense"] = []
+    for _ in range(20):
+        _, r = profile_jax(jit_dot, x, y, dimension_numbers=dnums, poll_ms=1)
+        res["dense"].append(r)
     
     return res
 
-range_ = [(i%9+1)*10**(i//9) for i in range(4)] + [2**i for i in range(1, 4)]
+range_ = [(i%9+1)*10**(i//9) for i in range(19)] + [2**i for i in range(1, 8)]
 def _timedout_calc(x):
     signal.alarm(10)
     try:
@@ -217,10 +211,7 @@ def _timedout_calc(x):
     except Exception:
         return dict()
 
-def _calc(x):
-    res = {}
-    i, bs = x
-    block_nums, block_size = bs
+def _calc(i, block_nums, block_size):
     res.setdefault(block_nums, {})
     res[block_nums].setdefault(block_size, {})
 
@@ -237,7 +228,7 @@ def _calc(x):
             [SparseDimension(0, block_nums, 0, 1, block_size)], 
             [SparseDimension(1, block_nums, 1, 0, block_size)] 
         )
-    )
+    , (bn, bs, "2d, 1c, 1s"))
 
     # 3D - 1
     res[block_nums][block_size]["3d, 1c, 1s"] = test(
@@ -256,7 +247,7 @@ def _calc(x):
                 DenseDimension(2, block_size, 2)
             ] 
         )
-    )
+    , (bn, bs, "3d, 1c, 1s"))
     
     # 3D - 2
     res[block_nums][block_size]["3d, 2c, 1s"] = test(
@@ -275,7 +266,7 @@ def _calc(x):
             ], 
             [SparseDimension(2, block_nums, 2, 0, block_size)]
         )
-    )
+    , (bn, bs, "3d, 2c, 1s"))
     
     # 4D - 1
     res[block_nums][block_size]["4d, 1c, 1s"] = test(
@@ -298,7 +289,7 @@ def _calc(x):
                 DenseDimension(3, block_size, 3)
             ] 
         )
-    )
+    , (bn, bs, "4d, 1c, 1s"))
 
     # 4D - 2
     res[block_nums][block_size]["4d, 1c, 2s"] = test(
@@ -320,26 +311,27 @@ def _calc(x):
                 SparseDimension(2, block_nums, 2, 0, block_size),
                 SparseDimension(3, block_nums, 3, 1, block_size)
             ], 
-        ))
+        )
+    , (bn, bs, "4d, 1c, 2s"))
 
-    return res
+# pool = multiprocessing.Pool(26)
 
+#res = {}
+#i = 0
+#for re in tqdm(pool.imap_unordered(_timedout_calc, enumerate(product(range_, range_))), total=len(range_)**2):
+#    for bn in re.keys():
+#        if bn not in res:
+#            res.update(re)
+#        else:
+#            res[bn].update(re[bn])
+#            #for bs in re[bn].keys():
+#            #    if bs not in res:
+#            #        res[bn].update(re[bn])
+#            #    else:
+#            #        res[bn][bs].update(re[bn][bs])
 
-pool = multiprocessing.Pool(4)
-
-res = {}
-i = 0
-for re in tqdm(pool.imap_unordered(_timedout_calc, enumerate(product(range_, range_))), total=len(range_)**2):
-    for bn in re.keys():
-        if bn not in res:
-            res.update(re)
-        else:
-            res[bn].update(re[bn])
-            #for bs in re[bn].keys():
-            #    if bs not in res:
-            #        res[bn].update(re[bn])
-            #    else:
-            #        res[bn][bs].update(re[bn][bs])
+for i, (bn, bs) in enumerate(product(range_, range_)):
+    _calc(i, bn, bs)
 
 with open("res.json", "w") as f:
     json.dump(res, f)
