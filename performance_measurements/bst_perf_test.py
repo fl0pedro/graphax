@@ -310,7 +310,7 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
 
     # 4D - 2
-    print("4D, 1 contraction, 2 sparse dim")
+    print("4D, 1 contraction, 2 sparse dims")
     res[block_nums][block_size]["4d, 1c, 2s"] = test(
         (block_nums, block_nums, block_size, block_size, block_size, block_size),
         k1, k2,
