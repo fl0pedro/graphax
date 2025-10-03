@@ -330,13 +330,10 @@ def _calc(x):
 
     return res
 
-r = list(product(range_, range_))
-shuffle(r)
-
-pool = multiprocessing.Pool(52)
+pool = multiprocessing.Pool(26)
 
 res = {}
-for re in pool.map(_calc, enumerate(r)):
+for re in pool.imap(_calc, enumerate(product(range_, range_))):
     res.update(re)
 
 with open("res.json", "w") as f:
