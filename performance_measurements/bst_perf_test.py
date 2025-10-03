@@ -217,7 +217,6 @@ def test(size, k1, k2, stx_dims, sty_dims):
     #        _, r = profile_jax(jit_dot, x, y, dimension_numbers=dnums, poll_ms=1)
     #        res["dense"].append(r)
     
-    print("")
     return res
 
 range_ = [(i%9+1)*10**(i//9) for i in range(19)] + [2**i for i in range(8)]
@@ -331,5 +330,8 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
                 SparseDimension(3, block_nums, 3, 1, block_size)
             ], 
         ))
+
+    print()
+
     with open("res.json", "w") as f:
         json.dump(res, f)
