@@ -220,7 +220,7 @@ def test(size, k1, k2, stx_dims, sty_dims):
     print("")
     return res
 
-range_ = [(i%9+1)*10**(i//9) for i in range(28)]
+range_ = [(i%9+1)*10**(i//9) for i in range(19)]
 res = {}
 
 for i, (block_nums, block_size) in enumerate(product(range_, range_)):
