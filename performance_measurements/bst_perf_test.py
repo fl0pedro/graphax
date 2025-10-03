@@ -194,7 +194,7 @@ def test(size, k1, k2, stx_dims, sty_dims):
     
     return res
 
-range_ = [(i%9+1)*10**(i//9) for i in range(10)]
+range_ = [(i%9+1)*10**(i//9) for i in range(100)]
 res = {}
 
 for i, (block_nums, block_size) in enumerate(product(range_, range_)):
