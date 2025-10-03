@@ -165,6 +165,13 @@ def test(size, k1, k2, stx_dims, sty_dims):
     stx = new_block_sparse_tensor(*stx_dims, jrand.normal(k1, size))
     sty = new_block_sparse_tensor(*sty_dims, jrand.normal(k2, size))
 
+    print(
+        f"({", ".join([str(i) for i in stx.out_shape])} | "
+        f"{", ".join([str(i) for i in stx.primal_shape])}) @ "
+        f"({", ".join([str(i) for i in sty.out_shape])} | "
+        f"{", ".join([str(i) for i in sty.primal_shape])})"
+    )
+
     res["sparse"] = dict()
     res["sparse"]["estimate"] = jit_matmul.lower(stx, sty).cost_analysis()
     #if res["sparse"]["estimate"] is not None \
