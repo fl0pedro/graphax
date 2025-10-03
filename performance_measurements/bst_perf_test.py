@@ -333,7 +333,7 @@ def _calc(x):
 r = list(product(range_, range_))
 shuffle(r)
 
-pool = multiprocessing.Pool(338)
+pool = multiprocessing.Pool(52)
 
 res = {}
 for re in pool.map(_calc, enumerate(r)):
