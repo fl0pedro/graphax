@@ -163,19 +163,21 @@ def get_dense_expansion_bytes(stx, sty):
     return bytes_x + bytes_y
 
 def handler(signum, frame):
-    raise Exception("end of time")
+    raise Exception("timeout")
 
 signal.signal(signal.SIGALRM, handler)
 
 def test(size, k1, k2, stx_dims, sty_dims):
-    signal.alarm(100)
-
     res = {}
     stx = new_block_sparse_tensor(*stx_dims, jrand.normal(k1, size))
     sty = new_block_sparse_tensor(*sty_dims, jrand.normal(k2, size))
 
     res["sparse"] = dict()
-    res["sparse"]["estimate"] = jit_matmul.lower(stx, sty).cost_analysis()
+    signal.alarm(60)
+    try:
+        res["sparse"]["estimate"] = jit_matmul.lower(stx, sty).cost_analysis()
+    except Exception:
+        return res
 
     print(json.dumps(res["sparse"]["estimate"], indent=4))
     print(jax.make_jaxpr(jit_matmul)(stx,sty))
@@ -189,14 +191,22 @@ def test(size, k1, k2, stx_dims, sty_dims):
     #    return res
     
     #if get_dense_expansion_bytes(stx, sty) <= MAX_MEMORY:
-    #    x = stx.dense()
-    #    y = sty.dense()
+    signal.alarm(60)
+    try:
+        x = stx.dense()
+        y = sty.dense()
+    except Exception:
+        return res
     #else:
     #    return res
     
     res["dense"] = dict()
     dnums = ((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))
-    res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=dnums).cost_analysis()
+    signal.alarm(60)
+    try:
+        res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=dnums).cost_analysis()
+    except Exception:
+        return res
 
     print(json.dumps(res["dense"]["estimate"], indent=4))
     print(jax.make_jaxpr(partial(jit_dot, dimension_numbers=dnums))(x, y))
