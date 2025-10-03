@@ -1,11 +1,10 @@
 import json
-from block import _dense
 import os
 from matplotlib import colormaps
 from jax import tree_util
 from itertools import product
 from jax import jit, make_jaxpr
-from graphax.sparse.block import BlockSparseTensor, SparseDimension, DenseDimension, new_block_sparse_tensor
+from graphax.sparse.block import BlockSparseTensor, SparseDimension, DenseDimension, new_block_sparse_tensor, _dense
 import jax.random as jrand
 import timeit
 from matplotlib import pyplot as plt
@@ -166,6 +165,7 @@ def test(size, k1, k2, stx_dims, sty_dims):
     stx = new_block_sparse_tensor(*stx_dims, jrand.normal(k1, size))
     sty = new_block_sparse_tensor(*sty_dims, jrand.normal(k2, size))
 
+    res["sparse"] = dict()
     res["sparse"]["estimate"] = jit_matmul.lower(stx, sty).cost_analysis()
     if res["sparse"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
         res["sparse"]["measured"] = []
@@ -181,6 +181,7 @@ def test(size, k1, k2, stx_dims, sty_dims):
     else:
         return res
     
+    res["dense"] = dict()
     res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))).cost_analysis()
     if res["dense"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
         res["dense"]["measured"] = []
