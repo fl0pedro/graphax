@@ -167,10 +167,11 @@ def test(size, k1, k2, stx_dims, sty_dims):
 
     res["sparse"] = dict()
     res["sparse"]["estimate"] = jit_matmul.lower(stx, sty).cost_analysis()
-    if res["sparse"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
+    if res["sparse"]["estimate"]["bytes accessed"] is not None \
+            and res["sparse"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
         res["sparse"]["measured"] = []
         for _ in range(20):
-            t, r = profile_jax(jit_matmul, stx, sty, poll_ms=1)
+            _, r = profile_jax(jit_matmul, stx, sty, poll_ms=1)
             res["sparse"]["measured"].append(r)
     else:
         return res
@@ -182,11 +183,13 @@ def test(size, k1, k2, stx_dims, sty_dims):
         return res
     
     res["dense"] = dict()
-    res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))).cost_analysis()
-    if res["dense"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
+    dnums = ((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))
+    res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=dnums).cost_analysis()
+    if res["dense"]["estimate"]["bytes accessed"] is not None \
+            and res["dense"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
         res["dense"]["measured"] = []
         for _ in range(20):
-            _, r = profile_jax(jit_matmul, x, y, poll_ms=1)
+            _, r = profile_jax(jit_dot, x, y, dimension_numbers=dnums, poll_ms=1)
             res["dense"].append(r)
     
     return res
