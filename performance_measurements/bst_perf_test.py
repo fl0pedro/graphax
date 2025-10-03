@@ -341,7 +341,6 @@ for re in tqdm(pool.imap_unordered(_timedout_calc, enumerate(product(range_, ran
                 else:
                     res[bn][bs].update(re[bn][bs])
 
-print(json.dumps(res, indent=4))
 with open("res.json", "w") as f:
     json.dump(res, f)
 
