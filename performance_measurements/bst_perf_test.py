@@ -165,15 +165,10 @@ def test(size, k1, k2, stx_dims, sty_dims):
     stx = new_block_sparse_tensor(*stx_dims, jrand.normal(k1, size))
     sty = new_block_sparse_tensor(*sty_dims, jrand.normal(k2, size))
 
-    print(
-        f"({", ".join([str(i) for i in stx.out_shape])} | "
-        f"{", ".join([str(i) for i in stx.primal_shape])}) @ "
-        f"({", ".join([str(i) for i in sty.out_shape])} | "
-        f"{", ".join([str(i) for i in sty.primal_shape])})"
-    )
-
     res["sparse"] = dict()
     res["sparse"]["estimate"] = jit_matmul.lower(stx, sty).cost_analysis()
+
+    print(jax.make_jaxpr(jit_matmul)(stx,sty))
     #if res["sparse"]["estimate"] is not None \
     #        and res["sparse"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
     #    res["sparse"]["measured"] = []
@@ -192,6 +187,8 @@ def test(size, k1, k2, stx_dims, sty_dims):
     res["dense"] = dict()
     dnums = ((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))
     res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=dnums).cost_analysis()
+
+    print(jax.make_jaxpr(jit_dot)(x, y, dimension_numbers=dnums))
     #if res["dense"]["estimate"] is not None \
     #        and res["dense"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
     #    res["dense"]["measured"] = []
