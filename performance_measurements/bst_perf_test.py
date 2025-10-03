@@ -333,7 +333,7 @@ def _calc(x):
 pool = multiprocessing.Pool(26)
 
 res = {}
-for re in pool.imap(_calc, enumerate(product(range_, range_))):
+for re in tqdm(pool.imap(_calc, enumerate(product(range_, range_))), total=len(range_)**2):
     res.update(re)
 
 with open("res.json", "w") as f:
