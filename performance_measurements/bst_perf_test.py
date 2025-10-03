@@ -1,4 +1,6 @@
 import json
+from random import shuffle
+import multiprocessing
 import signal
 from functools import partial
 import os
@@ -219,19 +221,18 @@ def test(size, k1, k2, stx_dims, sty_dims):
     
     return res
 
-range_ = [(i%9+1)*10**(i//9) for i in range(19)] + [2**i for i in range(8)]
+range_ = [(i%9+1)*10**(i//9) for i in range(19)] + [2**i for i in range(1, 8)]
 res = {}
 
-for i, (block_nums, block_size) in enumerate(product(range_, range_)):
-    print(f"{block_nums=}, {block_size=}")
-
+def _calc(x):
+    i, bs = x
+    block_nums, block_size = bs
     res.setdefault(block_nums, {})
     res[block_nums].setdefault(block_size, {})
 
     k1, k2 = jrand.split(jrand.PRNGKey(i), 2)
 
     # 2D
-    print("2D, 1 contraction, 1 sparse dim")
     res[block_nums][block_size]["2d, 1c, 1s"] = test(
         (block_nums, block_size, block_size), 
         k1, k2, 
@@ -245,7 +246,6 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
 
     # 3D - 1
-    print("3D, 1 contraction, 1 sparse dim")
     res[block_nums][block_size]["3d, 1c, 1s"] = test(
         (block_nums, block_size, block_size, block_size),
         k1, k2,
@@ -265,7 +265,6 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
     
     # 3D - 2
-    print("3D, 2 contractions, 1 sparse dim")
     res[block_nums][block_size]["3d, 2c, 1s"] = test(
         (block_nums, block_size, block_size, block_size),
         k1, k2,
@@ -285,7 +284,6 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
     
     # 4D - 1
-    print("4D, 1 contraction, 1 sparse dim")
     res[block_nums][block_size]["4d, 1c, 1s"] = test(
         (block_nums, block_size, block_size, block_size, block_size),
         k1, k2,
@@ -309,7 +307,6 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
     )
 
     # 4D - 2
-    print("4D, 1 contraction, 2 sparse dims")
     res[block_nums][block_size]["4d, 1c, 2s"] = test(
         (block_nums, block_nums, block_size, block_size, block_size, block_size),
         k1, k2,
@@ -331,7 +328,18 @@ for i, (block_nums, block_size) in enumerate(product(range_, range_)):
             ], 
         ))
 
-    print()
+    return res
 
-    with open("res.json", "w") as f:
-        json.dump(res, f)
+r = list(product(range_, range_))
+shuffle(r)
+
+pool = multiprocessing.Pool(338)
+
+res = {}
+for re in pool.map(_calc, enumerate(r)):
+    res.update(re)
+
+with open("res.json", "w") as f:
+    json.dump(res, f)
+#for i, (block_nums, block_size) in enumerate(r):
+#    _calc(i, block_nums, block_size)
