@@ -205,9 +205,6 @@ def _calc(x, res=None):
         res = {}
         res.setdefault(bn, {})
         res[bn].setdefault(bs, {})
-        ret_flag = True
-    else:
-        ret_flag = False
     
     k1, k2 = jrand.split(jrand.PRNGKey(i), 2)
 
@@ -313,8 +310,7 @@ def _calc(x, res=None):
         )
     , res[bn][bs].get("4d, 1c, 2s", None))
 
-    if ret_flag:
-        return res
+    return res
 
 def handler(signum, frame):
     raise Exception("timeout")
@@ -361,7 +357,7 @@ else:
         res = json.load(f)
 
     for x in enumerate(t:=tqdm(d)):
-        _calc(x, res)
+        res = _calc(x, res)
 
 with open("res.json", "w") as f:
     json.dump(res, f)
