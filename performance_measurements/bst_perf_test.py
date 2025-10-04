@@ -201,12 +201,13 @@ def _calc(x, res=None):
     bn = str(block_nums)
     bs = str(block_size)
 
-    ret_flag = False
     if res is None:
         res = {}
         res.setdefault(bn, {})
         res[bn].setdefault(bs, {})
         ret_flag = True
+    else:
+        ret_flag = False
     
     k1, k2 = jrand.split(jrand.PRNGKey(i), 2)
 
@@ -320,23 +321,34 @@ def handler(signum, frame):
 
 signal.signal(signal.SIGALRM, handler)
 
-def _timedout_calc(x, ms=10):
-    signal.alarm(ms)
+def _timedout_calc(x, timeout=10):
+    signal.alarm(timeout)
     try:
+        signal.alarm(0)
         return _calc(x)
     except Exception:
-        return 
+        return {}
 
-range_ = set([(i%9+1)*10**(i//9) for i in range(19)] + [2**i for i in range(8)])
+small = False
+if small:
+    n = m = k = 4
+else:
+    n = 19
+    m = 8
+    k = 23
+
+range_ = set([(i%9+1)*10**(i//9) for i in range(n)] + [2**i for i in range(m)])
 d = list(product(range_, range_))
 shuffle(d)
 
-pool = multiprocessing.Pool(23)
-
 if not os.path.isfile("res.json"):
     print("running estimates")
+
     res = {}
-    for re in tqdm(pool.imap(_timedout_calc, enumerate(product(range_, range_))), total=len(range_)**2):
+
+    pool = multiprocessing.Pool(k)
+
+    for re in tqdm(pool.imap(_timedout_calc, enumerate(d)), total=len(d)):
         for bn in re.keys():
             if bn not in res:
                 res.update(re)
@@ -344,8 +356,10 @@ if not os.path.isfile("res.json"):
                 res[bn].update(re[bn])
 else:
     print("running measurements")
+    
     with open("res.json", "r") as f:
         res = json.load(f)
+
     for x in enumerate(t:=tqdm(d)):
         _calc(x, res)
 
