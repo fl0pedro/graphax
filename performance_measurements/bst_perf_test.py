@@ -2,22 +2,18 @@ import json
 from random import shuffle
 import multiprocessing
 import signal
-from functools import partial
 import os
 from matplotlib import colormaps
 from jax import tree_util
 from itertools import product
-from jax import jit, make_jaxpr
-from graphax.sparse.block import BlockSparseTensor, SparseDimension, DenseDimension, new_block_sparse_tensor, _dense
+from graphax.sparse.block import BlockSparseTensor, SparseDimension, DenseDimension, new_block_sparse_tensor
 import jax.random as jrand
-import timeit
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 import numpy as np
-from functools import reduce
-from operator import mul
 import jax
 import jax.numpy as jnp
+from jax import jit
 import time
 import threading
 from jax import lax
@@ -34,46 +30,53 @@ def profile_jax(fn, *args, device=None, warmup=True, poll_ms=0, **kwargs):
         del tmp
 
     mem_before = device.memory_stats()
+
+    if mem_before is not None:
+        peak = mem_before["bytes_in_use"] or None
+        stop_flag = False
+
+        def poll():
+            nonlocal peak
+            while not stop_flag:
+                used = device.memory_stats()["bytes_in_use"]
+                peak = max(peak, used)
+                time.sleep(poll_ms / 1000.0)
+
+        thread = None
+        if poll_ms > 0:
+            thread = threading.Thread(target=poll, daemon=True)
+            thread.start()
+
     start = time.perf_counter()
-    peak = mem_before["bytes_in_use"]
-    stop_flag = False
-
-    def poll():
-        nonlocal peak
-        while not stop_flag:
-            used = device.memory_stats()["bytes_in_use"]
-            peak = max(peak, used)
-            time.sleep(poll_ms / 1000.0)
-
-    thread = None
-    if poll_ms > 0:
-        thread = threading.Thread(target=poll, daemon=True)
-        thread.start()
-
+    
     out = fn(*args, **kwargs)
     out.block_until_ready()
 
     end = time.perf_counter()
-    stop_flag = True
-    if thread:
-        thread.join()
+   
+    if mem_before is None:
+        stats = { "wall_s": end - start }
+    else:
+        stop_flag = True
+        if thread:
+            thread.join()
 
-    mem_after = device.memory_stats()
+        mem_after = device.memory_stats()
 
-    stats = {
-        "wall_s": end - start,
-        "bytes_in_use_before": mem_before["bytes_in_use"],
-        "bytes_in_use_after": mem_after["bytes_in_use"],
-        "net_bytes_in_use": mem_after["bytes_in_use"] - mem_before["bytes_in_use"],
-        "process_peak_bytes": mem_after["peak_bytes_in_use"],
-        "peak_bytes_during": (
-            max(0, peak - mem_before["bytes_in_use"])
-            if poll_ms > 0
-            else max(
-                0, mem_after["peak_bytes_in_use"] - mem_before["peak_bytes_in_use"]
-            )
-        ),
-    }
+        stats = {
+            "wall_s": end - start,
+            "bytes_in_use_before": mem_before["bytes_in_use"],
+            "bytes_in_use_after": mem_after["bytes_in_use"],
+            "net_bytes_in_use": mem_after["bytes_in_use"] - mem_before["bytes_in_use"],
+            "process_peak_bytes": mem_after["peak_bytes_in_use"],
+            "peak_bytes_during": (
+                max(0, peak - mem_before["bytes_in_use"])
+                if poll_ms > 0
+                else max(
+                    0, mem_after["peak_bytes_in_use"] - mem_before["peak_bytes_in_use"]
+                )
+            ),
+        }
 
     return out, stats
 
@@ -92,6 +95,8 @@ tree_util.register_pytree_node(BlockSparseTensor, flatten_block_sparse_tensor, u
 jit_matmul = jit(lambda a, b: a @ b)
 jit_dot = jit(lax.dot, static_argnames=["dimension_numbers"])
 
+
+# TODO WIP.
 def matshow3d(a, ax = None):
     if ax is None:
         ax = plt.figure().add_subplot(projection='3d')
@@ -132,102 +137,82 @@ def matshowXd(t):
         case _:
             raise ValueError("`t` must be a tensor of dimension 4 or less")
 
-def _test(size, k1, k2, stx_dims, sty_dims):
-    stx = new_block_sparse_tensor(*stx_dims, jrand.normal(k1, size))
-    sty = new_block_sparse_tensor(*sty_dims, jrand.normal(k2, size))
-#    print(
-#        f"({", ".join([str(i) for i in stx.out_shape])} | "
-#        f"{", ".join([str(i) for i in stx.primal_shape])}) @ "
-#        f"({", ".join([str(i) for i in sty.out_shape])} | "
-#        f"{", ".join([str(i) for i in sty.primal_shape])})"
-#    )
-    
-    x = stx.dense()
-    y = sty.dense()
-
-    print(json.dumps(jit_matmul.lower(stx, sty).cost_analysis(), indent=4))
-    print(json.dumps(jit_dot.lower(x, y, dimension_numbers=((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))).cost_analysis(), indent=4))
-    print("---")
-
-    a = jit_matmul(stx, sty)
-    b = jit_dot(x, y, dimension_numbers=((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ())))
-
-    print(jnp.linalg.norm(jnp.abs(a.dense()-b)))
-
-    assert a.shape == a.dense().shape, f"{a.shape=} is not equal to {a.dense().shape=}"
-    assert a.shape == b.shape, f"{a.shape=} is not equal to {b.shape}"
-    assert jnp.allclose(a.dense(), b, 1e2, 1e3), f"tensor a is not equal to b, with a normed delta of {jnp.linalg.norm(jnp.abs(a-b))}"
-
-jit_dense = jit(_dense)
-def get_dense_expansion_bytes(stx, sty):
-    bytes_x = jit_dense.lower(stx).cost_analysis()["bytes accessed"] 
-    bytes_y = jit_dense.lower(sty).cost_analysis()["bytes accessed"]
-    return bytes_x + bytes_y
-
-def handler(signum, frame):
-    raise Exception("timeout")
-
-signal.signal(signal.SIGALRM, handler)
-
-def test(size, k1, k2, stx_dims, sty_dims):
-    res = {}
+# TODO rename... these are shit :I
+def test(size, k1, k2, stx_dims, sty_dims, res = None):
     stx = new_block_sparse_tensor(*stx_dims, jrand.normal(k1, size))
     sty = new_block_sparse_tensor(*sty_dims, jrand.normal(k2, size))
 
-    res["sparse"] = dict()
-    res["sparse"]["estimate"] = jit_matmul.lower(stx, sty).cost_analysis()
+    # print(
+    #     f"({", ".join([str(i) for i in stx.out_shape])} | "
+    #     f"{", ".join([str(i) for i in stx.primal_shape])}) @ "
+    #     f"({", ".join([str(i) for i in sty.out_shape])} | "
+    #     f"{", ".join([str(i) for i in sty.primal_shape])})"
+    # )
+    
+    if res is None:
+        res = {}
 
-    #print(json.dumps(res["sparse"]["estimate"], indent=4))
-    #print(jax.make_jaxpr(jit_matmul)(stx,sty))
-    #if res["sparse"]["estimate"] is not None \
-    #        and res["sparse"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
-    #    res["sparse"]["measured"] = []
-    #    for _ in range(20):
-    #        _, r = profile_jax(jit_matmul, stx, sty, poll_ms=1)
-    #        res["sparse"]["measured"].append(r)
-    #else:
-    #    return res
+        res["sparse"] = {}
+        res["sparse"]["estimate"] = jit_matmul.lower(stx, sty).cost_analysis()
+        
+        x = stx.dense()
+        y = sty.dense()
+        
+        dnums = ((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))
+        
+        res["dense"] = {}
+        res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=dnums).cost_analysis()
+    else:
     
-    #if get_dense_expansion_bytes(stx, sty) <= MAX_MEMORY:
-    x = stx.dense()
-    y = sty.dense()
-    #else:
-    #    return res
+        a = None
+        if res["sparse"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
+            res["sparse"]["measured"] = []
+            for _ in range(20):
+                a, r = profile_jax(jit_matmul, stx, sty, poll_ms=1)
+                res["sparse"]["measured"].append(r)
+        else:
+            return res
+        
+        x = stx.dense()
+        y = sty.dense()
+        
+        dnums = ((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))
     
-    res["dense"] = dict()
-    dnums = ((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))
-    res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=dnums).cost_analysis()
+        b = None
+        if res["dense"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
+            res["dense"]["measured"] = []
+            for _ in range(20):
+                b, r = profile_jax(jit_dot, x, y, dimension_numbers=dnums, poll_ms=1)
+                res["dense"]["measured"].append(r)
+        else: 
+            return res
+    
+        if a is not None and b is not None:
+            assert a.shape == a.dense().shape, f"{a.shape=} is not equal to {a.dense().shape=}"
+            assert a.shape == b.shape, f"{a.shape=} is not equal to {b.shape}"
+            assert jnp.allclose(a.dense(), b, 1e2, 1e3), f"tensor a is not equal to b, with a normed delta of {jnp.linalg.norm(jnp.abs(a-b))}"
 
-    #print(json.dumps(res["dense"]["estimate"], indent=4))
-    #print(jax.make_jaxpr(partial(jit_dot, dimension_numbers=dnums))(x, y))
-    #if res["dense"]["estimate"] is not None \
-    #        and res["dense"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
-    #    res["dense"]["measured"] = []
-    #    for _ in range(20):
-    #        _, r = profile_jax(jit_dot, x, y, dimension_numbers=dnums, poll_ms=1)
-    #        res["dense"].append(r)
-    
     return res
 
-range_ = set([(i%9+1)*10**(i//9) for i in range(19)] + [2**i for i in range(8)])
-def _timedout_calc(x):
-    signal.alarm(10)
-    try:
-        return _calc(x)
-    except Exception:
-        return dict()
+def _calc(x, res=None):
 
-def _calc(x):
-    res = {}
-    i, bs = x
-    block_nums, block_size = bs
-    res.setdefault(block_nums, {})
-    res[block_nums].setdefault(block_size, {})
+    i, (block_nums, block_size) = x
 
+    bn = str(block_nums)
+    bs = str(block_size)
+
+    ret_flag = False
+    if res is None:
+        res = {}
+        res.setdefault(bn, {})
+        res[bn].setdefault(bs, {})
+        ret_flag = True
+    
     k1, k2 = jrand.split(jrand.PRNGKey(i), 2)
 
     # 2D
-    res[block_nums][block_size]["2d, 1c, 1s"] = test(
+    #print("2d, 1c, 1s")
+    res[bn][bs]["2d, 1c, 1s"] = test(
         (block_nums, block_size, block_size), 
         k1, k2, 
         (
@@ -237,10 +222,11 @@ def _calc(x):
             [SparseDimension(0, block_nums, 0, 1, block_size)], 
             [SparseDimension(1, block_nums, 1, 0, block_size)] 
         )
-    )
+    , res[bn][bs].get("2d, 1c, 1s", None))
 
     # 3D - 1
-    res[block_nums][block_size]["3d, 1c, 1s"] = test(
+    #print("3d, 1c, 1s")
+    res[bn][bs]["3d, 1c, 1s"] = test(
         (block_nums, block_size, block_size, block_size),
         k1, k2,
         (
@@ -256,10 +242,11 @@ def _calc(x):
                 DenseDimension(2, block_size, 2)
             ] 
         )
-    )
+    , res[bn][bs].get("3d, 1c, 1s", None))
     
     # 3D - 2
-    res[block_nums][block_size]["3d, 2c, 1s"] = test(
+    #print("3d, 2c, 1s")
+    res[bn][bs]["3d, 2c, 1s"] = test(
         (block_nums, block_size, block_size, block_size),
         k1, k2,
         (
@@ -275,10 +262,11 @@ def _calc(x):
             ], 
             [SparseDimension(2, block_nums, 2, 0, block_size)]
         )
-    )
+    , res[bn][bs].get("3d, 2c, 1s", None))
     
     # 4D - 1
-    res[block_nums][block_size]["4d, 1c, 1s"] = test(
+    #print("4d, 1c, 1s")
+    res[bn][bs]["4d, 1c, 1s"] = test(
         (block_nums, block_size, block_size, block_size, block_size),
         k1, k2,
         (
@@ -298,10 +286,11 @@ def _calc(x):
                 DenseDimension(3, block_size, 3)
             ] 
         )
-    )
+    , res[bn][bs].get("4d, 1c, 1s", None))
 
     # 4D - 2
-    res[block_nums][block_size]["4d, 1c, 2s"] = test(
+    #print("4d, 1c, 2s")
+    res[bn][bs]["4d, 1c, 2s"] = test(
         (block_nums, block_nums, block_size, block_size, block_size, block_size),
         k1, k2,
         (
@@ -320,29 +309,45 @@ def _calc(x):
                 SparseDimension(2, block_nums, 2, 0, block_size),
                 SparseDimension(3, block_nums, 3, 1, block_size)
             ], 
-        ))
+        )
+    , res[bn][bs].get("4d, 1c, 2s", None))
 
-    return res
+    if ret_flag:
+        return res
 
+def handler(signum, frame):
+    raise Exception("timeout")
 
-pool = multiprocessing.Pool(4)
+signal.signal(signal.SIGALRM, handler)
 
-res = {}
-i = 0
-for re in tqdm(pool.imap_unordered(_timedout_calc, enumerate(product(range_, range_))), total=len(range_)**2):
-    for bn in re.keys():
-        if bn not in res:
-            res.update(re)
-        else:
-            res[bn].update(re[bn])
-            #for bs in re[bn].keys():
-            #    if bs not in res:
-            #        res[bn].update(re[bn])
-            #    else:
-            #        res[bn][bs].update(re[bn][bs])
+def _timedout_calc(x, ms=10):
+    signal.alarm(ms)
+    try:
+        return _calc(x)
+    except Exception:
+        return 
+
+range_ = set([(i%9+1)*10**(i//9) for i in range(19)] + [2**i for i in range(8)])
+d = list(product(range_, range_))
+shuffle(d)
+
+pool = multiprocessing.Pool(23)
+
+if not os.path.isfile("res.json"):
+    print("running estimates")
+    res = {}
+    for re in tqdm(pool.imap(_timedout_calc, enumerate(product(range_, range_))), total=len(range_)**2):
+        for bn in re.keys():
+            if bn not in res:
+                res.update(re)
+            else:
+                res[bn].update(re[bn])
+else:
+    print("running measurements")
+    with open("res.json", "r") as f:
+        res = json.load(f)
+    for x in enumerate(t:=tqdm(d)):
+        _calc(x, res)
 
 with open("res.json", "w") as f:
     json.dump(res, f)
-
-#for i, (block_nums, block_size) in enumerate(r):
-#    _calc(i, block_nums, block_size)
