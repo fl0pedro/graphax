@@ -155,7 +155,7 @@ def test(size, k1, k2, stx_dims, sty_dims, res = None):
         res["sparse"] = {}
         res["sparse"]["estimate"] = jit_matmul.lower(stx, sty).cost_analysis()
         
-        res["vals_estimate"] = jit(lambda a, b: a.dense(), b.dense()).lowewr(stx, sty).cost_analysis()
+        res["vals_estimate"] = jit(lambda a, b: (a.dense(), b.dense())).lowewr(stx, sty).cost_analysis()
 
         x = stx.dense()
         y = sty.dense()
