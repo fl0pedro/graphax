@@ -320,10 +320,11 @@ signal.signal(signal.SIGALRM, handler)
 def _timedout_calc(x, timeout=10):
     signal.alarm(timeout)
     try:
-        signal.alarm(0)
         return _calc(x)
     except Exception:
         return {}
+    finally:
+        signal.alarm(0)
 
 small = False
 if small:
@@ -361,3 +362,6 @@ else:
 
 with open("res.json", "w") as f:
     json.dump(res, f)
+
+pool.close()
+pool.join()
