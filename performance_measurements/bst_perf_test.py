@@ -1,4 +1,5 @@
 import json
+import gc
 from random import shuffle
 import multiprocessing
 import signal
@@ -312,7 +313,8 @@ def _calc(x, res=None):
             ], 
         )
     , res[bn][bs].get("4d, 1c, 2s", None))
-
+    
+    gc.collect()
     return res
 
 small = False
