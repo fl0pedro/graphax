@@ -157,8 +157,8 @@ def test(size, k1, k2, stx_dims, sty_dims, res = None):
         
         res["vals_estimate"] = jit(lambda a, b: (a.dense(), b.dense())).lower(stx, sty).cost_analysis()
 
-        x = stx.dense()
-        y = sty.dense()
+        x = jax.ShapeDtypeStruct(stx.shape, stx.blocks.dtype)
+        y = jax.ShapeDtypeStruct(sty.shape, sty.blocks.dtype)
         
         dnums = ((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))
         
@@ -319,13 +319,14 @@ small = False
 if small:
     n = m = k = 4
 else:
-    n = 14
-    m = 8
-    k = 23
+    n = 19
+    m = 9
+    k = 4
 
-range_ = set([(i%9+1)*10**(i//9) for i in range(n)] + [2**i for i in range(m)])
-d = sorted(list(product(range_, range_)), key=lambda x: x[0]*x[1])
-#shuffle(d)
+b10 = [(i%9+1)*10**(i//9) for i in range(n)]
+b2 = [2**i for i in range(m)]
+d = list(set([*product(b10, b10), *product(b2, b2)]))
+shuffle(d)
 
 if not os.path.isfile("res.json"):
     print("running estimates")
@@ -334,10 +335,7 @@ if not os.path.isfile("res.json"):
 
     pool = multiprocessing.Pool(k)
 
-    #for re in tqdm(pool.imap_unordered(_calc, enumerate(d)), total=len(d)):
-    for x in enumerate(t:=tqdm(d)):
-        t.set_description(f"bn={x[1][0]}, bs={x[1][1]}")
-        re = _calc(x)
+    for re in tqdm(pool.imap_unordered(_calc, enumerate(d)), total=len(d)):
         for bn in re.keys():
             if bn not in res:
                 res.update(re)
