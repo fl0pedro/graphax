@@ -155,6 +155,8 @@ def test(size, k1, k2, stx_dims, sty_dims, res = None):
         res["sparse"] = {}
         res["sparse"]["estimate"] = jit_matmul.lower(stx, sty).cost_analysis()
         
+        res["vals_estimate"] = jit(lambda a, b: a.dense(), b.dense()).lowewr(stx, sty).cost_analysis()
+
         x = stx.dense()
         y = sty.dense()
         
@@ -173,8 +175,9 @@ def test(size, k1, k2, stx_dims, sty_dims, res = None):
         else:
             return res
         
-        x = stx.dense()
-        y = sty.dense()
+        if res["vals_estimate"]["bytes accessed"] <= MAX_MEMORY:
+            x = stx.dense()
+            y = sty.dense()
         
         dnums = ((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))
     
@@ -312,20 +315,6 @@ def _calc(x, res=None):
 
     return res
 
-def handler(signum, frame):
-    raise Exception("timeout")
-
-signal.signal(signal.SIGALRM, handler)
-
-def _timedout_calc(x, timeout=10):
-    signal.alarm(timeout)
-    try:
-        return _calc(x)
-    except Exception:
-        return {}
-    finally:
-        signal.alarm(0)
-
 small = False
 if small:
     n = m = k = 4
@@ -345,26 +334,12 @@ if not os.path.isfile("res.json"):
 
     pool = multiprocessing.Pool(k)
 
-    async_res = []
-    
-    for x in enumerate(d):
-        async_res.append(pool.apply_async(_calc, (x,)))
-
-    for async_result in tqdm(async_res):
-        try:
-            re = async_result.get(timeout=30)
-            
-            for bn in re.keys():
-                if bn not in res:
-                    res.update(re)
-                else:
-                    if isinstance(re[bn], dict) and bn in res:
-                        res[bn].update(re[bn])
-                    else:
-                        res.update(re)
-    
-        except multiprocessing.TimeoutError:
-            pass
+    for re in tqdm(pool.imap_unordered(_calc, enumerate(d)), total=len(d)):
+        for bn in re.keys():
+            if bn not in res:
+                res.update(re)
+            else:
+                res[bn].update(re[bn])
 
     pool.close()
     pool.join()
