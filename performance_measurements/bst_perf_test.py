@@ -319,8 +319,8 @@ small = False
 if small:
     n = m = k = 4
 else:
-    n = 19
-    m = 8
+    n = 14
+    m = 7
     k = 23
 
 range_ = set([(i%9+1)*10**(i//9) for i in range(n)] + [2**i for i in range(m)])
