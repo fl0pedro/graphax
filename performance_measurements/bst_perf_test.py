@@ -345,12 +345,26 @@ if not os.path.isfile("res.json"):
 
     pool = multiprocessing.Pool(k)
 
-    for re in tqdm(pool.imap_unordered(_calc, enumerate(d)), total=len(d)):
-        for bn in re.keys():
-            if bn not in res:
-                res.update(re)
-            else:
-                res[bn].update(re[bn])
+    async_res = []
+    
+    for x in enumerate(d):
+        async_res.append(pool.apply_async(_calc, (x,)))
+
+    for async_result in tqdm(async_res):
+        try:
+            re = async_result.get(timeout=30)
+            
+            for bn in re.keys():
+                if bn not in res:
+                    res.update(re)
+                else:
+                    if isinstance(re[bn], dict) and bn in res:
+                        res[bn].update(re[bn])
+                    else:
+                        res.update(re)
+    
+        except multiprocessing.TimeoutError:
+            pass
 
     pool.close()
     pool.join()
