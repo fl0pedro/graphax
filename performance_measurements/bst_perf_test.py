@@ -351,6 +351,9 @@ if not os.path.isfile("res.json"):
                 res.update(re)
             else:
                 res[bn].update(re[bn])
+
+    pool.close()
+    pool.join()
 else:
     print("running measurements")
     
@@ -363,5 +366,3 @@ else:
 with open("res.json", "w") as f:
     json.dump(res, f)
 
-pool.close()
-pool.join()
