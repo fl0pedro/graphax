@@ -345,7 +345,7 @@ if not os.path.isfile("res.json"):
 
     pool = multiprocessing.Pool(k)
 
-    for re in tqdm(pool.imap(_timedout_calc, enumerate(d)), total=len(d)):
+    for re in tqdm(pool.imap_unordered(_calc, enumerate(d)), total=len(d)):
         for bn in re.keys():
             if bn not in res:
                 res.update(re)
