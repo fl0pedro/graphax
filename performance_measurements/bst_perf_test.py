@@ -320,12 +320,12 @@ if small:
     n = m = k = 4
 else:
     n = 14
-    m = 7
+    m = 8
     k = 23
 
 range_ = set([(i%9+1)*10**(i//9) for i in range(n)] + [2**i for i in range(m)])
-d = list(product(range_, range_))
-shuffle(d)
+d = sorted(list(product(range_, range_)), key=lambda x: x[0]*x[1])
+#shuffle(d)
 
 if not os.path.isfile("res.json"):
     print("running estimates")
@@ -334,7 +334,10 @@ if not os.path.isfile("res.json"):
 
     pool = multiprocessing.Pool(k)
 
-    for re in tqdm(pool.imap_unordered(_calc, enumerate(d)), total=len(d)):
+    #for re in tqdm(pool.imap_unordered(_calc, enumerate(d)), total=len(d)):
+    for x in enumerate(t:=tqdm(d)):
+        t.set_description(f"bn={x[1][0]}, bs={x[1][1]}")
+        re = _calc(x)
         for bn in re.keys():
             if bn not in res:
                 res.update(re)
@@ -350,6 +353,7 @@ else:
         res = json.load(f)
 
     for x in enumerate(t:=tqdm(d)):
+        t.set_descripiton(f"bn={x[1][0]}, bs={x[1][1]}")
         res = _calc(x, res)
 
 with open("res.json", "w") as f:
