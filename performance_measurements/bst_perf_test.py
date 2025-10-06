@@ -198,12 +198,9 @@ def test(size, k1, k2, stx_dims, sty_dims, res = None):
 
     return res
 
-def _calc(x, res=None):
-
-    i, (block_nums, block_size) = x
-
-    bn = str(block_nums)
-    bs = str(block_size)
+def _calc(i, bn, bs, res=None):
+    block_nums = int(bn)
+    block_size = int(bs)
 
     if res is None:
         res = {}
@@ -317,44 +314,58 @@ def _calc(x, res=None):
     gc.collect()
     return res
 
-small = False
-if small:
-    n = m = k = 4
-else:
-    n = 19
-    m = 9
-    k = 4
+def handler(signum, frame):
+    raise Exception("timeout")
 
-b10 = [(i%9+1)*10**(i//9) for i in range(n)]
-b2 = [2**i for i in range(m)]
-d = list(set([*product(b10, b10), *product(b2, b2)]))
-shuffle(d)
+signal.signal(signal.SIGALRM, handler)
+
+def _timedout_calc(i, bn, bs, res=None, timeout=10):
+    signal.alarm(timeout)
+    try:
+        return _calc(i, bn, bs, res)
+    except Exception:
+        print("timedout")
+        return res or {}
+    finally:
+        signal.alarm(0)
 
 if not os.path.isfile("res.json"):
     print("running estimates")
 
+    small = False
+    if small:
+        n = m = k = 4
+    else:
+        n = 19
+        m = 9
+        k = 4
+    
+    b10 = [(i%9+1)*10**(i//9) for i in range(n)]
+    b2 = [2**i for i in range(m)]
+    d = list(set([*product(b10, b10), *product(b2, b2)]))
+    shuffle(d)
+
     res = {}
 
-    pool = multiprocessing.Pool(k)
-
-    for re in tqdm(pool.imap_unordered(_calc, enumerate(d)), total=len(d)):
+    for i, (bn, bs) in enumerate(t:=tqdm(d)):
+        t.set_description(f"{bn=}, {bs=}")
+        re = _timedout_calc(i, bn, bs, timeout=60)
         for bn in re.keys():
             if bn not in res:
                 res.update(re)
             else:
                 res[bn].update(re[bn])
-
-    pool.close()
-    pool.join()
 else:
     print("running measurements")
     
     with open("res.json", "r") as f:
         res = json.load(f)
 
-    for x in enumerate(t:=tqdm(d)):
-        t.set_descripiton(f"bn={x[1][0]}, bs={x[1][1]}")
-        res = _calc(x, res)
+    d = [(bn, bs) for bn in res for bs in res[bn]]
+
+    for i, (bn, bs) in enumerate(t:=tqdm(d)):
+        t.set_description(f"{bn=}, {bs=}")
+        res = _calc(i, bn, bs, res)
 
 with open("res.json", "w") as f:
     json.dump(res, f)
