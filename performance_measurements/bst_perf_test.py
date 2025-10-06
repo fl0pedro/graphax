@@ -1,7 +1,5 @@
 import json
-import gc
 from random import shuffle
-import multiprocessing
 import signal
 import os
 from matplotlib import colormaps
@@ -311,7 +309,6 @@ def _calc(i, bn, bs, res=None):
         )
     , res[bn][bs].get("4d, 1c, 2s", None))
     
-    gc.collect()
     return res
 
 def handler(signum, frame):
