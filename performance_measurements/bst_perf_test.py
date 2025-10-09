@@ -189,7 +189,7 @@ def test(size, k1, k2, stx_dims, sty_dims, res = None):
         else: 
             return res
 
-        res["norm_measured"] = jnp.linalg.norm(jnp.abs(a.dense()-b))
+        res["norm_measured"] = jnp.linalg.norm(jnp.abs(a.dense()-b)).tolist()
 
         if a is not None and b is not None:
             assert a.shape == a.dense().shape, f"{a.shape=} is not equal to {a.dense().shape=}"
