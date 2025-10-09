@@ -348,7 +348,7 @@ if not os.path.isfile("r1.json"):
 
     for i, (bn, bs) in enumerate(t:=tqdm(d)):
         t.set_description(f"{bn=}, {bs=}")
-        re = _timedout_calc(i, bn, bs, timeout=10)
+        re = _timedout_calc(i, bn, bs, timeout=60)
 
         for bn in re.keys():
             if bn not in res:
