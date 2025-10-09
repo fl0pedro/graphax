@@ -188,11 +188,13 @@ def test(size, k1, k2, stx_dims, sty_dims, res = None):
                 res["dense"]["measured"].append(r)
         else: 
             return res
-    
+
+        res["norm_measured"] = jnp.linalg.norm(jnp.abs(a-b))
+
         if a is not None and b is not None:
             assert a.shape == a.dense().shape, f"{a.shape=} is not equal to {a.dense().shape=}"
             assert a.shape == b.shape, f"{a.shape=} is not equal to {b.shape}"
-            assert jnp.allclose(a.dense(), b, 1e2, 1e3), f"tensor a is not equal to b, with a normed delta of {jnp.linalg.norm(jnp.abs(a-b))}"
+            assert jnp.allclose(a.dense(), b, 1e2, 1e3), f"tensor a is not equal to b, with a normed delta of {res["norm_measured"]}"
 
     return res
 
@@ -326,7 +328,7 @@ def _timedout_calc(i, bn, bs, res=None, timeout=10):
     finally:
         signal.alarm(0)
 
-if not os.path.isfile("res.json"):
+if not os.path.isfile("r1.json"):
     print("running estimates")
 
     small = False
@@ -347,15 +349,21 @@ if not os.path.isfile("res.json"):
     for i, (bn, bs) in enumerate(t:=tqdm(d)):
         t.set_description(f"{bn=}, {bs=}")
         re = _timedout_calc(i, bn, bs, timeout=10)
+
         for bn in re.keys():
             if bn not in res:
                 res.update(re)
             else:
                 res[bn].update(re[bn])
+
+        if i % 10 == 0:
+            with open("r1.json", "w") as f:
+                json.dump(res, f)
+
 else:
     print("running measurements")
     
-    with open("res.json", "r") as f:
+    with open("r1.json", "r") as f:
         res = json.load(f)
 
     d = [(bn, bs) for bn in res for bs in res[bn]]
@@ -364,6 +372,8 @@ else:
         t.set_description(f"{bn=}, {bs=}")
         res = _calc(i, bn, bs, res)
 
-with open("res.json", "w") as f:
-    json.dump(res, f)
+        if i % 10 == 0:
+            with open("r2.json", "w") as f:
+                json.dump(res, f)
+
 
