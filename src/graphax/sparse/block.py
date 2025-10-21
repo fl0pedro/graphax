@@ -123,6 +123,7 @@ class BlockSparseTensor:
     post_transforms = {multiline_post_transform}
 )"""
 
+    # This is not a transpose like w/ normal tensors. The order should be completely reversed.
     def transpose(self, *args):
         if len(args) > 0:
             pass # regular transpose, warn on breaking of sparsity
@@ -165,14 +166,14 @@ class BlockSparseTensor:
     def dense(self) -> Array:
         return _dense(self)
 
-    def __add__(lhs, rhs):
-        return _add(lhs, rhs)
+    def __add__(rhs, lhs):
+        return _add(rhs, lhs)
 
-    def __mul__(lhs, rhs):
-        return _mul(lhs, rhs)
+    def __mul__(rhs, lhs):
+        return _mul(rhs, lhs)
 
-    def __matmul__(lhs, rhs):
-        return _matmul(lhs, rhs)
+    def __matmul__(rhs, lhs):
+        return _matmul(rhs, lhs)
 
 def has_equal_depth(node: MultiSparseDimensionBlocks, depth=0):
     if isinstance(node, Array):
@@ -300,33 +301,15 @@ def _dense(bst: BlockSparseTensor) -> Array:
     # print()
     return dense_tensor
 
-# @partial(jit, static_argnames=('rhs', 'lhs'))
-def _add(rhs, lhs):
-    assert lhs.shape == rhs.shape, "Tensors must be of equal shape"
-    if isinstance(rhs, BlockSparseTensor):
-        if rhs.blocks is None:
-            pass
-        elif isinstance(lhs.blocks, Array) and isinstance(rhs.blocks, Array):
-            if lhs.shape == rhs.shape and lhs.primal_dims == rhs.primal_dims and lhs.out_dims == rhs.out_dims:
-                return BlockSparseTensor(lhs.out_dims, lhs.primal_dims, lhs.out_shape, lhs.primal_shape, lhs.blocks + rhs.blocks, lhs.sparse_dims)
-        elif all(b1.shape == b2.shape for b1, b2 in zip(lhs.blocks, rhs.blocks)):
-            pass
-    elif isinstance(rhs, SparseTensor):
-        pass
-    elif isinstance(rhs, Array):
-        lhs.dense() + rhs
-    else:
-        raise TypeError("Expected to add with type BlockSparseTensor, SparseTensor, or Array")
-
-# @partial(jit, static_argnames=('rhs', 'lhs'))
-def _mul(rhs, lhs):
+# @partial(jit, static_argnames=('lhs', 'rhs'))
+def _add(lhs, rhs):
     assert rhs.shape == lhs.shape, "Tensors must be of equal shape"
     if isinstance(lhs, BlockSparseTensor):
         if lhs.blocks is None:
             pass
         elif isinstance(rhs.blocks, Array) and isinstance(lhs.blocks, Array):
             if rhs.shape == lhs.shape and rhs.primal_dims == lhs.primal_dims and rhs.out_dims == lhs.out_dims:
-                return BlockSparseTensor(rhs.out_dims, rhs.primal_dims, rhs.out_shape, rhs.primal_shape, rhs.blocks * lhs.blocks, rhs.sparse_dims)
+                return BlockSparseTensor(rhs.out_dims, rhs.primal_dims, rhs.out_shape, rhs.primal_shape, rhs.blocks + lhs.blocks, rhs.sparse_dims)
         elif all(b1.shape == b2.shape for b1, b2 in zip(rhs.blocks, lhs.blocks)):
             pass
     elif isinstance(lhs, SparseTensor):
@@ -336,42 +319,115 @@ def _mul(rhs, lhs):
     else:
         raise TypeError("Expected to add with type BlockSparseTensor, SparseTensor, or Array")
 
-# @partial(jit, static_argnames=('rhs', 'lhs'))
-def _matmul(rhs, lhs):
-    # TODO assert something
-    if isinstance(lhs, BlockSparseTensor):
+# @partial(jit, static_argnames=('lhs', 'rhs'))
+def _mul(lhs, rhs):
+    assert lhs.shape == rhs.shape, "Tensors must be of equal shape"
+    if isinstance(rhs, BlockSparseTensor):
         if rhs.blocks is None:
-            return copy.copy(lhs)
-        elif lhs.blocks is None:
-            return copy.copy(rhs)
-        elif isinstance(rhs.blocks, Array) and isinstance(lhs.blocks, Array):
-            if rhs.out_shape == lhs.primal_shape and lhs.sparse_dims == rhs.sparse_dims:
-                out_dims = [
-                    d._replace(val_dim=i) 
-                    for i, d in enumerate(rhs.out_dims)
-                ]
-                
-                primal_dims = [
-                    d._replace(
-                        id=d.id - len(lhs.out_dims) + len(rhs.out_dims),
-                        val_dim=i+len(rhs.out_dims)
-                    )
-                    for i, d in enumerate(lhs.primal_dims)
-                ]
-                
-                return BlockSparseTensor(
-                    out_dims,
-                    primal_dims,
-                    rhs.out_shape,
-                    lhs.primal_shape,
-                    lax.dot_general(rhs.blocks, lhs.blocks, (([x.val_dim + rhs.sparse_dims for x in rhs.primal_dims], [x.val_dim + lhs.sparse_dims for x in lhs.out_dims]), (list(range(rhs.sparse_dims)),)*2)),
-                    rhs.sparse_dims
-                )
-        elif all(b1.shape == b2.shape for b1, b2 in zip(rhs.blocks, lhs.blocks)):
             pass
-    elif isinstance(lhs, SparseTensor):
+        elif isinstance(lhs.blocks, Array) and isinstance(rhs.blocks, Array):
+            if lhs.shape == rhs.shape and lhs.primal_dims == rhs.primal_dims and lhs.out_dims == rhs.out_dims:
+                return BlockSparseTensor(lhs.out_dims, lhs.primal_dims, lhs.out_shape, lhs.primal_shape, lhs.blocks * rhs.blocks, lhs.sparse_dims)
+        elif all(b1.shape == b2.shape for b1, b2 in zip(lhs.blocks, rhs.blocks)):
+            pass
+    elif isinstance(rhs, SparseTensor):
         pass
-    elif isinstance(lhs, Array):  # TODO: Fix default check
-        return rhs.dense() @ lhs
+    elif isinstance(rhs, Array):
+        lhs.dense() + rhs
     else:
         raise TypeError("Expected to add with type BlockSparseTensor, SparseTensor, or Array")
+
+# @partial(jit, static_argnames=('lhs', 'rhs'))
+def _matmul(lhs, rhs):
+    # TODO assert something
+    if isinstance(rhs, BlockSparseTensor):
+        if lhs.blocks is None:
+            return copy.copy(rhs)
+        elif rhs.blocks is None:
+            return copy.copy(lhs)
+        elif isinstance(lhs.blocks, Array) and isinstance(rhs.blocks, Array) \
+                and lhs.out_shape == rhs.primal_shape and rhs.sparse_dims == lhs.sparse_dims:
+            out_dims = [
+                d._replace(val_dim=i) 
+                for i, d in enumerate(lhs.out_dims)
+            ]
+            
+            primal_dims = [
+                d._replace(
+                    id=d.id - len(rhs.out_dims) + len(lhs.out_dims),
+                    val_dim=i+len(lhs.out_dims)
+                )
+                for i, d in enumerate(rhs.primal_dims)
+            ]
+            
+            return BlockSparseTensor(
+                out_dims,
+                primal_dims,
+                lhs.out_shape,
+                rhs.primal_shape,
+                lax.dot_general(lhs.blocks, rhs.blocks, (([x.val_dim + lhs.sparse_dims for x in lhs.primal_dims], [x.val_dim + rhs.sparse_dims for x in rhs.out_dims]), (list(range(lhs.sparse_dims)),)*2)),
+                lhs.sparse_dims
+            )
+    elif isinstance(rhs, SparseTensor):
+        pass
+    elif isinstance(rhs, Array):  # TODO: Fix default check
+        block_nums = lhs.blocks.shape[:lhs.sparse_dims]
+        block_idxs = tuple(range(lhs.sparse_dims))
+        block_sizes = [d.block_size for d in lhs.primal_dims if isinstance(d, SparseDimension)]
+        val_dims = [d.val_dim+lhs.sparse_dims for d in lhs.primal_dims if isinstance(d, SparseDimension)]
+        
+        print(lhs.shape, rhs.shape)
+        
+        # note the -1 for arbitrary last dimension (*)
+        rhs = rhs.reshape(*block_nums, *block_sizes, -1)
+        
+        print(lhs.blocks.shape, rhs.shape)
+        print(val_dims, block_nums)
+        
+        dim_nums = (
+            # the -1 is for being one left of the last dimension (*)
+            (val_dims, [x-1 for x in val_dims]),
+            (block_idxs,)*2 # block_idxs repeated twice
+        )
+
+        res = lax.dot(lhs.blocks, rhs, dimension_numbers=dim_nums)
+        
+        print(res.shape)
+        return res.reshape(lhs.out_shape + rhs.shape[-lhs.sparse_dims:])
+    else:
+        raise TypeError("Expected to matmul with type BlockSparseTensor, SparseTensor, or Array")
+
+def _rmatmul(lhs, rhs):
+    if isinstance(lhs, SparseTensor):
+        pass
+    elif isinstance(lhs, Array):
+        block_nums = rhs.blocks.shape[:rhs.sparse_dims]
+        block_idxs = tuple(range(rhs.sparse_dims))
+        block_sizes = [d.block_size for d in rhs.primal_dims if isinstance(d, SparseDimension)]
+        val_dims = [d.val_dim+rhs.sparse_dims for d in rhs.primal_dims if isinstance(d, SparseDimension)]
+
+        # print(rhs.shape, lhs.shape)
+
+        # note the -1 for arbitrary last dimension (*)
+        lhs = lhs.reshape(*block_nums, *block_sizes, -1)
+        transposed_axes = [rhs.primal_dims[d.other_id-len(rhs.out_dims)].val_dim for d in rhs.out_dims] \
+                            + [rhs.out_dims[d.other_id].val_dim for d in rhs.primal_dims]
+        # print(transposed_axes)
+        rhs.rhs = rhs.blocks.transpose(0,*[x+1 for x in transposed_axes])
+
+        # print(rhs.blocks.shape, lhs.shape)
+        # print(val_dims, block_nums)
+
+        dim_nums = (
+            # both axis are the same for the two tensors
+            # the -1 is for being one left of the last dimension (*)
+            ([x-1 for x in val_dims],)*2,
+            (block_idxs,)*2
+        )
+
+        res = lax.dot(rhs.blocks, lhs, dimension_numbers=dim_nums)
+        
+        print(res.shape)
+        return res.reshape(lhs.out_shape + rhs.shape[-lhs.sparse_dims:]).transpose(transposed_axes)
+    else:
+        raise TypeError("Expected to matmul SparseTensor or Array and BlockSparseTensor")
