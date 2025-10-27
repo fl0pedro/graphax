@@ -213,6 +213,10 @@ def dense_test(size, k1, k2, stx_dims, dense_shape, res = None):
         res = {}
 
         res["sparse"] = {}
+
+        print(f"{stx.shape=}, {y.shape=}")
+        print(f"{type(stx)=}, {type(y)=}")
+        # print(f"{(stx@y).shape=}")
         res["sparse"]["estimate"] = jit_matmul.lower(stx, y).cost_analysis()
         
         res["vals_estimate"] = jit(lambda a, b: (a.dense(), b)).lower(stx, y).cost_analysis()
@@ -222,8 +226,8 @@ def dense_test(size, k1, k2, stx_dims, dense_shape, res = None):
         d1 = tuple(d.id for d in stx.primal_dims)
         d2 = tuple(range(len(d1)))
         dnums = ((d1, d2), ((), ()))
-        print(x.shape, y.shape)
-        print(dnums)
+        print(f"{x.shape=}, {y.shape=}")
+        print(f"{dnums=}")
         
         res["dense"] = {}
         res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=dnums).cost_analysis()
@@ -244,9 +248,9 @@ def dense_test(size, k1, k2, stx_dims, dense_shape, res = None):
         d1 = tuple(d.id for d in stx.primal_dims)
         d2 = tuple(range(len(d1)))
         dnums = ((d1, d2), ((), ()))
-        print(x.shape, y.shape)
-        print(dnums)
-    
+        print(f"{x.shape=}, {y.shape=}")
+        print(f"{dnums=}")
+
         b = None
         if res["dense"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
             res["dense"]["measured"] = []
@@ -381,8 +385,8 @@ def _calc(i, bn, bs, res=None):
     # ---
 
     # 2D
-    #print("2d, 1s")
-    res[bn][bs]["2d, 1s"] = dense_test(
+    print("\n2d, 1c, 1s")
+    res[bn][bs]["2d, 1c, 1s"] = dense_test(
         (block_nums, block_size, block_size), 
         k1, k2, 
         (
@@ -390,56 +394,72 @@ def _calc(i, bn, bs, res=None):
             [SparseDimension(1, block_nums, 1, 0, block_size)] 
         ), 
         (block_size*block_nums,)*2
-    , res[bn][bs].get("2d, 1s", None))
+    , res[bn][bs].get("2d, 1c, 1s", None))
 
-    # # 3D
-    # #print("3d, 1s")
-    # res[bn][bs]["3d, 1s"] = dense_test(
-    #     (block_nums, block_size, block_size, block_size),
-    #     k1, k2,
-    #     (
-    #         [
-    #             SparseDimension(0, block_nums, 0, 2, block_size),
-    #             DenseDimension(1, block_size, 1)
-    #         ], 
-    #         [SparseDimension(2, block_nums, 2, 0, block_size)]
-    #     ),
-    #     (block_size*block_nums,)*2
-    # , res[bn][bs].get("3d, 1s", None))
-    # 
-    # # 4D - 1
-    # #print("4d, 1s")
-    # res[bn][bs]["4d, 1s"] = dense_test(
-    #     (block_nums, block_size, block_size, block_size, block_size),
-    #     k1, k2,
-    #     (
-    #         [
-    #             SparseDimension(0, block_nums, 0, 2, block_size),
-    #             DenseDimension(1, block_size, 1)
-    #         ], [
-    #             SparseDimension(2, block_nums, 2, 0, block_size),
-    #             DenseDimension(3, block_size, 3)
-    #         ] 
-    #     ), 
-    #     (block_size*block_nums,)*3
-    # , res[bn][bs].get("4d, 1s", None))
+    # 3D - 1
+    print("\n3d, 1c, 1s")
+    res[bn][bs]["3d, 1c, 1s"] = dense_test(
+        (block_nums, block_size, block_size, block_size),
+        k1, k2,
+        (
+            [
+                SparseDimension(0, block_nums, 0, 2, block_size),
+                DenseDimension(1, block_size, 1)
+            ], 
+            [SparseDimension(2, block_nums, 2, 0, block_size)]
+        ),
+        (block_size*block_nums,)*2
+    , res[bn][bs].get("3d, 1c, 1s", None))
 
-    # # 4D - 2
-    # #print("4d, 2s")
-    # res[bn][bs]["4d, 2s"] = dense_test(
-    #     (block_nums, block_nums, block_size, block_size, block_size, block_size),
-    #     k1, k2,
-    #     (
-    #         [
-    #             SparseDimension(0, block_nums, 0, 2, block_size),
-    #             SparseDimension(1, block_nums, 1, 3, block_size)
-    #         ], [
-    #             SparseDimension(2, block_nums, 2, 0, block_size),
-    #             SparseDimension(3, block_nums, 3, 1, block_size)
-    #         ], 
-    #     ),
-    #     (block_size*block_nums,)*3
-    # , res[bn][bs].get("4d, 2s", None))
+    # TODO currently the contracting dimensions aren't correct (same as above*).
+    # 3D - 2
+    print("\n3d, 2c, 1s")
+    res[bn][bs]["3d, 2c, 1s"] = dense_test(
+        (block_nums, block_size, block_size, block_size),
+        k1, k2,
+        (
+            [SparseDimension(0, block_nums, 0, 1, block_size)], 
+            [
+                SparseDimension(1, block_nums, 1, 0, block_size),
+                DenseDimension(2, block_size, 2)
+            ] 
+        ),
+        (block_size*block_nums, block_size, block_nums*block_size)
+    , res[bn][bs].get("3d, 2c, 1s", None))
+    
+    # 4D - 1
+    print("\n4d, 1c, 1s")
+    res[bn][bs]["4d, 1c, 1s"] = dense_test(
+        (block_nums, block_size, block_size, block_size, block_size),
+        k1, k2,
+        (
+            [
+                SparseDimension(0, block_nums, 0, 2, block_size),
+                DenseDimension(1, block_size, 1)
+            ], [
+                SparseDimension(2, block_nums, 2, 0, block_size),
+                DenseDimension(3, block_size, 3)
+            ] 
+        ), 
+        (block_size*block_nums,block_size,block_size*block_nums)
+    , res[bn][bs].get("4d, 1c, 1s", None))
+
+    # 4D - 2
+    print("\n4d, 1c, 2s")
+    res[bn][bs]["4d, 1c, 2s"] = dense_test(
+        (block_nums, block_nums, block_size, block_size, block_size, block_size),
+        k1, k2,
+        (
+            [
+                SparseDimension(0, block_nums, 0, 2, block_size),
+                SparseDimension(1, block_nums, 1, 3, block_size)
+            ], [
+                SparseDimension(2, block_nums, 2, 0, block_size),
+                SparseDimension(3, block_nums, 3, 1, block_size)
+            ], 
+        ),
+        (block_size*block_nums,)*3
+    , res[bn][bs].get("4d, 1c, 2s", None))
     
     return res
 
