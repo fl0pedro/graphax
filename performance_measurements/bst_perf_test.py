@@ -211,8 +211,7 @@ def dense_test(size, k1, k2, stx_dims, dense_shape, res = None):
     
     if res is None:
         res = {}
-
-        res["sparse"] = {}
+        res.setdefault("sparse", {})
 
         print(f"{stx.shape=}, {y.shape=}")
         print(f"{type(stx)=}, {type(y)=}")
@@ -277,116 +276,123 @@ def _calc(i, bn, bs, res=None):
         res = {}
         res.setdefault(bn, {})
         res[bn].setdefault(bs, {})
+        res[bn][bs] = {
+            "2d, 1c, 1s": {},
+            "3d, 1c, 1s": {},
+            "3d, 2c, 1s": {},
+            "4d, 1c, 1s": {},
+            "4d, 1c, 2s": {}
+        }
     
     k1, k2 = jrand.split(jrand.PRNGKey(i), 2)
 
-    # # 2D
-    # #print("2d, 1c, 1s")
-    # res[bn][bs]["2d, 1c, 1s"] = test(
-    #     (block_nums, block_size, block_size), 
-    #     k1, k2, 
-    #     (
-    #         [SparseDimension(0, block_nums, 0, 1, block_size)], 
-    #         [SparseDimension(1, block_nums, 1, 0, block_size)] 
-    #     ), (
-    #         [SparseDimension(0, block_nums, 0, 1, block_size)], 
-    #         [SparseDimension(1, block_nums, 1, 0, block_size)] 
-    #     )
-    # , res[bn][bs].get("2d, 1c, 1s", None))
+    # 2D
+    #print("2d, 1c, 1s")
+    res[bn][bs]["2d, 1c, 1s"]["matmul with BlockSparseTensor"] = test(
+        (block_nums, block_size, block_size), 
+        k1, k2, 
+        (
+            [SparseDimension(0, block_nums, 0, 1, block_size)], 
+            [SparseDimension(1, block_nums, 1, 0, block_size)] 
+        ), (
+            [SparseDimension(0, block_nums, 0, 1, block_size)], 
+            [SparseDimension(1, block_nums, 1, 0, block_size)] 
+        )
+    , res[bn][bs]["2d, 1c, 1s"].get("matmul with BlockSparseTensor", None))
 
-    # # 3D - 1
-    # #print("3d, 1c, 1s")
-    # res[bn][bs]["3d, 1c, 1s"] = test(
-    #     (block_nums, block_size, block_size, block_size),
-    #     k1, k2,
-    #     (
-    #         [
-    #             SparseDimension(0, block_nums, 0, 2, block_size),
-    #             DenseDimension(1, block_size, 1)
-    #         ], 
-    #         [SparseDimension(2, block_nums, 2, 0, block_size)]
-    #     ),(
-    #         [SparseDimension(0, block_nums, 0, 1, block_size)], 
-    #         [
-    #             SparseDimension(1, block_nums, 1, 0, block_size),
-    #             DenseDimension(2, block_size, 2)
-    #         ] 
-    #     )
-    # , res[bn][bs].get("3d, 1c, 1s", None))
-    # 
-    # # 3D - 2
-    # #print("3d, 2c, 1s")
-    # res[bn][bs]["3d, 2c, 1s"] = test(
-    #     (block_nums, block_size, block_size, block_size),
-    #     k1, k2,
-    #     (
-    #         [SparseDimension(0, block_nums, 0, 1, block_size)], 
-    #         [
-    #             SparseDimension(1, block_nums, 1, 0, block_size),
-    #             DenseDimension(2, block_size, 2)
-    #         ] 
-    #     ),(
-    #         [
-    #             SparseDimension(0, block_nums, 0, 2, block_size),
-    #             DenseDimension(1, block_size, 1)
-    #         ], 
-    #         [SparseDimension(2, block_nums, 2, 0, block_size)]
-    #     )
-    # , res[bn][bs].get("3d, 2c, 1s", None))
-    # 
-    # # 4D - 1
-    # #print("4d, 1c, 1s")
-    # res[bn][bs]["4d, 1c, 1s"] = test(
-    #     (block_nums, block_size, block_size, block_size, block_size),
-    #     k1, k2,
-    #     (
-    #         [
-    #             SparseDimension(0, block_nums, 0, 2, block_size),
-    #             DenseDimension(1, block_size, 1)
-    #         ], [
-    #             SparseDimension(2, block_nums, 2, 0, block_size),
-    #             DenseDimension(3, block_size, 3)
-    #         ] 
-    #     ), (
-    #         [
-    #             SparseDimension(0, block_nums, 0, 2, block_size),
-    #             DenseDimension(1, block_size, 1)
-    #         ], [
-    #             SparseDimension(2, block_nums, 2, 0, block_size),
-    #             DenseDimension(3, block_size, 3)
-    #         ] 
-    #     )
-    # , res[bn][bs].get("4d, 1c, 1s", None))
+    # 3D - 1
+    #print("3d, 1c, 1s")
+    res[bn][bs]["3d, 1c, 1s"]["matmul with BlockSparseTensor"] = test(
+        (block_nums, block_size, block_size, block_size),
+        k1, k2,
+        (
+            [
+                SparseDimension(0, block_nums, 0, 2, block_size),
+                DenseDimension(1, block_size, 1)
+            ], 
+            [SparseDimension(2, block_nums, 2, 0, block_size)]
+        ),(
+            [SparseDimension(0, block_nums, 0, 1, block_size)], 
+            [
+                SparseDimension(1, block_nums, 1, 0, block_size),
+                DenseDimension(2, block_size, 2)
+            ] 
+        )
+    , res[bn][bs]["3d, 1c, 1s"].get("matmul with BlockSparseTensor", None))
+    
+    # 3D - 2
+    #print("3d, 2c, 1s")
+    res[bn][bs]["3d, 2c, 1s"]["matmul with BlockSparseTensor"] = test(
+        (block_nums, block_size, block_size, block_size),
+        k1, k2,
+        (
+            [SparseDimension(0, block_nums, 0, 1, block_size)], 
+            [
+                SparseDimension(1, block_nums, 1, 0, block_size),
+                DenseDimension(2, block_size, 2)
+            ] 
+        ),(
+            [
+                SparseDimension(0, block_nums, 0, 2, block_size),
+                DenseDimension(1, block_size, 1)
+            ], 
+            [SparseDimension(2, block_nums, 2, 0, block_size)]
+        )
+    , res[bn][bs]["3d, 2c, 1s"].get("matmul with BlockSparseTensor", None))
+    
+    # 4D - 1
+    #print("4d, 1c, 1s")
+    res[bn][bs]["4d, 1c, 1s"]["matmul with BlockSparseTensor"] = test(
+        (block_nums, block_size, block_size, block_size, block_size),
+        k1, k2,
+        (
+            [
+                SparseDimension(0, block_nums, 0, 2, block_size),
+                DenseDimension(1, block_size, 1)
+            ], [
+                SparseDimension(2, block_nums, 2, 0, block_size),
+                DenseDimension(3, block_size, 3)
+            ] 
+        ), (
+            [
+                SparseDimension(0, block_nums, 0, 2, block_size),
+                DenseDimension(1, block_size, 1)
+            ], [
+                SparseDimension(2, block_nums, 2, 0, block_size),
+                DenseDimension(3, block_size, 3)
+            ] 
+        )
+    , res[bn][bs]["4d, 1c, 1s"].get("matmul with BlockSparseTensor", None))
 
-    # # 4D - 2
-    # #print("4d, 1c, 2s")
-    # res[bn][bs]["4d, 1c, 2s"] = test(
-    #     (block_nums, block_nums, block_size, block_size, block_size, block_size),
-    #     k1, k2,
-    #     (
-    #         [
-    #             SparseDimension(0, block_nums, 0, 2, block_size),
-    #             SparseDimension(1, block_nums, 1, 3, block_size)
-    #         ], [
-    #             SparseDimension(2, block_nums, 2, 0, block_size),
-    #             SparseDimension(3, block_nums, 3, 1, block_size)
-    #         ], 
-    #     ), (
-    #         [
-    #             SparseDimension(0, block_nums, 0, 2, block_size),
-    #             SparseDimension(1, block_nums, 1, 3, block_size)
-    #         ], [
-    #             SparseDimension(2, block_nums, 2, 0, block_size),
-    #             SparseDimension(3, block_nums, 3, 1, block_size)
-    #         ], 
-    #     )
-    # , res[bn][bs].get("4d, 1c, 2s", None))
+    # 4D - 2
+    #print("4d, 1c, 2s")
+    res[bn][bs]["4d, 1c, 2s"]["matmul with BlockSparseTensor"] = test(
+        (block_nums, block_nums, block_size, block_size, block_size, block_size),
+        k1, k2,
+        (
+            [
+                SparseDimension(0, block_nums, 0, 2, block_size),
+                SparseDimension(1, block_nums, 1, 3, block_size)
+            ], [
+                SparseDimension(2, block_nums, 2, 0, block_size),
+                SparseDimension(3, block_nums, 3, 1, block_size)
+            ], 
+        ), (
+            [
+                SparseDimension(0, block_nums, 0, 2, block_size),
+                SparseDimension(1, block_nums, 1, 3, block_size)
+            ], [
+                SparseDimension(2, block_nums, 2, 0, block_size),
+                SparseDimension(3, block_nums, 3, 1, block_size)
+            ], 
+        )
+    , res[bn][bs]["4d, 1c, 2s"].get("matmul with BlockSparseTensor", None))
 
     # ---
 
     # 2D
     print("\n2d, 1c, 1s")
-    res[bn][bs]["2d, 1c, 1s"] = dense_test(
+    res[bn][bs]["2d, 1c, 1s"]["matmul with Array"] = dense_test(
         (block_nums, block_size, block_size), 
         k1, k2, 
         (
@@ -394,11 +400,11 @@ def _calc(i, bn, bs, res=None):
             [SparseDimension(1, block_nums, 1, 0, block_size)] 
         ), 
         (block_size*block_nums,)*2
-    , res[bn][bs].get("2d, 1c, 1s", None))
+    , res[bn][bs]["2d, 1c, 1s"].get("matmul with Array", None))
 
     # 3D - 1
     print("\n3d, 1c, 1s")
-    res[bn][bs]["3d, 1c, 1s"] = dense_test(
+    res[bn][bs]["3d, 1c, 1s"]["matmul with Array"] = dense_test(
         (block_nums, block_size, block_size, block_size),
         k1, k2,
         (
@@ -409,12 +415,12 @@ def _calc(i, bn, bs, res=None):
             [SparseDimension(2, block_nums, 2, 0, block_size)]
         ),
         (block_size*block_nums,)*2
-    , res[bn][bs].get("3d, 1c, 1s", None))
+    , res[bn][bs]["3d, 1c, 1s"].get("matmul with Array", None))
 
     # TODO currently the contracting dimensions aren't correct (same as above*).
     # 3D - 2
     print("\n3d, 2c, 1s")
-    res[bn][bs]["3d, 2c, 1s"] = dense_test(
+    res[bn][bs]["3d, 2c, 1s"]["matmul with Array"] = dense_test(
         (block_nums, block_size, block_size, block_size),
         k1, k2,
         (
@@ -425,11 +431,11 @@ def _calc(i, bn, bs, res=None):
             ] 
         ),
         (block_size*block_nums, block_size, block_nums*block_size)
-    , res[bn][bs].get("3d, 2c, 1s", None))
+    , res[bn][bs]["3d, 2c, 1s"].get("matmul with Array", None))
     
     # 4D - 1
     print("\n4d, 1c, 1s")
-    res[bn][bs]["4d, 1c, 1s"] = dense_test(
+    res[bn][bs]["4d, 1c, 1s"]["matmul with Array"] = dense_test(
         (block_nums, block_size, block_size, block_size, block_size),
         k1, k2,
         (
@@ -442,11 +448,11 @@ def _calc(i, bn, bs, res=None):
             ] 
         ), 
         (block_size*block_nums,block_size,block_size*block_nums)
-    , res[bn][bs].get("4d, 1c, 1s", None))
+    , res[bn][bs]["4d, 1c, 1s"].get("matmul with Array", None))
 
     # 4D - 2
     print("\n4d, 1c, 2s")
-    res[bn][bs]["4d, 1c, 2s"] = dense_test(
+    res[bn][bs]["4d, 1c, 2s"]["matmul with Array"] = dense_test(
         (block_nums, block_nums, block_size, block_size, block_size, block_size),
         k1, k2,
         (
@@ -459,7 +465,7 @@ def _calc(i, bn, bs, res=None):
             ], 
         ),
         (block_size*block_nums,)*3
-    , res[bn][bs].get("4d, 1c, 2s", None))
+    , res[bn][bs]["4d, 1c, 2s"].get("matmul with Array", None))
     
     return res
 
@@ -481,7 +487,7 @@ def _timedout_calc(i, bn, bs, res=None, timeout=10):
 if not os.path.isfile("r1.json"):
     print("running estimates")
 
-    small = True
+    small = False
     if small:
         n = m = k = 4
     else:
