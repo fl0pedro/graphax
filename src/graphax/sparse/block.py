@@ -339,11 +339,14 @@ def _mul(lhs, rhs):
 
 # @partial(jit, static_argnames=('lhs', 'rhs'))
 def _matmul(lhs, rhs):
+    print("--- start matmul ---")
     # TODO assert something
     if isinstance(rhs, BlockSparseTensor):
         if lhs.blocks is None:
+            print("--- end matmul ---")
             return copy.copy(rhs)
         elif rhs.blocks is None:
+            print("--- end matmul ---")
             return copy.copy(lhs)
         elif isinstance(lhs.blocks, Array) and isinstance(rhs.blocks, Array) \
                 and lhs.out_shape == rhs.primal_shape and rhs.sparse_dims == lhs.sparse_dims:
@@ -360,6 +363,7 @@ def _matmul(lhs, rhs):
                 for i, d in enumerate(rhs.primal_dims)
             ]
             
+            print("--- end matmul ---")
             return BlockSparseTensor(
                 out_dims,
                 primal_dims,
@@ -369,31 +373,47 @@ def _matmul(lhs, rhs):
                 lhs.sparse_dims
             )
     elif isinstance(rhs, SparseTensor):
+        print("--- end matmul ---")
         pass
     elif isinstance(rhs, Array):  # TODO: Fix default check
         block_nums = lhs.blocks.shape[:lhs.sparse_dims]
         block_idxs = tuple(range(lhs.sparse_dims))
         block_sizes = [d.block_size for d in lhs.primal_dims if isinstance(d, SparseDimension)]
-        val_dims = [d.val_dim+lhs.sparse_dims for d in lhs.primal_dims if isinstance(d, SparseDimension)]
+        val_dims = tuple(d.val_dim+lhs.sparse_dims for d in lhs.primal_dims )
         
-        print(lhs.shape, rhs.shape)
+        print(f"{lhs.shape=}, {rhs.shape=}")
         
-        # note the -1 for arbitrary last dimension (*)
-        rhs = rhs.reshape(*block_nums, *block_sizes, -1)
+        print("--- reshape ---")
+        print(f"{block_nums} + {block_sizes}")
+        print(f"{lhs.sparse_dims=} -> {rhs.shape[lhs.sparse_dims:]}")
+        print(f"{len(lhs.primal_dims)=} -> {rhs.shape[-len(lhs.primal_dims):]}")
+        rhs = rhs.reshape(*block_nums, *block_sizes, *rhs.shape[lhs.sparse_dims:]) #*rhs.shape[-len(lhs.primal_dims):])
         
-        print(lhs.blocks.shape, rhs.shape)
-        print(val_dims, block_nums)
+        print(f"{lhs.blocks.shape=}, {rhs.shape=}")
+        print(f"{val_dims=}, {block_nums=}")
         
+        rhs_val_dims = tuple(i+lhs.sparse_dims for i in range(len(val_dims)))
         dim_nums = (
-            # the -1 is for being one left of the last dimension (*)
-            (val_dims, [x-1 for x in val_dims]),
+            (val_dims, rhs_val_dims),
             (block_idxs,)*2 # block_idxs repeated twice
         )
+        
+        print(f"{dim_nums=}")
 
         res = lax.dot(lhs.blocks, rhs, dimension_numbers=dim_nums)
         
-        print(res.shape)
-        return res.reshape(lhs.out_shape + rhs.shape[-lhs.sparse_dims:])
+        print("--- dot ---")
+        print(f"{lhs.out_shape=}")
+        # print(f"{res.shape=}")
+        # print(f"{lhs.sparse_dims=}")
+        # print(lhs.out_shape, "+", rhs.shape[:len(lhs.primal_dims)])
+
+        #print(res.reshape(*[x for i, x in enumerate(lhs.blocks.shape) if i not in val_dims]+*[x for i, x in enumerate(rhs.shape) if i-lhs.sparse_dims not in ...))
+        #res = res.reshape(
+        res = res.reshape(lhs.out_shape + rhs.shape[len(lhs.primal_dims)+lhs.sparse_dims:])
+        print(f"{res.shape=}")
+        print("--- end matmul ---")
+        return res
     else:
         raise TypeError("Expected to matmul with type BlockSparseTensor, SparseTensor, or Array")
 
