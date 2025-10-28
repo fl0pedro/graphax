@@ -1,4 +1,5 @@
 import json
+from functools import partial
 from random import shuffle
 import signal
 import os
@@ -16,6 +17,7 @@ from jax import jit
 import time
 import threading
 from jax import lax
+import cProfile
 
 MAX_MEMORY = int(os.environ.get("MAX_MEMORY", 9216000000))
 
@@ -217,8 +219,10 @@ def dense_test(size, k1, k2, stx_dims, dense_shape, res = None):
         print(f"{type(stx)=}, {type(y)=}")
         # print(f"{(stx@y).shape=}")
         res["sparse"]["estimate"] = jit_matmul.lower(stx, y).cost_analysis()
+        print(jax.make_jaxpr(jit_matmul)(stx, y))
         
         res["vals_estimate"] = jit(lambda a, b: (a.dense(), b)).lower(stx, y).cost_analysis()
+        print(jax.make_jaxpr(jit(lambda a, b: (a.dense(), b)))(stx, y))
 
         x = jax.ShapeDtypeStruct(stx.shape, stx.blocks.dtype)
         
@@ -230,6 +234,7 @@ def dense_test(size, k1, k2, stx_dims, dense_shape, res = None):
         
         res["dense"] = {}
         res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=dnums).cost_analysis()
+        print(jax.make_jaxpr(partial(jit_dot, dimension_numbers=dnums))(x, y))
     else:
     
         a = None
@@ -484,52 +489,60 @@ def _timedout_calc(i, bn, bs, res=None, timeout=10):
     finally:
         signal.alarm(0)
 
-if not os.path.isfile("r1.json"):
-    print("running estimates")
+def main():
+    if not os.path.isfile("r1.json"):
+        print("running estimates")
+    
+        small = True
+        if small:
+            n = m = k = 4
+        else:
+            n = 19
+            m = 9
+            k = 4
+        
+        b10 = [(i%9+1)*10**(i//9) for i in range(n)]
+        b2 = [2**i for i in range(m)]
+        d = list(set([*product(b10, b10), *product(b2, b2)]))
+        shuffle(d)
+    
+        res = {}
+    
+        for i, (bn, bs) in enumerate(t:=tqdm(d)):
+            t.set_description(f"{bn=}, {bs=}")
+            print(f"{bn=}, {bs=}")
+            #pr = cProfile.Profile()
+            #pr.enable()
+            re = _calc(i, bn, bs)
+    
+            for bn in re.keys():
+                if bn not in res:
+                    res.update(re)
+                else:
+                    res[bn].update(re[bn])
+    
+            #pr.disable()
+            #pr.print_stats()
 
-    small = False
-    if small:
-        n = m = k = 4
+            if i % 10 == 0:
+                with open("r1.json", "w") as f:
+                    json.dump(res, f)
+    
     else:
-        n = 19
-        m = 9
-        k = 4
+        print("running measurements")
+        
+        with open("r1.json", "r") as f:
+            res = json.load(f)
     
-    b10 = [(i%9+1)*10**(i//9) for i in range(n)]
-    b2 = [2**i for i in range(m)]
-    d = list(set([*product(b10, b10), *product(b2, b2)]))
-    shuffle(d)
-
-    res = {}
-
-    for i, (bn, bs) in enumerate(t:=tqdm(d)):
-        t.set_description(f"{bn=}, {bs=}")
-        re = _calc(i, bn, bs)
-
-        for bn in re.keys():
-            if bn not in res:
-                res.update(re)
-            else:
-                res[bn].update(re[bn])
-
-        if i % 10 == 0:
-            with open("r1.json", "w") as f:
-                json.dump(res, f)
-
-else:
-    print("running measurements")
+        d = [(bn, bs) for bn in res for bs in res[bn]]
     
-    with open("r1.json", "r") as f:
-        res = json.load(f)
-
-    d = [(bn, bs) for bn in res for bs in res[bn]]
-
-    for i, (bn, bs) in enumerate(t:=tqdm(d)):
-        t.set_description(f"{bn=}, {bs=}")
-        res = _calc(i, bn, bs, res)
-
-        if i % 10 == 0:
-            with open("r2.json", "w") as f:
-                json.dump(res, f)
-
-
+        for i, (bn, bs) in enumerate(t:=tqdm(d)):
+            t.set_description(f"{bn=}, {bs=}")
+            res = _calc(i, bn, bs, res)
+    
+            if i % 10 == 0:
+                with open("r2.json", "w") as f:
+                    json.dump(res, f)
+    
+if __name__ == "__main__":
+    jax.jit(main)()
