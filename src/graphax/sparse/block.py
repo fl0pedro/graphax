@@ -263,43 +263,131 @@ def get_ienumerated_blocks(seq: Sequence, cur_idx: list[int] = None) -> Iterable
         elif isinstance(elem, Array):
             yield cur_idx + [i], elem
 
+def _calculate_coords_for_one_idx(
+    idxs: Array,
+    dim1_ids: Array,
+    dim2_ids: Array,
+    block_sizes: Array,
+    sparse_indices: Array,
+    shape_len: int
+) -> Array:
+    """
+    JIT-compatible helper to calculate start_coords for a single block index.
+    
+    This function will be vectorized with vmap.
+    """
+    # Start with all-zero coordinates
+    start_coords = jnp.zeros(shape_len, dtype=jnp.int32)
+    
+    # Get the specific index values (e.g., idxs[0], idxs[1], ...)
+    # for each sparse dimension
+    idx_vals = idxs.take(sparse_indices)
+    
+    # Calculate the coordinate offset (block_size * index)
+    coord_vals = block_sizes * idx_vals
+    
+    # Set the coordinates for both paired dimensions
+    start_coords = start_coords.at[dim1_ids].set(coord_vals)
+    start_coords = start_coords.at[dim2_ids].set(coord_vals)
+    
+    return start_coords
+
+
 def _dense(bst: BlockSparseTensor) -> Array:
+    """
+    Efficiently converts a BlockSparseTensor to a dense Array 
+    using vmap and scan.
+    """
     shape = bst.out_shape + bst.primal_shape
-    dense_tensor = jnp.zeros(shape, dtype=bst.blocks.dtype)
-    start_coords = [0] * len(shape)
+    dense_tensor_init = jnp.zeros(shape, dtype=bst.blocks.dtype)
+
+    # --- 1. Original Transpose (unchanged) ---
     blocks = bst.blocks.transpose(
-        *range(bst.sparse_dims), 
-        *(d.val_dim+bst.sparse_dims 
-          for d in bst.out_dims+bst.primal_dims)
-    ) # not great but good enough
+        *range(bst.sparse_dims),
+        *(d.val_dim + bst.sparse_dims
+          for d in bst.out_dims + bst.primal_dims)
+    )
     
-    # TODO: blocks break when the shapes are different across the different dimensions, and you have val_dims different not in the same order as id...
-    # ^ this breaks Transpose.
+    # --- 2. Pre-process Metadata ---
+    # Convert Python-level dimension info into JAX arrays
+    sparse_dim_info = []
+    i = 0
+    for dim1 in bst.out_dims:
+        if isinstance(dim1, SparseDimension):
+            dim2 = bst.primal_dims[dim1.other_id - len(bst.out_dims)]
+            # Store (dim1.id, dim2.id, block_size, sparse_axis_index)
+            sparse_dim_info.append(
+                (dim1.id, dim2.id, dim1.block_size, i)
+            )
+            i += 1
+
+    if sparse_dim_info:
+        info_array = jnp.array(sparse_dim_info, dtype=jnp.int32)
+        dim1_ids = info_array[:, 0]
+        dim2_ids = info_array[:, 1]
+        block_sizes = info_array[:, 2]
+        sparse_indices = info_array[:, 3]
+    else:
+        # Handle case with no sparse dimensions
+        dim1_ids = jnp.array([], dtype=jnp.int32)
+        dim2_ids = jnp.array([], dtype=jnp.int32)
+        block_sizes = jnp.array([], dtype=jnp.int32)
+        sparse_indices = jnp.array([], dtype=jnp.int32)
+        
+    # --- 3. Pre-compute All Indices and Coordinates ---
     
-    # print(f"{val_id=}")
-    # print(f"{bst.sparse_dims=}")
-    # print(f"{bst.block_shape=}")
-    # print("dims = (", *(bst.primal_dims+bst.out_dims), sep='\n  ', end="\n)\n")
-    for idxs in np.ndindex(bst.blocks.shape[:bst.sparse_dims]):
-        i = 0
-        for dim1 in bst.out_dims:
-            if isinstance(dim1, SparseDimension):
-                dim2 = bst.primal_dims[dim1.other_id-len(bst.out_dims)]
+    # Get all multi-dimensional sparse indices
+    sparse_shape = bst.blocks.shape[:bst.sparse_dims]
     
-                start_coords[dim1.id] = dim1.block_size*idxs[i]
-                start_coords[dim2.id] = dim2.block_size*idxs[i]
+    # np.ndindex is fine here, as it runs once during tracing
+    all_idxs_np = np.array(list(np.ndindex(sparse_shape))) 
     
-                i += 1
-        # print(f"{idxs=}, {start_coords=}")
-        # print(f"{blocks[idxs].shape=}")
-        dense_tensor = lax.dynamic_update_slice(
-            dense_tensor,
-            blocks[idxs],
-            start_coords
+    if all_idxs_np.size == 0:
+        # Handle edge case: 0 sparse dims (1 block)
+        if np.prod(sparse_shape) == 1:
+            all_idxs_np = np.empty((1, 0), dtype=int)
+        else:
+            # No blocks, just return the zero tensor
+            return dense_tensor_init
+            
+    all_idxs = jnp.array(all_idxs_np) # Shape: (num_blocks, bst.sparse_dims)
+
+    # Vectorize the coordinate calculation over all indices
+    vmapped_coord_calc = jax.vmap(
+        _calculate_coords_for_one_idx,
+        in_axes=(0, None, None, None, None, None) # vmap over all_idxs
+    )
+    
+    # Calculate all start coordinates in parallel
+    all_start_coords = vmapped_coord_calc(
+        all_idxs, dim1_ids, dim2_ids, block_sizes, sparse_indices, len(shape)
+    ) # Shape: (num_blocks, len(shape))
+    
+    # --- 4. Flatten Blocks ---
+    num_blocks = all_idxs.shape[0]
+    val_shape = blocks.shape[bst.sparse_dims:]
+    flat_blocks = blocks.reshape(num_blocks, *val_shape)
+    
+    # --- 5. Run Sequential Scan ---
+    
+    def update_step(carry_dense_tensor, xs):
+        """One step of the scan loop."""
+        start_coords, block_data = xs
+        
+        new_dense_tensor = lax.dynamic_update_slice(
+            carry_dense_tensor, block_data, start_coords
         )
-        # print(blocks[idxs])
-    # print()
-    return dense_tensor
+        # Return new carry (tensor) and no y output
+        return new_dense_tensor, None 
+
+    # Run the scan over all blocks and their coordinates
+    final_dense, _ = lax.scan(
+        update_step,
+        init=dense_tensor_init,
+        xs=(all_start_coords, flat_blocks)
+    )
+    
+    return final_dense
 
 # @partial(jit, static_argnames=('lhs', 'rhs'))
 def _add(lhs, rhs):
