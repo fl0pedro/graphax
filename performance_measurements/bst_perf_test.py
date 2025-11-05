@@ -98,9 +98,6 @@ matmul_args = {
     }
 }
 
-def target(fn, *args, **kwargs):
-    return fn(*args, **kwargs)
-
 def calc(size, lhs_params, rhs_params, k1, k2, rhs_is_sparse, matmul_is_sparse, skip_matmul, is_test=False, iters=20):
     print("generating lhs sparse tensor")
     lhs = new_block_sparse_tensor(*lhs_params, jrand.normal(k1, size))
@@ -126,7 +123,7 @@ def calc(size, lhs_params, rhs_params, k1, k2, rhs_is_sparse, matmul_is_sparse, 
         print("running sparse matmul")
         if not is_test:
             for _ in range(iters):
-                _ = target(jit_matmul, lhs, rhs).block_until_ready()
+                jit_matmul(lhs, rhs).block_until_ready()
 
     if not matmul_is_sparse or is_test:
         print("generating dense tensor(s)")
@@ -138,7 +135,7 @@ def calc(size, lhs_params, rhs_params, k1, k2, rhs_is_sparse, matmul_is_sparse, 
         print("running dense matmul")
         if not is_test:
             for _ in range(iters):
-                _ = target(jit_dot, lhs, rhs, dimension_numbers=dnums).block_until_ready()
+                jit_dot(lhs, rhs, dimension_numbers=dnums).block_until_ready()
 
     if is_test and res_sparse is not None and res_dense is not None:
         print("checking correctness")
