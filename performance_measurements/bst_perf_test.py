@@ -98,7 +98,10 @@ matmul_args = {
     }
 }
 
-def calc(size, lhs_params, rhs_params, k1, k2, rhs_is_sparse, matmul_is_sparse, skip_matmul, is_test=False):
+def target(fn, *args, **kwargs):
+    return fn(*args, **kwargs)
+
+def calc(size, lhs_params, rhs_params, k1, k2, rhs_is_sparse, matmul_is_sparse, skip_matmul, is_test=False, iters=20):
     print("generating lhs sparse tensor")
     lhs = new_block_sparse_tensor(*lhs_params, jrand.normal(k1, size))
     d1 = tuple(d.id for d in lhs.primal_dims)
@@ -122,8 +125,8 @@ def calc(size, lhs_params, rhs_params, k1, k2, rhs_is_sparse, matmul_is_sparse, 
         res_sparse = jit_matmul(lhs, rhs).block_until_ready()
         print("running sparse matmul")
         if not is_test:
-            for _ in range(20):
-                _ = jit_matmul(lhs, rhs).block_until_ready()
+            for _ in range(iters):
+                _ = target(jit_matmul, lhs, rhs).block_until_ready()
 
     if not matmul_is_sparse or is_test:
         print("generating dense tensor(s)")
@@ -134,8 +137,8 @@ def calc(size, lhs_params, rhs_params, k1, k2, rhs_is_sparse, matmul_is_sparse, 
         res_dense = jit_dot(lhs, rhs, dimension_numbers=dnums).block_until_ready()
         print("running dense matmul")
         if not is_test:
-            for _ in range(20):
-                _ = jit_dot(lhs, rhs, dimension_numbers=dnums).block_until_ready()
+            for _ in range(iters):
+                _ = target(jit_dot, lhs, rhs, dimension_numbers=dnums).block_until_ready()
 
     if is_test and res_sparse is not None and res_dense is not None:
         print("checking correctness")
@@ -156,6 +159,7 @@ if __name__ == "__main__":
     parser.add_argument("-s", "--seed", type=int, default=0)
     parser.add_argument("-p", "--prof", action="store_true")
     parser.add_argument("-nop", "--skip-matmul", action="store_true")
+    parser.add_argument("-n", "--iterations", type=int)
 
     args = parser.parse_args()
 
@@ -167,9 +171,20 @@ if __name__ == "__main__":
 
     calc(
         *matmul_args[args.matmul_type][object_name](args.block_numbers, args.block_sizes),
-        k1, k2, args.sparse_rhs, args.sparse_matmul, args.skip_matmul
+        k1, k2, args.sparse_rhs, args.sparse_matmul, args.skip_matmul, iters=args.iterations
     )
 
     if args.prof:
-        profiler.save_device_memory_profile(f"memory_bn{args.block_numbers}_bs{args.block_sizes}_t{args.matmul_type.replace('-','')}{'_sparse_rhs' if args.sparse_rhs else ''}{'_sparse_matmul' if args.sparse_matmul else ''}{'_baseline' if args.skip_matmul else ''}_s{args.seed}.prof")
+        path_components = [
+            "memory",
+            f"bn{args.block_numbers}",
+            f"bs{args.block_sizes}",
+            f"t{args.matmul_type.replace('-','')}",
+            "sparse_rhs" if args.sparse_rhs else "",
+            "sparse_matmul" if args.sparse_matmul else "",
+            "baseline" if args.skip_matmul else f"s{args.seed}",
+        ]
+        path = "_".join([x for x in path_components if x]) + ".prof"
 
+        print("saving to", path)
+        profiler.save_device_memory_profile(path)
