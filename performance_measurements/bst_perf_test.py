@@ -1,85 +1,9 @@
-import json
-from functools import partial
-from random import shuffle
-import signal
-import os
-from matplotlib import colormaps
 from jax import tree_util
-from itertools import product
 from graphax.sparse.block import BlockSparseTensor, SparseDimension, DenseDimension, new_block_sparse_tensor
 import jax.random as jrand
-from matplotlib import pyplot as plt
-from tqdm import tqdm
-import numpy as np
-import jax
 import jax.numpy as jnp
-from jax import jit
-import time
-import threading
-from jax import lax
-import cProfile
-
-MAX_MEMORY = int(os.environ.get("MAX_MEMORY", 9216000000))
-
-def profile_jax(fn, *args, device=None, warmup=True, poll_ms=0, **kwargs):
-    if device is None:
-        device = jax.devices()[0]
-
-    if warmup:
-        tmp = fn(*args, **kwargs)
-        tmp.block_until_ready()
-        del tmp
-
-    mem_before = device.memory_stats()
-
-    if mem_before is not None:
-        peak = mem_before["bytes_in_use"] or None
-        stop_flag = False
-
-        def poll():
-            nonlocal peak
-            while not stop_flag:
-                used = device.memory_stats()["bytes_in_use"]
-                peak = max(peak, used)
-                time.sleep(poll_ms / 1000.0)
-
-        thread = None
-        if poll_ms > 0:
-            thread = threading.Thread(target=poll, daemon=True)
-            thread.start()
-
-    start = time.perf_counter()
-    
-    out = fn(*args, **kwargs)
-    out.block_until_ready()
-
-    end = time.perf_counter()
-   
-    if mem_before is None:
-        stats = { "wall_s": end - start }
-    else:
-        stop_flag = True
-        if thread:
-            thread.join()
-
-        mem_after = device.memory_stats()
-
-        stats = {
-            "wall_s": end - start,
-            "bytes_in_use_before": mem_before["bytes_in_use"],
-            "bytes_in_use_after": mem_after["bytes_in_use"],
-            "net_bytes_in_use": mem_after["bytes_in_use"] - mem_before["bytes_in_use"],
-            "process_peak_bytes": mem_after["peak_bytes_in_use"],
-            "peak_bytes_during": (
-                max(0, peak - mem_before["bytes_in_use"])
-                if poll_ms > 0
-                else max(
-                    0, mem_after["peak_bytes_in_use"] - mem_before["peak_bytes_in_use"]
-                )
-            ),
-        }
-
-    return out, stats
+from jax import jit, lax, profiler, clear_caches
+import argparse
 
 def flatten_block_sparse_tensor(tensor):
     children = (tensor.blocks,)
@@ -96,453 +20,156 @@ tree_util.register_pytree_node(BlockSparseTensor, flatten_block_sparse_tensor, u
 jit_matmul = jit(lambda a, b: a @ b)
 jit_dot = jit(lax.dot, static_argnames=["dimension_numbers"])
 
+matmul_args = {
+    "2d-1c-1s": {
+        "SparseTensor": lambda block_nums, block_size: (
+            (block_nums, block_size, block_size),
+            ([SparseDimension(0, block_nums, 0, 1, block_size)],
+             [SparseDimension(1, block_nums, 1, 0, block_size)]),
+            ([SparseDimension(0, block_nums, 0, 1, block_size)],
+             [SparseDimension(1, block_nums, 1, 0, block_size)])
+        ),
+        "Array": lambda block_nums, block_size: (
+            (block_nums, block_size, block_size),
+            ([SparseDimension(0, block_nums, 0, 1, block_size)],
+             [SparseDimension(1, block_nums, 1, 0, block_size)]),
+            (block_size*block_nums,) * 2
+        )
+    },
+    "3d-1c-1s": {
+        "SparseTensor": lambda block_nums, block_size: (
+            (block_nums, block_size, block_size, block_size),
+            ([SparseDimension(0, block_nums, 0, 2, block_size), DenseDimension(1, block_size, 1)],
+             [SparseDimension(2, block_nums, 2, 0, block_size)]),
+            ([SparseDimension(0, block_nums, 0, 1, block_size)],
+             [SparseDimension(1, block_nums, 1, 0, block_size), DenseDimension(2, block_size, 2)])
+        ),
+        "Array": lambda block_nums, block_size: (
+            (block_nums, block_size, block_size, block_size),
+            ([SparseDimension(0, block_nums, 0, 2, block_size), DenseDimension(1, block_size, 1)],
+             [SparseDimension(2, block_nums, 2, 0, block_size)]),
+            (block_size*block_nums,) * 2
+        )
+    },
+    "3d-2c-1s": {
+        "SparseTensor": lambda block_nums, block_size: (
+            (block_nums, block_size, block_size, block_size),
+            ([SparseDimension(0, block_nums, 0, 1, block_size)],
+             [SparseDimension(1, block_nums, 1, 0, block_size), DenseDimension(2, block_size, 2)]),
+            ([SparseDimension(0, block_nums, 0, 2, block_size), DenseDimension(1, block_size, 1)],
+             [SparseDimension(2, block_nums, 2, 0, block_size)])
+        ),
+        "Array": lambda block_nums, block_size: (
+            (block_nums, block_size, block_size, block_size),
+            ([SparseDimension(0, block_nums, 0, 1, block_size)],
+             [SparseDimension(1, block_nums, 1, 0, block_size), DenseDimension(2, block_size, 2)]),
+            (block_size*block_nums, block_size, block_nums*block_size)
+        )
+    },
+    "4d-1c-1s": {
+        "SparseTensor": lambda block_nums, block_size: (
+            (block_nums, block_size, block_size, block_size, block_size),
+            ([SparseDimension(0, block_nums, 0, 2, block_size), DenseDimension(1, block_size, 1)],
+             [SparseDimension(2, block_nums, 2, 0, block_size), DenseDimension(3, block_size, 3)]),
+            ([SparseDimension(0, block_nums, 0, 2, block_size), DenseDimension(1, block_size, 1)],
+             [SparseDimension(2, block_nums, 2, 0, block_size), DenseDimension(3, block_size, 3)])
+        ),
+        "Array": lambda block_nums, block_size: (
+            (block_nums, block_size, block_size, block_size, block_size),
+            ([SparseDimension(0, block_nums, 0, 2, block_size), DenseDimension(1, block_size, 1)],
+             [SparseDimension(2, block_nums, 2, 0, block_size), DenseDimension(3, block_size, 3)]),
+            (block_size*block_nums, block_size, block_size*block_nums)
+        )
+    },
+    "4d-1c-2s": {
+        "SparseTensor": lambda block_nums, block_size: (
+            (block_nums, block_nums, block_size, block_size, block_size, block_size),
+            ([SparseDimension(0, block_nums, 0, 2, block_size), SparseDimension(1, block_nums, 1, 3, block_size)],
+             [SparseDimension(2, block_nums, 2, 0, block_size), SparseDimension(3, block_nums, 3, 1, block_size)]),
+            ([SparseDimension(0, block_nums, 0, 2, block_size), SparseDimension(1, block_nums, 1, 3, block_size)],
+             [SparseDimension(2, block_nums, 2, 0, block_size), SparseDimension(3, block_nums, 3, 1, block_size)])
+        ),
+        "Array": lambda block_nums, block_size: (
+            (block_nums, block_nums, block_size, block_size, block_size, block_size),
+            ([SparseDimension(0, block_nums, 0, 2, block_size), SparseDimension(1, block_nums, 1, 3, block_size)],
+             [SparseDimension(2, block_nums, 2, 0, block_size), SparseDimension(3, block_nums, 3, 1, block_size)]),
+            (block_size*block_nums,) * 3
+        )
+    }
+}
 
-# TODO WIP.
-def matshow3d(a, ax = None):
-    if ax is None:
-        ax = plt.figure().add_subplot(projection='3d')
-    
-    ax.voxels(a, facecolors=colormaps["viridis"](a), shade=False)
-    
-    ax.set_aspect("equal")
-    
-    x=jnp.arange(a.shape[0])
-    y=jnp.arange(a.shape[1])
-    z=jnp.arange(a.shape[2])
-    
-    ax.set_xticks(x+0.5)
-    ax.set_yticks(y+0.5)
-    ax.set_zticks(z+0.5)
-    
-    ax.set_xticklabels(x)
-    ax.set_yticklabels(y)
-    ax.set_zticklabels(z)
+def calc(size, lhs_params, rhs_params, k1, k2, rhs_is_sparse, matmul_is_sparse, skip_matmul, is_test=False):
+    print("generating lhs sparse tensor")
+    lhs = new_block_sparse_tensor(*lhs_params, jrand.normal(k1, size))
+    d1 = tuple(d.id for d in lhs.primal_dims)
 
-    ax.grid(False)
-
-def matshowXd(t):
-    match t.ndim:
-        case 1:
-            plt.matshow(t[:, None])
-        case 2:
-            plt.matshow(t)
-        case 3:
-            matshow3d(t)
-        case 4:
-            fig, ax = plt.subplots(len(t), subplot_kw=dict(projection="3d"))
-            print(type(ax))
-            for i in range(len(t)):
-                if not isinstance(ax, np.array):
-                    ax = np.array([ax])
-                matshow3d(t[i], ax)
-        case _:
-            raise ValueError("`t` must be a tensor of dimension 4 or less")
-
-# TODO rename... these are shit :I
-def test(size, k1, k2, stx_dims, sty_dims, res = None):
-    stx = new_block_sparse_tensor(*stx_dims, jrand.normal(k1, size))
-    sty = new_block_sparse_tensor(*sty_dims, jrand.normal(k2, size))
-
-    # print(
-    #     f"({", ".join([str(i) for i in stx.out_shape])} | "
-    #     f"{", ".join([str(i) for i in stx.primal_shape])}) @ "
-    #     f"({", ".join([str(i) for i in sty.out_shape])} | "
-    #     f"{", ".join([str(i) for i in sty.primal_shape])})"
-    # )
-    
-    if res is None:
-        res = {}
-
-        res["sparse"] = {}
-        res["sparse"]["estimate"] = jit_matmul.lower(stx, sty).cost_analysis()
-        
-        res["vals_estimate"] = jit(lambda a, b: (a.dense(), b.dense())).lower(stx, sty).cost_analysis()
-
-        x = jax.ShapeDtypeStruct(stx.shape, stx.blocks.dtype)
-        y = jax.ShapeDtypeStruct(sty.shape, sty.blocks.dtype)
-        
-        dnums = ((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))
-        
-        res["dense"] = {}
-        res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=dnums).cost_analysis()
+    if rhs_is_sparse:
+        print("generating rhs sparse tensor")
+        rhs = new_block_sparse_tensor(*rhs_params, jrand.normal(k2, size))
+        d2 = tuple(d.id for d in rhs.out_dims)
     else:
-    
-        a = None
-        if res["sparse"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
-            res["sparse"]["measured"] = []
-            for _ in range(20):
-                a, r = profile_jax(jit_matmul, stx, sty, poll_ms=1)
-                res["sparse"]["measured"].append(r)
-        else:
-            return res
-        
-        if res["vals_estimate"]["bytes accessed"] <= MAX_MEMORY:
-            x = stx.dense()
-            y = sty.dense()
-        
-        dnums = ((tuple(d.id for d in stx.primal_dims), tuple(d.id for d in sty.out_dims)), ((), ()))
-    
-        b = None
-        if res["dense"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
-            res["dense"]["measured"] = []
-            for _ in range(20):
-                b, r = profile_jax(jit_dot, x, y, dimension_numbers=dnums, poll_ms=1)
-                res["dense"]["measured"].append(r)
-        else: 
-            return res
-
-        res["norm_measured"] = jnp.linalg.norm(jnp.abs(a.dense()-b)).tolist()
-
-        if a is not None and b is not None:
-            assert a.shape == a.dense().shape, f"{a.shape=} is not equal to {a.dense().shape=}"
-            assert a.shape == b.shape, f"{a.shape=} is not equal to {b.shape}"
-            assert jnp.allclose(a.dense(), b, 1e2, 1e3), f"tensor a is not equal to b, with a normed delta of {res["norm_measured"]}"
-
-    return res
-
-def dense_test(size, k1, k2, stx_dims, dense_shape, res = None):
-    stx = new_block_sparse_tensor(*stx_dims, jrand.normal(k1, size))
-    y = jrand.normal(k2, dense_shape)
-
-    # print(
-    #     f"({", ".join([str(i) for i in stx.out_shape])} | "
-    #     f"{", ".join([str(i) for i in stx.primal_shape])}) @ "
-    #     f"({", ".join([str(i) for i in sty.out_shape])} | "
-    #     f"{", ".join([str(i) for i in sty.primal_shape])})"
-    # )
-    
-    if res is None:
-        res = {}
-        res.setdefault("sparse", {})
-
-        print(f"{stx.shape=}, {y.shape=}")
-        print(f"{type(stx)=}, {type(y)=}")
-        # print(f"{(stx@y).shape=}")
-        res["sparse"]["estimate"] = jit_matmul.lower(stx, y).cost_analysis()
-        print(jax.make_jaxpr(jit_matmul)(stx, y))
-        
-        res["vals_estimate"] = jit(lambda a, b: (a.dense(), b)).lower(stx, y).cost_analysis()
-        print(jax.make_jaxpr(jit(lambda a, b: (a.dense(), b)))(stx, y))
-
-        x = jax.ShapeDtypeStruct(stx.shape, stx.blocks.dtype)
-        
-        d1 = tuple(d.id for d in stx.primal_dims)
+        print("generating rhs dense tensor")
+        rhs = jrand.normal(k2, rhs_params)
         d2 = tuple(range(len(d1)))
-        dnums = ((d1, d2), ((), ()))
-        print(f"{x.shape=}, {y.shape=}")
-        print(f"{dnums=}")
-        
-        res["dense"] = {}
-        res["dense"]["estimate"] = jit_dot.lower(x, y, dimension_numbers=dnums).cost_analysis()
-        print(jax.make_jaxpr(partial(jit_dot, dimension_numbers=dnums))(x, y))
-    else:
     
-        a = None
-        if res["sparse"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
-            res["sparse"]["measured"] = []
+    dnums = ((d1, d2), ((), ()))
+
+    if skip_matmul:
+        return
+    
+    if matmul_is_sparse or is_test:
+        print("compile sparse matmul")
+        res_sparse = jit_matmul(lhs, rhs).block_until_ready()
+        print("running sparse matmul")
+        if not is_test:
             for _ in range(20):
-                a, r = profile_jax(jit_matmul, stx, y, poll_ms=1)
-                res["sparse"]["measured"].append(r)
-        else:
-            return res
-        
-        if res["vals_estimate"]["bytes accessed"] <= MAX_MEMORY:
-            x = stx.dense()
-        
-        d1 = tuple(d.id for d in stx.primal_dims)
-        d2 = tuple(range(len(d1)))
-        dnums = ((d1, d2), ((), ()))
-        print(f"{x.shape=}, {y.shape=}")
-        print(f"{dnums=}")
+                _ = jit_matmul(lhs, rhs).block_until_ready()
 
-        b = None
-        if res["dense"]["estimate"]["bytes accessed"] <= MAX_MEMORY:
-            res["dense"]["measured"] = []
+    if not matmul_is_sparse or is_test:
+        print("generating dense tensor(s)")
+        lhs = lhs.dense()
+        rhs = rhs.dense() if rhs_is_sparse else rhs
+    
+        print("compile dense matmul")
+        res_dense = jit_dot(lhs, rhs, dimension_numbers=dnums).block_until_ready()
+        print("running dense matmul")
+        if not is_test:
             for _ in range(20):
-                b, r = profile_jax(jit_dot, x, y, dimension_numbers=dnums, poll_ms=1)
-                res["dense"]["measured"].append(r)
-        else: 
-            return res
+                _ = jit_dot(lhs, rhs, dimension_numbers=dnums).block_until_ready()
 
-        res["norm_measured"] = jnp.linalg.norm(jnp.abs(a-b)).tolist()
-
-        if a is not None and b is not None:
-            assert a.shape == a.shape, f"{a.shape=} is not equal to {a.shape=}"
-            assert a.shape == b.shape, f"{a.shape=} is not equal to {b.shape}"
-            assert jnp.allclose(a, b, 1e2, 1e3), f"tensor a is not equal to b, with a normed delta of {res["norm_measured"]}"
-
-    return res
-
-def _calc(i, bn, bs, res=None):
-    block_nums = int(bn)
-    block_size = int(bs)
-
-    if res is None:
-        res = {}
-        res.setdefault(bn, {})
-        res[bn].setdefault(bs, {})
-        res[bn][bs] = {
-            "2d, 1c, 1s": {},
-            "3d, 1c, 1s": {},
-            "3d, 2c, 1s": {},
-            "4d, 1c, 1s": {},
-            "4d, 1c, 2s": {}
-        }
-    
-    k1, k2 = jrand.split(jrand.PRNGKey(i), 2)
-
-    # 2D
-    #print("2d, 1c, 1s")
-    res[bn][bs]["2d, 1c, 1s"]["matmul with BlockSparseTensor"] = test(
-        (block_nums, block_size, block_size), 
-        k1, k2, 
-        (
-            [SparseDimension(0, block_nums, 0, 1, block_size)], 
-            [SparseDimension(1, block_nums, 1, 0, block_size)] 
-        ), (
-            [SparseDimension(0, block_nums, 0, 1, block_size)], 
-            [SparseDimension(1, block_nums, 1, 0, block_size)] 
-        )
-    , res[bn][bs]["2d, 1c, 1s"].get("matmul with BlockSparseTensor", None))
-
-    # 3D - 1
-    #print("3d, 1c, 1s")
-    res[bn][bs]["3d, 1c, 1s"]["matmul with BlockSparseTensor"] = test(
-        (block_nums, block_size, block_size, block_size),
-        k1, k2,
-        (
-            [
-                SparseDimension(0, block_nums, 0, 2, block_size),
-                DenseDimension(1, block_size, 1)
-            ], 
-            [SparseDimension(2, block_nums, 2, 0, block_size)]
-        ),(
-            [SparseDimension(0, block_nums, 0, 1, block_size)], 
-            [
-                SparseDimension(1, block_nums, 1, 0, block_size),
-                DenseDimension(2, block_size, 2)
-            ] 
-        )
-    , res[bn][bs]["3d, 1c, 1s"].get("matmul with BlockSparseTensor", None))
-    
-    # 3D - 2
-    #print("3d, 2c, 1s")
-    res[bn][bs]["3d, 2c, 1s"]["matmul with BlockSparseTensor"] = test(
-        (block_nums, block_size, block_size, block_size),
-        k1, k2,
-        (
-            [SparseDimension(0, block_nums, 0, 1, block_size)], 
-            [
-                SparseDimension(1, block_nums, 1, 0, block_size),
-                DenseDimension(2, block_size, 2)
-            ] 
-        ),(
-            [
-                SparseDimension(0, block_nums, 0, 2, block_size),
-                DenseDimension(1, block_size, 1)
-            ], 
-            [SparseDimension(2, block_nums, 2, 0, block_size)]
-        )
-    , res[bn][bs]["3d, 2c, 1s"].get("matmul with BlockSparseTensor", None))
-    
-    # 4D - 1
-    #print("4d, 1c, 1s")
-    res[bn][bs]["4d, 1c, 1s"]["matmul with BlockSparseTensor"] = test(
-        (block_nums, block_size, block_size, block_size, block_size),
-        k1, k2,
-        (
-            [
-                SparseDimension(0, block_nums, 0, 2, block_size),
-                DenseDimension(1, block_size, 1)
-            ], [
-                SparseDimension(2, block_nums, 2, 0, block_size),
-                DenseDimension(3, block_size, 3)
-            ] 
-        ), (
-            [
-                SparseDimension(0, block_nums, 0, 2, block_size),
-                DenseDimension(1, block_size, 1)
-            ], [
-                SparseDimension(2, block_nums, 2, 0, block_size),
-                DenseDimension(3, block_size, 3)
-            ] 
-        )
-    , res[bn][bs]["4d, 1c, 1s"].get("matmul with BlockSparseTensor", None))
-
-    # 4D - 2
-    #print("4d, 1c, 2s")
-    res[bn][bs]["4d, 1c, 2s"]["matmul with BlockSparseTensor"] = test(
-        (block_nums, block_nums, block_size, block_size, block_size, block_size),
-        k1, k2,
-        (
-            [
-                SparseDimension(0, block_nums, 0, 2, block_size),
-                SparseDimension(1, block_nums, 1, 3, block_size)
-            ], [
-                SparseDimension(2, block_nums, 2, 0, block_size),
-                SparseDimension(3, block_nums, 3, 1, block_size)
-            ], 
-        ), (
-            [
-                SparseDimension(0, block_nums, 0, 2, block_size),
-                SparseDimension(1, block_nums, 1, 3, block_size)
-            ], [
-                SparseDimension(2, block_nums, 2, 0, block_size),
-                SparseDimension(3, block_nums, 3, 1, block_size)
-            ], 
-        )
-    , res[bn][bs]["4d, 1c, 2s"].get("matmul with BlockSparseTensor", None))
-
-    # ---
-
-    # 2D
-    print("\n2d, 1c, 1s")
-    res[bn][bs]["2d, 1c, 1s"]["matmul with Array"] = dense_test(
-        (block_nums, block_size, block_size), 
-        k1, k2, 
-        (
-            [SparseDimension(0, block_nums, 0, 1, block_size)], 
-            [SparseDimension(1, block_nums, 1, 0, block_size)] 
-        ), 
-        (block_size*block_nums,)*2
-    , res[bn][bs]["2d, 1c, 1s"].get("matmul with Array", None))
-
-    # 3D - 1
-    print("\n3d, 1c, 1s")
-    res[bn][bs]["3d, 1c, 1s"]["matmul with Array"] = dense_test(
-        (block_nums, block_size, block_size, block_size),
-        k1, k2,
-        (
-            [
-                SparseDimension(0, block_nums, 0, 2, block_size),
-                DenseDimension(1, block_size, 1)
-            ], 
-            [SparseDimension(2, block_nums, 2, 0, block_size)]
-        ),
-        (block_size*block_nums,)*2
-    , res[bn][bs]["3d, 1c, 1s"].get("matmul with Array", None))
-
-    # TODO currently the contracting dimensions aren't correct (same as above*).
-    # 3D - 2
-    print("\n3d, 2c, 1s")
-    res[bn][bs]["3d, 2c, 1s"]["matmul with Array"] = dense_test(
-        (block_nums, block_size, block_size, block_size),
-        k1, k2,
-        (
-            [SparseDimension(0, block_nums, 0, 1, block_size)], 
-            [
-                SparseDimension(1, block_nums, 1, 0, block_size),
-                DenseDimension(2, block_size, 2)
-            ] 
-        ),
-        (block_size*block_nums, block_size, block_nums*block_size)
-    , res[bn][bs]["3d, 2c, 1s"].get("matmul with Array", None))
-    
-    # 4D - 1
-    print("\n4d, 1c, 1s")
-    res[bn][bs]["4d, 1c, 1s"]["matmul with Array"] = dense_test(
-        (block_nums, block_size, block_size, block_size, block_size),
-        k1, k2,
-        (
-            [
-                SparseDimension(0, block_nums, 0, 2, block_size),
-                DenseDimension(1, block_size, 1)
-            ], [
-                SparseDimension(2, block_nums, 2, 0, block_size),
-                DenseDimension(3, block_size, 3)
-            ] 
-        ), 
-        (block_size*block_nums,block_size,block_size*block_nums)
-    , res[bn][bs]["4d, 1c, 1s"].get("matmul with Array", None))
-
-    # 4D - 2
-    print("\n4d, 1c, 2s")
-    res[bn][bs]["4d, 1c, 2s"]["matmul with Array"] = dense_test(
-        (block_nums, block_nums, block_size, block_size, block_size, block_size),
-        k1, k2,
-        (
-            [
-                SparseDimension(0, block_nums, 0, 2, block_size),
-                SparseDimension(1, block_nums, 1, 3, block_size)
-            ], [
-                SparseDimension(2, block_nums, 2, 0, block_size),
-                SparseDimension(3, block_nums, 3, 1, block_size)
-            ], 
-        ),
-        (block_size*block_nums,)*3
-    , res[bn][bs]["4d, 1c, 2s"].get("matmul with Array", None))
-    
-    return res
-
-def handler(signum, frame):
-    raise Exception("timeout")
-
-signal.signal(signal.SIGALRM, handler)
-
-def _timedout_calc(i, bn, bs, res=None, timeout=10):
-    signal.alarm(timeout)
-    try:
-        return _calc(i, bn, bs, res)
-    except Exception:
-        print("timedout")
-        return res or {}
-    finally:
-        signal.alarm(0)
-
-def main():
-    if not os.path.isfile("r1.json"):
-        print("running estimates")
-    
-        small = True
-        if small:
-            n = m = k = 4
-        else:
-            n = 19
-            m = 9
-            k = 4
+    if is_test and res_sparse is not None and res_dense is not None:
+        print("checking correctness")
+        if rhs_is_sparse:
+            assert res_sparse.shape == res_sparse.dense().shape, f"{res_sparse.shape=} is not equal to {res_sparse.dense().shape=}"
         
-        b10 = [(i%9+1)*10**(i//9) for i in range(n)]
-        b2 = [2**i for i in range(m)]
-        d = list(set([*product(b10, b10), *product(b2, b2)]))
-        shuffle(d)
-    
-        res = {}
-    
-        for i, (bn, bs) in enumerate(t:=tqdm(d)):
-            t.set_description(f"{bn=}, {bs=}")
-            print(f"{bn=}, {bs=}")
-            #pr = cProfile.Profile()
-            #pr.enable()
-            re = _calc(i, bn, bs)
-    
-            for bn in re.keys():
-                if bn not in res:
-                    res.update(re)
-                else:
-                    res[bn].update(re[bn])
-    
-            #pr.disable()
-            #pr.print_stats()
+        norm = ...
+        assert res_sparse.shape == res_dense.shape, f"{res_sparse.shape=} is not equal to {res_dense.shape}"
+        assert jnp.allclose(res_sparse, res_dense, 1e2, 1e3), f"tensor a is not equal to b, with a normed delta of {norm}"
 
-            if i % 10 == 0:
-                with open("r1.json", "w") as f:
-                    json.dump(res, f)
-    
-    else:
-        print("running measurements")
-        
-        with open("r1.json", "r") as f:
-            res = json.load(f)
-    
-        d = [(bn, bs) for bn in res for bs in res[bn]]
-    
-        for i, (bn, bs) in enumerate(t:=tqdm(d)):
-            t.set_description(f"{bn=}, {bs=}")
-            res = _calc(i, bn, bs, res)
-    
-            if i % 10 == 0:
-                with open("r2.json", "w") as f:
-                    json.dump(res, f)
-    
 if __name__ == "__main__":
-    jax.jit(main)()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-bn", "--block_numbers", type=int, required=True)
+    parser.add_argument("-bs", "--block_sizes", type=int, required=True)
+    parser.add_argument("-t", "--matmul_type", choices=["2d-1c-1s", "3d-1c-1s", "3d-2c-1s", "4d-1c-1s", "4d-1c-2s"], required=True)
+    parser.add_argument("--sparse-rhs", action="store_true")
+    parser.add_argument("--sparse-matmul", action="store_true")
+    parser.add_argument("-s", "--seed", type=int, default=0)
+    parser.add_argument("-p", "--prof", action="store_true")
+    parser.add_argument("-nop", "--skip-matmul", action="store_true")
+
+    args = parser.parse_args()
+
+    if args.prof:
+        clear_caches()
+
+    k1, k2 = jrand.split(jrand.PRNGKey(args.seed))
+    object_name = "SparseTensor" if args.sparse_rhs else "Array"
+
+    calc(
+        *matmul_args[args.matmul_type][object_name](args.block_numbers, args.block_sizes),
+        k1, k2, args.sparse_rhs, args.sparse_matmul, args.skip_matmul
+    )
+
+    if args.prof:
+        profiler.save_device_memory_profile(f"memory_bn{args.block_numbers}_bs{args.block_sizes}_t{args.matmul_type.replace('-','')}{'_sparse_rhs' if args.sparse_rhs else ''}{'_sparse_matmul' if args.sparse_matmul else ''}{'_baseline' if args.skip_matmul else ''}_s{args.seed}.prof")
+
