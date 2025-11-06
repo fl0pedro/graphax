@@ -4,6 +4,7 @@ import jax.random as jrand
 import jax.numpy as jnp
 from jax import jit, lax, profiler, clear_caches
 import argparse
+import time
 
 def flatten_block_sparse_tensor(tensor):
     children = (tensor.blocks,)
@@ -98,44 +99,76 @@ matmul_args = {
     }
 }
 
-def calc(size, lhs_params, rhs_params, k1, k2, rhs_is_sparse, matmul_is_sparse, skip_matmul, is_test=False, iters=20):
+def calc(
+    size,
+    lhs_params,
+    rhs_params,
+    key1,
+    key2,
+    rhs_is_sparse,
+    matmul_is_sparse,
+    compile_only,
+    skip_matmul,
+    path,
+    is_test=False
+):
+    assert not (skip_matmul and is_test), "skip_matmul and is_test is mutually exclusive"
+    
+    if path is None:
+        def jax_prof(fn, *args, ext, **kwargs):
+            return fn(*args, **kwargs)
+    else:
+        def jax_prof(fn, *args, ext, **kwargs):
+            t1 = time.perf_counter()
+            res = fn(*args, **kwargs)
+            res.block_until_ready()
+            t2 = time.perf_counter()
+            profiler.save_device_memory_profile(path + ext + ".prof")
+            with open(path + ext + ".tsv", "a") as f:
+                f.write(str(t2-t1) + "\t") # assumes appending of mem data
+            return res 
+
     print("generating lhs sparse tensor")
-    lhs = new_block_sparse_tensor(*lhs_params, jrand.normal(k1, size))
+    lhs = new_block_sparse_tensor(*lhs_params, jrand.normal(key1, size))
     d1 = tuple(d.id for d in lhs.primal_dims)
 
     if rhs_is_sparse:
         print("generating rhs sparse tensor")
-        rhs = new_block_sparse_tensor(*rhs_params, jrand.normal(k2, size))
+        rhs = new_block_sparse_tensor(*rhs_params, jrand.normal(key2, size))
         d2 = tuple(d.id for d in rhs.out_dims)
     else:
         print("generating rhs dense tensor")
-        rhs = jrand.normal(k2, rhs_params)
+        rhs = jrand.normal(key2, rhs_params)
         d2 = tuple(range(len(d1)))
     
     dnums = ((d1, d2), ((), ()))
 
     if skip_matmul:
+        if not matmul_is_sparse:
+            print("generating dense tensor(s)")
+            lhs = lhs.dense()
+            rhs = rhs.dense() if rhs_is_sparse else rhs
+        if path is not None:
+            profiler.save_device_memory_profile(path + "_baseline.prof")
         return
     
     if matmul_is_sparse or is_test:
         print("compile sparse matmul")
-        res_sparse = jit_matmul(lhs, rhs).block_until_ready()
-        print("running sparse matmul")
-        if not is_test:
-            for _ in range(iters):
-                jit_matmul(lhs, rhs).block_until_ready()
+        res_sparse = jax_prof(jit_matmul, lhs, rhs, ext="_comp")
+        print("execute sparse matmul")
+        if not is_test and not compile_only:
+            jax_prof(jit_matmul, lhs, rhs, ext="_bench")
 
     if not matmul_is_sparse or is_test:
         print("generating dense tensor(s)")
         lhs = lhs.dense()
         rhs = rhs.dense() if rhs_is_sparse else rhs
     
-        print("compile dense matmul")
-        res_dense = jit_dot(lhs, rhs, dimension_numbers=dnums).block_until_ready()
-        print("running dense matmul")
-        if not is_test:
-            for _ in range(iters):
-                jit_dot(lhs, rhs, dimension_numbers=dnums).block_until_ready()
+        #print("compile dense matmul")
+        res_dense = jax_prof(jit_dot, lhs, rhs, dimension_numbers=dnums, ext="_comp")
+        print("execute dense matmul")
+        if not is_test and not compile_only:
+            jax_prof(jit_dot, lhs, rhs, dimension_numbers=dnums, ext="_bench")
 
     if is_test and res_sparse is not None and res_dense is not None:
         print("checking correctness")
@@ -156,7 +189,7 @@ if __name__ == "__main__":
     parser.add_argument("-s", "--seed", type=int, default=0)
     parser.add_argument("-p", "--prof", action="store_true")
     parser.add_argument("-nop", "--skip-matmul", action="store_true")
-    parser.add_argument("-n", "--iterations", type=int)
+    parser.add_argument("--compile-only", action="store_true")
 
     args = parser.parse_args()
 
@@ -166,22 +199,19 @@ if __name__ == "__main__":
     k1, k2 = jrand.split(jrand.PRNGKey(args.seed))
     object_name = "SparseTensor" if args.sparse_rhs else "Array"
 
-    calc(
-        *matmul_args[args.matmul_type][object_name](args.block_numbers, args.block_sizes),
-        k1, k2, args.sparse_rhs, args.sparse_matmul, args.skip_matmul, iters=args.iterations
-    )
-
     if args.prof:
         path_components = [
-            "memory",
             f"bn{args.block_numbers}",
             f"bs{args.block_sizes}",
             f"t{args.matmul_type.replace('-','')}",
             "sparse_rhs" if args.sparse_rhs else "",
             "sparse_matmul" if args.sparse_matmul else "",
-            "baseline" if args.skip_matmul else f"s{args.seed}",
         ]
-        path = "_".join([x for x in path_components if x]) + ".prof"
+        path = "_".join([x for x in path_components if x])
+    else:
+        path = None
 
-        print("saving to", path)
-        profiler.save_device_memory_profile(path)
+    calc(
+        *matmul_args[args.matmul_type][object_name](args.block_numbers, args.block_sizes),
+        k1, k2, args.sparse_rhs, args.sparse_matmul, args.compile_only, args.skip_matmul, path
+    )
