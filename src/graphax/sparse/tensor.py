@@ -20,7 +20,7 @@ from .utils import eye_like_copy, eye_like
 #   along the respective dimension `d.size` times to manage broadcasting
 #   operations such as broadcasted additions or multiplications.
 # TODO: what do we do when we have a tensor that consists only of DenseDimensions
-#   with val_dim=None? <- all ones no?
+#   with val_dim=None?
 @dataclass
 class DenseDimension:
     id: int
@@ -84,7 +84,6 @@ class SparseTensor:
 
         _assert_sparse_tensor_consistency(self)
             
-    # TODO: make this better (low priority)
     def __repr__(self) -> str:
         def map_str(a: Sequence) -> Generator:
             return (str(s) for s in a)
@@ -261,7 +260,7 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
     # TODO: check if val is consistent with tensor structure?
 
 
-def _get_fully_materialized_shape(st: SparseTensor) -> Tuple[int]:
+def _get_fully_materialized_shape(st: SparseTensor) -> Sequence[int]:
     """
     Function that returns the shape of a `SparseTensor` object if its `val`
     property would be fully materialized. Dimensions of size one are inserted 
@@ -425,7 +424,7 @@ def _get_new_val_dim(d: Dimension, st: SparseTensor) -> int:
 
 
 def _get_padding(lhs_out_dims: Sequence[Dimension], 
-                 rhs_primal_dims: Sequence[Dimension]) -> Tuple[Tuple[int], Tuple[int]]:
+                 rhs_primal_dims: Sequence[Dimension]) -> Tuple[Sequence[int], Sequence[int]]:
     """
     Function that calculates how many dimensions have to be prepended/appended
     to the `val` property of a `SparseTensor` to make it compatible for broadcast
@@ -440,7 +439,7 @@ def _get_padding(lhs_out_dims: Sequence[Dimension],
             SparseDimension object whose `val` property we want to multiply with `lhs.val`.
 
     Returns:
-        Tuple[Tuple[int, ...], Tuple[int, ...]]:
+        Tuple[Sequence[int, ...], Sequence[int, ...]]:
             A tuple of integers that tells us how many dimensions we have to
             append/prepend to the `val` property of `lhs` and `rhs`.
     """
@@ -469,7 +468,7 @@ def _assert_broadcast_compatibility(lhs_val: Array, rhs_val: Array):
 
 
 def _get_permutation_from_tensor(st: SparseTensor,
-                                 shape: Sequence[int] = None) -> Tuple[int]:
+                                 shape: Sequence[int] = None) -> Sequence[int]:
     """
     Function that calculates the permutation of the axes of the `val` property
     so as that `st.val.shape` matches `shape`. This is necessary to enable proper
@@ -482,11 +481,11 @@ def _get_permutation_from_tensor(st: SparseTensor,
                                         property of `st` to. Defaults to None.
     
     Returns:
-        Tuple[int]: Permutation of the axes of `st.val` so that it matches
+        Sequence[int]: Permutation of the axes of `st.val` so that it matches
                         `shape`.
     """
     shape = shape if shape else st.val.shape
-    permutation = (0,)*len(st.val.shape)
+    permutation = [0]*len(st.val.shape)
     
     i = 0
     for d in st.out_dims + st.primal_dims:
@@ -501,7 +500,7 @@ def _get_permutation_from_tensor(st: SparseTensor,
     return permutation
 
 
-def _get_val_shape(st: SparseTensor) -> Tuple[int]:
+def _get_val_shape(st: SparseTensor) -> Sequence[int]:
     """
     Function that computes the shape of the `val` property of a `SparseTensor`
     from its corresponding `Dimension` objects.
@@ -514,9 +513,9 @@ def _get_val_shape(st: SparseTensor) -> Tuple[int]:
                             compute the shape of.
                             
     Returns:
-        Tuple[int]: Shape of the `val` property of the `SparseTensor` object.
+        Sequence[int]: Shape of the `val` property of the `SparseTensor` object.
     """
-    shape = (0,)*st.val.ndim
+    shape = [0]*st.val.ndim
     for d in st.out_dims:
         if d.val_dim is not None:
             shape[d.val_dim] = d.size
@@ -968,7 +967,7 @@ def _replicate_along_axis(st: SparseTensor, ids: Sequence[int]) -> SparseTensor:
     return st
 
 
-def _get_contracting_axes(lhs: SparseTensor, rhs: SparseTensor) -> Tuple[Tuple[int], Tuple[int]]:
+def _get_contracting_axes(lhs: SparseTensor, rhs: SparseTensor) -> Tuple[Sequence[int], Sequence[int]]:
     """
     Function that computes the axes along which the `val` properties of two
     `SparseTensor` objects will get contracted. This is necessary to enable
@@ -982,17 +981,19 @@ def _get_contracting_axes(lhs: SparseTensor, rhs: SparseTensor) -> Tuple[Tuple[i
                             replicate along a given axis.
     
     Returns:
-        Tuple[Tuple[int], Tuple[int]]: A tuple of tuples of integers that
+        Tuple[Sequence[int], Sequence[int]]: A tuple of sequences of integers that
                                             tell us along which axes the `val`
                                             properties of `lhs` and `rhs` will
                                             get contracted.
     """
-    return tuple(zip(
-        (ld.val_dim, rd.val_dim) 
-        for ld, rd in zip(lhs.primal_dims, rhs.out_dims) 
-        if isinstance(ld, DenseDimension) and isinstance(rd, DenseDimension) 
-            and ld.val_dim is not None and rd.val_dim is not None
-    ))
+    lcontracting_axes, rcontracting_axes = [], []
+    for ld, rd in zip(lhs.primal_dims, rhs.out_dims):
+        if isinstance(ld, DenseDimension) and isinstance(rd, DenseDimension):
+            # TODO this causes a bug if both axes are replicating axes
+            if ld.val_dim is not None and rd.val_dim is not None:
+                lcontracting_axes.append(ld.val_dim)
+                rcontracting_axes.append(rd.val_dim)
+    return lcontracting_axes, rcontracting_axes
 
 
 def _pure_dot_product_mul(lhs: SparseTensor, rhs: SparseTensor) -> SparseTensor:
@@ -1022,7 +1023,7 @@ def _pure_dot_product_mul(lhs: SparseTensor, rhs: SparseTensor) -> SparseTensor:
     i = 0
     for d in rhs.primal_dims:
         if d.val_dim is not None:
-            new_primal_dims.append(DenseDimension(d.id-r+l, d.size, l+i))
+            new_primal_dims.append(DenseDimension(d.id-r+l, d.size, l+i))   
             i += 1
         else:
             new_primal_dims.append(DenseDimension(d.id-r+l, d.size, None))
