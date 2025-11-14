@@ -148,7 +148,7 @@ class BlockSparseTensor:
         def multiline_seq(s: Sequence, brackets: str) -> str:
             lb, rb, *_ = brackets
             if s:
-                res = f'{lb}\n\t\t' + ',\n\t\t'.join(map_str(s)) + f',\n\t{rb}'
+                res = f'{lb}\n    ' + ',\n    '.join(map_str(s)) + f',\n  {rb}'
             else:
                 res = lb + rb
             return res
@@ -165,7 +165,7 @@ class BlockSparseTensor:
                f"  shape = ({str_out_shape} | {str_primal_shape}),\n" \
                f"  out_dims = {multiline_out_dims},\n" \
                f"  primal_dims = {multiline_primal_dims},\n" \
-               f"  vals = Array(shape={self.blocks.shape}, dtype={self.blocks.dtype}),\n" \
+               f"  val = Array(shape={self.blocks.shape}, dtype={self.blocks.dtype}),\n" \
                f"  sparse_dims = {self.sparse_dims},\n" \
                f"  pre_transforms = {multiline_pre_transform},\n" \
                f"  post_transforms = {multiline_post_transform}\n" \
@@ -197,8 +197,6 @@ class BlockSparseTensor:
             return BlockSparseTensor(
                 out_dims,
                 primal_dims,
-                self.primal_shape,
-                self.out_shape,
                 self.blocks,
                 self.sparse_dims
             )
@@ -223,37 +221,15 @@ class BlockSparseTensor:
     def __matmul__(rhs, lhs):
         return _matmul(rhs, lhs)
 
-
-def _calculate_coords_for_one_idx(
-    idxs: Array,
-    dim1_ids: Array,
-    dim2_ids: Array,
-    block_sizes: Array,
-    sparse_indices: Array,
-    shape_len: int
-) -> Array:
-    # Start with all-zero coordinates
-    start_coords = jnp.zeros(shape_len, dtype=jnp.int32)
-    
-    # Get the specific index values (e.g., idxs[0], idxs[1], ...)
-    # for each sparse dimension
-    idx_vals = idxs.take(sparse_indices)
-    
-    # Calculate the coordinate offset (block_size * index)
-    coord_vals = block_sizes * idx_vals
-    
-    # Set the coordinates for both paired dimensions
-    start_coords = start_coords.at[dim1_ids].set(coord_vals)
-    start_coords = start_coords.at[dim2_ids].set(coord_vals)
-    
-    return start_coords
-
 def ndindex(*shape):
     if len(shape) == 1 and isinstance(shape[0], tuple):
         shape = shape[0]
     return jnp.indices(shape).reshape(len(shape),-1).T
 
-def _dense(bst: BlockSparseTensor) -> Array:
+def _dense(bst: BlockSparseTensor) -> Array: # really slow on GPU :(
+
+    # check efficient cases, already dense and blocksize = 1
+
     dense_tensor = jnp.zeros(bst.shape, dtype=bst.blocks.dtype)
 
     val_shape = bst.blocks.shape[bst.sparse_dims:]
@@ -279,7 +255,6 @@ def _dense(bst: BlockSparseTensor) -> Array:
 
     return dense_tensor
 
-# @partial(jit, static_argnames=('lhs', 'rhs'))
 def _add(lhs, rhs):
     assert rhs.shape == lhs.shape, "Tensors must be of equal shape"
     if isinstance(lhs, BlockSparseTensor):
@@ -287,7 +262,7 @@ def _add(lhs, rhs):
             pass
         elif isinstance(rhs.blocks, Array) and isinstance(lhs.blocks, Array):
             if rhs.shape == lhs.shape and rhs.primal_dims == lhs.primal_dims and rhs.out_dims == lhs.out_dims:
-                return BlockSparseTensor(rhs.out_dims, rhs.primal_dims, rhs.out_shape, rhs.primal_shape, rhs.blocks + lhs.blocks, rhs.sparse_dims)
+                return BlockSparseTensor(rhs.out_dims, rhs.primal_dims, rhs.blocks + lhs.blocks)
         elif all(b1.shape == b2.shape for b1, b2 in zip(rhs.blocks, lhs.blocks)):
             pass
     elif isinstance(lhs, SparseTensor):
@@ -297,7 +272,6 @@ def _add(lhs, rhs):
     else:
         raise TypeError("Expected to add with type BlockSparseTensor, SparseTensor, or Array")
 
-# @partial(jit, static_argnames=('lhs', 'rhs'))
 def _mul(lhs, rhs):
     assert lhs.shape == rhs.shape, "Tensors must be of equal shape"
     if isinstance(rhs, BlockSparseTensor):
@@ -305,7 +279,7 @@ def _mul(lhs, rhs):
             pass
         elif isinstance(lhs.blocks, Array) and isinstance(rhs.blocks, Array):
             if lhs.shape == rhs.shape and lhs.primal_dims == rhs.primal_dims and lhs.out_dims == rhs.out_dims:
-                return BlockSparseTensor(lhs.out_dims, lhs.primal_dims, lhs.out_shape, lhs.primal_shape, lhs.blocks * rhs.blocks, lhs.sparse_dims)
+                return BlockSparseTensor(lhs.out_dims, lhs.primal_dims, lhs.blocks * rhs.blocks)
         elif all(b1.shape == b2.shape for b1, b2 in zip(lhs.blocks, rhs.blocks)):
             pass
     elif isinstance(rhs, SparseTensor):
@@ -315,16 +289,12 @@ def _mul(lhs, rhs):
     else:
         raise TypeError("Expected to add with type BlockSparseTensor, SparseTensor, or Array")
 
-# @partial(jit, static_argnames=('lhs', 'rhs'))
 def _matmul(lhs, rhs):
-    #print("--- start matmul ---")
     # TODO assert something
     if isinstance(rhs, BlockSparseTensor):
         if lhs.blocks is None:
-            #print("--- end matmul ---")
             return copy.copy(rhs)
         elif rhs.blocks is None:
-            #print("--- end matmul ---")
             return copy.copy(lhs)
         elif isinstance(lhs.blocks, Array) and isinstance(rhs.blocks, Array) \
                 and lhs.out_shape == rhs.primal_shape and rhs.sparse_dims == lhs.sparse_dims:
@@ -341,17 +311,12 @@ def _matmul(lhs, rhs):
                 for i, d in enumerate(rhs.primal_dims)
             ]
             
-            #print("--- end matmul ---")
             return BlockSparseTensor(
                 out_dims,
                 primal_dims,
-                lhs.out_shape,
-                rhs.primal_shape,
                 lax.dot_general(lhs.blocks, rhs.blocks, (([x.val_dim + lhs.sparse_dims for x in lhs.primal_dims], [x.val_dim + rhs.sparse_dims for x in rhs.out_dims]), (list(range(lhs.sparse_dims)),)*2)),
-                lhs.sparse_dims
             )
     elif isinstance(rhs, SparseTensor):
-        #print("--- end matmul ---")
         pass
     elif isinstance(rhs, Array):  # TODO: Fix default check
         block_nums = lhs.blocks.shape[:lhs.sparse_dims]
@@ -361,7 +326,6 @@ def _matmul(lhs, rhs):
         
         #print(f"{lhs.shape=}, {rhs.shape=}")
         
-        #print("--- reshape ---")
         #print(f"{block_nums} + {block_sizes}")
         #print(f"{lhs.sparse_dims=} -> {rhs.shape[lhs.sparse_dims:]}")
         #print(f"{len(lhs.primal_dims)=} -> {rhs.shape[-len(lhs.primal_dims):]}")
@@ -373,14 +337,13 @@ def _matmul(lhs, rhs):
         rhs_val_dims = tuple(i+lhs.sparse_dims for i in range(len(val_dims)))
         dim_nums = (
             (val_dims, rhs_val_dims),
-            (block_idxs,)*2 # block_idxs repeated twice
+            (block_idxs, block_idxs)
         )
         
         #print(f"{dim_nums=}")
 
         res = lax.dot(lhs.blocks, rhs, dimension_numbers=dim_nums)
         
-        #print("--- dot ---")
         #print(f"{lhs.out_shape=}")
         # print(f"{res.shape=}")
         # print(f"{lhs.sparse_dims=}")
@@ -390,7 +353,6 @@ def _matmul(lhs, rhs):
         #res = res.reshape(
         res = res.reshape(lhs.out_shape + rhs.shape[len(lhs.primal_dims)+lhs.sparse_dims:])
         #print(f"{res.shape=}")
-        #print("--- end matmul ---")
         return res
     else:
         raise TypeError("Expected to matmul with type BlockSparseTensor, SparseTensor, or Array")
