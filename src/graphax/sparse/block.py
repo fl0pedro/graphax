@@ -12,6 +12,7 @@ from dataclasses import dataclass, KW_ONLY
 import copy
 from functools import reduce, partial
 import numpy as np
+from jax.tree_util import register_pytree_node_class
 
 # TODO: make parent class, or inherit sparse tensor ??
 
@@ -42,6 +43,7 @@ MultiSparseDimensionBlocks: TypeAlias = Sequence[Array] | Sequence['MultiSparseD
 
 # TODO (somewhere) blocks of blocks with neighbors can be combined to one block
 # I believe that tensors with d diagonal then there will be 2d blocks maximum (the rest can be merged into individual blocks)
+@register_pytree_node_class
 class BlockSparseTensor:
     out_dims: Any
     primal_dims: Any
@@ -59,14 +61,51 @@ class BlockSparseTensor:
     _sparse_dim_order: list[tuple[int, int]]
 
     def __init__(self,
-                 out_dims: Sequence[Dimension],
-                 primal_dims: Sequence[Dimension],
-                 out_shape: Sequence[int],
-                 primal_shape: Sequence[int],
-                 blocks: MultiSparseDimensionBlocks | Array | None,
-                 sparse_dims: int,
-                 pre_transforms: Sequence[Callable] = None,
-                 post_transforms: Sequence[Callable] = None) -> None:
+        out_dims: Sequence[Dimension],
+        primal_dims: Sequence[Dimension],
+        blocks: MultiSparseDimensionBlocks | Array | None,
+        pre_transforms: Sequence[Callable] = None,
+        post_transforms: Sequence[Callable] = None
+        ) -> None:
+
+        if pre_transforms is None:
+            pre_transforms = []
+        if post_transforms is None:
+            post_transforms = []
+
+        sparse_dims = sum(isinstance(d, SparseDimension) for d in out_dims)
+        assert sparse_dims == sum(isinstance(d, SparseDimension) for d in primal_dims)
+
+        #assert all(d == i for d, i in zip(sorted_val_dims, list(range(n)))), \
+        #    "Value dimensions should be continuous"
+        
+        #print(sorted_val_dims)
+        #print(
+        #    {d.val_axis for d in out_dims if isinstance(d, DenseDimension)} 
+        #    | {d.val_axis for d in primal_dims}
+        #)
+        #assert n == len(
+        #        {d.val_axis for d in out_dims if isinstance(d, DenseDimension)} 
+        #        | {d.val_axis for d in primal_dims}
+        #    ), "Value axis should be unique"
+
+        #assert blocks.ndim > sparse_dims # <-- breaks jit stuff
+        block_shape = blocks.shape[sparse_dims:]
+        # TODO add ones for non mentioned areas
+
+        #print(blocks.shape)
+        #print(block_shape)
+
+        out_shape = tuple(
+            x.size if isinstance(x, DenseDimension)
+            else x.size * block_shape[x.val_dim]
+            for x in out_dims
+        )
+        primal_shape = tuple(
+            x.size if isinstance(x, DenseDimension)
+            else x.size * block_shape[x.val_dim]
+            for x in primal_dims
+        )
 
         self.out_dims = out_dims if isinstance(out_dims, tuple) else tuple(out_dims)
         self.primal_dims = primal_dims if isinstance(primal_dims, tuple) else tuple(primal_dims)
@@ -93,6 +132,15 @@ class BlockSparseTensor:
 
         self._sparse_dim_order = [(d.id, d.other_id) for d in self.out_dims if isinstance(d, SparseDimension)] # may not be necessary to include, but must be mentioned in the docs
 
+    def tree_flatten(self):
+        return ((self.blocks,), (self.out_dims, self.primal_dims, self.pre_transforms, self.post_transforms))
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        blocks, = children
+        out_dims, primal_dims, pre_transforms, post_transforms = aux_data
+        return cls(out_dims, primal_dims, blocks, pre_transforms, post_transforms)
+
     def __repr__(self) -> str:
         def map_str(a: Sequence) -> Generator:
             return (str(s) for s in a)
@@ -113,15 +161,15 @@ class BlockSparseTensor:
         multiline_pre_transform = multiline_seq(self.pre_transforms, '[]')
         multiline_post_transform = multiline_seq(self.post_transforms, '[]')
 
-        return f"""BlockSparseTensor(
-    shape = ({str_out_shape} | {str_primal_shape}),
-    out_dims = {multiline_out_dims},
-    primal_dims = {multiline_primal_dims},
-    blocks = Array(shape={self.blocks.shape}, dtype={self.blocks.dtype}),
-    sparse_dims = {self.sparse_dims},
-    pre_transforms = {multiline_pre_transform},
-    post_transforms = {multiline_post_transform}
-)"""
+        return f"BlockSparseTensor(\n" \
+               f"  shape = ({str_out_shape} | {str_primal_shape}),\n" \
+               f"  out_dims = {multiline_out_dims},\n" \
+               f"  primal_dims = {multiline_primal_dims},\n" \
+               f"  vals = Array(shape={self.blocks.shape}, dtype={self.blocks.dtype}),\n" \
+               f"  sparse_dims = {self.sparse_dims},\n" \
+               f"  pre_transforms = {multiline_pre_transform},\n" \
+               f"  post_transforms = {multiline_post_transform}\n" \
+               f")"
 
     # This is not a transpose like w/ normal tensors. The order should be completely reversed.
     def transpose(self, *args):
@@ -175,93 +223,6 @@ class BlockSparseTensor:
     def __matmul__(rhs, lhs):
         return _matmul(rhs, lhs)
 
-def has_equal_depth(node: MultiSparseDimensionBlocks, depth=0):
-    if isinstance(node, Array):
-        return True, depth
-    else:
-        equality, depth = zip(*[has_equal_depth(child, depth+1) for child in node])
-        local_equality = all(d == depth[0] for d in depth)
-        return all(equality) and local_equality, max(depth)
-
-# TODO, this will be quite complex...
-def has_equal_shapes(node: MultiSparseDimensionBlocks, dims = Sequence[Dimension], shape=None): 
-    ...
-
-def new_block_sparse_tensor(
-    out_dims: Sequence[Dimension],
-    primal_dims: Sequence[Dimension],
-    blocks: MultiSparseDimensionBlocks | Array | None,
-    pre_transforms: Sequence[Callable] = None,
-    post_transforms: Sequence[Callable] = None
-) -> BlockSparseTensor:
-
-    if pre_transforms is None:
-        pre_transforms = []
-    if post_transforms is None:
-        post_transforms = []
-
-    n = sum(isinstance(d, SparseDimension) for d in out_dims)
-    assert n == sum(isinstance(d, SparseDimension) for d in primal_dims)
-
-    #assert all(d == i for d, i in zip(sorted_val_dims, list(range(n)))), \
-    #    "Value dimensions should be continuous"
-    
-    #print(sorted_val_dims)
-    #print(
-    #    {d.val_axis for d in out_dims if isinstance(d, DenseDimension)} 
-    #    | {d.val_axis for d in primal_dims}
-    #)
-    #assert n == len(
-    #        {d.val_axis for d in out_dims if isinstance(d, DenseDimension)} 
-    #        | {d.val_axis for d in primal_dims}
-    #    ), "Value axis should be unique"
-
-    # TODO add checks between primal and out dims.
-
-    if isinstance(blocks, Array):
-        assert blocks.ndim > n
-        block_shape = blocks.shape[n:]
-        # TODO add ones for non mentioned areas
-
-        #print(blocks.shape)
-        #print(block_shape)
-
-        out_shape = tuple(
-            x.size if isinstance(x, DenseDimension)
-            else x.size * block_shape[x.val_dim]
-            for x in out_dims
-        )
-        primal_shape = tuple(
-            x.size if isinstance(x, DenseDimension)
-            else x.size * block_shape[x.val_dim]
-            for x in primal_dims
-        )
-        #print(out_shape, primal_shape)
-    else:
-        raise TypeError("blocks as MultiSparseDimensionBlocks is not yet implemented")
-        assert has_equal_depth(blocks) == (True, n)
-        
-
-    return BlockSparseTensor(
-        out_dims,
-        primal_dims,
-        out_shape,
-        primal_shape,
-        blocks,
-        n,
-        pre_transforms,
-        post_transforms
-    )
-
-def get_ienumerated_blocks(seq: Sequence, cur_idx: list[int] = None) -> Iterable[tuple[list[int], Array]]:
-    if cur_idx is None:
-        cur_idx = []
-    for i, elem in enumerate(seq):
-        if isinstance(elem, Sequence):
-            for res in get_ienumerated_blocks(elem, cur_idx + [i]):
-                yield res
-        elif isinstance(elem, Array):
-            yield cur_idx + [i], elem
 
 def _calculate_coords_for_one_idx(
     idxs: Array,
@@ -271,11 +232,6 @@ def _calculate_coords_for_one_idx(
     sparse_indices: Array,
     shape_len: int
 ) -> Array:
-    """
-    JIT-compatible helper to calculate start_coords for a single block index.
-    
-    This function will be vectorized with vmap.
-    """
     # Start with all-zero coordinates
     start_coords = jnp.zeros(shape_len, dtype=jnp.int32)
     
@@ -292,102 +248,36 @@ def _calculate_coords_for_one_idx(
     
     return start_coords
 
+def ndindex(*shape):
+    if len(shape) == 1 and isinstance(shape[0], tuple):
+        shape = shape[0]
+    return jnp.indices(shape).reshape(len(shape),-1).T
 
 def _dense(bst: BlockSparseTensor) -> Array:
-    """
-    Efficiently converts a BlockSparseTensor to a dense Array 
-    using vmap and scan.
-    """
-    shape = bst.out_shape + bst.primal_shape
-    dense_tensor_init = jnp.zeros(shape, dtype=bst.blocks.dtype)
+    dense_tensor = jnp.zeros(bst.shape, dtype=bst.blocks.dtype)
 
-    # --- 1. Original Transpose (unchanged) ---
-    blocks = bst.blocks.transpose(
-        *range(bst.sparse_dims),
-        *(d.val_dim + bst.sparse_dims
-          for d in bst.out_dims + bst.primal_dims)
+    val_shape = bst.blocks.shape[bst.sparse_dims:]
+    blocks = bst.blocks.reshape(-1, *val_shape).transpose(
+        0, *(d.val_dim+1 for d in bst.out_dims+bst.primal_dims)
     )
-    
-    # --- 2. Pre-process Metadata ---
-    # Convert Python-level dimension info into JAX arrays
-    sparse_dim_info = []
-    i = 0
+
+    increments = jnp.empty(len(bst.shape), dtype=jnp.int8)
     for dim1 in bst.out_dims:
         if isinstance(dim1, SparseDimension):
-            dim2 = bst.primal_dims[dim1.other_id - len(bst.out_dims)]
-            # Store (dim1.id, dim2.id, block_size, sparse_axis_index)
-            sparse_dim_info.append(
-                (dim1.id, dim2.id, dim1.block_size, i)
-            )
-            i += 1
+            dim2 = bst.primal_dims[dim1.other_id-len(bst.out_dims)]
+            increments = increments.at[dim1.id].set(dim1.block_size)
+            increments = increments.at[dim2.id].set(dim2.block_size)
 
-    if sparse_dim_info:
-        info_array = jnp.array(sparse_dim_info, dtype=jnp.int32)
-        dim1_ids = info_array[:, 0]
-        dim2_ids = info_array[:, 1]
-        block_sizes = info_array[:, 2]
-        sparse_indices = info_array[:, 3]
-    else:
-        # Handle case with no sparse dimensions
-        dim1_ids = jnp.array([], dtype=jnp.int32)
-        dim2_ids = jnp.array([], dtype=jnp.int32)
-        block_sizes = jnp.array([], dtype=jnp.int32)
-        sparse_indices = jnp.array([], dtype=jnp.int32)
-        
-    # --- 3. Pre-compute All Indices and Coordinates ---
-    
-    # Get all multi-dimensional sparse indices
-    sparse_shape = bst.blocks.shape[:bst.sparse_dims]
-    
-    # np.ndindex is fine here, as it runs once during tracing
-    all_idxs_np = np.array(list(np.ndindex(sparse_shape))) 
-    
-    if all_idxs_np.size == 0:
-        # Handle edge case: 0 sparse dims (1 block)
-        if np.prod(sparse_shape) == 1:
-            all_idxs_np = np.empty((1, 0), dtype=int)
-        else:
-            # No blocks, just return the zero tensor
-            return dense_tensor_init
-            
-    all_idxs = jnp.array(all_idxs_np) # Shape: (num_blocks, bst.sparse_dims)
-
-    # Vectorize the coordinate calculation over all indices
-    vmapped_coord_calc = jax.vmap(
-        _calculate_coords_for_one_idx,
-        in_axes=(0, None, None, None, None, None) # vmap over all_idxs
+    start_coords = jax.vmap(lambda idxs: jnp.where(increments > 0, idxs*increments, 0))(
+        ndindex(*bst.blocks.shape[:bst.sparse_dims])
     )
-    
-    # Calculate all start coordinates in parallel
-    all_start_coords = vmapped_coord_calc(
-        all_idxs, dim1_ids, dim2_ids, block_sizes, sparse_indices, len(shape)
-    ) # Shape: (num_blocks, len(shape))
-    
-    # --- 4. Flatten Blocks ---
-    num_blocks = all_idxs.shape[0]
-    val_shape = blocks.shape[bst.sparse_dims:]
-    flat_blocks = blocks.reshape(num_blocks, *val_shape)
-    
-    # --- 5. Run Sequential Scan ---
-    
-    def update_step(carry_dense_tensor, xs):
-        """One step of the scan loop."""
-        start_coords, block_data = xs
-        
-        new_dense_tensor = lax.dynamic_update_slice(
-            carry_dense_tensor, block_data, start_coords
-        )
-        # Return new carry (tensor) and no y output
-        return new_dense_tensor, None 
 
-    # Run the scan over all blocks and their coordinates
-    final_dense, _ = lax.scan(
-        update_step,
-        init=dense_tensor_init,
-        xs=(all_start_coords, flat_blocks)
-    )
-    
-    return final_dense
+    def calc(dense_tensor, args):
+        return lax.dynamic_update_slice(dense_tensor, *args), None
+
+    dense_tensor, _ = lax.scan(calc, dense_tensor, (blocks, start_coords))
+
+    return dense_tensor
 
 # @partial(jit, static_argnames=('lhs', 'rhs'))
 def _add(lhs, rhs):
