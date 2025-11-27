@@ -2,8 +2,6 @@ from typing import Callable
 from functools import partial
 import copy
 
-import mmh3
-
 import numpy as np
 
 import jax
@@ -16,33 +14,58 @@ from jax._src.pjit import jit_p
 from .sparse.tensor import (SparseTensor, DenseDimension, SparseDimension, 
                             _swap_back_axes, _materialize_dimensions)
 
+from typing import Tuple, Any
+from chex import Array
+from jax.typing import ArrayLike
+from jax._src.core import Primitive
 
-def get_ndim(arr):
-    if isinstance(arr, (float, int)):
+
+def get_ndim(val: ArrayLike) -> int:
+    """
+    Safely get the number of dimensions.
+
+    Args:
+        val (ArrayLike): Array with or without abstract value attribute, or scalar.
+
+    Returns:
+        int: The number of dimensions of the value.
+    """
+    if hasattr(val, "aval"):
+        return get_ndim(val.aval)
+    if hasattr(val, "ndim"):
+        return val.ndim
+    else:
         return 0
-    else:
-        return arr.ndim
     
     
-def get_shape(arr):
-    if isinstance(arr, (float, int)):
-        return ()
-    else:
-        return arr.shape
-    
-    
-def get_aval_shape(val):
-    if isinstance(val, np.ndarray):
+def get_shape(val: ArrayLike) -> tuple[int, ...]:
+    """
+    Safely get the shape.
+
+    Args:
+        val (ArrayLike): Array with or without abstract value attribute, or scalar.
+
+    Returns:
+        int: The shape of the input value.
+    """
+    if hasattr(val, "aval"):
+        return get_shape(val.aval)
+    elif hasattr(val, "shape"):
         return val.shape
     else:
-        return val.aval.shape
+        return ()
     
 
 # TODO simplify this!
-def make_parallel_jacobian(i, primals, val_out, elemental):
+def make_parallel_jacobian(i: int, primals, val_out, elemental):
+    """
+    TBD
+    """
     primal = primals[i]
     primal_size = get_ndim(primal)
+    primal_shape = get_shape(primal)
     out_size = get_ndim(val_out)
+    out_shape = get_shape(val_out)
 
     if len(primals) == 1:
         if primal_size == 0 and out_size == 0:
@@ -51,13 +74,13 @@ def make_parallel_jacobian(i, primals, val_out, elemental):
             primal_dims = []
         elif primal_size == 0:
             # Handling broadcast of singletons
-            out_dims = [DenseDimension(i, e, i) for i, e in enumerate(val_out.aval.shape)]
+            out_dims = [DenseDimension(i, e, i) for i, e in enumerate(out_shape)]
             primal_dims = []
         else:
             out_dims = [SparseDimension(i, e, i, out_size+i) 
-                            for i, e in enumerate(val_out.aval.shape)]
+                            for i, e in enumerate(out_shape)]
             primal_dims = [SparseDimension(out_size+i, e, i, i) 
-                            for i, e in enumerate(val_out.aval.shape)]
+                            for i, e in enumerate(out_shape)]
     elif len(primals) == 2:
         if primal_size == 0 and out_size == 0:
             # Singletons
@@ -65,13 +88,13 @@ def make_parallel_jacobian(i, primals, val_out, elemental):
             primal_dims = []
         elif primal_size == 0:
             # Handling broadcast of singletons
-            out_dims = [DenseDimension(i, e, i) for i, e in enumerate(val_out.aval.shape)]
+            out_dims = [DenseDimension(i, e, i) for i, e in enumerate(out_shape)]
             primal_dims = []
         elif get_shape(primals[i]) != get_shape(val_out):
             # Broadcasting case
             out_dims, primal_dims = [], []
 
-            for i, (os, ps) in enumerate(zip(val_out.aval.shape, primal.aval.shape)):
+            for i, (os, ps) in enumerate(zip(out_shape, primal_shape)):
                 out_size = len(out_dims)
                 primal_size = len(primal_dims)
                 if ps != os:
@@ -93,14 +116,14 @@ def make_parallel_jacobian(i, primals, val_out, elemental):
             if not isinstance(elemental, float):
                 elemental = jnp.squeeze(elemental) # TODO dirty quick fix that needs to be properly addressed
             out_dims = [SparseDimension(i, e, None, out_size+i)
-                        for i, e in enumerate(primal.aval.shape)]
+                        for i, e in enumerate(primal_shape)]
             primal_dims = [SparseDimension(out_size+i, e, None, i)
-                            for i, e in enumerate(primal.aval.shape)]
+                            for i, e in enumerate(primal_shape)]
         else:
             out_dims = [SparseDimension(i, e, i, out_size+i)
-                        for i, e in enumerate(primal.aval.shape)]
+                        for i, e in enumerate(primal_shape)]
             primal_dims = [SparseDimension(out_size+i, e, i, i)
-                            for i, e in enumerate(primal.aval.shape)]
+                            for i, e in enumerate(primal_shape)]
     else:
         raise NotImplementedError(f"Parallel Jacobians with {len(primals)} inputs not yet supported!")
         
@@ -110,13 +133,19 @@ def make_parallel_jacobian(i, primals, val_out, elemental):
 elemental_rules = {}
 
 
-def defelemental(primitive, elementalrule):
+def defelemental(primitive: Primitive, elementalrule: Callable):
+    """
+    Helper function to ... TBD
+    """
     assert isinstance(primitive, core.Primitive)
     assert not primitive.multiple_results
     elemental_rules[primitive] = partial(standard_elemental, elementalrule, primitive)
 
 
-def standard_elemental(elementalrule, primitive, primals, **params):
+def standard_elemental(elementalrule: Callable, primitive: Primitive, primals: Tuple[Any, ...], **params):
+    """
+    Helper function for ...
+    """
     assert elementalrule is not None
     val_out = primitive.bind(*primals, **params)
     elementals = elementalrule(*primals, **params)
@@ -129,13 +158,13 @@ def standard_elemental(elementalrule, primitive, primals, **params):
 
 
 # NOTE: Useful for stuff such as exp_p
-def defelemental2(primitive, elementalrule):
+def defelemental2(primitive: Primitive, elementalrule: Callable):
     assert isinstance(primitive, core.Primitive)
     assert not primitive.multiple_results
     elemental_rules[primitive] = partial(standard_elemental2, elementalrule, primitive)
 
 
-def standard_elemental2(elementalrule, primitive, primals, **params):
+def standard_elemental2(elementalrule: Callable, primitive: Primitive, primals: Tuple[Any, ...], **params):
     assert elementalrule is not None
     val_out = primitive.bind(*primals, **params)
     elementals = elementalrule(val_out, *primals, **params)
@@ -177,9 +206,16 @@ defelemental(lax.erf_p, lambda x: 2.*jnp.exp(-x**2)/jnp.sqrt(jnp.pi))
 
 # TODO this can be significantly optimized
 # Currently we are creating a new array of ones everytime. Not smart!
-def add_elemental_rule(x, y):
+def add_elemental_rule(x: ArrayLike, y: ArrayLike) -> Array:
+    """
+        Arg:
+            x (ArrayLike): 
+            y (ArrayLike):
+    """
     return (jnp.ones_like(y), jnp.ones_like(x))
 defelemental(lax.add_p, add_elemental_rule)
+
+# this one isn't used anymore, instead they do a convert_elemental_type 
 defelemental(jax._src.ad_util.add_any_p, add_elemental_rule)
 
 
@@ -227,9 +263,10 @@ def select_elemental_rule(primals, **params):
     size = primals[0].size
     jacsize = (size, size)
     num_cases = len(primals) - 1
-    new_out_dims = [SparseDimension(0, 1, size, 1)]
-    new_primal_dims = [SparseDimension(1, 1, size, 0)]
+    new_out_dims = [SparseDimension(0, size, 1, 1)]
+    new_primal_dims = [SparseDimension(1, size, 1, 0)]
     jacval = jnp.zeros(jacsize)
+    print(f"{val_out=}", *[f"{new_out_dims=}, {new_primal_dims=}, {jacval=}" for _ in range(num_cases)])
     return val_out, [SparseTensor(new_out_dims, new_primal_dims, jacval) for _ in range(num_cases)]
 elemental_rules[lax.select_n_p] = select_elemental_rule
 
@@ -238,23 +275,23 @@ def pow_elemental_rule(out, x, y):
     return (y*x**(y-1), jnp.log(x)*out)
 defelemental2(lax.pow_p, pow_elemental_rule)
 
-
+# should this not be params["axis"]?
 # TODO Create a general reduce rule with a custom derivative!
 def reduce_sum_elemental_rule(primals, **params):
     val_out = lax.reduce_sum_p.bind(*primals, **params)
         
     primal = primals[0]
     axes = params["axes"]
+    new_out_dims, new_primal_dims, shape = [], [], []
     if axes is None:
         axes = tuple(range(primal.ndim))
         new_out_dims.append(DenseDimension(0, 1, 0))
     elif isinstance(axes, int):
         axes = (axes,)
-    new_out_dims, new_primal_dims, shape = [], [], []
                 
-    l = val_out.aval.ndim
+    l = get_ndim(val_out)
     count = 0
-    for i, size in enumerate(primal.aval.shape):
+    for i, size in enumerate(get_shape(primal)):
         if i in axes:
             # idx = len(new_out_dims) + len(new_primal_dims)
             # idx = max(idx, 1) if val_out.ndim > 0 else idx
@@ -277,17 +314,17 @@ def reduce_max_elemental_rule(primals, **params):
 
     primal = primals[0]
     axes = params["axes"]
-    shape = list(val_out.aval.shape)
+    shape = list(get_shape(val_out))
     
+    new_out_dims, new_primal_dims, _shape = [], [], []
     if axes is None:
         axes = tuple(range(primal.ndim))
         new_out_dims.append(DenseDimension(0, 1, 0, True))
     elif isinstance(axes, int):
         axes = (axes,)
-    new_out_dims, new_primal_dims, _shape = [], [], []
     
-    l = val_out.aval.ndim
-    for i, size in enumerate(primal.aval.shape):
+    l = get_ndim(val_out)
+    for i, size in enumerate(get_shape(primal)):
         if i in axes:
             shape.insert(i, 1)
             idx = len(new_out_dims) + len(new_primal_dims)
@@ -310,22 +347,23 @@ def reduce_max_elemental_rule(primals, **params):
 elemental_rules[lax.reduce_max_p] = reduce_max_elemental_rule
 
 
+# max is the correct impl.
 def reduce_min_elemental_rule(primals, **params):
     val_out = lax.reduce_min_p.bind(*primals, **params)
     
     primal = primals[0]
     axes = params["axes"]
     
+    new_out_dims, new_primal_dims, _shape = [], [], []
     if axes is None:
         axes = tuple(range(primal.ndim))
         new_out_dims.append(DenseDimension(0, 1, 0, True))
     elif isinstance(axes, int):
         axes = (axes,)
-    new_out_dims, new_primal_dims, _shape = [], [], []
     
-    l = val_out.aval.ndim
+    l = get_ndim(val_out)
     count = 0
-    for i, size in enumerate(primal.aval.shape):
+    for i, size in enumerate(get_shape(primal)):
         if i in axes:
             idx = len(new_out_dims) + len(new_primal_dims)
             idx = max(idx, 1) if val_out.ndim > 0 else idx
@@ -346,6 +384,55 @@ def reduce_min_elemental_rule(primals, **params):
 elemental_rules[lax.reduce_min_p] = reduce_min_elemental_rule
 
 
+#first draft unified reduce, TODO: test!
+def reduce_elemental_rule(primals, agg, **params):
+    assert agg in {"sum", "min", "max"}, f"{agg} is not one of the valid aggregate functions `sum`, `min`, `max`"
+    val_out = getattr(lax, f"reduce_{agg}_p").bind(*primals, **params)
+
+    shape = list(get_shape(val_out))
+    primal = primals[0]
+    axes = params["axes"]
+
+    new_out_dims, new_primal_dims, _shape = [], [], []
+    if axes is None:
+        axes = tuple(range(primal.ndim))
+        new_out_dims.append(DenseDimension(0, 1, 0))
+    elif isinstance(axes, int):
+        axes = (axes,)
+
+    l = get_ndim(val_out)
+    for i, size in enumerate(get_shape(primal)):
+        if i in axes:
+            if agg == "sum":
+                idx = l + i
+            else:
+                shape.insert(i, 1)
+                idx = len(new_out_dims) + len(new_primal_dims)
+                idx = max(idx, 1) if val_out.ndim > 0 else idx
+
+            new_primal_dims.append(DenseDimension(idx, size, i))
+            _shape.append(size)
+        else:
+            ll = len(new_out_dims)
+            val = None if "sum" else i
+            new_out_dims.append(SparseDimension(ll, size, val, l+i))
+            new_primal_dims.append(SparseDimension(l+i, size, val, ll))
+            
+    if agg == "sum":
+        new_val = jnp.ones(_shape, dtype=jnp.float32)
+    else:
+        _val_out = val_out.reshape(shape)
+        new_val = jnp.where(primal == _val_out, 1, 0) 
+        norm = jnp.sum(new_val, axis=axes, keepdims=True)
+        new_val /= norm
+
+    return val_out, [_swap_back_axes(SparseTensor(new_out_dims, new_primal_dims, new_val))]
+
+# elemental_rules[lax.reduce_sum_p] = partial(reduce_elemental_rule, agg="sum")
+# elemental_rules[lax.reduce_min_p] = partial(reduce_elemental_rule, agg="min")
+# elemental_rules[lax.reduce_max_p] = partial(reduce_elemental_rule, agg="max")
+
+
 def dot_general_elemental_rule(primals, **params):
     val_out = lax.dot_general_p.bind(*primals, **params)
     lhs, rhs = primals
@@ -361,9 +448,9 @@ def dot_general_elemental_rule(primals, **params):
     lhs_batch_dims = batch_dims[0]
     rhs_batch_dims = batch_dims[1]
     
-    lhs_shape = list(get_aval_shape(lhs))
-    rhs_shape = list(get_aval_shape(rhs))
-    out_shape = list(get_aval_shape(val_out))
+    lhs_shape = list(get_shape(lhs))
+    rhs_shape = list(get_shape(rhs))
+    out_shape = list(get_shape(val_out))
         
     lhs_out_dims, rhs_out_dims = [], []
     lhs_primal_dims, rhs_primal_dims = [], []

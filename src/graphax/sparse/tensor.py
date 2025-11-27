@@ -187,6 +187,7 @@ class SparseTensor:
         return SparseTensor(out_dims, primal_dims, val, self.pre_transforms, self.post_transforms)
 
 
+# TODO: is this needed? if yes, can we remove the weird val logic in the copy fn?
 def sparse_tensor_zeros_like(st: SparseTensor) -> SparseTensor:
     """
     Function that generates a new `SparseTensor` with only zeros with the 
@@ -311,8 +312,8 @@ def _is_pure_dot_product_mul(lhs: SparseTensor, rhs: SparseTensor) -> bool:
     Returns:
         bool: Are the tensors compatible for multiplication?
     """
-    return all(True if isinstance(r, DenseDimension) and isinstance(l, DenseDimension)
-               else False for r, l in zip(lhs.primal_dims, rhs.out_dims))
+    return all(isinstance(r, DenseDimension) and isinstance(l, DenseDimension)
+               for r, l in zip(lhs.primal_dims, rhs.out_dims))
 
 
 def _is_pure_broadcast_mul(lhs: SparseTensor, rhs: SparseTensor) -> bool:
@@ -327,8 +328,8 @@ def _is_pure_broadcast_mul(lhs: SparseTensor, rhs: SparseTensor) -> bool:
     Returns:
         bool: Are the tensors compatible for multiplication?
     """
-    return all(True if isinstance(l, SparseDimension) or isinstance(r, SparseDimension)
-               else False for l, r in zip(lhs.primal_dims, rhs.out_dims))
+    return all(isinstance(l, SparseDimension) or isinstance(r, SparseDimension)
+               for l, r in zip(lhs.primal_dims, rhs.out_dims))
 
     
 def _mul(lhs: SparseTensor, rhs: SparseTensor) -> SparseTensor:
