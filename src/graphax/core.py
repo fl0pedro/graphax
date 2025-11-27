@@ -385,7 +385,7 @@ def _build_graph(jaxpr: core.Jaxpr,
                 counter += 1
                     
         for invar in eqn.invars:
-            if invar in jaxpr._outvars:
+            if invar in jaxpr.outvars:
                 vertex = var_id[invar]
                 vo_vertices.add(vertex)
                 
