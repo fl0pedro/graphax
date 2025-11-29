@@ -317,72 +317,8 @@ def _transpose(bst, out_transpose=None, primal_transpose=None):
     return BlockSparseTensor(new_out_dims, new_primal_dims, new_blocks)
 
 
-def _dense_via_scatter(st: BlockSparseTensor):
-    sparse_shape_grid = st.blocks.shape[: st.sparse_dims]
-    dense_shape_block = st.blocks.shape[st.sparse_dims :]
-    num_blocks = np.prod(sparse_shape_grid).item()
-
-    sparse_dim_to_grid_axis = {}
-    axis = 0
-    processed_ids = set()
-    sparse_dims_ids = set()
-    for d in st.out_dims + st.primal_dims:
-        if isinstance(d, SparseDimension):
-            sparse_dims_ids.add(d.id)
-            if d.id not in processed_ids:
-                sparse_dim_to_grid_axis[d.id] = axis
-                sparse_dim_to_grid_axis[d.other_id] = axis
-                processed_ids.add(d.id)
-                processed_ids.add(d.other_id)
-                axis += 1
-
-    grid_coords = jnp.stack(
-        jnp.unravel_index(jnp.arange(num_blocks), sparse_shape_grid), axis=-1
-    )
-    blocks_flat = st.blocks.reshape(num_blocks, *dense_shape_block)
-
-    original_sparse_dims = [
-        d for d in st.out_dims + st.primal_dims if isinstance(d, SparseDimension)
-    ]
-    sparse_dims_shape = [st.shape[d.id] for d in original_sparse_dims]
-    sparse_slice = jnp.zeros(sparse_dims_shape, st.blocks.dtype)
-
-    start_indices_sparse = jnp.zeros(
-        (num_blocks, len(original_sparse_dims)), dtype=jnp.int32
-    )
-    for i, dim in enumerate(original_sparse_dims):
-        grid_axis = sparse_dim_to_grid_axis[dim.id]
-        start_indices_sparse = start_indices_sparse.at[:, i].set(
-            grid_coords[:, grid_axis] * dim.block_size
-        )
-
-    dn_sparse = jax.lax.ScatterDimensionNumbers(
-        update_window_dims=tuple(range(1, len(dense_shape_block) + 1)),
-        inserted_window_dims=(),
-        scatter_dims_to_operand_dims=tuple(range(len(original_sparse_dims))),
-    )
-
-    scattered_sparse = jax.lax.scatter(
-        sparse_slice, start_indices_sparse, blocks_flat, dn_sparse
-    )
-
-    if len(sparse_dims_ids) != st.ndim:
-        shape_for_reshape = []
-        sparse_idx = 0
-        for i in range(st.ndim):
-            if i in sparse_dims_ids:
-                shape_for_reshape.append(scattered_sparse.shape[sparse_idx])
-                sparse_idx += 1
-            else:
-                shape_for_reshape.append(1)
-        return jnp.broadcast_to(scattered_sparse.reshape(shape_for_reshape), st.shape)
-
-    return scattered_sparse
-
-
 def _dense(
     st: BlockSparseTensor,
-    method: Literal["multiplication", "broadcast", "scatter"],
 ):
     if st.sparse_dims == 0:
         return jnp.broadcast_to(st.blocks, st.shape)
@@ -391,33 +327,14 @@ def _dense(
     dense_shape_block = st.blocks.shape[st.sparse_dims :]
     num_blocks = np.prod(sparse_shape_grid).item()
 
-    if method == "multiplication":
-        blocks_flat = st.blocks.reshape(num_blocks, *dense_shape_block)
-        diag_blocks_flat = jnp.einsum(
-            "i...,ij->ij...", blocks_flat, jnp.eye(num_blocks, dtype=st.blocks.dtype)
-        )
+    blocks_flat = st.blocks.reshape(num_blocks, *dense_shape_block)
+    diag_blocks_flat = jnp.einsum(
+        "i...,ij->ij...", blocks_flat, jnp.eye(num_blocks, dtype=st.blocks.dtype)
+    )
 
-        diag_tensor_full_axes = diag_blocks_flat.reshape(
-            *sparse_shape_grid, *sparse_shape_grid, *dense_shape_block
-        )
-    elif method == "broadcast":
-        block_mask = jnp.eye(num_blocks, dtype=st.blocks.dtype).reshape(
-            *sparse_shape_grid, *sparse_shape_grid
-        )
-
-        blocks_bcast = st.blocks.reshape(
-            *sparse_shape_grid, *([1] * st.sparse_dims), *dense_shape_block
-        )
-        mask_bcast = block_mask.reshape(
-            *sparse_shape_grid, *sparse_shape_grid, *([1] * len(dense_shape_block))
-        )
-
-        diag_tensor_full_axes = blocks_bcast * mask_bcast
-
-    elif method == "scatter":
-        return _dense_via_scatter(st)
-    else:
-        raise ValueError(f"Unknown method: {method}")
+    diag_tensor_full_axes = diag_blocks_flat.reshape(
+        *sparse_shape_grid, *sparse_shape_grid, *dense_shape_block
+    )
 
     processed_pairs = {
         tuple(sorted((d.id, d.other_id)))
