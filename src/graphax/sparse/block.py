@@ -254,9 +254,6 @@ class BlockSparseTensor:
     def _apply_to_two_vals(lhs, rhs, fn, *args, **kwargs):
         return self.__copy__(fn(lhs.blocks, rhs.blocks, *args, **kwargs))
 
-    # missing is copy, but we will use the same logic as for tensor
-    # I don't love the weird val arg
-
 
 def _transpose(bst, out_transpose=None, primal_transpose=None):
     if out_transpose is None and primal_transpose is None:
@@ -284,7 +281,6 @@ def _transpose(bst, out_transpose=None, primal_transpose=None):
         old_dim = dims[old_idx]
         new_id = next(c)
         if isinstance(old_dim, SparseDimension):
-            # Find the new position of the paired dimension
             new_other_id = inverse_full_transpose[old_dim.other_id]
             return old_dim._replace(
                 id=new_id, other_id=new_other_id, val_dim=new_val_dim
@@ -300,8 +296,6 @@ def _transpose(bst, out_transpose=None, primal_transpose=None):
         remap_permuted_dim(i, new_val_dim + len(out_transpose))
         for new_val_dim, i in enumerate(primal_transpose)
     ]
-
-    # We also need to permute the blocks according to the new val_dim mapping
 
     val_dim_perm = np.argsort(
         [
