@@ -1,30 +1,20 @@
 import copy
 import operator
-from dataclasses import KW_ONLY, dataclass
-from functools import partial, reduce
+from functools import reduce
 from itertools import count
+from math import prod
 from typing import (
     Any,
     Callable,
     Generator,
-    Iterable,
-    Literal,
     NamedTuple,
     Sequence,
-    TypeAlias,
 )
 
-import jax
 import jax.numpy as jnp
-import numpy as np
-
-# import numpy as np
 from chex import Array
-from jax import jit, lax
-from jax._src.dispatch import Backend
+from jax import lax
 from jax.tree_util import register_pytree_node_class
-
-from .tensor import SparseTensor
 
 # TODO: make parent class, or inherit sparse tensor ??
 
@@ -41,17 +31,16 @@ class DenseDimension(NamedTuple):
 class SparseDimension(NamedTuple):
     id: int
     size: int
-    val_dim: int
+    val_dim: int | None
     other_id: int
     block_size: int = None
     # val_axis: int = None
 
 
-# TODO TODO TODO TODO TODO, the new idea is to setup Sparse dim, such that if two different val_dims are set for a pair,
-# then its sparse block...
-
-
 Dimension = DenseDimension | SparseDimension
+
+
+# TODO function like tensor._swap_axes where the val_dims match the out_/primal_dims
 
 
 # TODO (somewhere) blocks of blocks with neighbors can be combined to one block
@@ -105,19 +94,18 @@ class BlockSparseTensor:
         #    ), "Value axis should be unique"
 
         # assert blocks.ndim > sparse_dims # <-- breaks jit stuff
-        block_shape = blocks.shape[sparse_dims:]
-        # TODO add ones for non mentioned areas
+        # block_shape = blocks.shape[sparse_dims:]
 
         # print(blocks.shape)
         # print(block_shape)
 
         out_shape = tuple(
-            x.size if isinstance(x, DenseDimension) else x.size * block_shape[x.val_dim]
-            for x in out_dims
+            d.size * d.block_size if hasattr(d, "block_size") else d.size
+            for d in out_dims
         )
         primal_shape = tuple(
-            x.size if isinstance(x, DenseDimension) else x.size * block_shape[x.val_dim]
-            for x in primal_dims
+            d.size * d.block_size if hasattr(d, "block_size") else d.size
+            for d in primal_dims
         )
 
         self.out_dims = out_dims if isinstance(out_dims, tuple) else tuple(out_dims)
@@ -130,14 +118,9 @@ class BlockSparseTensor:
         self.block_size = reduce(operator.mul, self.block_shape)
 
         self.out_shape = tuple(out_shape)
-
         self.primal_shape = tuple(primal_shape)
 
-        # self.out_shape = get_block_shape(out_dims)
-        # self.primal_shape = get_block_shape(primal_dims)
-
         self.shape = tuple(self.out_shape + self.primal_shape)  # isn't quite right
-        # TODO: _get_fully_materialized_shape
         self.size = reduce(operator.mul, self.shape)
         self.ndim = len(self.shape)
 
@@ -179,9 +162,6 @@ class BlockSparseTensor:
                 res = lb + rb
             return res
 
-        str_out_shape = ", ".join(map_str(self.out_shape))
-        str_primal_shape = ", ".join(map_str(self.primal_shape))
-
         multiline_out_dims = multiline_seq(self.out_dims, "()")
         multiline_primal_dims = multiline_seq(self.primal_dims, "()")
         multiline_pre_transform = multiline_seq(self.pre_transforms, "[]")
@@ -189,7 +169,7 @@ class BlockSparseTensor:
 
         return (
             f"BlockSparseTensor(\n"
-            f"  shape = ({str_out_shape} | {str_primal_shape}),\n"
+            f"  shape = ({str(list(self.out_shape))[1:-1]} | {str(list(self.primal_shape))[1:-1]}),\n"
             f"  out_dims = {multiline_out_dims},\n"
             f"  primal_dims = {multiline_primal_dims},\n"
             f"  val = Array(shape={self.blocks.shape}, dtype={self.blocks.dtype}),\n"
@@ -198,10 +178,18 @@ class BlockSparseTensor:
             f")"
         )
 
-    # This is not a transpose like w/ normal tensors. The order should be completely reversed.
-    # testcase: st == st.T.T
-    def transpose(self, *args, **kwargs):
-        return _transpose(self, *args, **kwargs)
+    def transpose(
+        self,
+        out_transpose: Sequence[int] | None = None,
+        primal_transpose: Sequence[int] | None = None,
+    ):
+        return _transpose(self, out_transpose, primal_transpose)
+
+    def swapdims(self):
+        print([d.id for d in self.primal_dims], [d.id for d in self.out_dims])
+        return self.transpose(
+            [d.id for d in self.primal_dims], [d.id for d in self.out_dims]
+        )
 
     def block_until_ready(self):
         self.blocks.block_until_ready()
@@ -216,7 +204,10 @@ class BlockSparseTensor:
         return self.blocks.dtype
 
     def dense(self) -> Array:
-        return _dense(self, method="multiplication")
+        return _dense(self)
+
+    def all(self):
+        return self.blocks.all()
 
     def __eq__(lhs, rhs):
         return _eq(lhs, rhs)
@@ -248,67 +239,107 @@ class BlockSparseTensor:
     def __deepcopy__(self):
         return _copy(self, deep=True)
 
-    def _apply_to_val(self, fn, *args, **kwargs):
-        return self.__copy__(fn(self.blocks, *args, **kwargs))
 
-    def _apply_to_two_vals(lhs, rhs, fn, *args, **kwargs):
-        return self.__copy__(fn(lhs.blocks, rhs.blocks, *args, **kwargs))
-
-
-def _transpose(bst, out_transpose=None, primal_transpose=None):
+def _process_empty_transpose(
+    n_out_dims, n_primal_dims, out_transpose, primal_transpose
+):
     if out_transpose is None and primal_transpose is None:
-        n_out = len(bst.out_dims)
-        n_primal = len(bst.primal_dims)
-        out_transpose = tuple(range(n_out + n_primal - 1, n_out - 1, -1))
-        primal_transpose = tuple(range(n_out - 1, -1, -1))
+        full_transpose = tuple(range(n_out_dims + n_primal_dims - 1, -1, -1))
+        out_transpose = full_transpose[:n_primal_dims]
+        primal_transpose = full_transpose[n_primal_dims:]
+    else:
+        if out_transpose is None:
+            out_transpose = range(n_out_dims)
+        if primal_transpose is None:
+            primal_transpose = range(n_out_dims, n_primal_dims + n_out_dims)
 
-    full_transpose = tuple(out_transpose) + tuple(primal_transpose)
+        out_transpose = tuple(out_transpose)
+        primal_transpose = tuple(primal_transpose)
+        full_transpose = out_transpose + primal_transpose
 
-    if len(full_transpose) != bst.ndim or len(set(full_transpose)) != bst.ndim:
-        raise TypeError(
-            f"transpose permutation isn't a permutation of operand dimensions, "
-            f"got permutation ({str(out_transpose)[1:-1]} | {str(primal_transpose)[1:-1]}) "
-            f"for operand with {bst.ndim} dimensions."
-        )
+    assert len(full_transpose) == n_out_dims + n_primal_dims
+    assert len(set(full_transpose)) == n_out_dims + n_primal_dims
+    return full_transpose, out_transpose, primal_transpose
 
-    dims = bst.out_dims + bst.primal_dims
 
-    inverse_full_transpose = np.argsort(full_transpose)
-
+def _sparse_transpose(sparse_dims, out_transpose, out_dims, primal_dims):
     c = count()
+    sparse_id_to_pos = {
+        d.id: next(c) for d in out_dims if isinstance(d, SparseDimension)
+    }
 
-    def remap_permuted_dim(old_idx, new_val_dim):
-        old_dim = dims[old_idx]
-        new_id = next(c)
-        if isinstance(old_dim, SparseDimension):
-            new_other_id = inverse_full_transpose[old_dim.other_id]
-            return old_dim._replace(
-                id=new_id, other_id=new_other_id, val_dim=new_val_dim
-            )
-        else:
-            return old_dim._replace(id=new_id, val_dim=new_val_dim)
+    new_id = 0
+    axes = [0] * sparse_dims
+    dims = out_dims + primal_dims
+    for i in out_transpose:
+        d = dims[i]
+        if isinstance(d, SparseDimension):
+            id = d.id if d.id in sparse_id_to_pos else d.other_id
+            axes[sparse_id_to_pos[id]] = new_id
+            new_id += 1
 
-    new_out_dims = [
-        remap_permuted_dim(i, new_val_dim)
-        for new_val_dim, i in enumerate(out_transpose)
-    ]
-    new_primal_dims = [
-        remap_permuted_dim(i, new_val_dim + len(out_transpose))
-        for new_val_dim, i in enumerate(primal_transpose)
-    ]
+    return axes
 
-    val_dim_perm = np.argsort(
-        [
-            dims[i].val_dim
-            for i in full_transpose
-            if isinstance(dims[i], SparseDimension)
-        ]
+
+def _dense_transpose_and_new_dims(sparse_dims, transpose, dims):
+    axes = []
+    new_dims = []
+    for new_id, old_id in enumerate(transpose):
+        dim = dims[old_id]  # can also be new_id.
+        if isinstance(dim, SparseDimension):
+            dim = dim._replace(other_id=transpose.index(dim.other_id))
+        dim = dim._replace(id=new_id, val_dim=new_id)
+        axes.append(old_id + sparse_dims)
+        new_dims.append(dim)
+
+    return axes, new_dims
+
+
+def _transpose(
+    st: BlockSparseTensor,
+    out_transpose: Sequence[int] | None = None,
+    primal_transpose: Sequence[int] | None = None,
+):
+    full_transpose, out_transpose, primal_transpose = _process_empty_transpose(
+        len(st.out_dims), len(st.primal_dims), out_transpose, primal_transpose
     )
 
-    axes = list(range(bst.sparse_dims)) + [bst.sparse_dims + i for i in val_dim_perm]
-    new_blocks = jnp.transpose(bst.blocks, axes=axes)
+    sparse_axes = _sparse_transpose(
+        st.sparse_dims, out_transpose, st.out_dims, st.primal_dims
+    )
+    dense_axes, new_dims = _dense_transpose_and_new_dims(
+        st.sparse_dims, full_transpose, st.out_dims + st.primal_dims
+    )
 
-    return BlockSparseTensor(new_out_dims, new_primal_dims, new_blocks)
+    return BlockSparseTensor(
+        new_dims[: len(out_transpose)],
+        new_dims[len(out_transpose) :],
+        st.blocks.transpose(sparse_axes + dense_axes),
+        st.pre_transforms,
+        st.post_transforms,
+    )
+
+
+def _block_diag_raw_dense(blocks, sparse_shape, dense_shape):
+    num_blocks = prod(sparse_shape)
+
+    blocks_flat = blocks.reshape(num_blocks, *dense_shape)
+    diag_blocks_flat = jnp.einsum(
+        "i...,ij->ij...", blocks_flat, jnp.eye(num_blocks, dtype=blocks.dtype)
+    )
+
+    return diag_blocks_flat.reshape(*sparse_shape, *sparse_shape, *dense_shape)
+
+
+def _transpose_dense(dims: tuple[Dimension, ...], sparse_dims: int):
+    axes = []
+    sparse_id = 0
+    for d in dims:
+        if isinstance(d, SparseDimension):
+            axes.append(sparse_id)
+            sparse_id += 1
+        axes.append(sparse_dims * 2 + d.val_dim)
+    return axes
 
 
 def _dense(
@@ -317,58 +348,14 @@ def _dense(
     if st.sparse_dims == 0:
         return jnp.broadcast_to(st.blocks, st.shape)
 
-    sparse_shape_grid = st.blocks.shape[: st.sparse_dims]
-    dense_shape_block = st.blocks.shape[st.sparse_dims :]
-    num_blocks = np.prod(sparse_shape_grid).item()
+    # TODO for the Nones cases, generate the actual block values, this will make things easier and should still be efficient.
 
-    blocks_flat = st.blocks.reshape(num_blocks, *dense_shape_block)
-    diag_blocks_flat = jnp.einsum(
-        "i...,ij->ij...", blocks_flat, jnp.eye(num_blocks, dtype=st.blocks.dtype)
-    )
+    sparse_shape = st.blocks.shape[: st.sparse_dims]
+    dense_shape = st.blocks.shape[st.sparse_dims :]
 
-    diag_tensor_full_axes = diag_blocks_flat.reshape(
-        *sparse_shape_grid, *sparse_shape_grid, *dense_shape_block
-    )
-
-    processed_pairs = {
-        tuple(sorted((d.id, d.other_id)))
-        for d in st.out_dims + st.primal_dims
-        if isinstance(d, SparseDimension)
-    }
-    sparse_pair_to_abstract_grid_idx = {
-        pair: i for i, pair in enumerate(sorted(list(processed_pairs)))
-    }
-
-    permutation = []
-    block_dense_val_dim_to_source_axis = {
-        idx: 2 * st.sparse_dims + idx for idx in range(len(dense_shape_block))
-    }
-
-    for d in st.out_dims:
-        if isinstance(d, SparseDimension):
-            abstract_grid_idx = sparse_pair_to_abstract_grid_idx[
-                tuple(sorted((d.id, d.other_id)))
-            ]
-            permutation.append(abstract_grid_idx)
-        permutation.append(block_dense_val_dim_to_source_axis[d.val_dim])
-
-    for d in st.primal_dims:
-        if isinstance(d, SparseDimension):
-            abstract_grid_idx = sparse_pair_to_abstract_grid_idx[
-                tuple(sorted((d.id, d.other_id)))
-            ]
-            permutation.append(st.sparse_dims + abstract_grid_idx)
-        permutation.append(block_dense_val_dim_to_source_axis[d.val_dim])
-
-    all_source_axes_used = set(permutation)
-    expected_source_axes = set(range(2 * st.sparse_dims + len(dense_shape_block)))
-    if len(all_source_axes_used) != len(expected_source_axes):
-        unmapped_block_internal_axes = sorted(
-            list(expected_source_axes - all_source_axes_used)
-        )
-        permutation.extend(unmapped_block_internal_axes)
-
-    transposed_tensor = jnp.transpose(diag_tensor_full_axes, axes=permutation)
+    block_diag = _block_diag_raw_dense(st.blocks, sparse_shape, dense_shape)
+    axes = _transpose_dense(st.out_dims + st.primal_dims, st.sparse_dims)
+    transposed_tensor = block_diag.transpose(axes)
 
     return transposed_tensor.reshape(st.shape)
 
@@ -386,12 +373,12 @@ def _copy(bst, val=None, deep=False):
 
 
 def _eq(lhs, rhs):
-    return (
-        isinstance(rhs, BlockSparseTensor)
-        and lhs.out_dims == rhs.out_dims
-        and lhs.primal_dims == rhs.primal_dims
-        and jnp.all(lhs.blocks == rhs.blocks)
-    )
+    if not isinstance(rhs, BlockSparseTensor):
+        raise ValueError("Cannot compare BlockSparseTensor with non-BlockSparseTensor")
+    elif lhs.out_dims != rhs.out_dims or lhs.primal_dims != rhs.primal_dims:
+        raise ValueError("Cannot compare BlockSparseTensors with different dimensions")
+    else:
+        return _copy(lhs, lhs.blocks == rhs.blocks)
 
 
 # TODO TODO TODO TODO TODO
@@ -420,8 +407,6 @@ def _add(lhs, rhs):
             return BlockSparseTensor(
                 lhs.out_dims, lhs.primal_dims, lhs.blocks + rhs.blocks
             )
-    elif isinstance(rhs, SparseTensor):
-        pass
     elif isinstance(rhs, Array):
         return lhs.dense() + rhs
     else:
@@ -450,8 +435,6 @@ def _mul(lhs, rhs):
             return BlockSparseTensor(
                 lhs.out_dims, lhs.primal_dims, lhs.blocks * rhs.blocks
             )
-    elif isinstance(rhs, SparseTensor):
-        pass
     elif isinstance(rhs, Array):
         return lhs.dense() + rhs
     else:
@@ -461,12 +444,11 @@ def _mul(lhs, rhs):
 
 
 def _matmul(lhs, rhs):
-    # TODO assert something
     if isinstance(rhs, BlockSparseTensor):
         if lhs.blocks is None:
-            return copy.copy(rhs)
+            return _copy(rhs, deep=True)
         elif rhs.blocks is None:
-            return copy.copy(lhs)
+            return _copy(lhs, deep=True)
         elif (
             isinstance(lhs.blocks, Array)
             and isinstance(rhs.blocks, Array)
@@ -494,9 +476,11 @@ def _matmul(lhs, rhs):
             ]
 
             return BlockSparseTensor(out_dims, primal_dims, val)
+        else:
+            raise ValueError(
+                f"Can't multiply shapes: ({str(list(lhs.out_shape))[1:-1]} | {str(list(lhs.primal_shape))[1:-1]}) and ({str(list(rhs.out_shape))[1:-1]} | {str(list(rhs.primal_shape))[1:-1]})"
+            )
 
-    elif isinstance(rhs, SparseTensor):
-        pass
     elif isinstance(rhs, Array):  # TODO: Fix default check
         block_nums = lhs.blocks.shape[: lhs.sparse_dims]
         block_sizes = [
