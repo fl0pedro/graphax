@@ -78,8 +78,8 @@ def test_block_diagonal_transpose(stc):
 
 
 def test_transpose_one_sparse(stb):
-    n, x, y = stb.blocks.shape
-    assert stb.T.blocks.shape == (n, y, x)
+    n, x, y = stb.val.shape
+    assert stb.T.val.shape == (n, y, x)
     assert (stb.transpose((1,), (0,)) == stb.T).all()
 
 
@@ -89,13 +89,13 @@ def test_bad_transpose_one_sparse(stb):
 
 
 def test_transpose_mixed(stc):
-    n, x, a, y = stc.blocks.shape
-    assert stc.T.blocks.shape == (n, y, a, x)
+    n, x, a, y = stc.val.shape
+    assert stc.T.val.shape == (n, y, a, x)
     assert (stc.transpose((2, 1), (0,)) == stc.T).all()
-    assert stc.transpose((1, 0), (2,)).blocks.shape == (n, a, x, y)
-    assert stc.transpose((0, 1), (2,)).blocks.shape == (n, x, a, y)
-    assert stc.transpose((0,), (1, 2)).blocks.shape == (n, x, a, y)
-    assert stc.transpose((0,), (2, 1)).blocks.shape == (n, x, y, a)
+    assert stc.transpose((1, 0), (2,)).val.shape == (n, a, x, y)
+    assert stc.transpose((0, 1), (2,)).val.shape == (n, x, a, y)
+    assert stc.transpose((0,), (1, 2)).val.shape == (n, x, a, y)
+    assert stc.transpose((0,), (2, 1)).val.shape == (n, x, y, a)
 
 
 @pytest.mark.xfail
@@ -104,12 +104,12 @@ def test_bad_transpose_mixed(stb):
 
 
 def test_transpose_two_sparse(ste):
-    n, m, x, a, y, b = ste.blocks.shape
-    assert ste.T.blocks.shape == (m, n, b, y, a, x)
-    assert ste.swapdims().blocks.shape == (n, m, y, b, x, a)
-    assert ste.transpose(out_transpose=(1, 0)).blocks.shape == (m, n, a, x, y, b)
-    assert ste.transpose(primal_transpose=(3, 2)).blocks.shape == (n, m, x, a, b, y)
-    assert ste.transpose((0, 3), (2, 1)).blocks.shape == (n, m, x, b, y, a)
+    n, m, x, a, y, b = ste.val.shape
+    assert ste.T.val.shape == (m, n, b, y, a, x)
+    assert ste.swapdims().val.shape == (n, m, y, b, x, a)
+    assert ste.transpose(out_transpose=(1, 0)).val.shape == (m, n, a, x, y, b)
+    assert ste.transpose(primal_transpose=(3, 2)).val.shape == (n, m, x, a, b, y)
+    assert ste.transpose((0, 3), (2, 1)).val.shape == (n, m, x, b, y, a)
 
 
 @pytest.mark.xfail
@@ -151,14 +151,15 @@ def test_transpose_einsum(st_name, request):
 
     einsum_statement = f"{lhs_idxs},{rhs_idxs}->{res_idxs}"
 
-    assert jnp.allclose(
-        jnp.einsum(einsum_statement, st.dense(), st.swapdims().dense()),
-        (st @ st.swapdims()).dense(),
-    )
+    res = jnp.einsum(einsum_statement, st.dense(), st.swapdims().dense())
+
+    assert jnp.allclose(res, (st @ st.swapdims()).dense())
+    assert jnp.allclose(res, st @ st.swapdims().dense())
+    assert jnp.allclose(res, st.dense() @ st.swapdims())
 
 
 def test_non_blocK_consistency_one_sparse(sta):
-    val = sta.blocks.reshape(-1)
+    val = sta.val.reshape(-1)
     b1 = sta.dense()
     b2 = jnp.diag(val).reshape(sta.shape)
     assert b1.shape == b2.shape
@@ -166,7 +167,7 @@ def test_non_blocK_consistency_one_sparse(sta):
 
 
 def test_non_blocK_consistency_two_sparse(std):
-    val = std.blocks.reshape(-1)
+    val = std.val.reshape(-1)
     b1 = std.dense()
     b2 = jnp.diag(val).reshape(std.shape)
     assert b1.shape == b2.shape
@@ -175,7 +176,7 @@ def test_non_blocK_consistency_two_sparse(std):
 
 def test_2d_block_consistency(stb):
     b1 = stb.dense()
-    b2 = block_diag(*stb.blocks)
+    b2 = block_diag(*stb.val)
     assert b1.shape == b2.shape
     assert (b1 == b2).all()
 
@@ -185,7 +186,7 @@ def _block_diag_star(val):
 
 
 def test_3d_block_consistency(stc):
-    val = stc.blocks
+    val = stc.val
     b1 = stc.dense()
     diag_over_dense = vmap(_block_diag_star, in_axes=2, out_axes=1)
     b2 = diag_over_dense(val)
@@ -194,7 +195,7 @@ def test_3d_block_consistency(stc):
 
 
 def test_4d_block_consistency_one_sparse(stf):
-    val = stf.blocks
+    val = stf.val
     b1 = stf.dense()
     diag_over_dense_1 = vmap(_block_diag_star, in_axes=2, out_axes=1)
     diag_over_dense_2 = vmap(diag_over_dense_1, in_axes=4, out_axes=3)
@@ -204,7 +205,7 @@ def test_4d_block_consistency_one_sparse(stf):
 
 
 def test_4d_block_consistency_two_sparse(ste):
-    val = ste.blocks
+    val = ste.val
     b1 = ste.dense()
     diag_over_sparse_1 = vmap(_block_diag_star, in_axes=1, out_axes=0)
     diag_over_block_dim_1 = vmap(diag_over_sparse_1, in_axes=3, out_axes=2)
