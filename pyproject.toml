@@ -1,5 +1,4 @@
 [build-system]
-# AVOID CHANGING REQUIRES: IT WILL BE UPDATED BY PYSCAFFOLD!
 requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
@@ -11,16 +10,19 @@ authors = [
     { name = "Jamie Lohoff", email = "jamie.lohoff@gmail.com" },
     { name = "Florian Assmuth", email = "florianassmuth@gmail.com" }
 ]
+dynamic = ["urls"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
-license = { text = "MIT" } # Or other license information
-readme = "README.rst" # Path to your README file
-requires-python = "==3.12.*" # Minimum Python version
+license = { file = "LICENSE.txt" }
+readme = "README.rst"
+requires-python = "==3.12.*"
 dependencies = [
     "numpy",
     "jax>=0.5.0",
     "jaxlib>=0.5.0"
 ]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
