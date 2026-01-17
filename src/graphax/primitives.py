@@ -173,10 +173,12 @@ def standard_elemental(elementalrule, primitive, primals, **params):
 
 
 # NOTE: Useful for stuff such as exp_p
-def defelemental2(primitive, elementalrule):
+def defelemental2(primitive, elementalrule, **params):
     assert isinstance(primitive, core.Primitive)
     assert not primitive.multiple_results
-    elemental_rules[primitive] = partial(standard_elemental2, elementalrule, primitive)
+    elemental_rules[primitive] = partial(
+        standard_elemental2, elementalrule, primitive, **params
+    )
 
 
 def standard_elemental2(elementalrule, primitive, primals, **params):
@@ -199,30 +201,32 @@ defelemental2(
 )  # NOTE: not differentiable here!
 defelemental(lax.integer_pow_p, lambda x, y: y * x ** (y - 1))
 
-defelemental2(lax.exp_p, lambda out, primal, accuracy: out)
-defelemental(lax.log_p, lambda x: 1.0 / x)
-defelemental2(lax.sqrt_p, lambda out, primal: 0.5 / out)
-defelemental(lax.square_p, lambda x: 2.0 * x)
-defelemental2(lax.logistic_p, lambda out, primal: out * (1.0 - out))
-defelemental(lax.log1p_p, lambda x: 1.0 / (1.0 + x))
+defelemental2(lax.exp_p, lambda out, primal, accuracy=None: out)
+defelemental(lax.log_p, lambda x, accuracy=None: 1.0 / x)
+defelemental2(lax.sqrt_p, lambda out, primal, accuracy=None: 0.5 / out)
+defelemental(lax.square_p, lambda x, accuracy=None: 2.0 * x)
+defelemental2(lax.logistic_p, lambda out, primal, accuracy=None: out * (1.0 - out))
+defelemental(lax.log1p_p, lambda x, accuracy=None: 1.0 / (1.0 + x))
 
 defelemental(lax.sin_p, lax.cos)
-defelemental(lax.asin_p, lambda x, accuracy: 1.0 / lax.sqrt(1.0 - x**2, accuracy))
-defelemental(lax.cos_p, lambda x, accuracy: -lax.sin(x, accuracy))
-defelemental(lax.acos_p, lambda x, accuracy: -1.0 / lax.sqrt(1.0 - x**2, accuracy))
-defelemental2(lax.tan_p, lambda out, primal: 1.0 + out**2)
-defelemental(lax.atan_p, lambda x: 1.0 / (1.0 + x**2))
+defelemental(lax.asin_p, lambda x, accuracy=None: 1.0 / lax.sqrt(1.0 - x**2, accuracy))
+defelemental(lax.cos_p, lambda x, accuracy=None: -lax.sin(x, accuracy))
+defelemental(lax.acos_p, lambda x, accuracy=None: -1.0 / lax.sqrt(1.0 - x**2, accuracy))
+defelemental2(lax.tan_p, lambda out, primal, accuracy=None: 1.0 + out**2)
+defelemental(lax.atan_p, lambda x, accuracy=None: 1.0 / (1.0 + x**2))
 
 defelemental(lax.sinh_p, lax.cosh)
-defelemental(lax.asinh_p, lambda x, accuracy: lax.sqrt(1.0 + x**2, accuracy))
+defelemental(lax.asinh_p, lambda x, accuracy=None: lax.sqrt(1.0 + x**2, accuracy))
 defelemental(lax.cosh_p, lax.sinh)
-defelemental(lax.acosh_p, lambda x, accuracy: 1.0 / lax.sqrt(x**2 - 1.0, accuracy))
-defelemental2(lax.tanh_p, lambda out, primal, accuracy: 1.0 - out**2)
-defelemental(lax.atanh_p, lambda x: 1.0 / (1.0 - x**2))
+defelemental(lax.acosh_p, lambda x, accuracy=None: 1.0 / lax.sqrt(x**2 - 1.0, accuracy))
+defelemental2(lax.tanh_p, lambda out, primal, accuracy=None: 1.0 - out**2)
+defelemental(lax.atanh_p, lambda x, accuracy=None: 1.0 / (1.0 - x**2))
 
 defelemental(
     lax.erf_p,
-    lambda x, accuracy: 2.0 * lax.exp(-(x**2), accuracy) / lax.sqrt(jnp.pi, accuracy),
+    lambda x, accuracy=None: 2.0
+    * lax.exp(-(x**2), accuracy)
+    / lax.sqrt(jnp.pi, accuracy),
 )
 
 
@@ -1411,7 +1415,7 @@ def concatenate_elemental_rule(primals, **params):
                 raise NotImplementedError(
                     "DenseDimension without `val_dim` not yet supported!"
                 )
-        else:
+        elif isinstance(d, SparseDimension):
             _d = new_out_dims[d.other_id]
             if d.val_dim is not None:
                 new_out_dims[d.other_id] = DenseDimension(_d.id, _d.size, _d.val_dim)
@@ -1540,13 +1544,17 @@ def convert_element_type_rule(primals, **params):
     new_dtype = params["new_dtype"]
 
     def convert_element_type_transform(pre, iota):
-        new_pre_val = lax.convert_element_type(pre.val, new_dtype)
+        new_pre_val = (
+            None if pre.val is None else lax.convert_element_type(pre.val, new_dtype)
+        )
         new_out_dims = copy.deepcopy(pre.out_dims)
         new_primal_dims = copy.deepcopy(pre.primal_dims)
         return SparseTensor(new_out_dims, new_primal_dims, new_pre_val)
 
     def inverse_convert_element_type_transform(post, iota):
-        new_post_val = lax.convert_element_type(post.val, new_dtype)
+        new_post_val = (
+            None if post.val is None else lax.convert_element_type(post.val, new_dtype)
+        )
         new_out_dims = copy.deepcopy(post.out_dims)
         new_primal_dims = copy.deepcopy(post.primal_dims)
         return SparseTensor(new_out_dims, new_primal_dims, new_post_val)
