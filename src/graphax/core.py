@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import re
+import string
 from collections import defaultdict
 from functools import partial, wraps
-from typing import Callable, Dict, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, Sequence, Set, Tuple, Union
 
 import jax
 import jax._src.core as core
@@ -14,6 +16,88 @@ from jax._src.util import safe_map
 from .primitives import elemental_rules
 from .sparse.tensor import _assert_sparse_tensor_consistency, get_num_adds, get_num_muls
 from .sparse.utils import get_largest_tensor, zeros_like
+
+vocab = (
+    {str(i): i for i in range(10)}
+    | {c: i + 10 for i, c in enumerate(string.ascii_lowercase)}
+    | {c: i + 36 for i, c in enumerate(list("%|<>\n,"))}
+    | {c.name: i + 42 for i, c in enumerate(elemental_rules.keys())}
+)
+n_vocab = {v: k for k, v in vocab.items()}
+
+
+class CleanJaxpr:
+    def __init__(self, jaxpr: core.Jaxpr):
+        self.jaxpr = jaxpr
+
+    def __repr__(self):
+        s = str(self.jaxpr)
+        # TODO in future cases check approx with quantization and precision/accuracy if available
+        s = re.sub(r":[a-z0-9]+", "", s)  # remove types
+        s = re.sub(r"\n\s*_[^=]*=[^\]]*.*", "", s)  # remove unused variabls `_`
+
+        # simple case, remove params:
+        s = re.sub(r"(\w+)\[(?:\n?\s*\w*=.*)*\n?\s*\]", lambda x: x.group(1), s)
+
+        # replace shape w/ <>'s
+        s = re.sub(
+            r"(?<=\S)\[([\d,]*)\]",
+            lambda x: " <" + x.group(1) + ">",
+            s,
+        )
+        return s
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self, name, getattr(self.jaxpr, name))
+
+    def pre_tokenization(self):
+        s = str(self)
+        # removes colors, periods, ()'s, {}'s, ='s, indents, and turn 1.0's (only literal) to 1's
+        s = re.sub(
+            r"(?:\x1b\[34;1m|\x1b\[39;22m;|\x1b\[35m|\x1b\[39;22m|\x1b\[39m|\.0|\.|\(|\)|{|}| =|    )",
+            "",
+            s,
+        )
+
+        # remove first line lambda, and let
+        s = re.sub(r"^ lambda  ", "", s)
+        s = re.sub(r"^([^=]*) let\n", lambda x: x.group(1) + "\n%\n", s)
+        # remove last line in
+        s = re.sub(
+            r"  in ([a-z, ]*) ", lambda x: "%\n" + x.group(1).replace(",", ""), s
+        )
+
+        # replace spaces with seperator |
+        s = s.replace(" ", "|")
+        return s
+
+    def tokenized(self):
+        def tokenize_sac(s):
+            res = []
+            for ln in s.splitlines():
+                # at least 3 items: var_a|op|var_b (no shape, one input)
+                p = ln.split("|", 3)
+                p3 = "" if len(p) == 3 else "|" + p[3]
+                if p[1][0] == "<":  # if has shape, op is in idx 2
+                    res.extend([vocab[c] for c in p[0] + "|" + p[1] + "|"])  # var|shape
+                    res.append(vocab[p[2]])  # op
+                    res.extend([vocab[c] for c in p3])  # vars ...
+                else:
+                    res.extend([vocab[c] for c in p[0] + "|"])  # var
+                    res.append(vocab[p[1]])  # op
+                    res.extend([vocab[c] for c in "|" + p[2] + p3])  # vars ...
+
+                res.append(vocab["\n"])
+            res.pop()  # remove last \n
+            return res
+
+        # first line (input) % sac % last line (output); strip to remove lingering \n's
+        p = [s.strip() for s in self.pre_tokenization().split("%")]
+        return (
+            [vocab[c] for c in p[0] + "%"]
+            + tokenize_sac(p[1])
+            + [vocab[c] for c in "%" + p[2]]
+        )
 
 
 def tree_allclose(tree1, tree2, equal_nan: bool = False) -> bool:
@@ -608,15 +692,19 @@ def vertex_elimination_jaxpr(
     order = _checkify_order(order, jaxpr, vo_vertices)
 
     if return_history:
-        extract_jaxpr(
-            jaxpr,
-            argnums,
-            has_aux,
-            order,
-            0,
-            sparse_representation,
-            args,
-            consts,
+        history.append(
+            CleanJaxpr(
+                extract_jaxpr(
+                    jaxpr,
+                    argnums,
+                    has_aux,
+                    order,
+                    0,
+                    sparse_representation,
+                    args,
+                    consts,
+                )
+            )
         )
 
     for i, vertex in enumerate(order):
@@ -633,15 +721,17 @@ def vertex_elimination_jaxpr(
 
         if return_history:
             history.append(
-                extract_jaxpr(
-                    jaxpr,
-                    argnums,
-                    has_aux,
-                    order,
-                    i + 1,
-                    sparse_representation,
-                    args,
-                    consts,
+                CleanJaxpr(
+                    extract_jaxpr(
+                        jaxpr,
+                        argnums,
+                        has_aux,
+                        order,
+                        i + 1,
+                        sparse_representation,
+                        args,
+                        consts,
+                    )
                 )
             )
 
