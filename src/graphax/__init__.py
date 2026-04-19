@@ -1,7 +1,9 @@
 import sys
+
 from .core import jacve, tree_allclose
 from .equinox_bindings import filter_jacve
-from .sparse import sparse_tensor_zeros_like # custom_elemental,
+
+# from .sparse import sparse_tensor_zeros_like
 
 if sys.version_info[:2] >= (3, 8):
     # TODO: Import directly (no need for conditional) when `python_requires = >= 3.8`
@@ -17,4 +19,3 @@ except PackageNotFoundError:  # pragma: no cover
     __version__ = "unknown"
 finally:
     del version, PackageNotFoundError
-

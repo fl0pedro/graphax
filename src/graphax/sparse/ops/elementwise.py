@@ -1,0 +1,466 @@
+from __future__ import annotations
+
+import math
+from dataclasses import replace
+from typing import TYPE_CHECKING, Callable
+
+import jax
+import jax.numpy as jnp
+from jax import Array
+
+from .utils import _arr2st
+from .layout import generate_block_permutation
+
+from ..dimensions import Dimension, SparseDimension, DenseDimension
+
+if TYPE_CHECKING:
+    from ..tensor import SparseTensor
+
+
+def _normalize_inputs(
+    lhs: SparseTensor | Array, rhs: SparseTensor | Array
+) -> tuple[SparseTensor, SparseTensor]:
+    from ..tensor import SparseTensor
+
+    # Determine target dtype for potential dense-to-sparse promotion
+    target_dtype = None
+    if isinstance(lhs, SparseTensor) and not isinstance(rhs, SparseTensor):
+        target_dtype = lhs.dtype
+    elif isinstance(rhs, SparseTensor) and not isinstance(lhs, SparseTensor):
+        target_dtype = rhs.dtype
+
+    if not isinstance(lhs, SparseTensor):
+        obj = jnp.asarray(lhs)
+        if hasattr(rhs, "shape") and obj.size == 1:
+            obj = jnp.broadcast_to(obj, rhs.shape)
+        lhs = _arr2st(
+            obj,
+            out_ndim=len(rhs.out_dims) if isinstance(rhs, SparseTensor) else None,
+            dtype=target_dtype,
+        )
+    if not isinstance(rhs, SparseTensor):
+        obj = jnp.asarray(rhs)
+        if hasattr(lhs, "shape") and obj.size == 1:
+            obj = jnp.broadcast_to(obj, lhs.shape)
+        rhs = _arr2st(obj, out_ndim=len(lhs.out_dims), dtype=target_dtype)
+
+    if lhs.shape != rhs.shape:
+        raise ValueError(f"Shape mismatch: {lhs.shape} != {rhs.shape}")
+    return lhs, rhs
+
+
+def _handle_sparse_sparse_pair(left_dim, right_dim, left_dims, right_dims):
+    partner_idx = next(j for j, d in enumerate(left_dims) if d.id == left_dim.other_id)
+    left_partner, right_partner = left_dims[partner_idx], right_dims[partner_idx]
+
+    if (
+        not isinstance(right_partner, SparseDimension)
+        or right_dim.other_id != right_partner.id
+    ):
+        raise ValueError(
+            "Topology mismatch: LHS and RHS sparse pairs do not positionally align."
+        )
+    return (left_dim, left_partner, right_dim, right_partner), partner_idx
+
+
+def _promote_left_dense_to_sparse(left_dim, right_dim, left_dims, right_dims):
+    partner_idx = next(
+        j for j, d in enumerate(right_dims) if d.id == right_dim.other_id
+    )
+    right_partner, left_partner = right_dims[partner_idx], left_dims[partner_idx]
+
+    if not isinstance(left_partner, DenseDimension):
+        raise ValueError(
+            "Topology mismatch: Expected DenseDimension to pair with SparseDimension(size=1)"
+        )
+
+    synthetic_left = SparseDimension(
+        left_dim.id,
+        1,
+        val_dim=None,
+        other_id=left_partner.id,
+        block_size=left_dim.size,
+        block_val_dim=left_dim.val_dim,
+    )
+    synthetic_left_partner = SparseDimension(
+        left_partner.id,
+        1,
+        val_dim=None,
+        other_id=left_dim.id,
+        block_size=left_partner.size,
+        block_val_dim=left_partner.val_dim,
+    )
+    return (
+        synthetic_left,
+        synthetic_left_partner,
+        right_dim,
+        right_partner,
+    ), partner_idx
+
+
+def _promote_right_dense_to_sparse(left_dim, right_dim, left_dims, right_dims):
+    partner_idx = next(j for j, d in enumerate(left_dims) if d.id == left_dim.other_id)
+    left_partner, right_partner = left_dims[partner_idx], right_dims[partner_idx]
+
+    if not isinstance(right_partner, DenseDimension):
+        raise ValueError(
+            "Topology mismatch: Expected DenseDimension to pair with SparseDimension(size=1)"
+        )
+
+    synthetic_right = SparseDimension(
+        right_dim.id,
+        1,
+        val_dim=None,
+        other_id=right_partner.id,
+        block_size=right_dim.size,
+        block_val_dim=right_dim.val_dim,
+    )
+    synthetic_right_partner = SparseDimension(
+        right_partner.id,
+        1,
+        val_dim=None,
+        other_id=right_dim.id,
+        block_size=right_partner.size,
+        block_val_dim=right_partner.val_dim,
+    )
+    return (
+        left_dim,
+        left_partner,
+        synthetic_right,
+        synthetic_right_partner,
+    ), partner_idx
+
+
+def _resolve_dim_pairing(i, left_dims, right_dims, processed_indices):
+    left_dim, right_dim = left_dims[i], right_dims[i]
+
+    if isinstance(left_dim, SparseDimension) and isinstance(right_dim, SparseDimension):
+        pair, partner_idx = _handle_sparse_sparse_pair(
+            left_dim, right_dim, left_dims, right_dims
+        )
+        processed_indices.update([i, partner_idx])
+        return "sparse", pair
+
+    if isinstance(left_dim, DenseDimension) and isinstance(right_dim, SparseDimension):
+        pair, partner_idx = _promote_left_dense_to_sparse(
+            left_dim, right_dim, left_dims, right_dims
+        )
+        processed_indices.update([i, partner_idx])
+        return "sparse", pair
+
+    if isinstance(right_dim, DenseDimension) and isinstance(left_dim, SparseDimension):
+        pair, partner_idx = _promote_right_dense_to_sparse(
+            left_dim, right_dim, left_dims, right_dims
+        )
+        processed_indices.update([i, partner_idx])
+        return "sparse", pair
+
+    if not isinstance(left_dim, SparseDimension) and not isinstance(
+        right_dim, SparseDimension
+    ):
+        processed_indices.add(i)
+        return "dense", (left_dim, right_dim)
+
+    raise ValueError("Topology mismatch: Unhandled dimension combination.")
+
+
+def _map_topology(
+    left_tensor: SparseTensor, right_tensor: SparseTensor
+) -> tuple[list[tuple], list[tuple]]:
+    sparse_pairs, dense_pairs, processed_indices = [], [], set()
+    for i in range(len(left_tensor.dims)):
+        if i not in processed_indices:
+            type_key, pair = _resolve_dim_pairing(
+                i, left_tensor.dims, right_tensor.dims, processed_indices
+            )
+            (sparse_pairs if type_key == "sparse" else dense_pairs).append(pair)
+    return sparse_pairs, dense_pairs
+
+
+def _calculate_pair_metric(pair):
+    left_d1, left_d2, right_d1, right_d2 = pair
+    left_b1, left_b2 = left_d1.block_size or 1, left_d2.block_size or 1
+    right_b1, right_b2 = right_d1.block_size or 1, right_d2.block_size or 1
+    common_b1, common_b2 = math.lcm(left_b1, right_b1), math.lcm(left_b2, right_b2)
+    return {
+        "unified_size": left_d1.size // (common_b1 // left_b1),
+        "common_b1": common_b1,
+        "common_b2": common_b2,
+        "left_b1": left_b1,
+        "left_b2": left_b2,
+        "right_b1": right_b1,
+        "right_b2": right_b2,
+        "left_size": left_d1.size,
+        "right_size": right_d1.size,
+    }
+
+
+def _compute_pair_metrics(sparse_pairs: list[tuple]) -> list[dict]:
+    return [_calculate_pair_metric(p) for p in sparse_pairs]
+
+
+def _get_axes_info(sparse_pairs, dense_pairs, is_left):
+    axes = []
+    for pair in sparse_pairs:
+        d1, d2 = (pair[0], pair[1]) if is_left else (pair[2], pair[3])
+        axes.extend(
+            [
+                d1.val_dim,
+                getattr(d1, "block_val_dim", None),
+                getattr(d2, "block_val_dim", None),
+            ]
+        )
+    for pair in dense_pairs:
+        axes.append((pair[0] if is_left else pair[1]).val_dim)
+    return axes
+
+
+def _get_value_axes_info(
+    tensor: SparseTensor,
+    sparse_pairs: list[tuple],
+    dense_pairs: list[tuple],
+    is_left: bool,
+):
+    value = tensor.val if tensor.val is not None else jnp.array(1.0, dtype=tensor.dtype)
+    axes = _get_axes_info(sparse_pairs, dense_pairs, is_left)
+    used_axes = [ax for ax in axes if ax is not None]
+    unused_shape = [value.shape[i] for i in range(value.ndim) if i not in used_axes]
+    return value, axes, unused_shape
+
+
+def _align_tensor_values(
+    value: Array,
+    tensor: SparseTensor,
+    sparse_pairs: list[tuple],
+    dense_pairs: list[tuple],
+    axes: list[int | None],
+    broadcast_unused_shape: list[int],
+    is_left: bool,
+) -> Array:
+    value = value * tensor.scalar_mult
+    target_shape = []
+    for pair in sparse_pairs:
+        d1 = pair[0] if is_left else pair[2]
+        target_shape.extend(
+            [
+                d1.size,
+                d1.block_size or 1,
+                (pair[1] if is_left else pair[3]).block_size or 1,
+            ]
+        )
+    for pair in dense_pairs:
+        target_shape.append((pair[0] if is_left else pair[1]).size)
+
+    used_axes = [ax for ax in axes if ax is not None]
+    unused_indices = [i for i in range(value.ndim) if i not in used_axes]
+    value = value.transpose(used_axes + unused_indices)
+
+    broadcast_dims = [i for i, ax in enumerate(axes) if ax is not None]
+    offset = len(axes) + len(broadcast_unused_shape) - len(unused_indices)
+    broadcast_dims.extend([offset + i for i in range(len(unused_indices))])
+
+    return jax.lax.broadcast_in_dim(
+        value,
+        tuple(target_shape) + tuple(broadcast_unused_shape),
+        tuple(broadcast_dims),
+    )
+
+
+def _promote_to_unified_blocks(
+    value: Array, pair_metrics: list[dict], is_left: bool
+) -> Array:
+    input_reshape, expansion_reshape, output_reshape = [], [], []
+    for metrics in pair_metrics:
+        b1, b2 = (
+            (metrics["left_b1"], metrics["left_b2"])
+            if is_left
+            else (metrics["right_b1"], metrics["right_b2"])
+        )
+        common_b1, common_b2 = metrics["common_b1"], metrics["common_b2"]
+        exp = common_b1 // b1
+        input_reshape.extend([metrics["unified_size"], exp, b1, b2])
+        expansion_reshape.extend([metrics["unified_size"], exp, 1, b1, b2])
+        output_reshape.extend([metrics["unified_size"], common_b1, common_b2])
+
+    rem = list(value.shape[3 * len(pair_metrics) :])
+    input_reshape.extend(rem)
+    expansion_reshape.extend(rem)
+    output_reshape.extend(rem)
+    value = value.reshape(input_reshape).reshape(expansion_reshape)
+
+    mask = jnp.array(1.0, dtype=value.dtype)
+    for i, m in enumerate(pair_metrics):
+        exp = m["common_b1"] // (m["left_b1"] if is_left else m["right_b1"])
+        if exp > 1:
+            m_shape = [1] * len(expansion_reshape)
+            m_shape[5 * i + 1] = exp
+            m_shape[5 * i + 2] = exp
+            mask = mask * jnp.eye(exp, dtype=value.dtype).reshape(m_shape)
+
+    perm = generate_block_permutation(len(pair_metrics), 5, [0, 1, 3, 2, 4])
+    perm.extend(range(5 * len(pair_metrics), len(expansion_reshape)))
+    return (value * mask).transpose(perm).reshape(output_reshape)
+
+
+def _demote_intersection(
+    value: Array, pair_metrics: list[dict], is_intersection: bool
+) -> tuple[Array, list[list[int]]]:
+    if not is_intersection:
+        return value, [
+            [m["unified_size"], m["common_b1"], m["common_b2"]] for m in pair_metrics
+        ]
+
+    input_reshape, output_reshape, sum_axes, meta = [], [], [], []
+    off = 0
+    for m in pair_metrics:
+        min_b1, min_b2 = (
+            min(m["left_b1"], m["right_b1"]),
+            min(m["left_b2"], m["right_b2"]),
+        )
+        dex = m["common_b1"] // min_b1
+        input_reshape.extend([m["unified_size"], dex, min_b1, dex, min_b2])
+        output_reshape.extend([m["unified_size"] * dex, min_b1, min_b2])
+        if dex > 1:
+            sum_axes.append(off + 3)
+        off += 5
+        meta.append([m["unified_size"] * dex, min_b1, min_b2])
+
+    rem = list(value.shape[3 * len(pair_metrics) :])
+    input_reshape.extend(rem)
+    output_reshape.extend(rem)
+    if sum_axes:
+        value = (
+            value.reshape(input_reshape)
+            .sum(axis=tuple(sum_axes))
+            .reshape(output_reshape)
+        )
+    return value, meta
+
+
+def _reconstruct_dimension_pair(i, pair, meta, next_info):
+    lid1, lid2 = pair[0].id, pair[1].id
+    size, b1, b2 = meta[i]
+
+    v_ax = next_info["axis"] if size > 1 else None
+    if size > 1:
+        next_info["axis"] += 1
+    else:
+        next_info["squeeze"].append(3 * i)
+
+    b1_ax = next_info["axis"] if b1 > 1 else None
+    if b1 > 1:
+        next_info["axis"] += 1
+    else:
+        next_info["squeeze"].append(3 * i + 1)
+
+    b2_ax = next_info["axis"] if b2 > 1 else None
+    if b2 > 1:
+        next_info["axis"] += 1
+    else:
+        next_info["squeeze"].append(3 * i + 2)
+
+    return (
+        lid1,
+        replace(
+            pair[0],
+            size=size,
+            block_size=b1 if b1 > 1 else None,
+            val_dim=v_ax,
+            block_val_dim=b1_ax,
+        ),
+    ), (
+        lid2,
+        replace(
+            pair[1],
+            size=size,
+            block_size=b2 if b2 > 1 else None,
+            val_dim=v_ax,
+            block_val_dim=b2_ax,
+        ),
+    )
+
+
+def _reconstruct_result_tensor(
+    value: Array,
+    lhs: SparseTensor,
+    sparse_pairs: list[tuple],
+    dense_pairs: list[tuple],
+    output_pairs_meta: list[list[int]],
+    op: Callable,
+    rhs: SparseTensor,
+) -> SparseTensor:
+    from ..tensor import SparseTensor
+
+    reconstructed = {}
+    info = {"axis": 0, "squeeze": []}
+    for i, pair in enumerate(sparse_pairs):
+        p1, p2 = _reconstruct_dimension_pair(i, pair, output_pairs_meta, info)
+        reconstructed[p1[0]], reconstructed[p2[0]] = p1[1], p2[1]
+    for pair in dense_pairs:
+        reconstructed[pair[0].id] = replace(pair[0], val_dim=info["axis"])
+        info["axis"] += 1
+
+    if info["squeeze"]:
+        value = value[
+            tuple(
+                0 if ax in info["squeeze"] else slice(None) for ax in range(value.ndim)
+            )
+        ]
+        # for rid, dim in reconstructed.items():
+
+        #     def shift(ax):
+        #         return (
+        #             ax - sum(1 for s in info["squeeze"] if s < ax)
+        #             if ax is not None
+        #             else None
+        #         )
+
+        #     reconstructed[rid] = replace(
+        #         dim,
+        #         val_dim=shift(dim.val_dim),
+        #         **(
+        #             {"block_val_dim": shift(getattr(dim, "block_val_dim", None))}
+        #             if isinstance(dim, SparseDimension)
+        #             else {}
+        #         ),
+        #     )
+
+    s_mult = (
+        jnp.array(1.0, dtype=value.dtype)
+        if value.dtype != jnp.bool_
+        else jnp.array(True)
+    )
+    return SparseTensor(
+        tuple(reconstructed[d.id] for d in lhs.out_dims),
+        tuple(reconstructed[d.id] for d in lhs.primal_dims),
+        value,
+        scalar_mult=s_mult,
+        fill_value=op(
+            lhs.fill_value * lhs.scalar_mult, rhs.fill_value * rhs.scalar_mult
+        ),
+        check_consistency=False,
+    )
+
+
+def elementwise(
+    lhs: SparseTensor | Array,
+    rhs: SparseTensor | Array,
+    op: Callable,
+    is_intersection: bool = False,
+) -> SparseTensor:
+    lhs, rhs = _normalize_inputs(lhs, rhs)
+    sparse_pairs, dense_pairs = _map_topology(lhs, rhs)
+    metrics = _compute_pair_metrics(sparse_pairs)
+    vl, al, ul = _get_value_axes_info(lhs, sparse_pairs, dense_pairs, True)
+    vr, ar, ur = _get_value_axes_info(rhs, sparse_pairs, dense_pairs, False)
+    bus = list(jnp.broadcast_shapes(tuple(ul), tuple(ur)))
+    vl = _align_tensor_values(vl, lhs, sparse_pairs, dense_pairs, al, bus, True)
+    vr = _align_tensor_values(vr, rhs, sparse_pairs, dense_pairs, ar, bus, False)
+    res_val = op(
+        _promote_to_unified_blocks(vl, metrics, True),
+        _promote_to_unified_blocks(vr, metrics, False),
+    )
+    res_val, out_meta = _demote_intersection(res_val, metrics, is_intersection)
+    return _reconstruct_result_tensor(
+        res_val, lhs, sparse_pairs, dense_pairs, out_meta, op, rhs
+    )
