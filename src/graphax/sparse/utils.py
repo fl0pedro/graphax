@@ -1,6 +1,7 @@
 import copy
-from functools import reduce
 from typing import Sequence
+from itertools import chain
+import math
 
 import jax.lax as lax
 import jax.numpy as jnp
@@ -45,8 +46,8 @@ def eye_like(shape: Sequence[int], out_len: int) -> jnp.ndarray:
     primal_shape = shape[out_len:]
     out_shape = shape[:out_len]
     if any([primal_shape == out_shape]):
-        primal_size = reduce((lambda x, y: x * y), primal_shape, 1)
-        out_size = reduce((lambda x, y: x * y), out_shape, 1)
+        primal_size = math.prod(primal_shape)
+        out_size = math.prod(out_shape)
         if out_size == 1:
             return jnp.ones((1,) + tuple(primal_shape))
         elif primal_size == 1:
@@ -54,7 +55,7 @@ def eye_like(shape: Sequence[int], out_len: int) -> jnp.ndarray:
         else:
             return jnp.eye(out_size, primal_size).reshape(*out_shape, *primal_shape)
     else:
-        out_size = reduce((lambda x, y: x * y), out_shape, 1)
+        out_size = math.prod(out_shape)
         val = jnp.eye(out_size).reshape(*out_shape, *primal_shape)
         return val
 
@@ -79,8 +80,8 @@ def eye_like_copy(shape: Sequence[int], out_len: int, iota: jnp.ndarray) -> jnp.
     primal_shape = shape[out_len:]
     out_shape = shape[:out_len]
     if any([primal_shape == out_shape]):
-        primal_size = reduce((lambda x, y: x * y), primal_shape, 1)
-        out_size = reduce((lambda x, y: x * y), out_shape, 1)
+        primal_size = math.prod(primal_shape)
+        out_size = math.prod(out_shape)
         if out_size == 1:
             return jnp.ones((1,) + tuple(primal_shape))
         elif primal_size == 1:
@@ -161,12 +162,10 @@ def count_muls(eqn: JaxprEqn) -> int:
 
         for d in contraction_dims[1] + batch_dims[1]:
             var1_shape[d] = 1
-        return reduce((lambda x, y: x * y), var0_shape, 1) * reduce(
-            (lambda x, y: x * y), var1_shape, 1
-        )
+        return math.prod(chain(var0_shape, var1_shape))
 
     elif eqn.primitive is lax.mul_p:
-        return reduce((lambda x, y: x * y), eqn.outvars[0].aval.shape, 1)
+        return math.prod(eqn.outvars[0].aval.shape)
     else:
         return 0
 

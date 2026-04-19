@@ -1,5 +1,4 @@
 [build-system]
-# AVOID CHANGING REQUIRES: IT WILL BE UPDATED BY PYSCAFFOLD!
 requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
@@ -9,6 +8,7 @@ version = "0.0.1"
 description = "Graphax is an Automatic Differentiation interpreter written in JAX."
 authors = [
     { name = "Jamie Lohoff", email = "jamie.lohoff@gmail.com" },
+    { name = "Florian Assmuth", email = "florianassmuth@gmail.com" },
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
