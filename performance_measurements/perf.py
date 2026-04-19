@@ -1,6 +1,3 @@
-from typing import Callable, Sequence, Union
-from timeit import default_timer as timer
-from tqdm import tqdm
 
 import matplotlib.pyplot as plt
 

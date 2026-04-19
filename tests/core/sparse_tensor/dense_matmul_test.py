@@ -1,11 +1,16 @@
+import unittest
+
+import jax
+import jax.lax as lax
 import jax.numpy as jnp
 import jax.random as jrand
 
-from graphax.sparse.tensor import BlockSparseTensor as SparseTensor
-from graphax.sparse.tensor import DenseDimension
+from graphax.sparse.dimensions import DenseDimension
+from graphax.sparse.tensor import SparseTensor
+from utils import assert_matmul_result
 
 
-class TestDenseMul:
+class TestDenseMatmul(unittest.TestCase):
     def test_simple_matmul(self):
         key = jrand.PRNGKey(42)
         xkey, ykey = jrand.split(key, 2)
@@ -16,9 +21,8 @@ class TestDenseMul:
         stx = SparseTensor([DenseDimension(0, 4, 0)], [DenseDimension(1, 3, 1)], x)
         sty = SparseTensor([DenseDimension(0, 3, 0)], [DenseDimension(1, 2, 1)], y)
         stres = stx @ sty
-        assert isinstance(stres, SparseTensor) and stres.val is not None
 
-        assert jnp.allclose(res, stres.val)
+        assert_matmul_result(stres, res, (4,), (2,), (4, 2))
 
     def test_3d_dense_single_contraction(self):
         key = jrand.PRNGKey(42)
@@ -28,7 +32,10 @@ class TestDenseMul:
         res = jnp.einsum("ijk,klm->ijlm", x, y)
 
         stx = SparseTensor(
-            [DenseDimension(0, 3, 0), DenseDimension(1, 4, 1)],
+            [
+                DenseDimension(0, 3, 0),
+                DenseDimension(1, 4, 1),
+            ],
             [DenseDimension(2, 5, 2)],
             x,
         )
@@ -38,9 +45,8 @@ class TestDenseMul:
             y,
         )
         stres = stx @ sty
-        assert isinstance(stres, SparseTensor) and stres.val is not None
 
-        assert jnp.allclose(res, stres.val)
+        assert_matmul_result(stres, res, (3, 4), (2, 2), (3, 4, 2, 2))
 
     def test_3d_dense_double_contraction(self):
         key = jrand.PRNGKey(42)
@@ -60,9 +66,8 @@ class TestDenseMul:
             y,
         )
         stres = stx @ sty
-        assert isinstance(stres, SparseTensor) and stres.val is not None
 
-        assert jnp.all(res == stres.val)
+        assert_matmul_result(stres, res, (3,), (2,), (3, 2))
 
     def test_4d_dense_double_contraction(self):
         key = jrand.PRNGKey(42)
@@ -84,6 +89,9 @@ class TestDenseMul:
             y,
         )
         stres = stx @ sty
-        assert isinstance(stres, SparseTensor) and stres.val is not None
 
-        assert jnp.allclose(res, jnp.array(stres))
+        assert_matmul_result(stres, res, (3, 4), (2, 7), (3, 4, 2, 7))
+
+
+if __name__ == "__main__":
+    unittest.main()

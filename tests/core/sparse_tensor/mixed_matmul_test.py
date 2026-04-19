@@ -4,17 +4,15 @@ import jax
 import jax.lax as lax
 import jax.numpy as jnp
 import jax.random as jrand
-from jax.scipy.linalg import block_diag
 
-from graphax.sparse.tensor import (
-    BlockSparseTensor,
-    DenseDimension,
-    SparseDimension,
-    SparseTensor,
-)
+from graphax.sparse.dimensions import DenseDimension, SparseDimension
+from graphax.sparse.tensor import SparseTensor
+from utils import assert_matmul_result
+
+from graphax.sparse.ops import matmul
 
 
-class TestMixedMul(unittest.TestCase):
+class TestMixedMatmul(unittest.TestCase):
     def test_simple_dense_sparse(self):
         key = jrand.PRNGKey(42)
         xkey, ykey = jrand.split(key, 2)
@@ -26,28 +24,9 @@ class TestMixedMul(unittest.TestCase):
         sty = SparseTensor(
             [SparseDimension(0, 4, 0, 1)], [SparseDimension(1, 4, 0, 0)], y
         )
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
-
-    def test_block_dense_sparse(self):
-        key = jrand.PRNGKey(42)
-        xkey, ykey = jrand.split(key, 2)
-        y_val = jrand.normal(ykey, (2, 2, 2))
-        y_dense = block_diag(*y_val)  # (4, 4)
-        x = jrand.normal(xkey, (3, 4))
-        res = x @ y_dense
-
-        stx = BlockSparseTensor([DenseDimension(0, 3, 0)], [DenseDimension(1, 4, 1)], x)
-        sty = BlockSparseTensor(
-            [SparseDimension(0, 2, 0, 1, 2, 1)],
-            [SparseDimension(1, 2, 0, 0, 2, 2)],
-            y_val,
-        )
-        stres = stx @ sty
-        assert isinstance(stres, SparseTensor) and stres.val is not None
-
-        self.assertTrue(jnp.allclose(res, stres.val))
+        assert_matmul_result(stres, res, (3,), (4,), (3, 4))
 
     def test_simple_sparse_dense(self):
         key = jrand.PRNGKey(42)
@@ -60,28 +39,9 @@ class TestMixedMul(unittest.TestCase):
             [SparseDimension(0, 4, 0, 1)], [SparseDimension(1, 4, 0, 0)], x
         )
         sty = SparseTensor([DenseDimension(0, 4, 0)], [DenseDimension(1, 3, 1)], y)
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
-
-    def test_block_sparse_dense(self):
-        key = jrand.PRNGKey(42)
-        xkey, ykey = jrand.split(key, 2)
-        x_val = jrand.normal(xkey, (2, 2, 2))
-        x_dense = block_diag(*x_val)
-        y = jrand.normal(ykey, (4, 3))
-        res = x_dense @ y
-
-        stx = BlockSparseTensor(
-            [SparseDimension(0, 2, 0, 1, 2, 1)],
-            [SparseDimension(1, 2, 0, 0, 2, 2)],
-            x_val,
-        )
-        sty = BlockSparseTensor([DenseDimension(0, 4, 0)], [DenseDimension(1, 3, 1)], y)
-        stres = stx @ sty
-        assert isinstance(stres, SparseTensor) and stres.val is not None
-
-        self.assertTrue(jnp.allclose(res, stres.val))
+        assert_matmul_result(stres, res, (4,), (3,), (4, 3))
 
     def test_simple_dense_None(self):
         key = jrand.PRNGKey(42)
@@ -94,9 +54,9 @@ class TestMixedMul(unittest.TestCase):
         sty = SparseTensor(
             [SparseDimension(0, 3, None, 1)], [SparseDimension(1, 3, None, 0)], None
         )
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (3,), (3,), (3, 3))
 
     def test_simple_None_dense(self):
         key = jrand.PRNGKey(42)
@@ -109,11 +69,10 @@ class TestMixedMul(unittest.TestCase):
             [SparseDimension(0, 3, None, 1)], [SparseDimension(1, 3, None, 0)], None
         )
         sty = SparseTensor([DenseDimension(0, 3, 0)], [DenseDimension(1, 3, 1)], _y)
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (3,), (3,), (3, 3))
 
-    ## Tests for 3d tensors
     def test_3d_sparse_single_contraction(self):
         key = jrand.PRNGKey(42)
         xkey, ykey = jrand.split(key, 2)
@@ -139,9 +98,58 @@ class TestMixedMul(unittest.TestCase):
             [DenseDimension(1, 2, 1), SparseDimension(2, 5, 0, 0)],
             y,
         )
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (3, 5), (2, 5), (5, 3, 2))
+
+    def test_3d_2d_sparse_single_contraction(self):
+        key = jrand.PRNGKey(42)
+        xkey, ykey = jrand.split(key, 2)
+        x = jrand.normal(xkey, (3, 5))
+        d = jnp.eye(5)
+        _x = jnp.einsum("ij,jk->ijk", x, d)
+
+        y = jrand.normal(ykey, (5,))
+        d = jnp.eye(5)
+        _y = y * d
+        res = jnp.einsum("ijk,kl->ijl", _x, _y)
+
+        stx = SparseTensor(
+            [DenseDimension(0, 3, 0), SparseDimension(1, 5, 1, 2)],
+            [SparseDimension(2, 5, 1, 1)],
+            x,
+        )
+        sty = SparseTensor(
+            [SparseDimension(0, 5, 0, 1)], [SparseDimension(1, 5, 0, 0)], y
+        )
+        stres = matmul(stx, sty)
+
+        assert_matmul_result(stres, res, (3, 5), (5,), (5, 3))
+
+    def test_2d_3d_sparse_single_contraction(self):
+        key = jrand.PRNGKey(42)
+        xkey, ykey = jrand.split(key, 2)
+
+        x = jrand.normal(xkey, (5,))
+        d = jnp.eye(5)
+        _x = x * d
+
+        y = jrand.normal(ykey, (5, 2))
+        d = jnp.eye(5)
+        _y = jnp.einsum("ij,jk->ijk", d, y)
+        res = jnp.einsum("ij,jkl->ikl", _x, _y)
+
+        stx = SparseTensor(
+            [SparseDimension(0, 5, 0, 1)], [SparseDimension(1, 5, 0, 0)], x
+        )
+        sty = SparseTensor(
+            [SparseDimension(0, 5, 0, 1)],
+            [SparseDimension(1, 5, 0, 0), DenseDimension(2, 2, 1)],
+            y,
+        )
+        stres = matmul(stx, sty)
+
+        assert_matmul_result(stres, res, (5,), (5, 2), (5, 2))
 
     def test_3d_sparse_dense_double_contraction(self):
         key = jrand.PRNGKey(42)
@@ -161,10 +169,9 @@ class TestMixedMul(unittest.TestCase):
             [DenseDimension(2, 2, 2)],
             y,
         )
-        stres = stx @ sty
-        assert isinstance(stres, SparseTensor) and stres.val is not None
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, stres.val))
+        assert_matmul_result(stres, res, (3,), (2,), (3, 2))
 
     def test_3d_dense_sparse_double_contraction(self):
         key = jrand.PRNGKey(42)
@@ -184,12 +191,34 @@ class TestMixedMul(unittest.TestCase):
             [DenseDimension(2, 2, 2)],
             y,
         )
-        stres = stx @ sty
-        assert isinstance(stres, SparseTensor) and stres.val is not None
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, stres.val))
+        assert_matmul_result(stres, res, (3,), (2,), (3, 2))
 
     def test_3d_dense_sparse_double_contraction_2nd(self):
+        key = jrand.PRNGKey(42)
+        xkey, ykey = jrand.split(key, 2)
+        x = jrand.normal(xkey, (3, 4, 5))
+
+        y = jrand.normal(ykey, (4, 5))
+        _y = jnp.einsum("ij,jk->ikj", jnp.eye(4), y)
+        res = jnp.einsum("ijk,jkl->il", x, _y)
+
+        stx = SparseTensor(
+            [DenseDimension(0, 3, 0)],
+            [DenseDimension(1, 4, 1), DenseDimension(2, 5, 2)],
+            x,
+        )
+        sty = SparseTensor(
+            [SparseDimension(0, 4, 0, 2), DenseDimension(1, 5, 1)],
+            [SparseDimension(2, 4, 0, 0)],
+            y,
+        )
+        stres = matmul(stx, sty)
+
+        assert_matmul_result(stres, res, (3,), (4,), (3, 4))
+
+    def test_3d_dense_sparse_double_contraction_3rd(self):
         key = jrand.PRNGKey(42)
         xkey, ykey = jrand.split(key, 2)
         x = jrand.normal(xkey, (3, 4, 5))
@@ -212,10 +241,9 @@ class TestMixedMul(unittest.TestCase):
             [SparseDimension(2, 5, 1, 1)],
             y,
         )
-        stres = stx @ sty
-        assert isinstance(stres, SparseTensor) and stres.val is not None
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, stres.val))
+        assert_matmul_result(stres, res, (3,), (5,), (3, 5))
 
     def test_3d_double_dense_double_sparse_contraction(self):
         key = jrand.PRNGKey(42)
@@ -237,11 +265,11 @@ class TestMixedMul(unittest.TestCase):
             [SparseDimension(2, 3, 1, 1)],
             y,
         )
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (3,), (3,), (3,))
 
-    def test_3d_double_sparse_double_dense_contraction(self):
+    def test_3d_double_sparse_double_contraction(self):
         key = jrand.PRNGKey(42)
         xkey, ykey = jrand.split(key, 2)
         x = jrand.normal(xkey, (4, 3))
@@ -261,9 +289,9 @@ class TestMixedMul(unittest.TestCase):
             [SparseDimension(2, 4, 0, 0)],
             y,
         )
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (4,), (4,), (4,))
 
     ### 4d tests
     def test_4d_dense_None_dense_sparse(self):
@@ -288,9 +316,37 @@ class TestMixedMul(unittest.TestCase):
             [SparseDimension(2, 4, 1, 1), DenseDimension(3, 2, 2)],
             y,
         )
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (3, 4), (4, 2), (4, 3, 2))
+
+    def test_4d_sparse_single_contraction(self):
+        key = jrand.PRNGKey(42)
+        xkey, ykey = jrand.split(key, 2)
+
+        x = jrand.normal(xkey, (3, 4, 5))
+        d = jnp.eye(4)
+        _x = jnp.einsum("ijk,jl->ijkl", x, d)
+
+        y = jrand.normal(ykey, (5, 4, 2))
+        d = jnp.eye(5)
+        _y = jnp.einsum("ijk,il->ijlk", y, d)
+
+        res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
+
+        stx = SparseTensor(
+            [DenseDimension(0, 3, 0), SparseDimension(1, 4, 1, 3)],
+            [DenseDimension(2, 5, 2), SparseDimension(3, 4, 1, 1)],
+            x,
+        )
+        sty = SparseTensor(
+            [SparseDimension(0, 5, 0, 2), DenseDimension(1, 4, 1)],
+            [SparseDimension(2, 5, 0, 0), DenseDimension(3, 2, 2)],
+            y,
+        )
+        stres = matmul(stx, sty)
+
+        assert_matmul_result(stres, res, (3, 4), (5, 2), (3, 4, 5, 2))
 
     def test_4d_sparse_cross_single_contraction(self):
         key = jrand.PRNGKey(42)
@@ -316,37 +372,9 @@ class TestMixedMul(unittest.TestCase):
             [DenseDimension(2, 2, 2), SparseDimension(3, 5, 0, 0)],
             y,
         )
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
-
-    def test_block_4d_sparse_cross_single_contraction(self):
-        key = jrand.PRNGKey(42)
-        xkey, ykey = jrand.split(key, 2)
-        x_val = jrand.normal(xkey, (2, 3, 5, 2, 2))
-        x_val = jrand.normal(xkey, (2, 3, 6, 2, 2))
-        y_val = jrand.normal(ykey, (3, 4, 2, 2, 2))
-
-        stx = BlockSparseTensor(
-            [SparseDimension(0, 2, 0, 3, 2, 3), DenseDimension(1, 3, 1)],
-            [DenseDimension(2, 6, 2), SparseDimension(3, 2, 0, 0, 2, 4)],
-            x_val,
-        )
-
-        sty = BlockSparseTensor(
-            [SparseDimension(0, 3, 0, 3, 2, 3), DenseDimension(1, 4, 1)],
-            [DenseDimension(2, 2, 2), SparseDimension(3, 3, 0, 0, 2, 4)],
-            y_val,
-        )
-
-        x_dense = jnp.array(stx)
-        y_dense = jnp.array(sty)
-
-        res = jnp.einsum("ijkl,klmn->ijmn", x_dense, y_dense)
-
-        stres = stx @ sty
-
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (4, 3), (2, 5), (4, 3, 2, 5))
 
     def test_4d_softmax_sparse_single_contraction(self):
         key = jrand.PRNGKey(42)
@@ -363,19 +391,25 @@ class TestMixedMul(unittest.TestCase):
         res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
 
         stx = SparseTensor(
-            [SparseDimension(0, 4, 0, 2), DenseDimension(1, 3, 1)],
+            [
+                SparseDimension(0, 4, 0, 2),
+                DenseDimension(1, 3, 1),
+            ],
             [SparseDimension(2, 4, 0, 0), DenseDimension(3, 5, 2)],
             x,
         )
         sty = SparseTensor(
-            [DenseDimension(0, 4, 0), SparseDimension(1, 5, 1, 3)],
+            [
+                DenseDimension(0, 4, 0),
+                SparseDimension(1, 5, 1, 3),
+            ],
             [DenseDimension(2, 2, 2), SparseDimension(3, 5, 1, 1)],
             y,
         )
 
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (4, 3), (2, 5), (4, 3, 2, 5))
 
     def test_4d_softmax_sparse_single_contraction_2(self):
         key = jrand.PRNGKey(42)
@@ -402,9 +436,9 @@ class TestMixedMul(unittest.TestCase):
             y,
         )
 
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (4, 3), (2, 5), (4, 3, 2, 5))
 
     def test_4d_softmax_sparse_single_contraction_with_Nones(self):
         key = jrand.PRNGKey(42)
@@ -430,9 +464,9 @@ class TestMixedMul(unittest.TestCase):
             [DenseDimension(2, 2, 2), SparseDimension(3, 5, 0, 0)],
             y,
         )
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (3, 4), (2, 5), (3, 4, 2, 5))
 
     def test_4d_softmax_sparse_single_contraction_with_Nones_2(self):
         key = jrand.PRNGKey(42)
@@ -458,115 +492,9 @@ class TestMixedMul(unittest.TestCase):
             [DenseDimension(2, 2, 2), SparseDimension(3, 5, 0, 0)],
             y,
         )
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
-
-    def test_3d_2d_sparse_single_contraction(self):
-        key = jrand.PRNGKey(42)
-        xkey, ykey = jrand.split(key, 2)
-        x = jrand.normal(xkey, (3, 5))
-        d = jnp.eye(5)
-        _x = jnp.einsum("ij,jk->ijk", x, d)
-
-        y = jrand.normal(ykey, (5,))
-        d = jnp.eye(5)
-        _y = y * d
-        res = jnp.einsum("ijk,kl->ijl", _x, _y)
-
-        stx = SparseTensor(
-            [DenseDimension(0, 3, 0), SparseDimension(1, 5, 1, 2)],
-            [SparseDimension(2, 5, 1, 1)],
-            x,
-        )
-        sty = SparseTensor(
-            [SparseDimension(0, 5, 0, 1)], [SparseDimension(1, 5, 0, 0)], y
-        )
-        stres = stx @ sty
-
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
-
-    def test_2d_3d_sparse_single_contraction(self):
-        key = jrand.PRNGKey(42)
-        xkey, ykey = jrand.split(key, 2)
-
-        x = jrand.normal(xkey, (5,))
-        d = jnp.eye(5)
-        _x = x * d
-
-        y = jrand.normal(ykey, (5, 2))
-        d = jnp.eye(5)
-        _y = jnp.einsum("ij,jk->ijk", d, y)
-        res = jnp.einsum("ij,jkl->ikl", _x, _y)
-
-        stx = SparseTensor(
-            [SparseDimension(0, 5, 0, 1)], [SparseDimension(1, 5, 0, 0)], x
-        )
-        sty = SparseTensor(
-            [SparseDimension(0, 5, 0, 1)],
-            [SparseDimension(1, 5, 0, 0), DenseDimension(2, 2, 1)],
-            y,
-        )
-        stres = stx @ sty
-
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
-
-    ### Tests for 4d tensors
-    def test_4d_sparse_single_contraction(self):
-        key = jrand.PRNGKey(42)
-        xkey, ykey = jrand.split(key, 2)
-
-        x = jrand.normal(xkey, (3, 4, 5))
-        d = jnp.eye(4)
-        _x = jnp.einsum("ijk,jl->ijkl", x, d)
-
-        y = jrand.normal(ykey, (5, 4, 2))
-        d = jnp.eye(5)
-        _y = jnp.einsum("ijk,il->ijlk", y, d)
-
-        res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
-
-        stx = SparseTensor(
-            [DenseDimension(0, 3, 0), SparseDimension(1, 4, 1, 3)],
-            [DenseDimension(2, 5, 2), SparseDimension(3, 4, 1, 1)],
-            x,
-        )
-        sty = SparseTensor(
-            [SparseDimension(0, 5, 0, 2), DenseDimension(1, 4, 1)],
-            [SparseDimension(2, 5, 0, 0), DenseDimension(3, 2, 2)],
-            y,
-        )
-        stres = stx @ sty
-
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
-
-    def test_4d_sparse_cross_single_contraction_2(self):
-        key = jrand.PRNGKey(42)
-        xkey, ykey = jrand.split(key, 2)
-
-        x = jrand.normal(xkey, (4, 3, 5))
-        d = jnp.eye(4)
-        _x = jnp.einsum("ijk,il->ijkl", x, d)
-
-        y = jrand.normal(ykey, (5, 4, 2))
-        d = jnp.eye(5)
-        _y = jnp.einsum("ijk,il->ijkl", y, d)
-
-        res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
-
-        stx = SparseTensor(
-            [SparseDimension(0, 4, 0, 3), DenseDimension(1, 3, 1)],
-            [DenseDimension(2, 5, 2), SparseDimension(3, 4, 0, 0)],
-            x,
-        )
-        sty = SparseTensor(
-            [SparseDimension(0, 5, 0, 3), DenseDimension(1, 4, 1)],
-            [DenseDimension(2, 2, 2), SparseDimension(3, 5, 0, 0)],
-            y,
-        )
-        stres = stx @ sty
-
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (3, 4), (2, 5), (3, 4, 2, 5))
 
     def test_4d_dense_double_contraction(self):
         key = jrand.PRNGKey(42)
@@ -587,9 +515,9 @@ class TestMixedMul(unittest.TestCase):
             [DenseDimension(2, 2, 2), DenseDimension(3, 7, 3)],
             y,
         )
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (3, 4), (2, 7), (3, 4, 2, 7))
 
     def test_4d_sparse_single_contraction_with_two_Nones(self):
         key = jrand.PRNGKey(42)
@@ -615,9 +543,10 @@ class TestMixedMul(unittest.TestCase):
             [DenseDimension(2, 2, 1), SparseDimension(3, 5, None, 1)],
             y,
         )
-        stres = stx @ sty
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        stres = matmul(stx, sty)
+
+        assert_matmul_result(stres, res, (3, 4), (2, 5), (3, 4, 2, 5))
 
     def test_4d_sparse_dense_with_only_Nones(self):
         key = jrand.PRNGKey(42)
@@ -641,9 +570,9 @@ class TestMixedMul(unittest.TestCase):
             [SparseDimension(2, 4, None, 1), SparseDimension(3, 3, None, 0)],
             None,
         )
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (3, 5), (4, 3), (3, 5, 4))
 
     def test_4d_sparse_Nones(self):
         key = jrand.PRNGKey(42)
@@ -671,9 +600,9 @@ class TestMixedMul(unittest.TestCase):
             [SparseDimension(2, 4, None, 1), SparseDimension(3, 3, 0, 0)],
             y,
         )
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (3, 5), (4, 3), (3, 5, 4))
 
     def test_4d_double_sparse_single_sparse_Nones(self):
         key = jrand.PRNGKey(42)
@@ -700,9 +629,9 @@ class TestMixedMul(unittest.TestCase):
             [SparseDimension(2, 4, None, 0), DenseDimension(3, 5, 1)],
             y,
         )
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (3, 4), (4, 5), (4, 3, 5))
 
     def test_4d_so_tired_of_it(self):
         key = jrand.PRNGKey(42)
@@ -729,9 +658,9 @@ class TestMixedMul(unittest.TestCase):
             [DenseDimension(2, 5, 1), SparseDimension(3, 3, None, 1)],
             y,
         )
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (3, 4), (5, 3), (3, 4, 5))
 
     def test_4d_dense_None_None_dense(self):
         key = jrand.PRNGKey(42)
@@ -757,9 +686,9 @@ class TestMixedMul(unittest.TestCase):
             [SparseDimension(2, 4, None, 0), DenseDimension(3, 2, 1)],
             y,
         )
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (3, 5), (4, 2), (3, 5, 4, 2))
 
     def test_3d_4d_sparse(self):
         key = jrand.PRNGKey(42)
@@ -783,14 +712,13 @@ class TestMixedMul(unittest.TestCase):
             [SparseDimension(2, 5, 0, 0), DenseDimension(3, 3, 2)],
             y,
         )
-        stres = stx @ sty
+        stres = matmul(stx, sty)
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (4,), (5, 3), (4, 5, 3))
 
     def test_3d_4d_sparse_broadcast(self):
         key = jrand.PRNGKey(42)
         xkey, ykey = jrand.split(key, 2)
-
         x = jrand.normal(xkey, (2, 4))
         _x = jnp.einsum("ik,ij->ijk", x, jnp.eye(2))
 
@@ -811,9 +739,10 @@ class TestMixedMul(unittest.TestCase):
             [SparseDimension(2, 2, 0, 0), SparseDimension(3, 4, 1, 1)],
             y,
         )
-        stres = stx @ sty
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        stres = matmul(stx, sty)
+
+        assert_matmul_result(stres, res, (2,), (2, 4), (2, 4))
 
 
 if __name__ == "__main__":

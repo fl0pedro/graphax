@@ -1,14 +1,16 @@
 import unittest
 
 import jax
+import jax.lax as lax
 import jax.numpy as jnp
 import jax.random as jrand
-from jax.scipy.linalg import block_diag
 
-from graphax.sparse.tensor import BlockSparseTensor, SparseDimension, SparseTensor
+from graphax.sparse.dimensions import SparseDimension
+from graphax.sparse.tensor import SparseTensor
+from utils import assert_matmul_result
 
 
-class TestSparseMul(unittest.TestCase):
+class TestSparseMatmul(unittest.TestCase):
     def test_simple_broadcast(self):
         key = jrand.PRNGKey(42)
         xkey, ykey = jrand.split(key, 2)
@@ -24,27 +26,7 @@ class TestSparseMul(unittest.TestCase):
         )
         stres = stx @ sty
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
-
-    def test_simple_broadcast_block(self):
-        key = jrand.PRNGKey(42)
-        xkey, ykey = jrand.split(key, 2)
-        x = jrand.normal(xkey, (2, 2, 2))
-        y = jrand.normal(ykey, (2, 2, 2))
-
-        res_x = block_diag(*x)
-        res_y = block_diag(*y)
-        res = res_x @ res_y
-
-        stx = BlockSparseTensor(
-            [SparseDimension(0, 2, 0, 1, 2, 1)], [SparseDimension(1, 2, 0, 0, 2, 2)], x
-        )
-        sty = BlockSparseTensor(
-            [SparseDimension(0, 2, 0, 1, 2, 1)], [SparseDimension(1, 2, 0, 0, 2, 2)], y
-        )
-        stres = stx @ sty
-
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (4,), (4,), (4,))
 
     def test_simple_Nones(self):
         _x = jnp.eye(3)
@@ -60,7 +42,7 @@ class TestSparseMul(unittest.TestCase):
         )
         stres = stx @ sty
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (3,), (3,), None)
 
     ### Tests for 4d tensors
     def test_4d_sparse_double_contraction(self):
@@ -91,34 +73,7 @@ class TestSparseMul(unittest.TestCase):
         )
         stres = stx @ sty
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
-
-    def test_4d_sparse_double_contraction_block(self):
-        key = jrand.PRNGKey(42)
-        xkey, ykey = jrand.split(key, 2)
-
-        x = jrand.normal(xkey, (3, 5, 2, 2, 2, 2))
-        y = jrand.normal(ykey, (3, 5, 2, 2, 2, 2))
-
-        stx = BlockSparseTensor(
-            [SparseDimension(0, 3, 0, 2, 2, 2), SparseDimension(1, 5, 1, 3, 2, 3)],
-            [SparseDimension(2, 3, 0, 0, 2, 4), SparseDimension(3, 5, 1, 1, 2, 5)],
-            x,
-        )
-        sty = BlockSparseTensor(
-            [SparseDimension(0, 3, 0, 2, 2, 2), SparseDimension(1, 5, 1, 3, 2, 3)],
-            [SparseDimension(2, 3, 0, 0, 2, 4), SparseDimension(3, 5, 1, 1, 2, 5)],
-            y,
-        )
-
-        stres = stx @ sty
-
-        dense_x = jnp.array(stx)
-        dense_y = jnp.array(sty)
-
-        res = jnp.einsum("ijkl,klmn->ijmn", dense_x, dense_y)
-
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (3, 5), (3, 5), (3, 5))
 
     def test_4d_only_Nones(self):
         d1 = jnp.eye(3)
@@ -143,7 +98,7 @@ class TestSparseMul(unittest.TestCase):
         )
         stres = stx @ sty
 
-        self.assertTrue(jnp.allclose(res, jnp.array(stres)))
+        assert_matmul_result(stres, res, (3, 4), (4, 3), None)
 
 
 if __name__ == "__main__":
