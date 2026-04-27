@@ -118,7 +118,7 @@ def make_parallel_jacobian(i, primals, val_out, elemental):
                     if isinstance(d, SparseDimension):
                         _d = out_dims[d.other_id]
                         out_dims[d.other_id] = replace(_d, other_id=_d.other_id + 1)
-            return _swap_back_axes(SparseTensor(out_dims, primal_dims, elemental))
+            return SparseTensor(out_dims, primal_dims, elemental, sort_val=False)
 
         elif isinstance(elemental, float) or elemental.size == 1:
             if not isinstance(elemental, float):
@@ -148,7 +148,7 @@ def make_parallel_jacobian(i, primals, val_out, elemental):
             f"Parallel Jacobians with {len(primals)} inputs not yet supported!"
         )
 
-    return SparseTensor(out_dims, primal_dims, elemental)
+    return SparseTensor(out_dims, primal_dims, elemental, sort_val=False)
 
 
 elemental_rules = {}
@@ -296,7 +296,7 @@ def with_type_promotion(fn: Callable) -> Callable:
 # TODO this can be significantly optimized
 # Currently we are creating a new array of ones everytime. Not smart!
 @with_type_promotion
-def add_elemental_rule(x, y):
+def add_elemental_rule(x, y, **kwargs):
     return (jnp.ones_like(y), jnp.ones_like(x))
 
 
@@ -305,7 +305,7 @@ defelemental(lax.add_p, add_elemental_rule)
 
 # TODO this can also be optimized significantly
 @with_type_promotion
-def sub_elemental_rule(x, y):
+def sub_elemental_rule(x, y, **kwargs):
     return (jnp.ones_like(y), -jnp.ones_like(x))
 
 
@@ -313,7 +313,7 @@ defelemental(lax.sub_p, sub_elemental_rule)
 
 
 @with_type_promotion
-def mul_elemental_rule(x, y):
+def mul_elemental_rule(x, y, **kwargs):
     return (y, x)
 
 
@@ -321,7 +321,7 @@ defelemental(lax.mul_p, mul_elemental_rule)
 
 
 @with_type_promotion
-def div_elemental_rule(x, y):
+def div_elemental_rule(x, y, **kwargs):
     return (1.0 / y, ((-1.0) * x) / y**2)
 
 
@@ -329,7 +329,7 @@ defelemental(lax.div_p, div_elemental_rule)
 
 
 @with_type_promotion
-def atan2_elemental_rule(x, y):
+def atan2_elemental_rule(x, y, **kwargs):
     abs2 = x**2 + y**2
     return (y / abs2, ((-1.0) * x) / abs2)
 
@@ -338,7 +338,7 @@ defelemental(lax.atan2_p, atan2_elemental_rule)
 
 
 @with_type_promotion
-def max_elemental_rule(x, y):
+def max_elemental_rule(x, y, **kwargs):
     return (x < y, x >= y)
 
 
@@ -346,7 +346,7 @@ defelemental(lax.max_p, max_elemental_rule)
 
 
 @with_type_promotion
-def min_elemental_rule(x, y):
+def min_elemental_rule(x, y, **kwargs):
     return (x < y, x <= y)
 
 
@@ -354,7 +354,7 @@ defelemental(lax.min_p, min_elemental_rule)
 
 
 @with_type_promotion
-def eq_elemental_rule(x, y):
+def eq_elemental_rule(x, y, **kwargs):
     return (jnp.zeros_like(y), jnp.zeros_like(x))
 
 
@@ -378,7 +378,7 @@ defelemental(lax.clamp_p, clamp_elemental_rule)
 
 # rem(x, y) = x - y * trunc(x/y): d/dx = 1, d/dy = -trunc(x/y)
 @with_type_promotion
-def rem_elemental_rule(x, y):
+def rem_elemental_rule(x, y, **kwargs):
     return (jnp.ones_like(y), -jnp.trunc(x / y))
 
 
@@ -734,11 +734,10 @@ def dot_general_elemental_rule(primals, **params):
                 rhs_primal_dims.append(SparseDimension(other_rid, rd, None, _rid))
                 lhs_out_dims.append(DenseDimension(len(lhs_out_dims), rd, rid))
 
-    lhs_tensor = SparseTensor(lhs_out_dims, lhs_primal_dims, rhs)
-    rhs_tensor = SparseTensor(rhs_out_dims, rhs_primal_dims, lhs)
+    # Initialize with sort_val=False to strictly preserve the logical ID order
+    lhs_tensor = SparseTensor(lhs_out_dims, lhs_primal_dims, rhs, sort_val=False)
+    rhs_tensor = SparseTensor(rhs_out_dims, rhs_primal_dims, lhs, sort_val=False)
 
-    lhs_tensor = _swap_back_axes(lhs_tensor)
-    rhs_tensor = _swap_back_axes(rhs_tensor)
     return val_out, [lhs_tensor, rhs_tensor]
 
 
