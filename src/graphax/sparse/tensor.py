@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC
-from dataclasses import dataclass
+from dataclasses import replace
 from math import prod
 from typing import Callable, Literal, override
 from collections.abc import Sequence
@@ -12,18 +12,23 @@ from jax import Array
 from jax.tree_util import register_pytree_node_class
 from jax.typing import DTypeLike
 
-from .ops.utils import (
+import math
+from functools import partial
+
+from graphax.sparse.ops.utils import (
     _assert_sparse_tensor_consistency,
     _copy,
     _sort_val,
     _arr2st,
+    _swap_back_axes,
+    _materialize_dimensions
 )
-from .ops.dense import dense
-from .ops.transpose import transpose
-from .ops.matmul import matmul
-from .ops.elementwise import elementwise
+from graphax.sparse.ops.dense import dense
+from graphax.sparse.ops.transpose import transpose
+from graphax.sparse.ops.matmul import matmul
+from graphax.sparse.ops.elementwise import elementwise
 
-from .dimensions import Dimension, DenseDimension, SparseDimension
+from graphax.sparse.dimensions import Dimension, DenseDimension, SparseDimension
 
 
 Transform = Callable[["SparseTensor", "SparseTensor", Array], "SparseTensor"]
@@ -128,28 +133,6 @@ class SparseMathMixin:
     def __ge__(self, other):
         return elementwise(self, other, jax.lax.ge)
 
-    def __neg__(self):
-        return self.copy(scalar_mult=-self.scalar_mult)
-
-    def __pos__(self):
-        return self.copy()
-
-    def __abs__(self):
-        return self.copy(
-            val=jnp.abs(self.val) if self.val is not None else None,
-            scalar_mult=jnp.abs(self.scalar_mult),
-        )
-
-    def __invert__(self):
-        return self.copy(
-            val=jax.lax.bitwise_not(self.val) if self.val is not None else None
-        )
-
-    def __round__(self, ndigits=None):
-        return self.copy(
-            val=jnp.round(self.val, ndigits) if self.val is not None else None,
-            scalar_mult=jnp.round(self.scalar_mult, ndigits),
-        )
 
 
 @register_pytree_node_class
@@ -340,7 +323,8 @@ class SparseTensor(SparseMathMixin):
 
     def swapdims(self) -> SparseTensor:
         return self.transpose(
-            [d.id for d in self.primal_dims], [d.id for d in self.out_dims]
+            list(range(len(self.out_dims), self.ndim)),
+            list(range(len(self.out_dims)))
         )
 
     @property
@@ -406,8 +390,19 @@ class SparseTensor(SparseMathMixin):
         val: Array | None = None,
         scalar_mult: Array | None = None,
         fill_value: Array | None = None,
+        out_dims: Sequence[Dimension] | None = None,
+        primal_dims: Sequence[Dimension] | None = None,
+        deep=False,
     ):
-        return _copy(self, val, scalar_mult, fill_value)
+        return _copy(
+            self,
+            val,
+            scalar_mult,
+            fill_value,
+            out_dims=out_dims,
+            primal_dims=primal_dims,
+            deep=deep,
+        )
 
     # Low priority TODO: axis, and other args
     def all(self) -> Array:
@@ -484,6 +479,8 @@ class SparseTensor(SparseMathMixin):
 
     # TODO make __iter__ return an iterable of sparse tensors along the sparse component?
     def __iter__(self):
+        if self.ndim == 0:
+            return iter([self.dense()])
         return iter(self.dense())
 
     # TODO as with at, make this sparse aware for generalization.
@@ -675,4 +672,326 @@ class SparseTensor(SparseMathMixin):
     def on_device_size_in_bytes(self):
         return self._target_arr.on_device_size_in_bytes()
 
+    def __neg__(self):
+        return self.copy(scalar_mult=-self.scalar_mult)
 
+    def __pos__(self):
+        return self.copy()
+
+    def __abs__(self):
+        return self.copy(
+            val=jnp.abs(self.val) if self.val is not None else None,
+            scalar_mult=jnp.abs(self.scalar_mult),
+        )
+
+    def __invert__(self):
+        return self.copy(
+            val=jax.lax.bitwise_not(self.val) if self.val is not None else None
+        )
+
+    def __round__(self, ndigits=None):
+        return self.copy(
+            val=jnp.round(self.val, ndigits) if self.val is not None else None,
+            scalar_mult=jnp.round(self.scalar_mult, ndigits),
+        )
+
+
+def get_valid_pairings(
+    st: SparseTensor, 
+    dim_id: int, 
+    grouping_vector: tuple[int, ...] | None = None
+) -> list[int]:
+    """
+    Finds valid dimension IDs that can be paired with the given dim_id.
+    If grouping_vector is provided, dimensions already paired (not -1) are ignored.
+    """
+    target_dim = None
+    is_out_dim = False
+    target_dim_pos = -1
+    
+    out_len = len(st.out_dims)
+
+    # 1. Locate the dimension and positional index
+    for i, d in enumerate(st.out_dims):
+        if d.id == dim_id:
+            target_dim = d
+            is_out_dim = True
+            target_dim_pos = i
+            break
+            
+    if target_dim is None:
+        for i, d in enumerate(st.primal_dims):
+            if d.id == dim_id:
+                target_dim = d
+                target_dim_pos = out_len + i
+                break
+                
+    if target_dim is None:
+        raise ValueError(f"Dimension ID {dim_id} not found in SparseTensor.")
+
+    # If the target itself is already paired, return empty
+    if grouping_vector is not None and target_dim_pos < len(grouping_vector):
+        if grouping_vector[target_dim_pos] != -1:
+            return []
+
+    # 2. Find positional index of a given ID (helper)
+    def _get_dim_pos(search_id: int) -> int:
+        for i, d in enumerate(st.out_dims):
+            if d.id == search_id: return i
+        for i, d in enumerate(st.primal_dims):
+            if d.id == search_id: return out_len + i
+        return -1
+
+    # 3. Identify valid partners
+    valid_ids = []
+
+    if isinstance(target_dim, SparseDimension):
+        # Sparse dimensions are locked to their other_id
+        valid_ids = [target_dim.other_id]
+    else:
+        # Dense dimensions scan the opposite side
+        opposite_dims = st.primal_dims if is_out_dim else st.out_dims
+        for d in opposite_dims:
+            if isinstance(d, DenseDimension) and math.gcd(target_dim.logical_size, d.logical_size) > 1:
+                valid_ids.append(d.id)
+
+    # 4. Filter against the grouping vector
+    if grouping_vector is not None:
+        filtered_ids = []
+        for v_id in valid_ids:
+            idx = _get_dim_pos(v_id)
+            if idx != -1 and idx < len(grouping_vector) and grouping_vector[idx] == -1:
+                filtered_ids.append(v_id)
+        valid_ids = filtered_ids
+
+    return valid_ids
+
+@partial(jax.jit, static_argnums=1)
+def apply_dynamic_sparsity(
+    st: SparseTensor, 
+    sp_rules: tuple[tuple[int, ...], ...]
+) -> SparseTensor:
+    if not sp_rules or st.val is None:
+        return st
+
+    out_len = len(st.out_dims)
+    total_ndim = out_len + len(st.primal_dims)
+    
+    valid_pairs = {}
+    factors = {}
+    
+    for group_id, rule in enumerate(sp_rules):
+        if len(rule) == 2:
+            idx1, idx2 = rule
+            factor = -1
+        elif len(rule) == 3:
+            idx1, idx2, factor = rule
+        else:
+            continue
+            
+        if idx1 < total_ndim and idx2 < total_ndim:
+            is_out1 = idx1 < out_len
+            is_out2 = idx2 < out_len
+            rel_idx1 = idx1 if is_out1 else idx1 - out_len
+            rel_idx2 = idx2 if is_out2 else idx2 - out_len
+            valid_pairs[group_id] = ((is_out1, rel_idx1), (is_out2, rel_idx2))
+            factors[group_id] = factor
+
+    filtered_pairs = {}
+    used_axes = set()
+    for gid, ((is_out1, idx1), (is_out2, idx2)) in valid_pairs.items():
+        abs_idx1 = idx1 if is_out1 else idx1 + out_len
+        abs_idx2 = idx2 if is_out2 else idx2 + out_len
+        
+        if abs_idx1 in used_axes or abs_idx2 in used_axes or abs_idx1 == abs_idx2:
+            continue
+            
+        d1 = st.out_dims[idx1] if is_out1 else st.primal_dims[idx1]
+        d2 = st.out_dims[idx2] if is_out2 else st.primal_dims[idx2]
+        
+        # Prevent breaking existing external pairs
+        conflict = False
+        if isinstance(d1, SparseDimension) and getattr(d1, 'other_id', None) != d2.id:
+            conflict = True
+        if isinstance(d2, SparseDimension) and getattr(d2, 'other_id', None) != d1.id:
+            conflict = True
+            
+        if conflict:
+            continue
+            
+        used_axes.add(abs_idx1)
+        used_axes.add(abs_idx2)
+        filtered_pairs[gid] = ((is_out1, idx1), (is_out2, idx2))
+        
+    if not filtered_pairs:
+        return st
+
+    # 1. Determine axes to extract and drop
+    axes_to_front = []
+    axes_to_drop = []
+    idx_arrays = []
+
+    for gid, ((is_out1, idx1), (is_out2, idx2)) in filtered_pairs.items():
+        d1 = st.out_dims[idx1] if is_out1 else st.primal_dims[idx1]
+        d2 = st.out_dims[idx2] if is_out2 else st.primal_dims[idx2]
+        
+        factor = factors[gid]
+        size = math.gcd(d1.logical_size, d2.logical_size) if factor == -1 else factor
+        
+        v1 = getattr(d1, 'val_dim', None)
+        v2 = getattr(d2, 'val_dim', None)
+        if v1 is not None and v1 >= st.val.ndim: v1 = None
+        if v2 is not None and v2 >= st.val.ndim: v2 = None
+        
+        if factor == 0:
+            if v1 is not None: axes_to_drop.append(v1)
+            if v2 is not None: axes_to_drop.append(v2)
+        else:
+            # FIX 1: Only extract if they are distinct physical axes!
+            if v1 is not None and v2 is not None and v1 != v2:
+                axes_to_front.extend([v1, v2])
+                idx_arrays.append(jnp.arange(size))
+
+    # 2. Build explicit map of physical axes
+    seen_axes = set()
+    unique_front = []
+    for ax in axes_to_front:
+        if ax not in seen_axes:
+            unique_front.append(ax)
+            seen_axes.add(ax)
+            
+    axes_to_drop = list(set(axes_to_drop))
+    remaining_axes = [i for i in range(st.val.ndim) if i not in seen_axes and i not in axes_to_drop]
+    
+    val_dim_map = {}
+    current_val_dim = 0
+    
+    # Paired extractions collapse into a single target axis
+    for i in range(0, len(unique_front), 2):
+        val_dim_map[unique_front[i]] = current_val_dim
+        val_dim_map[unique_front[i+1]] = current_val_dim
+        current_val_dim += 1
+        
+    for ax in remaining_axes:
+        val_dim_map[ax] = current_val_dim
+        current_val_dim += 1
+        
+    # 3. Vectorized Array Extraction
+    perm = tuple(unique_front) + tuple(remaining_axes) + tuple(axes_to_drop)
+    val_transposed = jnp.transpose(st.val, perm)
+    
+    if idx_arrays:
+        mesh_indices = jnp.ix_(*idx_arrays) 
+        val_diagonal = val_transposed[tuple(idx for pair in mesh_indices for idx in (pair, pair))]
+    else:
+        val_diagonal = val_transposed
+
+    if axes_to_drop:
+        for _ in range(len(axes_to_drop)):
+            val_diagonal = val_diagonal[..., 0]
+
+    # 4. Reconstruct Dimensions enforcing exact shared assignments
+    new_out_dims = list(st.out_dims)
+    new_primal_dims = list(st.primal_dims)
+    touched_out = set()
+    touched_primal = set()
+
+    for gid, ((is_out1, idx1), (is_out2, idx2)) in filtered_pairs.items():
+        d1 = st.out_dims[idx1] if is_out1 else st.primal_dims[idx1]
+        d2 = st.out_dims[idx2] if is_out2 else st.primal_dims[idx2]
+        
+        factor = factors[gid]
+        size = math.gcd(d1.logical_size, d2.logical_size) if factor == -1 else factor
+        b1 = d1.logical_size // size
+        b2 = d2.logical_size // size
+        
+        v1 = getattr(d1, 'val_dim', None)
+        v2 = getattr(d2, 'val_dim', None)
+        if v1 is not None and v1 >= st.val.ndim: v1 = None
+        if v2 is not None and v2 >= st.val.ndim: v2 = None
+        
+        if factor == 0:
+            nv = None
+        else:
+            # Force both halves to adopt the exact same physical axis mappings
+            old_v = v1 if v1 is not None else v2
+            nv = val_dim_map.get(old_v) if old_v is not None else None
+
+        def _update_dim(d, other_d, b_size):
+            old_b = getattr(d, 'block_val_dim', None)
+            if old_b is not None and old_b >= st.val.ndim: old_b = None
+            nb = val_dim_map.get(old_b) if (factor != 0 and old_b is not None) else None
+            
+            # FIX: Route the primary physical axis to the block if the outer size is 1
+            actual_nv = nv if size > 1 else None
+            actual_nb = nb
+            if size == 1 and b_size > 1 and nv is not None:
+                actual_nb = nv
+                
+            return SparseDimension(
+                id=d.id, size=size, val_dim=actual_nv,
+                other_id=other_d.id,
+                block_size=b_size if b_size > 1 else None,
+                block_val_dim=actual_nb if b_size > 1 else None
+            )
+
+        if is_out1: 
+            new_out_dims[idx1] = _update_dim(d1, d2, b1)
+            touched_out.add(idx1)
+        else: 
+            new_primal_dims[idx1] = _update_dim(d1, d2, b1)
+            touched_primal.add(idx1)
+            
+        if is_out2: 
+            new_out_dims[idx2] = _update_dim(d2, d1, b2)
+            touched_out.add(idx2)
+        else: 
+            new_primal_dims[idx2] = _update_dim(d2, d1, b2)
+            touched_primal.add(idx2)
+
+    def _remap_untouched(d):
+        old_v = getattr(d, 'val_dim', None)
+        old_b = getattr(d, 'block_val_dim', None)
+        nv = val_dim_map.get(old_v) if old_v is not None else None
+        nb = val_dim_map.get(old_b) if old_b is not None else None
+        
+        if isinstance(d, SparseDimension):
+            return replace(d, val_dim=nv, block_val_dim=nb)
+        return replace(d, val_dim=nv)
+
+    final_out = tuple(_remap_untouched(d) if i not in touched_out else new_out_dims[i] for i, d in enumerate(st.out_dims))
+    final_primal = tuple(_remap_untouched(d) if i not in touched_primal else new_primal_dims[i] for i, d in enumerate(st.primal_dims))
+
+    # 5. Lock Canonical Physical Ordering
+    final_dims = final_out + final_primal
+    target_perm = []
+    seen_target = set()
+    
+    for d in final_dims:
+        if getattr(d, 'val_dim', None) is not None and d.val_dim not in seen_target:
+            target_perm.append(d.val_dim)
+            seen_target.add(d.val_dim)
+        if getattr(d, 'block_val_dim', None) is not None and d.block_val_dim not in seen_target:
+            target_perm.append(d.block_val_dim)
+            seen_target.add(d.block_val_dim)
+            
+    for i in range(val_diagonal.ndim):
+        if i not in seen_target:
+            target_perm.append(i)
+            seen_target.add(i)
+            
+    if target_perm != list(range(val_diagonal.ndim)):
+        val_diagonal = jnp.transpose(val_diagonal, target_perm)
+        inv_perm = {old: new for new, old in enumerate(target_perm)}
+        
+        def _reorder_val_dim(d):
+            nv = inv_perm.get(getattr(d, 'val_dim', None)) if getattr(d, 'val_dim', None) is not None else None
+            if isinstance(d, SparseDimension):
+                nb = inv_perm.get(getattr(d, 'block_val_dim', None)) if getattr(d, 'block_val_dim', None) is not None else None
+                return replace(d, val_dim=nv, block_val_dim=nb)
+            return replace(d, val_dim=nv)
+            
+        final_out = tuple(_reorder_val_dim(d) for d in final_out)
+        final_primal = tuple(_reorder_val_dim(d) for d in final_primal)
+
+    return SparseTensor(final_out, final_primal, val_diagonal, st.scalar_mult, sort_val=False, check_consistency=False)

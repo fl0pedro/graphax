@@ -87,17 +87,20 @@ class ContractionResult:
     scalar_multiplier: float
 
 
+def _is_sparse(obj) -> bool: # maybe we can add this to dimensions
+    return getattr(type(obj), "__name__", "") == "SparseTensor"
+
 @jax.custom_vjp
-def matmul(lhs: SparseTensor | Array, rhs: SparseTensor | Array) -> SparseTensor:
+def matmul(lhs: SparseTensor | Array, rhs: SparseTensor | Array, count: bool = False) -> SparseTensor | Array:
     from ..tensor import SparseTensor
 
-    if not isinstance(lhs, SparseTensor) and not isinstance(rhs, SparseTensor):
-        raise ValueError("At least one of lhs or rhs must be a SparseTensor.")
-    if not isinstance(lhs, SparseTensor):
-        assert isinstance(rhs, SparseTensor)
+    if not _is_sparse(lhs) and not _is_sparse(rhs):
+        return jnp.matmul(lhs, rhs)
+    if not _is_sparse(lhs):
+        assert _is_sparse(rhs)
         lhs = _arr2st(lhs, out_ndim=lhs.ndim - len(rhs.out_dims))
-    if not isinstance(rhs, SparseTensor):
-        assert isinstance(lhs, SparseTensor)
+    if not _is_sparse(rhs):
+        assert _is_sparse(lhs)
         rhs = _arr2st(rhs, out_ndim=len(lhs.primal_dims))
 
     rhs_out_dims, rhs_primal_dims, rhs_id_offset = _align_tensor_ids(lhs, rhs)
@@ -123,7 +126,10 @@ def matmul(lhs: SparseTensor | Array, rhs: SparseTensor | Array) -> SparseTensor
         final_lhs_block_lens,
         final_rhs_block_lens,
         scalar_multiplier,
-    ) = _execute_block_sparse_contraction(left_val, right_val, ctx.pairs)
+        adds,
+        muls,
+        fmas
+    ) = _execute_block_sparse_contraction(left_val, right_val, ctx.pairs, count)
 
     res = ContractionResult(
         grid=contracted_grid,
@@ -133,7 +139,10 @@ def matmul(lhs: SparseTensor | Array, rhs: SparseTensor | Array) -> SparseTensor
         scalar_multiplier=scalar_multiplier,
     )
 
-    return _build_output_tensor(ctx, rhs_dims, res)
+    st, (_adds, _muls, _fmas) = _build_output_tensor(ctx, rhs_dims, res, count)
+    if count is not False:
+        return st, (_adds + adds, _muls + muls, _fmas + fmas)
+    return st
 
 
 def _resolve_matched_dims(
@@ -471,9 +480,7 @@ def _resolve_contract_pair(
     r_block_len, r_block_val_dim = _get_dim_vals(rhs_out_dim, False)
     r_shared_len, r_shared_val_dim = _get_dim_vals(rhs_primal_dim, False)
 
-    logical_element_count = getattr(
-        lhs_primal_dim, "block_size", getattr(lhs_primal_dim, "size", 1)
-    )
+    logical_element_count = lhs_primal_dim.logical_size
 
     meta = DimensionPair(
         pairing_type="contract",
@@ -614,34 +621,44 @@ def _prepare_physical_array(
     metadata_value_axes: Sequence[tuple[int | None, int | None, int | None]],
     metadata_logical_lengths: Sequence[tuple[int, int, int]],
 ) -> Array:
-    """Broadcasting and transposing raw values into the canonical contraction shape."""
+    """Prepare raw values without eagerly broadcasting to the canonical shape."""
     broadcast_dims, canonical_shape = _extract_broadcast_info(
         metadata_value_axes, metadata_logical_lengths
     )
 
-    valid_indices = tuple(i for i, v in enumerate(broadcast_dims) if v is not None)
+    valid_indices = tuple(i for i, v in enumerate(broadcast_dims) if v is not None and v < val.ndim)
     source_dims = tuple(broadcast_dims[i] for i in valid_indices)
 
     leftover_axes = [v for v in range(val.ndim) if v not in source_dims]
-    canonical_shape.extend([val.shape[v] for v in leftover_axes])
 
     full_source_dims = source_dims + tuple(leftover_axes)
     full_target_map = valid_indices + tuple(
         len(broadcast_dims) + i for i in range(len(leftover_axes))
     )
 
-    if val.ndim < len(full_source_dims):
-        val = val.reshape(val.shape + (1,) * (len(full_source_dims) - val.ndim))
+    N = len(broadcast_dims) + len(leftover_axes)
+    
+    # 0-cost passthrough if array is already inherently aligned 
+    if full_source_dims == full_target_map and N == val.ndim:
+        return val
 
-    val = val.transpose(full_source_dims)
-
-    # Broadcast to canonical shape
-    intermediate_shape = list(canonical_shape)
-    for i, target_dim in enumerate(full_target_map):
-        intermediate_shape[target_dim] = val.shape[i]
-
-    val = jax.lax.broadcast_in_dim(val, tuple(intermediate_shape), full_target_map)
-    return jnp.broadcast_to(val, tuple(canonical_shape))
+    perm = [-1] * N
+    for src, tgt in zip(full_source_dims, full_target_map):
+        perm[tgt] = src
+        
+    ones_idx = val.ndim
+    for i in range(N):
+        if perm[i] == -1:
+            perm[i] = ones_idx
+            ones_idx += 1
+            
+    if ones_idx > val.ndim:
+        val = val.reshape(val.shape + (1,) * (ones_idx - val.ndim))
+        
+    if perm != list(range(N)):
+        val = val.transpose(perm)
+    
+    return val
 
 
 def _prepare_physical_arrays(
@@ -806,43 +823,125 @@ def _prepare_contraction_views(
     block_split_factors: list[int],
 ) -> tuple[Array, Array, list[int], list[int]]:
     num_pairs = len(pairs_meta)
-    lhs_bc_shape, rhs_bc_shape = list(lhs_val.shape), list(rhs_val.shape)
-    for i, pm in enumerate(pairs_meta):
-        _process_bc_shape_pair(
-            i, pm, total_tiled_lengths, block_split_factors, lhs_bc_shape, rhs_bc_shape
-        )
 
-    lhs_val = jnp.broadcast_to(lhs_val, tuple(lhs_bc_shape))
-    rhs_val = jnp.broadcast_to(rhs_val, tuple(rhs_bc_shape))
+    lhs_phy_split = []
+    rhs_phy_split = []
 
-    lhs_split, rhs_split = _calculate_contraction_splits(
-        num_pairs,
-        pairs_meta,
-        total_tiled_lengths,
-        block_split_factors,
-        lhs_bc_shape,
-        rhs_bc_shape,
-    )
+    for i, p in enumerate(pairs_meta):
+        phy_0 = lhs_val.shape[AXES_PER_PAIR * i]
+        phy_1 = lhs_val.shape[AXES_PER_PAIR * i + 1]
+        phy_2 = lhs_val.shape[AXES_PER_PAIR * i + 2]
+
+        lhs_phy_split.append(phy_0)
+        lhs_phy_split.append(phy_1)
+        if phy_2 == 1:
+            lhs_phy_split.extend([1, 1])
+        else:
+            lhs_phy_split.extend([total_tiled_lengths[i] // p.lhs.outer_len, block_split_factors[i]])
+
+        phy_0_r = rhs_val.shape[AXES_PER_PAIR * i]
+        phy_1_r = rhs_val.shape[AXES_PER_PAIR * i + 1]
+        phy_2_r = rhs_val.shape[AXES_PER_PAIR * i + 2]
+
+        rhs_phy_split.append(phy_0_r)
+        if phy_1_r == 1:
+            rhs_phy_split.extend([1, 1])
+        else:
+            rhs_phy_split.extend([total_tiled_lengths[i] // p.rhs.outer_len, block_split_factors[i]])
+        rhs_phy_split.append(phy_2_r)
+
+    lhs_leftovers = list(lhs_val.shape[AXES_PER_PAIR * num_pairs :])
+    rhs_leftovers = list(rhs_val.shape[AXES_PER_PAIR * num_pairs :])
+    lhs_phy_split.extend(lhs_leftovers)
+    rhs_phy_split.extend(rhs_leftovers)
+
     perm_lhs, perm_rhs = _calculate_contraction_perms(num_pairs)
+    for ax in range(SPLIT_AXES * num_pairs, len(lhs_phy_split)):
+        perm_lhs.append(ax)
+    for ax in range(SPLIT_AXES * num_pairs, len(rhs_phy_split)):
+        perm_rhs.append(ax)
 
-    lhs_view = (
-        lhs_val.reshape(lhs_split)
-        .transpose(perm_lhs)
-        .reshape(
-            *total_tiled_lengths,
-            *[p.lhs.block_len for p in pairs_meta],
-            *block_split_factors,
-        )
-    )
-    rhs_view = (
-        rhs_val.reshape(rhs_split)
-        .transpose(perm_rhs)
-        .reshape(
-            *total_tiled_lengths,
-            *block_split_factors,
-            *[p.rhs.shared_block_len for p in pairs_meta],
-        )
-    )
+    # Conditionally execute memory-heavy topology mappings
+    if tuple(lhs_phy_split) != lhs_val.shape:
+        lhs_view = lhs_val.reshape(lhs_phy_split)
+    else:
+        lhs_view = lhs_val
+        
+    if perm_lhs != list(range(len(lhs_phy_split))):
+        lhs_view = lhs_view.transpose(perm_lhs)
+
+    if tuple(rhs_phy_split) != rhs_val.shape:
+        rhs_view = rhs_val.reshape(rhs_phy_split)
+    else:
+        rhs_view = rhs_val
+        
+    if perm_rhs != list(range(len(rhs_phy_split))):
+        rhs_view = rhs_view.transpose(perm_rhs)
+
+    # Target unmerged shape (Broadcast BEFORE merge) - Fixed loop variable leakage
+    lhs_unmerged_target = []
+    for i in range(num_pairs):
+        p = pairs_meta[i]
+        lhs_unmerged_target.extend([p.lhs.outer_len, total_tiled_lengths[i] // p.lhs.outer_len])
+    for i in range(num_pairs):
+        p = pairs_meta[i]
+        lhs_unmerged_target.append(p.lhs.block_len)
+    for i in range(num_pairs):
+        lhs_unmerged_target.append(block_split_factors[i])
+    lhs_unmerged_target.extend(lhs_leftovers)
+
+    rhs_unmerged_target = []
+    for i in range(num_pairs):
+        p = pairs_meta[i]
+        rhs_unmerged_target.extend([p.rhs.outer_len, total_tiled_lengths[i] // p.rhs.outer_len])
+    for i in range(num_pairs):
+        rhs_unmerged_target.append(block_split_factors[i])
+    for i in range(num_pairs):
+        p = pairs_meta[i]
+        rhs_unmerged_target.append(p.rhs.shared_block_len)
+    rhs_unmerged_target.extend(rhs_leftovers)
+
+    # Free broadcast without materializing a dense grid yet
+    if lhs_view.shape != tuple(lhs_unmerged_target):
+        lhs_view = jnp.broadcast_to(lhs_view, tuple(lhs_unmerged_target))
+    if rhs_view.shape != tuple(rhs_unmerged_target):
+        rhs_view = jnp.broadcast_to(rhs_view, tuple(rhs_unmerged_target))
+
+    # Now safely merge the tiles (Materializes only when tiling is required)
+    lhs_merged_shape = list(total_tiled_lengths)
+    for i in range(num_pairs):
+        p = pairs_meta[i]
+        lhs_merged_shape.append(p.lhs.block_len)
+    for i in range(num_pairs):
+        lhs_merged_shape.append(block_split_factors[i])
+    lhs_merged_shape.extend(lhs_leftovers)
+
+    rhs_merged_shape = list(total_tiled_lengths)
+    for i in range(num_pairs):
+        rhs_merged_shape.append(block_split_factors[i])
+    for i in range(num_pairs):
+        p = pairs_meta[i]
+        rhs_merged_shape.append(p.rhs.shared_block_len)
+    rhs_merged_shape.extend(rhs_leftovers)
+
+    if lhs_view.shape != tuple(lhs_merged_shape):
+        lhs_view = lhs_view.reshape(lhs_merged_shape)
+    if rhs_view.shape != tuple(rhs_merged_shape):
+        rhs_view = rhs_view.reshape(rhs_merged_shape)
+
+    lhs_bc_shape = []
+    rhs_bc_shape = []
+    for i, p in enumerate(pairs_meta):
+        lhs_bc_shape.extend([
+            p.lhs.outer_len,
+            p.lhs.block_len,
+            (total_tiled_lengths[i] // p.lhs.outer_len) * block_split_factors[i]
+        ])
+        rhs_bc_shape.extend([
+            p.rhs.outer_len,
+            (total_tiled_lengths[i] // p.rhs.outer_len) * block_split_factors[i],
+            p.rhs.shared_block_len
+        ])
 
     return lhs_view, rhs_view, lhs_bc_shape, rhs_bc_shape
 
@@ -870,6 +969,7 @@ def _reduce_contraction_grid(
     total_tiled_lengths: list[int],
     final_lhs_block_lens: list[int],
     final_rhs_block_lens: list[int],
+    count: bool = False,
 ) -> Array:
     num_dimension_pairs = len(pairs_meta)
     per_idx, per_num = [], []
@@ -889,12 +989,29 @@ def _reduce_contraction_grid(
         )
 
     extra = final_lhs_block_lens + final_rhs_block_lens
+    flat_idx_array = flat_idx.flatten()
+    
+    # OPTIMIZATION: Fast path for identity mapping (no collisions, already in order)
+    if np.array_equal(flat_idx_array, np.arange(len(flat_idx_array))):
+        return res_view.reshape(*per_num, *extra), (0, 0, 0)
+        
+    # OPTIMIZATION: Fast path for pure permutation (no collisions, needs fast reorder)
+    if len(np.unique(flat_idx_array)) == len(flat_idx_array):
+        inverse_idx = np.argsort(flat_idx_array)
+        res_reduced = res_view.reshape(math.prod(total_tiled_lengths), math.prod(extra))[inverse_idx]
+        return res_reduced.reshape(*per_num, *extra), (0, 0, 0)
+
+    # Fallback to segment_sum for actual reductions (e.g. misaligned block collisions)
     res_reduced = jax.ops.segment_sum(
         res_view.reshape(math.prod(total_tiled_lengths), math.prod(extra)),
-        jnp.array(flat_idx.flatten()),
+        jnp.array(flat_idx_array),
         num_segments=math.prod(per_num),
     )
-    return res_reduced.reshape(*per_num, *extra)
+    res = res_reduced.reshape(*per_num, *extra)
+    adds = 0
+    if count is not False:
+        adds = res_view.size - math.prod(per_num)
+    return res, (adds, 0, 0)
 
 
 def _collect_dot_general_axes(
@@ -961,120 +1078,125 @@ def _finalize_contraction_output(
     shared_tiling_factors: list[int],
     lhs_bc_shape: list[int],
     rhs_bc_shape: list[int],
-) -> tuple[Array, list[int], list[int]]:
+    lhs_leftovers: list[int],
+    rhs_leftovers: list[int],
+    count: bool = False,
+) -> tuple[Array, list[int], list[int], tuple[int, int, int]]:
+    N = num_dimension_pairs
     non_contract_indices = [
         i for i, p in enumerate(pairs_meta) if p.pairing_type != "contract"
     ]
-    num_non_contract = len(non_contract_indices)
 
-    # Order in res_raw: Tiled_Batch (num_pairs), Non_Contract_Splits (num_non_contract), LHS_Spatial (num_pairs), RHS_Spatial (num_pairs)
-    tiled_batch_axes = list(range(num_dimension_pairs))
-    nc_split_axes = list(
-        range(num_dimension_pairs, num_dimension_pairs + num_non_contract)
-    )
-    lhs_spatial_axes = list(
-        range(
-            num_dimension_pairs + num_non_contract,
-            2 * num_dimension_pairs + num_non_contract,
-        )
-    )
-    rhs_spatial_axes = list(
-        range(
-            2 * num_dimension_pairs + num_non_contract,
-            3 * num_dimension_pairs + num_non_contract,
-        )
-    )
-
-    # We want: (Tiled_Batch, LHS_Spatial, NC_Splits, RHS_Spatial)
-    reorder = tiled_batch_axes + lhs_spatial_axes + nc_split_axes + rhs_spatial_axes
-
-    # For reshape, we need to know the actual block sizes
     d_ls = [p.lhs.block_len for p in pairs_meta]
     f_ls = [p.rhs.shared_block_len for p in pairs_meta]
     ss_out = [
         block_split_factors[i] if i in non_contract_indices else 1
-        for i in range(num_dimension_pairs)
+        for i in range(N)
     ]
 
-    # Target shape after transpose: (*total_tiled_lengths, *d_ls, *[block_split_factors[i] for i in non_contract_indices], *f_ls)
-    res_aligned = res_raw.transpose(reorder)
+    expanded_shape = []
+    expanded_shape.extend(total_tiled_lengths)
+    expanded_shape.extend(ss_out)
+    expanded_shape.extend(d_ls)
+    expanded_shape.extend(f_ls)
+    expanded_shape.extend(lhs_leftovers)
+    expanded_shape.extend(rhs_leftovers)
 
-    # To use interleaved logic (_build_interleave_reorder expects 4 axes per pair),
-    # we need to re-insert the 1s for contracting splits.
-    interleaved_shape = total_tiled_lengths + d_ls + ss_out + f_ls
-    res_interleaved = res_aligned.reshape(interleaved_shape)
+    if res_raw.shape != tuple(expanded_shape):
+        res_expanded = res_raw.reshape(expanded_shape)
+    else:
+        res_expanded = res_raw
 
-    interleave_reorder = _build_interleave_reorder(num_dimension_pairs, pairs_meta)
+    fast_perm = []
+    for i in range(N):
+        fast_perm.append(i)
+    for i in range(N):
+        fast_perm.append(2 * N + i)
+        if pairs_meta[i].pairing_type == "spatial_sparse_rhs":
+            fast_perm.append(N + i)
+    for i in range(N):
+        if pairs_meta[i].pairing_type != "spatial_sparse_rhs":
+            fast_perm.append(N + i)
+        fast_perm.append(3 * N + i)
+
+    for ax in range(4 * N, len(expanded_shape)):
+        fast_perm.append(ax)
 
     final_lhs_block_lens = [
-        d_ls[i]
-        * (ss_out[i] if pairs_meta[i].pairing_type == "spatial_sparse_rhs" else 1)
-        for i in range(num_dimension_pairs)
+        d_ls[i] * (ss_out[i] if pairs_meta[i].pairing_type == "spatial_sparse_rhs" else 1)
+        for i in range(N)
     ]
     final_rhs_block_lens = [
-        f_ls[i]
-        * (ss_out[i] if pairs_meta[i].pairing_type != "spatial_sparse_rhs" else 1)
-        for i in range(num_dimension_pairs)
+        f_ls[i] * (ss_out[i] if pairs_meta[i].pairing_type != "spatial_sparse_rhs" else 1)
+        for i in range(N)
     ]
 
-    res_view = res_interleaved.transpose(interleave_reorder).reshape(
-        *total_tiled_lengths, *final_lhs_block_lens, *final_rhs_block_lens
-    )
+    target_shape = (*total_tiled_lengths, *final_lhs_block_lens, *final_rhs_block_lens, *lhs_leftovers, *rhs_leftovers)
+    
+    if fast_perm != list(range(len(fast_perm))):
+        res_view = res_expanded.transpose(fast_perm)
+        if res_view.shape != target_shape:
+            res_view = res_view.reshape(target_shape)
+    else:
+        if res_expanded.shape != target_shape:
+            res_view = res_expanded.reshape(target_shape)
+        else:
+            res_view = res_expanded
 
-    if any(
-        shared_tiling_factors[i] != total_tiled_lengths[i]
-        for i in range(num_dimension_pairs)
-    ):
-        res_reduced = _reduce_contraction_grid(
+    if any(shared_tiling_factors[i] != total_tiled_lengths[i] for i in range(N)):
+        res_reduced, counts = _reduce_contraction_grid(
             res_view,
             pairs_meta,
             shared_tiling_factors,
             total_tiled_lengths,
             final_lhs_block_lens,
-            final_rhs_block_lens,
+            final_rhs_block_lens + lhs_leftovers + rhs_leftovers,
+            count
         )
     else:
+        counts = (0, 0, 0)
         res_reduced = res_view
 
     grid = _build_final_grid(
-        num_dimension_pairs,
+        N,
         shared_tiling_factors,
         lhs_bc_shape,
         rhs_bc_shape,
         final_lhs_block_lens,
         final_rhs_block_lens,
     )
+    grid.extend(lhs_leftovers)
+    grid.extend(rhs_leftovers)
+
     perm_out = (
-        generate_grouped_permutation(num_dimension_pairs, GRID_AXES_PER_PAIR, [0])
-        + [
-            ax
-            for i in range(num_dimension_pairs)
-            for ax in (
-                GRID_AXES_PER_PAIR * i + 1,
-                GRID_AXES_PER_PAIR * num_dimension_pairs + i,
-            )
-        ]
-        + [
-            ax
-            for i in range(num_dimension_pairs)
-            for ax in (
-                GRID_AXES_PER_PAIR * i + 2,
-                (GRID_AXES_PER_PAIR + 1) * num_dimension_pairs + i,
-            )
-        ]
+        generate_grouped_permutation(N, GRID_AXES_PER_PAIR, [0])
+        + [ax for i in range(N) for ax in (GRID_AXES_PER_PAIR * i + 1, GRID_AXES_PER_PAIR * N + i)]
+        + [ax for i in range(N) for ax in (GRID_AXES_PER_PAIR * i + 2, (GRID_AXES_PER_PAIR + 1) * N + i)]
     )
+    
+    # FIX: Base grid without leftovers has size 5*N (shared, lhs_outer, rhs_outer, lhs_block, rhs_block).
+    for ax in range(5 * N, len(grid)):
+        perm_out.append(ax)
+        
+    if res_reduced.shape != tuple(grid):
+        res_reduced = res_reduced.reshape(grid)
+        
+    if perm_out != list(range(len(grid))):
+        res_reduced = res_reduced.transpose(perm_out)
 
     return (
-        res_reduced.reshape(grid).transpose(perm_out),
+        res_reduced,
         final_lhs_block_lens,
         final_rhs_block_lens,
+        counts
     )
 
 
 def _execute_block_sparse_contraction(
-    lhs_val: Array, rhs_val: Array, pairs_meta: list[DimensionPair]
+    lhs_val: Array, rhs_val: Array, pairs_meta: list[DimensionPair], count: bool = False
 ) -> tuple[Array, list[int], list[int], list[int], float]:
     num_dimension_pairs = len(pairs_meta)
+    N = num_dimension_pairs
     (
         shared_tiling_factors,
         total_tiled_lengths,
@@ -1091,38 +1213,44 @@ def _execute_block_sparse_contraction(
         block_split_factors,
     )
 
-    is_pure_diag = all(
-        (p.lhs.block_len == 1 and p.lhs.shared_block_len == 1)
-        or (p.rhs.block_len == 1 and p.rhs.shared_block_len == 1)
-        for p in pairs_meta
+    lhs_leftovers = list(lhs_view.shape[3 * N :])
+    rhs_leftovers = list(rhs_view.shape[3 * N :])
+
+    dot_axes = _collect_dot_general_axes(N, pairs_meta)
+    res_raw = jax.lax.dot_general(lhs_view, rhs_view, dot_axes)
+
+    nc_len = sum(1 for p in pairs_meta if p.pairing_type != "contract")
+    
+    # Reorder dot_general output to pull shared_R ahead of lhs_leftovers
+    dg_perm = (
+        list(range(2 * N + nc_len)) +
+        list(range(2 * N + nc_len + len(lhs_leftovers), 3 * N + nc_len + len(lhs_leftovers))) +
+        list(range(2 * N + nc_len, 2 * N + nc_len + len(lhs_leftovers))) +
+        list(range(3 * N + nc_len + len(lhs_leftovers), res_raw.ndim))
     )
+    if dg_perm != list(range(len(dg_perm))):
+        res_raw = jnp.transpose(res_raw, dg_perm)
 
-    if is_pure_diag:
-        N = num_dimension_pairs
+    lhs_shape = lhs_view.shape
+    rhs_shape = rhs_view.shape
+    L, R, B, C = 1, 1, 1, 1
+    r_dims = dot_axes[0][1] + dot_axes[1][1]
+    for i in range(lhs_view.ndim):
+        if i in dot_axes[0][0]:
+            B *= lhs_shape[i]
+        elif i in dot_axes[1][0]:
+            C *= lhs_shape[i]
+        else:
+            L *= lhs_shape[i]
+    for i in range(rhs_view.ndim):
+        if i not in r_dims:
+            R *= rhs_shape[i]
+            
+    muls = L * R * B
+    fmas = L * R * B * (C - 1)
+    adds = fmas
 
-        lhs_exp = jnp.expand_dims(lhs_view, axis=tuple(range(3 * N, 4 * N)))
-        rhs_exp = jnp.expand_dims(rhs_view, axis=tuple(range(N, 2 * N)))
-
-        prod = lhs_exp * rhs_exp
-
-        contract_axes = tuple(
-            2 * N + i for i, p in enumerate(pairs_meta) if p.pairing_type == "contract"
-        )
-        res_summed = jnp.sum(prod, axis=contract_axes) if contract_axes else prod
-
-        nc_len = sum(1 for p in pairs_meta if p.pairing_type != "contract")
-        perm = (
-            list(range(N))
-            + list(range(2 * N, 2 * N + nc_len))
-            + list(range(N, 2 * N))
-            + list(range(2 * N + nc_len, 3 * N + nc_len))
-        )
-        res_raw = jnp.transpose(res_summed, axes=perm)
-    else:
-        dot_axes = _collect_dot_general_axes(num_dimension_pairs, pairs_meta)
-        res_raw = jax.lax.dot_general(lhs_view, rhs_view, dot_axes)
-
-    contracted_grid, final_lhs_block_lens, final_rhs_block_lens = (
+    contracted_grid, final_lhs_block_lens, final_rhs_block_lens, (adds_r, _, _) = (
         _finalize_contraction_output(
             num_dimension_pairs,
             res_raw,
@@ -1132,6 +1260,9 @@ def _execute_block_sparse_contraction(
             shared_tiling_factors,
             lhs_bc_shape,
             rhs_bc_shape,
+            lhs_leftovers,
+            rhs_leftovers,
+            count
         )
     )
 
@@ -1141,6 +1272,9 @@ def _execute_block_sparse_contraction(
         final_lhs_block_lens,
         final_rhs_block_lens,
         scalar_multiplier,
+        adds + adds_r,
+        muls,
+        fmas,
     )
 
 
@@ -1281,6 +1415,12 @@ def _resolve_output_shape_and_axes(
             rhs_val_axis_map[i] = current_physical_axis
             current_physical_axis += 1
 
+    # 4. Append leftover unmapped dense axes at the end
+    # The grid is built out of 5*N layout dimensions (shared, lhs_bc, rhs_bc, lhs_block, rhs_block), 
+    # anything beyond that are the dense leftovers perfectly preserved.
+    leftover_axes = list(res.grid.shape[5 * ctx.num_pairs :])
+    reshaped_output_shape.extend(leftover_axes)
+
     axis_map = OutputAxisMap(
         shared=shared_val_axis_map, lhs=lhs_val_axis_map, rhs=rhs_val_axis_map
     )
@@ -1311,6 +1451,7 @@ def _build_output_tensor(
     ctx: MatmulContext,
     rhs_dims: tuple[Dimension, ...],
     res: ContractionResult,
+    count: bool = False,
 ) -> SparseTensor:
     from ..tensor import SparseTensor
 
@@ -1318,7 +1459,6 @@ def _build_output_tensor(
         ctx, res
     )
 
-    contracted_values = res.grid.reshape(reshaped_output_shape)
     global_max_id = max([d.id for d in ctx.lhs.dims] + [d.id for d in rhs_dims] + [-1])
 
     state = OutputState(
@@ -1346,14 +1486,29 @@ def _build_output_tensor(
     out_dims, primal_dims = state.out_dims, state.primal_dims
     squeeze_axes = state.squeeze_axes
 
+    if res.grid.shape != tuple(reshaped_output_shape):
+        grid_view = res.grid.reshape(reshaped_output_shape)
+    else:
+        grid_view = res.grid
+
     if squeeze_axes:
         unique_squeeze_axes = tuple(sorted(set(squeeze_axes)))
-        contracted_values = contracted_values[
-            tuple(
-                0 if i in unique_squeeze_axes else slice(None)
-                for i in range(contracted_values.ndim)
-            )
+        final_shape = [
+            s for i, s in enumerate(reshaped_output_shape)
+            if i not in unique_squeeze_axes
         ]
+        
+        # 0-cost reshape if squeezed axes are all size 1, fallback to slice if size > 1
+        if grid_view.size == math.prod(final_shape):
+            contracted_values = grid_view.reshape(final_shape)
+        else:
+            idx = tuple(
+                0 if i in unique_squeeze_axes else slice(None)
+                for i in range(len(reshaped_output_shape))
+            )
+            contracted_values = grid_view[idx]
+            if contracted_values.shape != tuple(final_shape):
+                contracted_values = contracted_values.reshape(final_shape)
 
         def shift_ax(axis_idx: int | None) -> int | None:
             return (
@@ -1386,6 +1541,8 @@ def _build_output_tensor(
             )
             for d in primal_dims
         ]
+    else:
+        contracted_values = grid_view
 
     final_out_dims = tuple(sorted(out_dims, key=lambda d: d.id))
     final_primal_dims = tuple(sorted(primal_dims, key=lambda d: d.id))
@@ -1418,15 +1575,20 @@ def _build_output_tensor(
 
     final_mult = ctx.lhs.scalar_mult * ctx.rhs.scalar_mult * res.scalar_multiplier
     if not has_val and contracted_values is not None and contracted_values.size == 1:
-        final_mult *= contracted_values.item()
+        # Use jnp.squeeze to avoid item() call which fails on tracers
+        final_mult *= jnp.squeeze(contracted_values)
         contracted_values = None
 
-    return SparseTensor(
+    res = SparseTensor(
         final_out_dims,
         final_primal_dims,
         contracted_values,
         scalar_mult=jnp.array(final_mult, dtype=ctx.lhs.dtype),
+        sort_val=True
     )
+
+    final_counts = (0, 2, 0) if count is not False else (0, 0, 0)
+    return res, final_counts
 
 
 def _resolve_output_pair_ids(pm: DimensionPair, state: OutputState) -> tuple[int, int]:
@@ -1640,7 +1802,7 @@ def _handle_spatial_sparse_case(
             _handle_output_dim(
                 state.out_dims,
                 r_id,
-                -1,
+                info.final_lhs_block_size,
                 info.lhs_val_axis,
                 pm.rhs.block_val_dim is not None,
                 state.squeeze_axes,
@@ -1648,7 +1810,7 @@ def _handle_spatial_sparse_case(
             _handle_output_dim(
                 state.primal_dims,
                 s_id,
-                -1,
+                info.final_rhs_block_size,
                 info.rhs_val_axis,
                 presence.rhs,
                 state.squeeze_axes,

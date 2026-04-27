@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable
+import numpy as np
 
 import jax
 import jax.numpy as jnp
@@ -17,29 +18,39 @@ if TYPE_CHECKING:
     from ..tensor import SparseTensor
 
 
+def _is_sparse(obj) -> bool: # TODO move this to dimensions
+    from ..tensor import SparseTensor
+    return isinstance(obj, SparseTensor)
+
 def _normalize_inputs(
     lhs: SparseTensor | Array, rhs: SparseTensor | Array
 ) -> tuple[SparseTensor, SparseTensor]:
-    from ..tensor import SparseTensor
-
     # Determine target dtype for potential dense-to-sparse promotion
     target_dtype = None
-    if isinstance(lhs, SparseTensor) and not isinstance(rhs, SparseTensor):
+    if _is_sparse(lhs) and not _is_sparse(rhs):
         target_dtype = lhs.dtype
-    elif isinstance(rhs, SparseTensor) and not isinstance(lhs, SparseTensor):
+    elif _is_sparse(rhs) and not _is_sparse(lhs):
         target_dtype = rhs.dtype
 
-    if not isinstance(lhs, SparseTensor):
-        obj = jnp.asarray(lhs)
+    if not _is_sparse(lhs):
+        if hasattr(lhs, "dense"):
+            obj = lhs.dense()
+        else:
+            obj = lhs
+
         if hasattr(rhs, "shape") and obj.size == 1:
             obj = jnp.broadcast_to(obj, rhs.shape)
         lhs = _arr2st(
             obj,
-            out_ndim=len(rhs.out_dims) if isinstance(rhs, SparseTensor) else None,
+            out_ndim=len(rhs.out_dims) if _is_sparse(rhs) else None,
             dtype=target_dtype,
         )
-    if not isinstance(rhs, SparseTensor):
-        obj = jnp.asarray(rhs)
+    if not _is_sparse(rhs):
+        if hasattr(rhs, "dense"):
+            obj = rhs.dense()
+        else:
+            obj = rhs
+
         if hasattr(lhs, "shape") and obj.size == 1:
             obj = jnp.broadcast_to(obj, lhs.shape)
         rhs = _arr2st(obj, out_ndim=len(lhs.out_dims), dtype=target_dtype)
@@ -71,7 +82,7 @@ def _promote_left_dense_to_sparse(left_dim, right_dim, left_dims, right_dims):
 
     if not isinstance(left_partner, DenseDimension):
         raise ValueError(
-            "Topology mismatch: Expected DenseDimension to pair with SparseDimension(size=1)"
+            "Topology mismatch: Expected DenseDimension to pair with SparseDimension"
         )
 
     synthetic_left = SparseDimension(
@@ -104,7 +115,7 @@ def _promote_right_dense_to_sparse(left_dim, right_dim, left_dims, right_dims):
 
     if not isinstance(right_partner, DenseDimension):
         raise ValueError(
-            "Topology mismatch: Expected DenseDimension to pair with SparseDimension(size=1)"
+            "Topology mismatch: Expected DenseDimension to pair with SparseDimension"
         )
 
     synthetic_right = SparseDimension(
@@ -270,6 +281,8 @@ def _promote_to_unified_blocks(
     value: Array, pair_metrics: list[dict], is_left: bool
 ) -> Array:
     input_reshape, expansion_reshape, output_reshape = [], [], []
+    needs_expansion = False
+    
     for metrics in pair_metrics:
         b1, b2 = (
             (metrics["left_b1"], metrics["left_b2"])
@@ -278,28 +291,44 @@ def _promote_to_unified_blocks(
         )
         common_b1, common_b2 = metrics["common_b1"], metrics["common_b2"]
         exp = common_b1 // b1
+        
         input_reshape.extend([metrics["unified_size"], exp, b1, b2])
         expansion_reshape.extend([metrics["unified_size"], exp, 1, b1, b2])
         output_reshape.extend([metrics["unified_size"], common_b1, common_b2])
+        
+        if exp > 1:
+            needs_expansion = True
 
     rem = list(value.shape[3 * len(pair_metrics) :])
     input_reshape.extend(rem)
     expansion_reshape.extend(rem)
     output_reshape.extend(rem)
+    
     value = value.reshape(input_reshape).reshape(expansion_reshape)
 
-    mask = jnp.array(1.0, dtype=value.dtype)
+    # FAST PATH: If block sizes match identically, avoid masking entirely
+    if not needs_expansion:
+        perm = generate_block_permutation(len(pair_metrics), 5, [0, 1, 3, 2, 4])
+        perm.extend(range(5 * len(pair_metrics), len(expansion_reshape)))
+        return value.transpose(perm).reshape(output_reshape)
+
+    # Construct a pure boolean mask
+    mask = jnp.array(True, dtype=jnp.bool_)
     for i, m in enumerate(pair_metrics):
         exp = m["common_b1"] // (m["left_b1"] if is_left else m["right_b1"])
         if exp > 1:
             m_shape = [1] * len(expansion_reshape)
             m_shape[5 * i + 1] = exp
             m_shape[5 * i + 2] = exp
-            mask = mask * jnp.eye(exp, dtype=value.dtype).reshape(m_shape)
+            # Boolean logic avoids FLOPs entirely
+            mask = mask & jnp.eye(exp, dtype=jnp.bool_).reshape(m_shape)
+
+    # Predication (jnp.where) instead of arithmetic mapping (value * mask)
+    value = jnp.where(mask, value, jnp.array(0, dtype=value.dtype))
 
     perm = generate_block_permutation(len(pair_metrics), 5, [0, 1, 3, 2, 4])
     perm.extend(range(5 * len(pair_metrics), len(expansion_reshape)))
-    return (value * mask).transpose(perm).reshape(output_reshape)
+    return value.transpose(perm).reshape(output_reshape)
 
 
 def _demote_intersection(
@@ -447,7 +476,8 @@ def elementwise(
     rhs: SparseTensor | Array,
     op: Callable,
     is_intersection: bool = False,
-) -> SparseTensor:
+    count: bool = False
+) -> SparseTensor | tuple[SparseTensor, Array]:
     lhs, rhs = _normalize_inputs(lhs, rhs)
     sparse_pairs, dense_pairs = _map_topology(lhs, rhs)
     metrics = _compute_pair_metrics(sparse_pairs)
@@ -461,6 +491,19 @@ def elementwise(
         _promote_to_unified_blocks(vr, metrics, False),
     )
     res_val, out_meta = _demote_intersection(res_val, metrics, is_intersection)
-    return _reconstruct_result_tensor(
+    res = _reconstruct_result_tensor(
         res_val, lhs, sparse_pairs, dense_pairs, out_meta, op, rhs
     )
+
+    if count:
+        return res, math.prod(np.minimum(vl.shape, vr.shape))
+    else:
+        return res
+
+def add_w_counts(a, b):
+    res = elementwise(a, b, jax.lax.add, count=True)
+    return res[0], (res[1], 0, 0)
+
+def mul_w_counts(a, b):
+    res = elementwise(a, b, jax.lax.mul, is_intersection=True, count=True)
+    return res[0], (0, res[1], 0)
