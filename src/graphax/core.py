@@ -16,6 +16,10 @@ import jax.tree_util as jtu
 from jax._src.core import ShapeDtypeStruct
 from jax._src.util import safe_map
 
+import numpy as np
+
+from graphax.sparse.ops import matmul, add_w_counts
+
 from .jaxpr import VEJaxpr
 from .primitives import elemental_rules
 from .sparse.tensor import (
@@ -23,10 +27,7 @@ from .sparse.tensor import (
     SparseDimension,
     SparseTensor,
     _assert_sparse_tensor_consistency,
-    _create_optimized,
     apply_dynamic_sparsity,
-    elementwise_fmas,
-    matmul_fmas,
 )
 from .sparse.utils import get_largest_tensor, zeros_like
 
@@ -200,7 +201,7 @@ def _eliminate_vertex(
     """
 
     eqn = jaxpr.eqns[vertex - 1]
-    fmas = 0
+    adds, muls, fmas, mem = 0, 0, 0, 0
 
     out_var = eqn.outvars[0]
     out_edges = graph.get(out_var)
@@ -215,14 +216,19 @@ def _eliminate_vertex(
         return 0
 
     for out_edge, post_val_orig in out_edges.items():
+        # print("scanning fan out")
         post_val = post_val_orig.copy()
         for in_edge, pre_val_orig in in_edges_map.items():
+            # print(" . canning fan in")
             pre_val = pre_val_orig.copy()
 
             # Handle stuff like reshape, squeeze etc.
             # Apply Jacobian transforms where applicable
             _pre_val = pre_val.copy()
             _post_val = post_val.copy()
+
+            # print(f"  {_pre_val=}")
+            # print(f"  {_post_val=}")
 
             if len(pre_val.post_transforms) > 0 and post_val.val is not None:
                 _post_val = unload_post_transforms(post_val, pre_val, iota)
@@ -232,14 +238,16 @@ def _eliminate_vertex(
 
             # Multiply the two values of the edges if applicable
             if pre_val.val is not None and post_val.val is not None:
-                if _post_val.ndim == 0 or _pre_val.ndim == 0:
-                    edge_outval = _post_val * _pre_val
-                else:
-                    edge_outval = _post_val @ _pre_val
+                edge_outval, (_adds, _muls, _fmas) = matmul(_post_val, _pre_val, count=True)
                 # jax.debug.print("{}\n@\n{}\n=\n{}", _post_val, _pre_val, edge_outval)
                 _assert_sparse_tensor_consistency(edge_outval)
-
-                fmas += matmul_fmas(_post_val, _pre_val)
+                adds += np.sum(_adds)
+                muls += np.sum(_muls)
+                fmas += np.sum(_fmas)
+                post_size = _post_val.val.size if _post_val.val is not None else 0
+                pre_size = _pre_val.val.size if _pre_val.val is not None else 0
+                out_size = edge_outval.val.size if edge_outval.val is not None else 0
+                mem += max(post_size*_post_val.dtype.itemsize, pre_size*_pre_val.dtype.itemsize, out_size*edge_outval.dtype.itemsize)
             elif pre_val.val is not None:
                 edge_outval = _pre_val
             else:
@@ -278,10 +286,13 @@ def _eliminate_vertex(
                         _edge = transform.apply_inverse(_edge, iota)
 
                 _assert_sparse_tensor_consistency(edge_outval)
-                pre_edge_outval = edge_outval
-                edge_outval += _edge
+                # pre_edge_outval = edge_outval
+                edge_outval, (_adds, _muls, _fmas) = add_w_counts(edge_outval, _edge)
+                adds += np.sum(_adds)
+                muls += np.sum(_muls)
+                fmas += np.sum(_fmas)
+                mem += (edge_outval.val.size if edge_outval.val is not None else 0)*edge_outval.dtype.itemsize
                 # jax.debug.print("{}\n+\n{}\n=\n{}", pre_edge_outval, _edge, edge_outval)
-                fmas += elementwise_fmas(edge_outval, _edge)
 
             if sp_rules:
                 edge_outval = apply_dynamic_sparsity(edge_outval, sp_rules)
@@ -313,22 +324,28 @@ def _eliminate_vertex(
     if vertex not in vo_vertices:
         transpose_graph.pop(out_var, None)
 
-    return fmas
+    return adds, muls, fmas, mem
 
 
 class GraphState:
-    __slots__ = ["children", "graph", "transpose_graph", "fmas", "lock"]
+    __slots__ = ["children", "graph", "transpose_graph", "adds", "muls", "fmas", "mem", "lock"]
 
     def __init__(
         self,
         graph: ComputationalGraph,
         transpose_graph: ComputationalGraph,
+        adds: int = 0,
+        muls: int = 0,
         fmas: int = 0,
+        mem: int = 0,
     ):
         self.children: dict[int, GraphState] = {}
         self.graph = graph
         self.transpose_graph = transpose_graph
+        self.adds = adds
+        self.muls = muls
         self.fmas = fmas
+        self.mem = mem
         self.lock = threading.Lock()
 
 
@@ -371,19 +388,27 @@ class VertexEliminator:
                     else:
                         break
 
+        adds = node.adds
+        muls = node.muls
         fmas = node.fmas
+        mem = node.mem
         counts = []
         m_graph = node.graph.mutate()
         m_transpose_graph = node.transpose_graph.mutate()
 
         for vertex in order[prefix_length:]:
             sp_rules = sp_dict.get(vertex, ())
-            step_fmas = _eliminate_vertex(
+            _adds, _muls, _fmas, _mem = _eliminate_vertex(
                 vertex, jaxpr, m_graph, m_transpose_graph, iota, vo_vertices, sp_rules
             )
-            fmas += step_fmas
+
+            adds += np.sum(_adds)
+            muls += np.sum(_muls)
+            fmas += np.sum(_fmas)
+            mem += np.sum(_mem)
+
             if count_ops:
-                counts.append(fmas)
+                counts.append((adds, muls, fmas, mem))
 
             if ENABLE_CACHE:
                 key = (vertex, sp_rules)
@@ -394,14 +419,14 @@ class VertexEliminator:
                         m_graph = cur_graph.mutate()
                         m_transpose_graph = cur_transpose_graph.mutate()
                         node.children[key] = GraphState(
-                            cur_graph, cur_transpose_graph, fmas
+                            cur_graph, cur_transpose_graph, adds, muls, fmas, mem
                         )
                     node = node.children[key]
 
         graph = m_graph.finish()
         transpose_graph = m_transpose_graph.finish()
 
-        return graph, transpose_graph, fmas, counts
+        return graph, transpose_graph, adds, muls, fmas, mem, counts
 
 
 _topology_cache = {}
@@ -423,22 +448,22 @@ def vertex_elimination_jaxpr(
     sparse_representation: bool = False,
     sparsity_map: Sequence[tuple[int, tuple[tuple[int, ...], ...]]] = None,
 ) -> Any:
-    # Explicitly clear caches to ensure new logical ID logic is applied
-    global _TRACING_CACHE, _topology_cache
-    with _TRACING_LOCK:
-        _TRACING_CACHE.clear()
-    with _topology_lock:
-        _topology_cache.clear()
+    # TODO should we clear cache like this?
+    # global _TRACING_CACHE, _topology_cache
+    # with _TRACING_LOCK:
+    #     _TRACING_CACHE.clear()
+    # with _topology_lock:
+    #     _topology_cache.clear()
         
     jaxpr_invars = [invar for i, invar in enumerate(jaxpr.invars) if i in argnums]
-    env, _, _, jaxpr_graph, vo_vertices = _build_graph(jaxpr, args, consts)
+    env, _, _, jaxpr_graph, vo_vertices = _build_graph(jaxpr, args, consts, tuple(argnums))
 
     eliminator = _get_eliminator(jaxpr, args, consts, tuple(argnums))
 
     iota = _iota_shape(jaxpr, argnums)
     order = _checkify_order(order, jaxpr, vo_vertices)
 
-    graph, _, fmas, counts = eliminator.eliminate(
+    graph, _, adds, muls, fmas, mem, counts = eliminator.eliminate(
         order, jaxpr, sparsity_map, iota, vo_vertices, count_ops
     )
 
@@ -479,7 +504,7 @@ def vertex_elimination_jaxpr(
             for invar in jaxpr_invars:
                 invar_graph = graph.get(invar)
                 if invar_graph is not None and outvar in invar_graph:
-                    jac_vals.append(jnp.array(invar_graph[outvar]))
+                    jac_vals.append(invar_graph[outvar].dense())
                 else:
                     jac_vals.append(zeros_like(outvar, invar))
 
@@ -492,9 +517,12 @@ def vertex_elimination_jaxpr(
 
     if count_ops:
         aux = {}
+        aux["adds"] = adds
+        aux["muls"] = muls
         aux["fmas"] = fmas
+        aux["mem"] = mem
         aux["order_counts"] = [
-            (int(o), int(c[0]) if isinstance(c, tuple) else int(c))
+            (int(o), c[0] if isinstance(c, tuple) else c)
             for o, c in zip(order, counts)
         ]
         return outputs, aux
@@ -512,7 +540,7 @@ def extract_jaxpr(
     sparsity_map: Sequence[tuple[int, tuple[tuple[int, ...], ...]]] = None,
 ) -> VEJaxpr:
     if isinstance(order, str):
-        _, _, _, _, vo_vertices = _build_graph(jaxpr, args, consts)
+        _, _, _, _, vo_vertices = _build_graph(jaxpr, args, consts, tuple(argnums))
         _order = tuple(_checkify_order(order, jaxpr, vo_vertices))
     elif hasattr(order, "tolist"):
         _order = tuple(map(int, order.tolist()))
@@ -642,13 +670,13 @@ def pytree_hash_cache(maxsize=None):
 
 @pytree_hash_cache()
 def _get_eliminator(jaxpr: core.Jaxpr, args: tuple, consts: tuple, argnums: tuple):
-    _, initial_graph, initial_transpose_graph, _, _ = _build_graph(jaxpr, args, consts)
+    _, initial_graph, initial_transpose_graph, _, _ = _build_graph(jaxpr, args, consts, argnums)
     return VertexEliminator(initial_graph, initial_transpose_graph)
 
 
 @pytree_hash_cache()
 def _build_graph(
-    jaxpr: core.Jaxpr, args: Sequence[jnp.ndarray], consts: Sequence[core.Literal]
+    jaxpr: core.Jaxpr, args: Sequence[jnp.ndarray], consts: Sequence[core.Literal], argnums: tuple[int, ...]
 ):  # -> Tuple[ComputationalGraph, ComputationalGraph, Set[core.Var]]:
     """
         This function performs the `tracing` of the jaxpression into a computational
@@ -671,12 +699,14 @@ def _build_graph(
         args (Sequence[jnp.ndarray]): The input arguments of the function as a
                                         flattened PyTree.
         consts (Sequence[core.Literal]): The constant arguments of the function.
+        argnums (tuple[int, ...]): Argument numbers to differentiate with respect to.
 
     Returns:
 
 
     """
     env = {}  # env stores the primal value associated with the core.Var object
+    active_vars = {jaxpr.invars[i] for i in argnums}
 
     counter = 1  # vertex id counter
     var_id = {}  # associates every application of a JaxprEqn with a unique integer
@@ -696,15 +726,27 @@ def _build_graph(
             dim_counter[0] += rank
         return var_dim_ids[var]
 
-    def set_tensor_logical_ids(st, out_ids, primal_ids):
-        from graphax.sparse.tensor import replace
+    def set_tensor_ids(st, out_ids, primal_ids):
+        all_new_ids = out_ids + primal_ids
+        # Mapping from old ID to new ID for consistent partner remapping
+        id_map = {d.id: all_new_ids[i] for i, d in enumerate(st.dims)}
         
-        def set_dim_lids(dims, ids):
-            return tuple(replace(d, logical_id=ids[i]) for i, d in enumerate(dims))
+        def update_dims(dims, start_idx):
+            from dataclasses import replace
+            from graphax.sparse.dimensions import SparseDimension
+            res = []
+            for i, d in enumerate(dims):
+                new_id = all_new_ids[start_idx + i]
+                if isinstance(d, SparseDimension):
+                    new_other_id = id_map.get(d.other_id, d.other_id)
+                    res.append(replace(d, id=new_id, other_id=new_other_id))
+                else:
+                    res.append(replace(d, id=new_id))
+            return tuple(res)
             
-        new_out = set_dim_lids(st.out_dims, out_ids)
-        new_primal = set_dim_lids(st.primal_dims, primal_ids)
-        return replace(st, out_dims=new_out, primal_dims=new_primal)
+        new_out = update_dims(st.out_dims, 0)
+        new_primal = update_dims(st.primal_dims, len(st.out_dims))
+        return st.copy(out_dims=new_out, primal_dims=new_primal)
 
     graph = defaultdict(lambda: defaultdict())  # Input connectivity
     transpose_graph = defaultdict(lambda: defaultdict())  # Output connectivity
@@ -713,16 +755,20 @@ def _build_graph(
     vo_vertices = set()  # contains all intermediate and output vertices
     # Writes a new elemental partial to the graph and transpose_graph
     def write_elemental(outvar, invar, val, eqns):
+        if invar not in active_vars:
+            return
+        
         _assert_sparse_tensor_consistency(val)
         if isinstance(invar, core.Var):
             # Assign global logical IDs to the elemental partial
             out_ids = get_var_dim_ids(outvar)
             in_ids = get_var_dim_ids(invar)
-            val = set_tensor_logical_ids(val, out_ids, in_ids)
+            val = set_tensor_ids(val, out_ids, in_ids)
             
             graph[invar][outvar] = val
             transpose_graph[outvar][invar] = val
             jaxpr_graph[invar][outvar] = eqns
+            active_vars.add(outvar)
 
     # Reads variable and corresponding traced shaped array
     def read(var):
