@@ -6,7 +6,7 @@ class Layout:
     def __init__(self):
         self.names_to_indices: dict[str, int] = {}
 
-    def set(self, name: str, index: int):
+    def set(self, name: str, index: int) -> int:
         self.names_to_indices[name] = index
         return index
 
@@ -27,19 +27,19 @@ def generate_block_permutation(
     num_pairs: int, axes_per_pair: int, offsets: Sequence[int]
 ) -> list[int]:
     """Generates a permutation by repeating offsets for each pair."""
-    perm = []
-    for pair_idx in range(num_pairs):
-        for offset in offsets:
-            perm.append(pair_idx * axes_per_pair + offset)
-    return perm
+    return [
+        pair_idx * axes_per_pair + offset
+        for pair_idx in range(num_pairs)
+        for offset in offsets
+    ]
 
 
 def generate_grouped_permutation(
     num_pairs: int, axes_per_pair: int, group_offsets: Sequence[int]
 ) -> list[int]:
     """Generates a permutation by grouping specific offsets across all pairs."""
-    perm = []
-    for offset in group_offsets:
-        for pair_idx in range(num_pairs):
-            perm.append(pair_idx * axes_per_pair + offset)
-    return perm
+    return [
+        pair_idx * axes_per_pair + offset
+        for offset in group_offsets
+        for pair_idx in range(num_pairs)
+    ]

@@ -5,12 +5,13 @@ from dataclasses import replace
 
 import jax.numpy as jnp
 
-from .dense import dense
+from graphax.sparse.ops.dense import dense
 
-from ..dimensions import Dimension, SparseDimension, DenseDimension
+from graphax.sparse.dimensions import Dimension, SparseDimension, DenseDimension
 
 if TYPE_CHECKING:
-    from ..tensor import SparseTensor
+    from graphax.sparse.tensor import SparseTensor
+from graphax.sparse.dimensions import Dimension, SparseDimension, DenseDimension
 
 
 def _get_full_permutation(
@@ -74,72 +75,42 @@ def _ensure_valid_sparsity(
     return tensor
 
 
-def _remap_logical_dimensions(
-    tensor: SparseTensor,
-    full_permutation: tuple[int, ...],
-    out_axes: Sequence[int],
-    primal_axes: Sequence[int],
-) -> tuple[list[Dimension], list[Dimension]]:
-    """Update logical dimension metadata (IDs and other_IDs) after transpose."""
-    dims = tensor.dims
-    # Map from old dimension ID to its new position (ID) in the full permutation
-    old_to_new_id = {
-        dims[old_idx].id: new_idx for new_idx, old_idx in enumerate(full_permutation)
-    }
-
-    def update_dimension_metadata(dim: Dimension, new_id: int) -> Dimension:
-        if isinstance(dim, SparseDimension):
-            return replace(dim, id=new_id, other_id=old_to_new_id[dim.other_id])
-        return replace(dim, id=new_id)
-
-    new_out_dims = [
-        update_dimension_metadata(dims[i], idx) for idx, i in enumerate(out_axes)
-    ]
-    new_primal_dims = [
-        update_dimension_metadata(dims[i], len(out_axes) + idx)
-        for idx, i in enumerate(primal_axes)
-    ]
-
-    return new_out_dims, new_primal_dims
-
-
 def transpose(
     tensor: SparseTensor,
     out_axes: Sequence[int] | None = None,
     primal_axes: Sequence[int] | None = None,
 ) -> SparseTensor:
     """Transpose a SparseTensor by reordering its out and primal dimensions."""
-    from .utils import _sort_val  # Late import to avoid cycle
-
-    num_out = len(tensor.out_dims)
-    num_primal = len(tensor.primal_dims)
+    from graphax.sparse.ops.utils import _sort_val, _copy
 
     # 1. Normalize and validate the permutation
     full_permutation, new_out_axes, new_primal_axes = _get_full_permutation(
-        num_out, num_primal, out_axes, primal_axes
+        len(tensor.out_dims), len(tensor.primal_dims), out_axes, primal_axes
     )
 
     # 2. Ensure sparse dimensions remain split across sides; densify if not.
     tensor = _ensure_valid_sparsity(tensor, new_out_axes, new_primal_axes)
 
-    # 3. Update logical dimension metadata
-    new_out_dims, new_primal_dims = _remap_logical_dimensions(
-        tensor, full_permutation, new_out_axes, new_primal_axes
-    )
+    # 3. Reorder dimensions and update IDs
+    all_dims = tensor.dims
+    reordered_dims = [all_dims[i] for i in full_permutation]
+    id_map = {d.id: i for i, d in enumerate(reordered_dims)}
 
-    # 4. Sort the values based on new dimensions and return
+    updated_dims = []
+    for i, d in enumerate(reordered_dims):
+        kwargs = {"id": i}
+        if isinstance(d, SparseDimension):
+            kwargs["other_id"] = id_map[d.other_id]
+        updated_dims.append(replace(d, **kwargs))
+
+    n_out = len(new_out_axes)
+    new_out_dims, new_primal_dims = updated_dims[:n_out], updated_dims[n_out:]
+
+    # 4. Sort values and return
     new_out_dims, new_primal_dims, new_val = _sort_val(
         new_out_dims, new_primal_dims, tensor.val
     )
 
-    from ..tensor import SparseTensor
-
-    return SparseTensor(
-        new_out_dims,
-        new_primal_dims,
-        new_val,
-        tensor.scalar_mult,
-        tensor.fill_value,
-        sort_val=False,
-        check_consistency=False,
+    return _copy(
+        tensor, val=new_val, out_dims=new_out_dims, primal_dims=new_primal_dims
     )

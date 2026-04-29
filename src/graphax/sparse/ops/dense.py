@@ -7,10 +7,10 @@ from jax import Array
 from typing import TYPE_CHECKING, Sequence
 from dataclasses import replace
 
-from ..dimensions import Dimension, SparseDimension, DenseDimension
+from graphax.sparse.dimensions import Dimension, SparseDimension, DenseDimension
 
 if TYPE_CHECKING:
-    from ..tensor import SparseTensor
+    from graphax.sparse.tensor import SparseTensor
 
 
 def _is_dimension_implicit(dim, id_to_idx):
@@ -149,7 +149,7 @@ def dense(
     values, result_dims = _apply_dense_scattering(
         values, tensor.fill_value, updated_dims, actual_scatter, phys_to_scatter
     )
-    from ..tensor import SparseTensor
+    from graphax.sparse.tensor import SparseTensor
 
     return SparseTensor(
         tuple(result_dims[: len(tensor.out_dims)]),
@@ -169,12 +169,7 @@ def _prepare_values_for_scattering(
         return values, {idx: idx for idx in range(values.ndim)}
 
     other_axes = [i for i in range(values.ndim) if i not in scatter_axes]
-    unique_perm = []
-    seen = set()
-    for ax in scatter_axes + other_axes:
-        if ax not in seen:
-            unique_perm.append(ax)
-            seen.add(ax)
+    unique_perm = list(dict.fromkeys(scatter_axes + other_axes))
 
     values = values.transpose(unique_perm)
     num_scatter = len(scatter_axes)
@@ -199,129 +194,70 @@ def _apply_dense_scattering(
     values, phys_map = _prepare_values_for_scattering(
         values, scatter_phys_axes, fill_value
     )
-    unique_perm, final_val_shape, logical_to_physical = _compute_physical_layout_fixed(
-        values.ndim, logical_dims, scatter_logical_indices, phys_map
-    )
-    redundant = set(range(len(scatter_phys_axes), 2 * len(scatter_phys_axes)))
-    leftover = [i for i in range(values.ndim) if i not in unique_perm and i not in redundant]
-    full_perm = unique_perm + leftover
-    
-    values = values.transpose(full_perm).reshape(
-        tuple(final_val_shape) + tuple(values.shape[i] for i in leftover)
-    )
-    return values, _reconstruct_logical_dimensions(logical_dims, logical_to_physical)
 
+    final_perm, final_shape, active_axes = [], [], set()
+    log_to_phys, visited_pairs, sparse_phys_to_final = {}, set(), {}
+    curr_f_idx = 0
 
-def _process_scatter_dim(
-    dim, phys_map, visited_scatter_pairs, final_val_perm, active_axes, curr_final_idx
-):
-    pair_key = tuple(sorted((dim.id, dim.other_id)))
-    idx = 1 if pair_key in visited_scatter_pairs else 0
-    visited_scatter_pairs.add(pair_key)
-    phys_idx = phys_map[dim.val_dim][idx]
-    final_val_perm.append(phys_idx)
-    active_axes.add(phys_idx)
-    l_size = dim.size
-    if dim.block_val_dim is not None:
-        b_phys = phys_map[dim.block_val_dim]
-        final_val_perm.append(b_phys)
-        active_axes.add(b_phys)
-        l_size *= dim.block_size
-    return (curr_final_idx, None, l_size), curr_final_idx + 1
-
-
-def _process_remain_sparse(
-    dim,
-    phys_map,
-    visited_sparse_pairs,
-    final_val_perm,
-    active_axes,
-    curr_f_idx,
-    sparse_phys_to_final,
-):
-    pair_key = tuple(sorted((dim.id, dim.other_id)))
-    if pair_key not in visited_sparse_pairs:
-        if dim.val_dim is not None:
-            phys_idx = phys_map[dim.val_dim]
-            final_val_perm.append(phys_idx)
-            active_axes.add(phys_idx)
-            sparse_phys_to_final[dim.val_dim] = curr_f_idx
-            curr_f_idx += 1
-        visited_sparse_pairs.add(pair_key)
-
-    new_val_dim = sparse_phys_to_final.get(dim.val_dim)
-    new_block_dim = None
-    if dim.block_val_dim is not None:
-        b_phys = phys_map[dim.block_val_dim]
-        final_val_perm.append(b_phys)
-        active_axes.add(b_phys)
-        new_block_dim = curr_f_idx
-        curr_f_idx += 1
-    return (new_val_dim, new_block_dim, None), curr_f_idx
-
-
-def _process_remain_dense(dim, phys_map, final_val_perm, active_axes, curr_f_idx):
-    new_val_dim = None
-    if dim.val_dim is not None:
-        phys_idx = phys_map[dim.val_dim]
-        final_val_perm.append(phys_idx)
-        active_axes.add(phys_idx)
-        new_val_dim = curr_f_idx
-        curr_f_idx += 1
-    return (new_val_dim, None, None), curr_f_idx
-
-
-def _compute_physical_layout_fixed(
-    values_ndim: int,
-    logical_dims: list[Dimension],
-    scatter_logical_indices: set[int],
-    phys_map: dict[int, int | tuple[int, int]],
-):
-    final_val_perm, final_val_shape, active_axes = [], [], set()
-    curr_f_idx, visited_scatter, visited_sparse, sparse_phys_map, log_to_phys = (
-        0,
-        set(),
-        set(),
-        {},
-        {},
-    )
     for i, dim in enumerate(logical_dims):
+        pair_key = (
+            tuple(sorted((dim.id, dim.other_id)))
+            if isinstance(dim, SparseDimension)
+            else (dim.id,)
+        )
         if i in scatter_logical_indices and isinstance(dim, SparseDimension):
-            res, curr_f_idx = _process_scatter_dim(
-                dim, phys_map, visited_scatter, final_val_perm, active_axes, curr_f_idx
-            )
-            final_val_shape.append(res[2])
+            idx = 1 if pair_key in visited_pairs else 0
+            visited_pairs.add(pair_key)
+            p_idx = phys_map[dim.val_dim][idx]
+            final_perm.append(p_idx)
+            active_axes.add(p_idx)
+            l_size = dim.size
+            if dim.block_val_dim is not None:
+                b_p = phys_map[dim.block_val_dim]
+                final_perm.append(b_p)
+                active_axes.add(b_p)
+                l_size *= dim.block_size
+            final_shape.append(l_size)
+            log_to_phys[i] = (curr_f_idx, None, l_size)
+            curr_f_idx += 1
         elif isinstance(dim, SparseDimension):
-            res, curr_f_idx = _process_remain_sparse(
-                dim,
-                phys_map,
-                visited_sparse,
-                final_val_perm,
-                active_axes,
-                curr_f_idx,
-                sparse_phys_map,
-            )
-            if res[0] is not None:
-                final_val_shape.append(dim.size)
-            if res[1] is not None:
-                final_val_shape.append(dim.block_size)
+            new_v, new_b = None, None
+            if pair_key not in visited_pairs:
+                if dim.val_dim is not None:
+                    p_idx = phys_map[dim.val_dim]
+                    final_perm.append(p_idx)
+                    active_axes.add(p_idx)
+                    sparse_phys_to_final[dim.val_dim] = curr_f_idx
+                    final_shape.append(dim.size)
+                    curr_f_idx += 1
+                visited_pairs.add(pair_key)
+            new_v = sparse_phys_to_final.get(dim.val_dim)
+            if dim.block_val_dim is not None:
+                b_p = phys_map[dim.block_val_dim]
+                final_perm.append(b_p)
+                active_axes.add(b_p)
+                new_b = curr_f_idx
+                final_shape.append(dim.block_size)
+                curr_f_idx += 1
+            log_to_phys[i] = (new_v, new_b, None)
         else:
-            res, curr_f_idx = _process_remain_dense(
-                dim, phys_map, final_val_perm, active_axes, curr_f_idx
-            )
-            if res[0] is not None:
-                final_val_shape.append(dim.size)
-        log_to_phys[i] = res
+            new_v = None
+            if dim.val_dim is not None:
+                p_idx = phys_map[dim.val_dim]
+                final_perm.append(p_idx)
+                active_axes.add(p_idx)
+                new_v = curr_f_idx
+                final_shape.append(dim.size)
+                curr_f_idx += 1
+            log_to_phys[i] = (new_v, None, None)
 
-    # unique_perm should only contain axes associated with logical dimensions
+    final_perm.extend(i for i in range(values.ndim) if i not in active_axes)
+    unique_perm = list(dict.fromkeys(final_perm))
 
-    unique_perm = []
-    seen = set()
-    for p in final_val_perm:
-        if p not in seen:
-            unique_perm.append(p)
-            seen.add(p)
-    return unique_perm, final_val_shape, log_to_phys
+    values = values.transpose(unique_perm).reshape(
+        tuple(final_shape) + values.shape[len(unique_perm) :]
+    )
+    return values, _reconstruct_logical_dimensions(logical_dims, log_to_phys)
 
 
 def _reconstruct_logical_dimensions(
