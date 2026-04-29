@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from abc import ABC
 from dataclasses import replace
 from math import prod
 from typing import Callable, Literal, override
@@ -133,10 +132,48 @@ class SparseMathMixin:
     def __ge__(self, other):
         return elementwise(self, other, jax.lax.ge)
 
+    def __neg__(self):
+        return self.copy(scalar_mult=-self.scalar_mult)
+
+    def __pos__(self):
+        return self.copy()
+
+    def __abs__(self):
+        return self.copy(
+            val=jnp.abs(self.val) if self.val is not None else None,
+            scalar_mult=jnp.abs(self.scalar_mult),
+        )
+
+    def __invert__(self):
+        return self.copy(
+            val=jax.lax.bitwise_not(self.val) if self.val is not None else None
+        )
+
+    def __round__(self, ndigits=None):
+        return self.copy(
+            val=jnp.round(self.val, ndigits) if self.val is not None else None,
+            scalar_mult=jnp.round(self.scalar_mult, ndigits),
+        )
+
 
 
 @register_pytree_node_class
 class SparseTensor(SparseMathMixin):
+    """
+    The core JAX PyTree node representing a block-sparse tensor.
+
+    A SparseTensor partitions its dimensions into two semantic groups: `out_dims` and `primal_dims`.
+    This bipartite graph topology enables mathematically rigorous generalized tensor contractions
+    and element-wise operations while avoiding premature dense materializations.
+
+    Attributes:
+        out_dims (tuple[Dimension, ...]): Dimensions mapped to the output/batch subspace.
+        primal_dims (tuple[Dimension, ...]): Dimensions mapped to the contractible/inner subspace.
+        val (Array | None): The underlying physical JAX array storing the compressed non-zero values.
+            If None, the tensor represents a uniform grid initialized by `fill_value`.
+        scalar_mult (Array): A global scalar multiplier to scale the tensor's values without reallocating `val`.
+        fill_value (Array): The structural background value (typically 0) of the sparse regions.
+    """
     out_dims: tuple[Dimension, ...]
     primal_dims: tuple[Dimension, ...]
     val: Array | None
@@ -323,8 +360,7 @@ class SparseTensor(SparseMathMixin):
 
     def swapdims(self) -> SparseTensor:
         return self.transpose(
-            list(range(len(self.out_dims), self.ndim)),
-            list(range(len(self.out_dims)))
+            [d.id for d in self.primal_dims], [d.id for d in self.out_dims]
         )
 
     @property
@@ -370,13 +406,13 @@ class SparseTensor(SparseMathMixin):
         if self.val is not None:
             return self.val.dtype
         # Infer from scalar_mult or fill_value if val is None
-        return jnp.asarray(self.fill_value).dtype
+        return self.fill_value.dtype
 
     def astype(
         self, dtype: DTypeLike, copy: bool = True, **kwargs: Any
     ) -> SparseTensor:
         new_val = self.val.astype(dtype, **kwargs) if self.val is not None else None
-        new_fill = jnp.asarray(self.fill_value).astype(dtype)
+        new_fill = self.fill_value.astype(dtype)
         # Use dtype for scalar_mult to ensure consistency
         new_scalar_mult = (
             self.scalar_mult.astype(dtype)
@@ -672,28 +708,6 @@ class SparseTensor(SparseMathMixin):
     def on_device_size_in_bytes(self):
         return self._target_arr.on_device_size_in_bytes()
 
-    def __neg__(self):
-        return self.copy(scalar_mult=-self.scalar_mult)
-
-    def __pos__(self):
-        return self.copy()
-
-    def __abs__(self):
-        return self.copy(
-            val=jnp.abs(self.val) if self.val is not None else None,
-            scalar_mult=jnp.abs(self.scalar_mult),
-        )
-
-    def __invert__(self):
-        return self.copy(
-            val=jax.lax.bitwise_not(self.val) if self.val is not None else None
-        )
-
-    def __round__(self, ndigits=None):
-        return self.copy(
-            val=jnp.round(self.val, ndigits) if self.val is not None else None,
-            scalar_mult=jnp.round(self.scalar_mult, ndigits),
-        )
 
 
 def get_valid_pairings(

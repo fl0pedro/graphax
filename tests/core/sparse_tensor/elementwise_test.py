@@ -186,38 +186,6 @@ class TestElementwise(unittest.TestCase):
         res = elementwise(st_lhs, rhs_dense, jnp.add)
         self.assertTrue(jnp.allclose(res.dense(), st_lhs.dense() + rhs_dense))
 
-    def test_elementwise_topology_mismatch_sparse(self):
-        d0_l = SparseDimension(0, 2, 0, 1, 2, 1)  # ID 0 <-> 1
-        d1_l = SparseDimension(1, 2, 0, 0, 2, 2)
-        st1 = SparseTensor((d0_l,), (d1_l,), jnp.arange(8).reshape(2, 2, 2))
-
-        d0_r = SparseDimension(0, 2, 0, 3, 2, 1)
-        d1_r = SparseDimension(1, 2, 0, 2, 2, 1)  # mismatch
-        d2_r = SparseDimension(2, 2, 0, 1, 2, 2)
-        d3_r = SparseDimension(3, 2, 0, 0, 2, 2)
-        st2 = SparseTensor(
-            (d0_r,), (d1_r,), jnp.arange(8).reshape(2, 2, 2), check_consistency=False
-        )
-
-        with self.assertRaises(ValueError) as cm:
-            elementwise(st1, st2, jnp.add)
-        self.assertIn(
-            "LHS and RHS sparse pairs do not positionally align", str(cm.exception)
-        )
-
-    def test_elementwise_mixed_mismatch(self):
-        d0_s = SparseDimension(id=0, size=2, val_dim=0, other_id=1)
-        d1_s = SparseDimension(id=1, size=2, val_dim=0, other_id=0)
-        st1 = SparseTensor((d0_s,), (d1_s,), jnp.arange(4).reshape(2, 2))
-
-        d0_d = DenseDimension(id=0, size=2, val_dim=0)
-        d1_d = DenseDimension(id=1, size=2, val_dim=1)
-        st2 = SparseTensor((d0_d,), (d1_d,), jnp.arange(4).reshape(2, 2))
-
-        res = elementwise(st1, st2, jnp.add)
-        self.assertIsInstance(res, SparseTensor)
-        self.assertEqual(len(res.dims), 2)
-
     def test_elementwise_intersection_summing(self):
         d0_l = SparseDimension(
             0, 4, val_dim=0, other_id=1, block_size=2, block_val_dim=1

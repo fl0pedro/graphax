@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 from jax import Array
-import jax
 from typing import TYPE_CHECKING, Any, Sequence
 from itertools import chain, count
 from dataclasses import replace
@@ -12,6 +11,14 @@ from graphax.sparse.dimensions import Dimension, DenseDimension, SparseDimension
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
+
+
+def _is_sparse(obj) -> bool:
+    if getattr(type(obj), "__name__", "") == "SparseTensor":
+        return True
+    if isinstance(obj, tuple) and len(obj) > 0:
+        return getattr(type(obj[0]), "__name__", "") == "SparseTensor"
+    return False
 
 
 def _check_sparse_dim_pair(d, dim_map):
@@ -42,8 +49,9 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
     from graphax.sparse.dimensions import SparseDimension
 
     dim_ids = [d.id for d in st.dims]
-    assert len(set(dim_ids)) == len(dim_ids), (
-        f"Topology Error: Dimension IDs must be unique. Got {dim_ids}"
+    expected_ids = list(range(len(dim_ids)))
+    assert sorted(dim_ids) == expected_ids, (
+        f"Topology Error: Dimension IDs must be a contiguous sequence. Got {dim_ids}"
     )
 
     dim_map = {d.id: d for d in st.dims}
@@ -135,53 +143,39 @@ def _update_dim_axes(ds, s_map, d_map):
     return tuple(res)
 
 
-def _sort_val(out_dims, primal_dims, val):
+def _sort_val(
+    out_dims: Sequence[Dimension], primal_dims: Sequence[Dimension], val: Array | None
+) -> tuple[tuple[Dimension, ...], tuple[Dimension, ...], Array | None]:
     if val is None:
-        return out_dims, primal_dims, val
-        
-    dims = tuple(out_dims) + tuple(primal_dims)
-    target_perm = []
-    seen = set()
-    
-    # 1. Extract physical axes strictly in logical tuple sequence
-    for d in dims:
-        if getattr(d, 'val_dim', None) is not None and d.val_dim not in seen:
-            target_perm.append(d.val_dim)
-            seen.add(d.val_dim)
-        if getattr(d, 'block_val_dim', None) is not None and d.block_val_dim not in seen:
-            target_perm.append(d.block_val_dim)
-            seen.add(d.block_val_dim)
-            
-    # 2. Catch any unmapped physical axes (leftovers)
-    for i in range(val.ndim):
-        if i not in seen:
-            target_perm.append(i)
-            seen.add(i)
-            
-    # 3. Transpose physical array to match logical sequence, NOT vice versa
-    if target_perm != list(range(val.ndim)):
-        import jax.numpy as jnp
-        from dataclasses import replace
-        
-        val = jnp.transpose(val, target_perm)
-        inv_perm = {old: new for new, old in enumerate(target_perm)}
-        
-        def _update(d):
-            nv = inv_perm.get(d.val_dim) if getattr(d, 'val_dim', None) is not None else None
-            if hasattr(d, 'block_val_dim'):
-                nb = inv_perm.get(d.block_val_dim) if getattr(d, 'block_val_dim', None) is not None else None
-                return replace(d, val_dim=nv, block_val_dim=nb)
-            return replace(d, val_dim=nv)
-            
-        out_dims = tuple(_update(d) for d in out_dims)
-        primal_dims = tuple(_update(d) for d in primal_dims)
-        
-    return out_dims, primal_dims, val
+        return tuple(out_dims), tuple(primal_dims), None
+
+    s_map, s_perm, c_s = {}, [], count()
+    _map_sparse_axes(out_dims, s_map, c_s, s_perm)
+    _map_sparse_axes(primal_dims, s_map, c_s, s_perm)
+
+    d_map, d_perm, c_d = {}, [], count(len(s_map))
+    _map_dense_axes(tuple(out_dims) + tuple(primal_dims), d_map, c_d, d_perm)
+
+    new_out, new_primal = (
+        _update_dim_axes(out_dims, s_map, d_map),
+        _update_dim_axes(primal_dims, s_map, d_map),
+    )
+
+    full_perm, seen = [], set()
+    for p in s_perm + d_perm:
+        if p not in seen:
+            full_perm.append(p)
+            seen.add(p)
+    full_perm.extend(i for i in range(val.ndim) if i not in seen)
+
+    return new_out, new_primal, val.transpose(full_perm)
 
 
 def _arr2st(
     arr: Array, out_ndim: int | None = None, dtype: Any = None, **kwargs: Any
 ) -> SparseTensor:
+    from graphax.sparse.tensor import SparseTensor
+    from graphax.sparse.dimensions import DenseDimension
     if dtype is not None:
         arr = arr.astype(dtype)
     if out_ndim is None:
@@ -200,6 +194,8 @@ def _arr2st(
         check_consistency=False,
         **kwargs,
     )
+
+
 def _materialize_dimensions(st: SparseTensor, dims: Sequence[int]) -> Array:
     """
     Function that materializes the `val` property of a `SparseTensor` object
@@ -234,13 +230,15 @@ def _swap_back_axes(st: SparseTensor) -> SparseTensor:
     permutation = [0] * st.val.ndim
     for d in st.dims:
         if d.val_dim is not None:
-            if isinstance(d, DenseDimension):
+            if isinstance(d, DenseDimension) or d.id < getattr(
+                d, "other_id", float("inf")
+            ):
                 permutation[i] = d.val_dim
                 i += 1
-            elif d.id < d.other_id:
-                permutation[i] = d.val_dim
-                i += 1
-        if isinstance(d, SparseDimension) and d.block_val_dim is not None:
+        if (
+            isinstance(d, SparseDimension)
+            and getattr(d, "block_val_dim", None) is not None
+        ):
             permutation[i] = d.block_val_dim
             i += 1
 
@@ -281,7 +279,7 @@ def _swap_back_axes(st: SparseTensor) -> SparseTensor:
             current_i += 1
 
         new_d = replace(d, val_dim=nv)
-        if hasattr(new_d, "block_val_dim"):
+        if isinstance(new_d, SparseDimension):
             new_d = replace(new_d, block_val_dim=nb)
 
         processed_ids[d.id] = new_d

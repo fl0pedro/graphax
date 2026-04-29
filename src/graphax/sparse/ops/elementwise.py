@@ -3,24 +3,20 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable
-import numpy as np
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 
-from .utils import _arr2st
-from .layout import generate_block_permutation
+from graphax.sparse.ops.utils import _arr2st, _is_sparse
+from graphax.sparse.ops.layout import generate_block_permutation
 
-from ..dimensions import Dimension, SparseDimension, DenseDimension
+from graphax.sparse.dimensions import Dimension, SparseDimension, DenseDimension
 
 if TYPE_CHECKING:
-    from ..tensor import SparseTensor
+    from graphax.sparse.tensor import SparseTensor
 
-
-def _is_sparse(obj) -> bool: # TODO move this to dimensions
-    from ..tensor import SparseTensor
-    return isinstance(obj, SparseTensor)
 
 def _normalize_inputs(
     lhs: SparseTensor | Array, rhs: SparseTensor | Array
@@ -32,29 +28,22 @@ def _normalize_inputs(
     elif _is_sparse(rhs) and not _is_sparse(lhs):
         target_dtype = rhs.dtype
 
-    if not _is_sparse(lhs):
-        if hasattr(lhs, "dense"):
-            obj = lhs.dense()
-        else:
-            obj = lhs
+    inputs = [lhs, rhs]
+    for i in range(2):
+        if not _is_sparse(inputs[i]):
+            other = inputs[1 - i]
+            obj = inputs[i].dense() if hasattr(inputs[i], "dense") else inputs[i]
+            if hasattr(other, "shape") and getattr(obj, "size", 0) == 1:
+                obj = jnp.broadcast_to(obj, other.shape)
+            inputs[i] = _arr2st(
+                obj,
+                out_ndim=len(other.out_dims) if _is_sparse(other) else None,
+                dtype=target_dtype,
+            )
+        elif isinstance(inputs[i], tuple):
+            inputs[i] = inputs[i][0]
 
-        if hasattr(rhs, "shape") and obj.size == 1:
-            obj = jnp.broadcast_to(obj, rhs.shape)
-        lhs = _arr2st(
-            obj,
-            out_ndim=len(rhs.out_dims) if _is_sparse(rhs) else None,
-            dtype=target_dtype,
-        )
-    if not _is_sparse(rhs):
-        if hasattr(rhs, "dense"):
-            obj = rhs.dense()
-        else:
-            obj = rhs
-
-        if hasattr(lhs, "shape") and obj.size == 1:
-            obj = jnp.broadcast_to(obj, lhs.shape)
-        rhs = _arr2st(obj, out_ndim=len(lhs.out_dims), dtype=target_dtype)
-
+    lhs, rhs = tuple(inputs)
     if lhs.shape != rhs.shape:
         raise ValueError(f"Shape mismatch: {lhs.shape} != {rhs.shape}")
     return lhs, rhs
@@ -248,7 +237,10 @@ def _align_tensor_values(
     broadcast_unused_shape: list[int],
     is_left: bool,
 ) -> Array:
-    value = value * tensor.scalar_mult
+    if tensor.dtype == jnp.bool_:
+        value = value & tensor.scalar_mult.astype(jnp.bool_)
+    else:
+        value = value * tensor.scalar_mult
     target_shape = []
     for pair in sparse_pairs:
         d1 = pair[0] if is_left else pair[2]
@@ -282,7 +274,7 @@ def _promote_to_unified_blocks(
 ) -> Array:
     input_reshape, expansion_reshape, output_reshape = [], [], []
     needs_expansion = False
-    
+
     for metrics in pair_metrics:
         b1, b2 = (
             (metrics["left_b1"], metrics["left_b2"])
@@ -291,11 +283,11 @@ def _promote_to_unified_blocks(
         )
         common_b1, common_b2 = metrics["common_b1"], metrics["common_b2"]
         exp = common_b1 // b1
-        
+
         input_reshape.extend([metrics["unified_size"], exp, b1, b2])
         expansion_reshape.extend([metrics["unified_size"], exp, 1, b1, b2])
         output_reshape.extend([metrics["unified_size"], common_b1, common_b2])
-        
+
         if exp > 1:
             needs_expansion = True
 
@@ -303,7 +295,7 @@ def _promote_to_unified_blocks(
     input_reshape.extend(rem)
     expansion_reshape.extend(rem)
     output_reshape.extend(rem)
-    
+
     value = value.reshape(input_reshape).reshape(expansion_reshape)
 
     # FAST PATH: If block sizes match identically, avoid masking entirely
@@ -312,19 +304,20 @@ def _promote_to_unified_blocks(
         perm.extend(range(5 * len(pair_metrics), len(expansion_reshape)))
         return value.transpose(perm).reshape(output_reshape)
 
-    # Construct a pure boolean mask
-    mask = jnp.array(True, dtype=jnp.bool_)
+    # Construct a pure boolean mask only for dimensions that need expansion
+    mask = None
     for i, m in enumerate(pair_metrics):
         exp = m["common_b1"] // (m["left_b1"] if is_left else m["right_b1"])
         if exp > 1:
             m_shape = [1] * len(expansion_reshape)
             m_shape[5 * i + 1] = exp
             m_shape[5 * i + 2] = exp
-            # Boolean logic avoids FLOPs entirely
-            mask = mask & jnp.eye(exp, dtype=jnp.bool_).reshape(m_shape)
+            eye_mask = jnp.eye(exp, dtype=jnp.bool_).reshape(m_shape)
+            mask = eye_mask if mask is None else mask & eye_mask
 
     # Predication (jnp.where) instead of arithmetic mapping (value * mask)
-    value = jnp.where(mask, value, jnp.array(0, dtype=value.dtype))
+    if mask is not None:
+        value = jnp.where(mask, value, jnp.array(0, dtype=value.dtype))
 
     perm = generate_block_permutation(len(pair_metrics), 5, [0, 1, 3, 2, 4])
     perm.extend(range(5 * len(pair_metrics), len(expansion_reshape)))
@@ -418,7 +411,7 @@ def _reconstruct_result_tensor(
     op: Callable,
     rhs: SparseTensor,
 ) -> SparseTensor:
-    from ..tensor import SparseTensor
+    from graphax.sparse.tensor import SparseTensor
 
     reconstructed = {}
     info = {"axis": 0, "squeeze": []}
@@ -435,24 +428,6 @@ def _reconstruct_result_tensor(
                 0 if ax in info["squeeze"] else slice(None) for ax in range(value.ndim)
             )
         ]
-        # for rid, dim in reconstructed.items():
-
-        #     def shift(ax):
-        #         return (
-        #             ax - sum(1 for s in info["squeeze"] if s < ax)
-        #             if ax is not None
-        #             else None
-        #         )
-
-        #     reconstructed[rid] = replace(
-        #         dim,
-        #         val_dim=shift(dim.val_dim),
-        #         **(
-        #             {"block_val_dim": shift(getattr(dim, "block_val_dim", None))}
-        #             if isinstance(dim, SparseDimension)
-        #             else {}
-        #         ),
-        #     )
 
     s_mult = (
         jnp.array(1.0, dtype=value.dtype)
@@ -476,7 +451,7 @@ def elementwise(
     rhs: SparseTensor | Array,
     op: Callable,
     is_intersection: bool = False,
-    count: bool = False
+    count: bool = False,
 ) -> SparseTensor | tuple[SparseTensor, Array]:
     lhs, rhs = _normalize_inputs(lhs, rhs)
     sparse_pairs, dense_pairs = _map_topology(lhs, rhs)
@@ -500,9 +475,11 @@ def elementwise(
     else:
         return res
 
+
 def add_w_counts(a, b):
     res = elementwise(a, b, jax.lax.add, count=True)
     return res[0], (res[1], 0, 0)
+
 
 def mul_w_counts(a, b):
     res = elementwise(a, b, jax.lax.mul, is_intersection=True, count=True)
