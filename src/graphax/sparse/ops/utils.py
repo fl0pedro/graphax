@@ -49,9 +49,8 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
     from graphax.sparse.dimensions import SparseDimension
 
     dim_ids = [d.id for d in st.dims]
-    expected_ids = list(range(len(dim_ids)))
-    assert sorted(dim_ids) == expected_ids, (
-        f"Topology Error: Dimension IDs must be a contiguous sequence. Got {dim_ids}"
+    assert len(set(dim_ids)) == len(dim_ids), (
+        f"Topology Error: Duplicate dimension IDs found: {dim_ids}"
     )
 
     dim_map = {d.id: d for d in st.dims}
