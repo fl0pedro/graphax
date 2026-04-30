@@ -94,14 +94,7 @@ def transpose(
     # 3. Reorder dimensions and update IDs
     all_dims = tensor.dims
     reordered_dims = [all_dims[i] for i in full_permutation]
-    id_map = {d.id: i for i, d in enumerate(reordered_dims)}
-
-    updated_dims = []
-    for i, d in enumerate(reordered_dims):
-        kwargs = {"id": i}
-        if isinstance(d, SparseDimension):
-            kwargs["other_id"] = id_map[d.other_id]
-        updated_dims.append(replace(d, **kwargs))
+    updated_dims = reordered_dims
 
     n_out = len(new_out_axes)
     new_out_dims, new_primal_dims = updated_dims[:n_out], updated_dims[n_out:]
