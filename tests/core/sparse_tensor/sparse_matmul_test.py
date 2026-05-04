@@ -5,7 +5,7 @@ import jax.lax as lax
 import jax.numpy as jnp
 import jax.random as jrand
 
-from graphax.sparse.dimensions import SparseDimension
+from graphax.sparse.indexes import SparseIndex
 from graphax.sparse.tensor import SparseTensor
 from utils import assert_matmul_result
 
@@ -19,10 +19,10 @@ class TestSparseMatmul(unittest.TestCase):
         res = jnp.diag(x) @ jnp.diag(y)
 
         stx = SparseTensor(
-            [SparseDimension(0, 4, 0, 1)], [SparseDimension(1, 4, 0, 0)], x
+            [SparseIndex(0, 4, 0, 1)], [SparseIndex(1, 4, 0, 0)], x
         )
         sty = SparseTensor(
-            [SparseDimension(0, 4, 0, 1)], [SparseDimension(1, 4, 0, 0)], y
+            [SparseIndex(0, 4, 0, 1)], [SparseIndex(1, 4, 0, 0)], y
         )
         stres = stx @ sty
 
@@ -35,10 +35,10 @@ class TestSparseMatmul(unittest.TestCase):
         res = _x @ _y
 
         stx = SparseTensor(
-            [SparseDimension(0, 3, None, 1)], [SparseDimension(1, 3, None, 0)], None
+            [SparseIndex(0, 3, None, 1)], [SparseIndex(1, 3, None, 0)], None
         )
         sty = SparseTensor(
-            [SparseDimension(0, 3, None, 1)], [SparseDimension(1, 3, None, 0)], None
+            [SparseIndex(0, 3, None, 1)], [SparseIndex(1, 3, None, 0)], None
         )
         stres = stx @ sty
 
@@ -62,13 +62,13 @@ class TestSparseMatmul(unittest.TestCase):
         res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
 
         stx = SparseTensor(
-            [SparseDimension(0, 3, 0, 2), SparseDimension(1, 5, 1, 3)],
-            [SparseDimension(2, 3, 0, 0), SparseDimension(3, 5, 1, 1)],
+            [SparseIndex(0, 3, 0, 2), SparseIndex(1, 5, 1, 3)],
+            [SparseIndex(2, 3, 0, 0), SparseIndex(3, 5, 1, 1)],
             x,
         )
         sty = SparseTensor(
-            [SparseDimension(0, 3, 0, 2), SparseDimension(1, 5, 1, 3)],
-            [SparseDimension(2, 3, 0, 0), SparseDimension(3, 5, 1, 1)],
+            [SparseIndex(0, 3, 0, 2), SparseIndex(1, 5, 1, 3)],
+            [SparseIndex(2, 3, 0, 0), SparseIndex(3, 5, 1, 1)],
             y,
         )
         stres = stx @ sty
@@ -87,13 +87,13 @@ class TestSparseMatmul(unittest.TestCase):
         res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
 
         stx = SparseTensor(
-            [SparseDimension(0, 3, None, 2), SparseDimension(1, 4, None, 3)],
-            [SparseDimension(2, 3, None, 0), SparseDimension(3, 4, None, 1)],
+            [SparseIndex(0, 3, None, 2), SparseIndex(1, 4, None, 3)],
+            [SparseIndex(2, 3, None, 0), SparseIndex(3, 4, None, 1)],
             None,
         )
         sty = SparseTensor(
-            [SparseDimension(0, 3, None, 3), SparseDimension(1, 4, None, 2)],
-            [SparseDimension(2, 4, None, 1), SparseDimension(3, 3, None, 0)],
+            [SparseIndex(0, 3, None, 3), SparseIndex(1, 4, None, 2)],
+            [SparseIndex(2, 4, None, 1), SparseIndex(3, 3, None, 0)],
             None,
         )
         stres = stx @ sty

@@ -7,7 +7,7 @@ from itertools import chain, count
 from dataclasses import replace
 import copy
 
-from graphax.sparse.dimensions import Dimension, DenseDimension, SparseDimension
+from graphax.sparse.indexes import Index, DenseIndex, SparseIndex
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
@@ -24,7 +24,7 @@ def _is_sparse(obj) -> bool:
 def _check_sparse_dim_pair(d, dim_map):
     other = dim_map.get(d.other_id)
     if (
-        not isinstance(other, SparseDimension)
+        not isinstance(other, SparseIndex)
         or other.other_id != d.id
         or d.size != other.size
     ):
@@ -32,21 +32,21 @@ def _check_sparse_dim_pair(d, dim_map):
     return True
 
 
-def _check_block_val_dim(d, dim_map, block_val_dims):
-    if d.block_val_dim in block_val_dims:
+def _check_block_axis(d, dim_map, block_axiss):
+    if d.block_axis in block_axiss:
         other = dim_map.get(d.other_id)
         if not (
-            isinstance(other, SparseDimension)
-            and other.block_val_dim == d.block_val_dim
+            isinstance(other, SparseIndex)
+            and other.block_axis == d.block_axis
         ):
             raise ValueError(
-                f"Topology Error: Duplicate block_val_dim {d.block_val_dim} found in SparseDimension {d.id}"
+                f"Topology Error: Duplicate block_axis {d.block_axis} found in SparseIndex {d.id}"
             )
-    block_val_dims.add(d.block_val_dim)
+    block_axiss.add(d.block_axis)
 
 
 def _assert_sparse_tensor_consistency(st: SparseTensor):
-    from graphax.sparse.dimensions import SparseDimension
+    from graphax.sparse.indexes import SparseIndex
 
     dim_ids = [d.id for d in st.dims]
     assert len(set(dim_ids)) == len(dim_ids), (
@@ -54,14 +54,14 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
     )
 
     dim_map = {d.id: d for d in st.dims}
-    block_val_dims = set()
+    block_axiss = set()
     for d in st.dims:
-        if isinstance(d, SparseDimension):
+        if isinstance(d, SparseIndex):
             assert _check_sparse_dim_pair(d, dim_map), (
                 f"Topology Error: Invalid sparse dimension pair configuration for dimension {d.id}"
             )
-            if getattr(d, "block_val_dim", None) is not None:
-                _check_block_val_dim(d, dim_map, block_val_dims)
+            if getattr(d, "block_axis", None) is not None:
+                _check_block_axis(d, dim_map, block_axiss)
 
 
 def _copy(
@@ -69,8 +69,8 @@ def _copy(
     val: Array | None = None,
     scalar_mult: Array | None = None,
     fill_value: Array | None = None,
-    out_dims: Sequence[Dimension] | None = None,
-    primal_dims: Sequence[Dimension] | None = None,
+    out_dims: Sequence[Index] | None = None,
+    primal_dims: Sequence[Index] | None = None,
     deep=False,
 ):
     from graphax.sparse.tensor import SparseTensor
@@ -91,10 +91,10 @@ def _copy(
         od,
         pd,
         v,
-        s,
-        f,
-        st.pre_transforms,
-        st.post_transforms,
+        scalar_mult=s,
+        fill_value=f,
+        pre_transforms=st.pre_transforms,
+        post_transforms=st.post_transforms,
         sort_val=False,
         check_consistency=False,
     )
@@ -103,50 +103,53 @@ def _copy(
 def _map_sparse_axes(dims_list, sparse_axis_map, counter, perm):
     for d in dims_list:
         if (
-            isinstance(d, SparseDimension)
-            and d.val_dim is not None
-            and d.val_dim not in sparse_axis_map
+            isinstance(d, SparseIndex)
+            and d.axis is not None
+            and d.axis not in sparse_axis_map
         ):
-            sparse_axis_map[d.val_dim] = next(counter)
-            perm.append(d.val_dim)
+            sparse_axis_map[d.axis] = next(counter)
+            perm.append(d.axis)
 
 
 def _map_dense_axes(dims, dense_axis_map, counter, perm):
     for d in dims:
         if (
-            isinstance(d, DenseDimension)
-            and d.val_dim is not None
-            and d.val_dim not in dense_axis_map
+            isinstance(d, DenseIndex)
+            and d.axis is not None
+            and d.axis not in dense_axis_map
         ):
-            dense_axis_map[d.val_dim] = next(counter)
-            perm.append(d.val_dim)
+            dense_axis_map[d.axis] = next(counter)
+            perm.append(d.axis)
         if (
-            isinstance(d, SparseDimension)
-            and d.block_val_dim is not None
-            and d.block_val_dim not in dense_axis_map
+            isinstance(d, SparseIndex)
+            and d.block_axis is not None
+            and d.block_axis not in dense_axis_map
         ):
-            dense_axis_map[d.block_val_dim] = next(counter)
-            perm.append(d.block_val_dim)
+            dense_axis_map[d.block_axis] = next(counter)
+            perm.append(d.block_axis)
 
 
 def _update_dim_axes(ds, s_map, d_map):
     res = []
     for d in ds:
-        if isinstance(d, SparseDimension):
-            nv = s_map.get(d.val_dim) if d.val_dim is not None else None
-            nb = d_map.get(d.block_val_dim) if d.block_val_dim is not None else None
-            res.append(replace(d, val_dim=nv, block_val_dim=nb))
+        if isinstance(d, SparseIndex):
+            nv = s_map.get(d.axis) if d.axis is not None else None
+            nb = d_map.get(d.block_axis) if d.block_axis is not None else None
+            res.append(replace(d, axis=nv, block_axis=nb))
         else:
-            nv = d_map.get(d.val_dim) if d.val_dim is not None else None
-            res.append(replace(d, val_dim=nv))
+            nv = d_map.get(d.axis) if d.axis is not None else None
+            res.append(replace(d, axis=nv))
     return tuple(res)
 
 
 def _sort_val(
-    out_dims: Sequence[Dimension], primal_dims: Sequence[Dimension], val: Array | None
-) -> tuple[tuple[Dimension, ...], tuple[Dimension, ...], Array | None]:
+    out_dims: Sequence[Index], primal_dims: Sequence[Index], val: Array | None
+) -> tuple[tuple[Index, ...], tuple[Index, ...], Array | None]:
     if val is None:
         return tuple(out_dims), tuple(primal_dims), None
+
+    if not hasattr(val, "ndim"):
+        val = jnp.asarray(val)
 
     s_map, s_perm, c_s = {}, [], count()
     _map_sparse_axes(out_dims, s_map, c_s, s_perm)
@@ -174,7 +177,7 @@ def _arr2st(
     arr: Array, out_ndim: int | None = None, dtype: Any = None, **kwargs: Any
 ) -> SparseTensor:
     from graphax.sparse.tensor import SparseTensor
-    from graphax.sparse.dimensions import DenseDimension
+    from graphax.sparse.indexes import DenseIndex
     if dtype is not None:
         arr = arr.astype(dtype)
     if out_ndim is None:
@@ -184,7 +187,7 @@ def _arr2st(
         arr = jnp.expand_dims(arr, 0)
         out_ndim = max(out_ndim or 0, 0)
 
-    dims = tuple(DenseDimension(i, s, i) for i, s in enumerate(arr.shape))
+    dims = tuple(DenseIndex(i, s, i) for i, s in enumerate(arr.shape))
     return SparseTensor(
         dims[:out_ndim],
         dims[out_ndim:],
@@ -195,7 +198,7 @@ def _arr2st(
     )
 
 
-def _materialize_dimensions(st: SparseTensor, dims: Sequence[int]) -> Array:
+def _materialize_indexes(st: SparseTensor, dims: Sequence[int]) -> Array:
     """
     Function that materializes the `val` property of a `SparseTensor` object
     along a given set of axes.
@@ -228,17 +231,17 @@ def _swap_back_axes(st: SparseTensor) -> SparseTensor:
     i = 0
     permutation = [0] * st.val.ndim
     for d in st.dims:
-        if d.val_dim is not None:
-            if isinstance(d, DenseDimension) or d.id < getattr(
+        if d.axis is not None:
+            if isinstance(d, DenseIndex) or d.id < getattr(
                 d, "other_id", float("inf")
             ):
-                permutation[i] = d.val_dim
+                permutation[i] = d.axis
                 i += 1
         if (
-            isinstance(d, SparseDimension)
-            and getattr(d, "block_val_dim", None) is not None
+            isinstance(d, SparseIndex)
+            and getattr(d, "block_axis", None) is not None
         ):
-            permutation[i] = d.block_val_dim
+            permutation[i] = d.block_axis
             i += 1
 
     # Fill remaining axes if any
@@ -256,30 +259,30 @@ def _swap_back_axes(st: SparseTensor) -> SparseTensor:
     new_dims = []
     dim_map = {d.id: d for d in st.dims}
 
-    # We need to update both out_dims and primal_dims, but they might share SparseDimensions
+    # We need to update both out_dims and primal_dims, but they might share SparseIndexes
     processed_ids = {}
 
     def update_dim(d, current_i):
         if d.id in processed_ids:
             return processed_ids[d.id], current_i
 
-        nv, nb = d.val_dim, getattr(d, "block_val_dim", None)
+        nv, nb = d.axis, getattr(d, "block_axis", None)
         if nv is not None:
-            if isinstance(d, DenseDimension) or d.id < d.other_id:
+            if isinstance(d, DenseIndex) or d.id < d.other_id:
                 nv = current_i
                 current_i += 1
             else:
-                # It's a SparseDimension and we are at the second one of the pair
+                # It's a SparseIndex and we are at the second one of the pair
                 other = dim_map[d.other_id]
-                nv = processed_ids[other.id].val_dim
+                nv = processed_ids[other.id].axis
 
         if nb is not None:
             nb = current_i
             current_i += 1
 
-        new_d = replace(d, val_dim=nv)
-        if isinstance(new_d, SparseDimension):
-            new_d = replace(new_d, block_val_dim=nb)
+        new_d = replace(d, axis=nv)
+        if isinstance(new_d, SparseIndex):
+            new_d = replace(new_d, block_axis=nb)
 
         processed_ids[d.id] = new_d
         return new_d, current_i

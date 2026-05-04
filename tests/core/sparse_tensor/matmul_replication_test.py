@@ -5,7 +5,7 @@ import jax.lax as lax
 import jax.numpy as jnp
 import jax.random as jrand
 
-from graphax.sparse.dimensions import DenseDimension, SparseDimension
+from graphax.sparse.indexes import DenseIndex, SparseIndex
 from graphax.sparse.tensor import SparseTensor
 from utils import assert_matmul_result
 
@@ -21,8 +21,8 @@ class TestReplicationMatmul(unittest.TestCase):
         y = jrand.normal(ykey, (3, 2))
         res = _x @ y
 
-        stx = SparseTensor([DenseDimension(0, 4, 0)], [DenseDimension(1, 3, None)], x)
-        sty = SparseTensor([DenseDimension(0, 3, 0)], [DenseDimension(1, 2, 1)], y)
+        stx = SparseTensor([DenseIndex(0, 4, 0)], [DenseIndex(1, 3, None)], x)
+        sty = SparseTensor([DenseIndex(0, 3, 0)], [DenseIndex(1, 2, 1)], y)
         stres = stx @ sty
 
         assert_matmul_result(stres, res, (4,), (2,), (4, 2))
@@ -39,8 +39,8 @@ class TestReplicationMatmul(unittest.TestCase):
         _y = jnp.tile(_y, (3, 1))
         res = _x @ _y
 
-        stx = SparseTensor([DenseDimension(0, 4, 0)], [DenseDimension(1, 3, None)], x)
-        sty = SparseTensor([DenseDimension(0, 3, None)], [DenseDimension(1, 2, 0)], y)
+        stx = SparseTensor([DenseIndex(0, 4, 0)], [DenseIndex(1, 3, None)], x)
+        sty = SparseTensor([DenseIndex(0, 3, None)], [DenseIndex(1, 2, 0)], y)
         stres = stx @ sty
 
         assert_matmul_result(stres, res, (4,), (2,), (4, 2))
@@ -60,13 +60,13 @@ class TestReplicationMatmul(unittest.TestCase):
         res = jnp.einsum("ijk,jkl->il", _x, _y)
 
         stx = SparseTensor(
-            [SparseDimension(0, 4, 0, 1)],
-            [SparseDimension(1, 4, 0, 0), DenseDimension(2, 5, None)],
+            [SparseIndex(0, 4, 0, 1)],
+            [SparseIndex(1, 4, 0, 0), DenseIndex(2, 5, None)],
             x,
         )
         sty = SparseTensor(
-            [DenseDimension(0, 4, 0), SparseDimension(1, 5, 1, 2)],
-            [SparseDimension(2, 5, 1, 1)],
+            [DenseIndex(0, 4, 0), SparseIndex(1, 5, 1, 2)],
+            [SparseIndex(2, 5, 1, 1)],
             y,
         )
         stres = stx @ sty
@@ -88,13 +88,13 @@ class TestReplicationMatmul(unittest.TestCase):
         res = jnp.einsum("ijk,jkl->il", _x, _y)
 
         stx = SparseTensor(
-            [SparseDimension(0, 4, 0, 1)],
-            [SparseDimension(1, 4, 0, 0), DenseDimension(2, 5, 1)],
+            [SparseIndex(0, 4, 0, 1)],
+            [SparseIndex(1, 4, 0, 0), DenseIndex(2, 5, 1)],
             x,
         )
         sty = SparseTensor(
-            [DenseDimension(0, 4, None), SparseDimension(1, 5, 0, 2)],
-            [SparseDimension(2, 5, 0, 1)],
+            [DenseIndex(0, 4, None), SparseIndex(1, 5, 0, 2)],
+            [SparseIndex(2, 5, 0, 1)],
             y,
         )
         stres = stx @ sty
@@ -114,13 +114,13 @@ class TestReplicationMatmul(unittest.TestCase):
         res = jnp.einsum("ijkl,klm->ijm", _x, _y)
 
         stx = SparseTensor(
-            [DenseDimension(0, 3, 0), SparseDimension(1, 4, 1, 2)],
-            [SparseDimension(2, 4, 1, 1), DenseDimension(3, 5, 2)],
+            [DenseIndex(0, 3, 0), SparseIndex(1, 4, 1, 2)],
+            [SparseIndex(2, 4, 1, 1), DenseIndex(3, 5, 2)],
             x,
         )
         sty = SparseTensor(
-            [DenseDimension(0, 4, None), DenseDimension(1, 5, 0)],
-            [DenseDimension(2, 2, 1)],
+            [DenseIndex(0, 4, None), DenseIndex(1, 5, 0)],
+            [DenseIndex(2, 2, 1)],
             y,
         )
         stres = stx @ sty

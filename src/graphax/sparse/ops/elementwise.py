@@ -12,7 +12,7 @@ from jax import Array
 from graphax.sparse.ops.utils import _arr2st, _is_sparse
 from graphax.sparse.ops.layout import generate_block_permutation
 
-from graphax.sparse.dimensions import Dimension, SparseDimension, DenseDimension
+from graphax.sparse.indexes import Index, SparseIndex, DenseIndex
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
@@ -54,7 +54,7 @@ def _handle_sparse_sparse_pair(left_dim, right_dim, left_dims, right_dims):
     left_partner, right_partner = left_dims[partner_idx], right_dims[partner_idx]
 
     if (
-        not isinstance(right_partner, SparseDimension)
+        not isinstance(right_partner, SparseIndex)
         or right_dim.other_id != right_partner.id
     ):
         raise ValueError(
@@ -69,26 +69,26 @@ def _promote_left_dense_to_sparse(left_dim, right_dim, left_dims, right_dims):
     )
     right_partner, left_partner = right_dims[partner_idx], left_dims[partner_idx]
 
-    if not isinstance(left_partner, DenseDimension):
+    if not isinstance(left_partner, DenseIndex):
         raise ValueError(
-            "Topology mismatch: Expected DenseDimension to pair with SparseDimension"
+            "Topology mismatch: Expected DenseIndex to pair with SparseIndex"
         )
 
-    synthetic_left = SparseDimension(
+    synthetic_left = SparseIndex(
         left_dim.id,
         1,
-        val_dim=None,
+        axis=None,
         other_id=left_partner.id,
         block_size=left_dim.size,
-        block_val_dim=left_dim.val_dim,
+        block_axis=left_dim.axis,
     )
-    synthetic_left_partner = SparseDimension(
+    synthetic_left_partner = SparseIndex(
         left_partner.id,
         1,
-        val_dim=None,
+        axis=None,
         other_id=left_dim.id,
         block_size=left_partner.size,
-        block_val_dim=left_partner.val_dim,
+        block_axis=left_partner.axis,
     )
     return (
         synthetic_left,
@@ -102,26 +102,26 @@ def _promote_right_dense_to_sparse(left_dim, right_dim, left_dims, right_dims):
     partner_idx = next(j for j, d in enumerate(left_dims) if d.id == left_dim.other_id)
     left_partner, right_partner = left_dims[partner_idx], right_dims[partner_idx]
 
-    if not isinstance(right_partner, DenseDimension):
+    if not isinstance(right_partner, DenseIndex):
         raise ValueError(
-            "Topology mismatch: Expected DenseDimension to pair with SparseDimension"
+            "Topology mismatch: Expected DenseIndex to pair with SparseIndex"
         )
 
-    synthetic_right = SparseDimension(
+    synthetic_right = SparseIndex(
         right_dim.id,
         1,
-        val_dim=None,
+        axis=None,
         other_id=right_partner.id,
         block_size=right_dim.size,
-        block_val_dim=right_dim.val_dim,
+        block_axis=right_dim.axis,
     )
-    synthetic_right_partner = SparseDimension(
+    synthetic_right_partner = SparseIndex(
         right_partner.id,
         1,
-        val_dim=None,
+        axis=None,
         other_id=right_dim.id,
         block_size=right_partner.size,
-        block_val_dim=right_partner.val_dim,
+        block_axis=right_partner.axis,
     )
     return (
         left_dim,
@@ -134,29 +134,29 @@ def _promote_right_dense_to_sparse(left_dim, right_dim, left_dims, right_dims):
 def _resolve_dim_pairing(i, left_dims, right_dims, processed_indices):
     left_dim, right_dim = left_dims[i], right_dims[i]
 
-    if isinstance(left_dim, SparseDimension) and isinstance(right_dim, SparseDimension):
+    if isinstance(left_dim, SparseIndex) and isinstance(right_dim, SparseIndex):
         pair, partner_idx = _handle_sparse_sparse_pair(
             left_dim, right_dim, left_dims, right_dims
         )
         processed_indices.update([i, partner_idx])
         return "sparse", pair
 
-    if isinstance(left_dim, DenseDimension) and isinstance(right_dim, SparseDimension):
+    if isinstance(left_dim, DenseIndex) and isinstance(right_dim, SparseIndex):
         pair, partner_idx = _promote_left_dense_to_sparse(
             left_dim, right_dim, left_dims, right_dims
         )
         processed_indices.update([i, partner_idx])
         return "sparse", pair
 
-    if isinstance(right_dim, DenseDimension) and isinstance(left_dim, SparseDimension):
+    if isinstance(right_dim, DenseIndex) and isinstance(left_dim, SparseIndex):
         pair, partner_idx = _promote_right_dense_to_sparse(
             left_dim, right_dim, left_dims, right_dims
         )
         processed_indices.update([i, partner_idx])
         return "sparse", pair
 
-    if not isinstance(left_dim, SparseDimension) and not isinstance(
-        right_dim, SparseDimension
+    if not isinstance(left_dim, SparseIndex) and not isinstance(
+        right_dim, SparseIndex
     ):
         processed_indices.add(i)
         return "dense", (left_dim, right_dim)
@@ -205,13 +205,13 @@ def _get_axes_info(sparse_pairs, dense_pairs, is_left):
         d1, d2 = (pair[0], pair[1]) if is_left else (pair[2], pair[3])
         axes.extend(
             [
-                d1.val_dim,
-                getattr(d1, "block_val_dim", None),
-                getattr(d2, "block_val_dim", None),
+                d1.axis,
+                getattr(d1, "block_axis", None),
+                getattr(d2, "block_axis", None),
             ]
         )
     for pair in dense_pairs:
-        axes.append((pair[0] if is_left else pair[1]).val_dim)
+        axes.append((pair[0] if is_left else pair[1]).axis)
     return axes
 
 
@@ -387,8 +387,8 @@ def _reconstruct_dimension_pair(i, pair, meta, next_info):
             pair[0],
             size=size,
             block_size=b1 if b1 > 1 else None,
-            val_dim=v_ax,
-            block_val_dim=b1_ax,
+            axis=v_ax,
+            block_axis=b1_ax,
         ),
     ), (
         lid2,
@@ -396,8 +396,8 @@ def _reconstruct_dimension_pair(i, pair, meta, next_info):
             pair[1],
             size=size,
             block_size=b2 if b2 > 1 else None,
-            val_dim=v_ax,
-            block_val_dim=b2_ax,
+            axis=v_ax,
+            block_axis=b2_ax,
         ),
     )
 
@@ -419,7 +419,7 @@ def _reconstruct_result_tensor(
         p1, p2 = _reconstruct_dimension_pair(i, pair, output_pairs_meta, info)
         reconstructed[p1[0]], reconstructed[p2[0]] = p1[1], p2[1]
     for pair in dense_pairs:
-        reconstructed[pair[0].id] = replace(pair[0], val_dim=info["axis"])
+        reconstructed[pair[0].id] = replace(pair[0], axis=info["axis"])
         info["axis"] += 1
 
     if info["squeeze"]:

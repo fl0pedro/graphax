@@ -59,5 +59,12 @@ MANIFEST
 
 samples
 data
+**/samples/
+**/data/
 
 playground
+
+LAZY_EVAL_PLAN.md
+.claude
+*.md
+!OPTIMIZATION_PLAN.md

@@ -7,22 +7,22 @@ from jax import Array
 from typing import TYPE_CHECKING, Sequence
 from dataclasses import replace
 
-from graphax.sparse.dimensions import Dimension, SparseDimension, DenseDimension
+from graphax.sparse.indexes import Index, SparseIndex, DenseIndex
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
 
 
 def _is_dimension_implicit(dim, id_to_idx):
-    needs_val = dim.val_dim is None
+    needs_val = dim.axis is None
     needs_block = (
-        isinstance(dim, SparseDimension)
+        isinstance(dim, SparseIndex)
         and dim.block_size
-        and dim.block_val_dim is None
+        and dim.block_axis is None
     )
     if needs_val or needs_block:
         to_add = {id_to_idx[dim.id]}
-        if isinstance(dim, SparseDimension):
+        if isinstance(dim, SparseIndex):
             to_add.add(id_to_idx[dim.other_id])
         return True, to_add
     return False, set()
@@ -43,50 +43,50 @@ def _get_implicit_indices(
 def _calculate_target_shape(val_shape, dims):
     target = list(val_shape)
     for dim in dims:
-        if dim.val_dim is not None:
-            target[dim.val_dim] = max(target[dim.val_dim], dim.size)
-        if isinstance(dim, SparseDimension) and dim.block_val_dim is not None:
-            target[dim.block_val_dim] = max(
-                target[dim.block_val_dim], dim.block_size or 1
+        if dim.axis is not None:
+            target[dim.axis] = max(target[dim.axis], dim.size)
+        if isinstance(dim, SparseIndex) and dim.block_axis is not None:
+            target[dim.block_axis] = max(
+                target[dim.block_axis], dim.block_size or 1
             )
     return tuple(target)
 
 
 def _append_primary_dimension(
-    i, dim, implicit_indices, current_ndim, dims_to_append, sparse_pair_val_dim_map
+    i, dim, implicit_indices, current_ndim, dims_to_append, sparse_pair_axis_map
 ):
-    if i in implicit_indices and dim.val_dim is None:
-        if isinstance(dim, SparseDimension):
+    if i in implicit_indices and dim.axis is None:
+        if isinstance(dim, SparseIndex):
             pair_key = tuple(sorted((dim.id, dim.other_id)))
-            if pair_key in sparse_pair_val_dim_map:
-                new_idx = sparse_pair_val_dim_map[pair_key]
+            if pair_key in sparse_pair_axis_map:
+                new_idx = sparse_pair_axis_map[pair_key]
             else:
                 new_idx = current_ndim + len(dims_to_append)
                 dims_to_append.append(dim.size)
-                sparse_pair_val_dim_map[pair_key] = new_idx
+                sparse_pair_axis_map[pair_key] = new_idx
         else:
             new_idx = current_ndim + len(dims_to_append)
             dims_to_append.append(dim.size)
-        return replace(dim, val_dim=new_idx)
+        return replace(dim, axis=new_idx)
     return dim
 
 
 def _append_block_dimension(i, dim, implicit_indices, current_ndim, dims_to_append):
     if (
         i in implicit_indices
-        and isinstance(dim, SparseDimension)
-        and dim.block_val_dim is None
+        and isinstance(dim, SparseIndex)
+        and dim.block_axis is None
         and dim.block_size is not None
     ):
         new_idx = current_ndim + len(dims_to_append)
         dims_to_append.append(dim.block_size)
-        return replace(dim, block_val_dim=new_idx)
+        return replace(dim, block_axis=new_idx)
     return dim
 
 
 def _broadcast_and_append_dimensions(
     tensor: SparseTensor, values: Array, implicit_indices: set[int]
-) -> tuple[Array, list[Dimension]]:
+) -> tuple[Array, list[Index]]:
     if tensor.val is not None:
         target = _calculate_target_shape(values.shape, tensor.dims)
         if target != values.shape:
@@ -115,7 +115,7 @@ def _collect_scatter_indices(logical_indices, updated_dims, id_to_idx):
     scatter_logical = set()
     for i in logical_indices:
         scatter_logical.add(i)
-        if isinstance(updated_dims[i], SparseDimension):
+        if isinstance(updated_dims[i], SparseIndex):
             scatter_logical.add(id_to_idx[updated_dims[i].other_id])
     return scatter_logical
 
@@ -138,10 +138,10 @@ def dense(
     phys_to_scatter = sorted(
         list(
             {
-                updated_dims[i].val_dim
+                updated_dims[i].axis
                 for i in actual_scatter
-                if isinstance(updated_dims[i], SparseDimension)
-                and updated_dims[i].val_dim is not None
+                if isinstance(updated_dims[i], SparseIndex)
+                and updated_dims[i].axis is not None
             }
         )
     )
@@ -187,10 +187,10 @@ def _prepare_values_for_scattering(
 def _apply_dense_scattering(
     values: Array,
     fill_value: Array,
-    logical_dims: list[Dimension],
+    logical_dims: list[Index],
     scatter_logical_indices: set[int],
     scatter_phys_axes: list[int],
-) -> tuple[Array, list[Dimension]]:
+) -> tuple[Array, list[Index]]:
     values, phys_map = _prepare_values_for_scattering(
         values, scatter_phys_axes, fill_value
     )
@@ -202,38 +202,38 @@ def _apply_dense_scattering(
     for i, dim in enumerate(logical_dims):
         pair_key = (
             tuple(sorted((dim.id, dim.other_id)))
-            if isinstance(dim, SparseDimension)
+            if isinstance(dim, SparseIndex)
             else (dim.id,)
         )
-        if i in scatter_logical_indices and isinstance(dim, SparseDimension):
+        if i in scatter_logical_indices and isinstance(dim, SparseIndex):
             idx = 1 if pair_key in visited_pairs else 0
             visited_pairs.add(pair_key)
-            p_idx = phys_map[dim.val_dim][idx]
+            p_idx = phys_map[dim.axis][idx]
             final_perm.append(p_idx)
             active_axes.add(p_idx)
             l_size = dim.size
-            if dim.block_val_dim is not None:
-                b_p = phys_map[dim.block_val_dim]
+            if dim.block_axis is not None:
+                b_p = phys_map[dim.block_axis]
                 final_perm.append(b_p)
                 active_axes.add(b_p)
                 l_size *= dim.block_size
             final_shape.append(l_size)
             log_to_phys[i] = (curr_f_idx, None, l_size)
             curr_f_idx += 1
-        elif isinstance(dim, SparseDimension):
+        elif isinstance(dim, SparseIndex):
             new_v, new_b = None, None
             if pair_key not in visited_pairs:
-                if dim.val_dim is not None:
-                    p_idx = phys_map[dim.val_dim]
+                if dim.axis is not None:
+                    p_idx = phys_map[dim.axis]
                     final_perm.append(p_idx)
                     active_axes.add(p_idx)
-                    sparse_phys_to_final[dim.val_dim] = curr_f_idx
+                    sparse_phys_to_final[dim.axis] = curr_f_idx
                     final_shape.append(dim.size)
                     curr_f_idx += 1
                 visited_pairs.add(pair_key)
-            new_v = sparse_phys_to_final.get(dim.val_dim)
-            if dim.block_val_dim is not None:
-                b_p = phys_map[dim.block_val_dim]
+            new_v = sparse_phys_to_final.get(dim.axis)
+            if dim.block_axis is not None:
+                b_p = phys_map[dim.block_axis]
                 final_perm.append(b_p)
                 active_axes.add(b_p)
                 new_b = curr_f_idx
@@ -242,8 +242,8 @@ def _apply_dense_scattering(
             log_to_phys[i] = (new_v, new_b, None)
         else:
             new_v = None
-            if dim.val_dim is not None:
-                p_idx = phys_map[dim.val_dim]
+            if dim.axis is not None:
+                p_idx = phys_map[dim.axis]
                 final_perm.append(p_idx)
                 active_axes.add(p_idx)
                 new_v = curr_f_idx
@@ -261,17 +261,17 @@ def _apply_dense_scattering(
 
 
 def _reconstruct_logical_dimensions(
-    logical_dims: list[Dimension], logical_to_physical: dict[int, tuple]
+    logical_dims: list[Index], logical_to_physical: dict[int, tuple]
 ):
     res = []
     for i, dim in enumerate(logical_dims):
         v_ax, b_ax, d_size = logical_to_physical[i]
         if d_size is not None:
-            res.append(DenseDimension(dim.id, d_size, v_ax))
-        elif isinstance(dim, SparseDimension):
-            res.append(replace(dim, val_dim=v_ax, block_val_dim=b_ax))
+            res.append(DenseIndex(dim.id, d_size, v_ax))
+        elif isinstance(dim, SparseIndex):
+            res.append(replace(dim, axis=v_ax, block_axis=b_ax))
         else:
-            res.append(replace(dim, val_dim=v_ax))
+            res.append(replace(dim, axis=v_ax))
     return res
 
 

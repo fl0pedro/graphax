@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 
-from graphax.sparse.dimensions import SparseDimension, DenseDimension
+from graphax.sparse.indexes import SparseIndex, DenseIndex
 from graphax.sparse.tensor import SparseTensor, _arr2st
 from graphax.sparse.ops.matmul import matmul
 
@@ -28,14 +28,14 @@ class TestImplicit(unittest.TestCase):
         B = jr.normal(k2, (a, c, d))
 
         A_st = SparseTensor(
-            (DenseDimension(0, a, None), DenseDimension(1, b, 0)),
-            (DenseDimension(2, c, 1),),
+            (DenseIndex(0, a, None), DenseIndex(1, b, 0)),
+            (DenseIndex(2, c, 1),),
             A,
             scalar_mult=jnp.array(x),
         )
         B_st = SparseTensor(
-            (DenseDimension(0, a, 0), DenseDimension(1, c, 1)),
-            (DenseDimension(2, d, 2),),
+            (DenseIndex(0, a, 0), DenseIndex(1, c, 1)),
+            (DenseIndex(2, d, 2),),
             B,
             scalar_mult=jnp.array(y),
         )
@@ -46,8 +46,8 @@ class TestImplicit(unittest.TestCase):
         # Manual val logic
         R = jax.lax.dot_general(A, B, (((1,), (1,)), ((), ()))).transpose(1, 0, 2)
         R_st = SparseTensor(
-            (DenseDimension(0, a, 0), DenseDimension(1, b, 1)),
-            (DenseDimension(2, d, 2),),
+            (DenseIndex(0, a, 0), DenseIndex(1, b, 1)),
+            (DenseIndex(2, d, 2),),
             R,
             scalar_mult=jnp.array(x * y),
         )
@@ -71,14 +71,14 @@ class TestImplicit(unittest.TestCase):
         B = jr.normal(k2, (a, c, d))
 
         A_st = SparseTensor(
-            (DenseDimension(0, a, 0), DenseDimension(1, b, None)),
-            (DenseDimension(2, c, 1),),
+            (DenseIndex(0, a, 0), DenseIndex(1, b, None)),
+            (DenseIndex(2, c, 1),),
             A,
             scalar_mult=jnp.array(x),
         )
         B_st = SparseTensor(
-            (DenseDimension(0, a, 0), DenseDimension(1, c, 1)),
-            (DenseDimension(2, d, 2),),
+            (DenseIndex(0, a, 0), DenseIndex(1, c, 1)),
+            (DenseIndex(2, d, 2),),
             B,
             scalar_mult=jnp.array(y),
         )
@@ -89,8 +89,8 @@ class TestImplicit(unittest.TestCase):
         # Manual val logic
         R = jax.lax.dot_general(A, B, (((1,), (1,)), ((0,), (0,))))
         R_st = SparseTensor(
-            (DenseDimension(0, a, 0), DenseDimension(1, b, None)),
-            (DenseDimension(2, d, 1),),
+            (DenseIndex(0, a, 0), DenseIndex(1, b, None)),
+            (DenseIndex(2, d, 1),),
             R,
             scalar_mult=jnp.array(x * y),
         )
@@ -116,14 +116,14 @@ class TestImplicit(unittest.TestCase):
         B = jr.normal(k2, (a, c, d))
 
         A_st = SparseTensor(
-            (DenseDimension(0, a, 0), DenseDimension(1, b, 1)),
-            (DenseDimension(2, c, None),),
+            (DenseIndex(0, a, 0), DenseIndex(1, b, 1)),
+            (DenseIndex(2, c, None),),
             A,
             scalar_mult=jnp.array(x),
         )
         B_st = SparseTensor(
-            (DenseDimension(0, a, 0), DenseDimension(1, c, 1)),
-            (DenseDimension(2, d, 2),),
+            (DenseIndex(0, a, 0), DenseIndex(1, c, 1)),
+            (DenseIndex(2, d, 2),),
             B,
             scalar_mult=jnp.array(y),
         )
@@ -134,8 +134,8 @@ class TestImplicit(unittest.TestCase):
         # Manual val logic
         R = jnp.expand_dims(A, 2) * jnp.expand_dims(B.sum(axis=1), 1)
         R_st = SparseTensor(
-            (DenseDimension(0, a, 0), DenseDimension(1, b, 1)),
-            (DenseDimension(2, d, 2),),
+            (DenseIndex(0, a, 0), DenseIndex(1, b, 1)),
+            (DenseIndex(2, d, 2),),
             R,
             scalar_mult=jnp.array(x * y),
         )
@@ -160,14 +160,14 @@ class TestImplicit(unittest.TestCase):
         B = jr.normal(k2, (a, d))
 
         A_st = SparseTensor(
-            (DenseDimension(0, a, 0), DenseDimension(1, b, 1)),
-            (DenseDimension(2, c, 2),),
+            (DenseIndex(0, a, 0), DenseIndex(1, b, 1)),
+            (DenseIndex(2, c, 2),),
             A,
             scalar_mult=jnp.array(x),
         )
         B_st = SparseTensor(
-            (DenseDimension(0, a, 0), DenseDimension(1, c, None)),
-            (DenseDimension(2, d, 1),),
+            (DenseIndex(0, a, 0), DenseIndex(1, c, None)),
+            (DenseIndex(2, d, 1),),
             B,
             scalar_mult=jnp.array(y),
         )
@@ -178,8 +178,8 @@ class TestImplicit(unittest.TestCase):
         # Manual val logic
         R = jnp.expand_dims(A.sum(axis=2), 2) * jnp.expand_dims(B, 1)
         R_st = SparseTensor(
-            (DenseDimension(0, a, 0), DenseDimension(1, b, 1)),
-            (DenseDimension(2, d, 2),),
+            (DenseIndex(0, a, 0), DenseIndex(1, b, 1)),
+            (DenseIndex(2, d, 2),),
             R,
             scalar_mult=jnp.array(x * y),
         )
@@ -204,14 +204,14 @@ class TestImplicit(unittest.TestCase):
         B = jr.normal(k2, (a, c, d))
 
         A_st = SparseTensor(
-            (DenseDimension(0, a, None), DenseDimension(1, b, None)),
-            (DenseDimension(2, c, 0),),
+            (DenseIndex(0, a, None), DenseIndex(1, b, None)),
+            (DenseIndex(2, c, 0),),
             A,
             scalar_mult=jnp.array(x),
         )
         B_st = SparseTensor(
-            (DenseDimension(0, a, 0), DenseDimension(1, c, 1)),
-            (DenseDimension(2, d, 2),),
+            (DenseIndex(0, a, 0), DenseIndex(1, c, 1)),
+            (DenseIndex(2, d, 2),),
             B,
             scalar_mult=jnp.array(y),
         )
@@ -222,8 +222,8 @@ class TestImplicit(unittest.TestCase):
         # Manual val logic
         R = jax.lax.dot_general(A, B, (((0,), (1,)), ((), ())))
         R_st = SparseTensor(
-            (DenseDimension(0, a, 0), DenseDimension(1, b, None)),
-            (DenseDimension(2, d, 1),),
+            (DenseIndex(0, a, 0), DenseIndex(1, b, None)),
+            (DenseIndex(2, d, 1),),
             R,
             scalar_mult=jnp.array(x * y),
         )
@@ -246,14 +246,14 @@ class TestImplicit(unittest.TestCase):
         B = jr.normal(k2, (a,))
 
         A_st = SparseTensor(
-            (DenseDimension(0, a, None), DenseDimension(1, b, None)),
-            (DenseDimension(2, c, None),),
+            (DenseIndex(0, a, None), DenseIndex(1, b, None)),
+            (DenseIndex(2, c, None),),
             None,
             scalar_mult=jnp.array(x),
         )
         B_st = SparseTensor(
-            (DenseDimension(0, a, 0), DenseDimension(1, c, None)),
-            (DenseDimension(2, d, None),),
+            (DenseIndex(0, a, 0), DenseIndex(1, c, None)),
+            (DenseIndex(2, d, None),),
             B,
             scalar_mult=jnp.array(y),
         )
@@ -265,8 +265,8 @@ class TestImplicit(unittest.TestCase):
         # Manual val logic
         R = B
         R_st = SparseTensor(
-            (DenseDimension(0, a, 0), DenseDimension(1, b, None)),
-            (DenseDimension(2, d, None),),
+            (DenseIndex(0, a, 0), DenseIndex(1, b, None)),
+            (DenseIndex(2, d, None),),
             R,
             scalar_mult=jnp.array(c * x * y),
         )
@@ -285,14 +285,14 @@ class TestImplicit(unittest.TestCase):
         x, y = 0.24, 1.32
 
         A_st = SparseTensor(
-            (DenseDimension(0, a, None), DenseDimension(1, b, None)),
-            (DenseDimension(2, c, None),),
+            (DenseIndex(0, a, None), DenseIndex(1, b, None)),
+            (DenseIndex(2, c, None),),
             None,
             scalar_mult=jnp.array(x),
         )
         B_st = SparseTensor(
-            (DenseDimension(0, a, None), DenseDimension(1, c, None)),
-            (DenseDimension(2, d, None),),
+            (DenseIndex(0, a, None), DenseIndex(1, c, None)),
+            (DenseIndex(2, d, None),),
             None,
             scalar_mult=jnp.array(y),
         )
@@ -302,8 +302,8 @@ class TestImplicit(unittest.TestCase):
         R_dense_ref = dense_ref(A_dense * x, B_dense * y)
 
         R_st = SparseTensor(
-            (DenseDimension(0, a, None), DenseDimension(1, b, None)),
-            (DenseDimension(2, d, None),),
+            (DenseIndex(0, a, None), DenseIndex(1, b, None)),
+            (DenseIndex(2, d, None),),
             None,
             scalar_mult=jnp.array(c * x * y),
         )

@@ -6,8 +6,8 @@ import jax.numpy as jnp
 import jax.random as jrand
 
 from graphax.sparse.tensor import (
-    DenseDimension,
-    SparseDimension,
+    DenseIndex,
+    SparseIndex,
     SparseTensor,
 )
 
@@ -35,13 +35,13 @@ class TestDenseNones(unittest.TestCase):
                 n_c = len(shape) // 2
                 for c in combinations(range(len(shape)), nones):
                     dims = []
-                    val_dim = count()
+                    axis = count()
                     for i, s in enumerate(shape):
                         dims.append(
-                            DenseDimension(i, s, None if i in c else next(val_dim))
+                            DenseIndex(i, s, None if i in c else next(axis))
                         )
 
-                    none_shape = tuple(d.size for d in dims if d.val_dim is not None)
+                    none_shape = tuple(d.size for d in dims if d.axis is not None)
 
                     val = jrand.normal(keys[0], none_shape) if none_shape else None
                     st = SparseTensor(
@@ -64,11 +64,11 @@ class TestDenseNones(unittest.TestCase):
         keys = self.get_keys()
         val = jrand.normal(keys[0], (2, 4))
 
-        d0 = SparseDimension(
-            id=0, size=2, val_dim=0, other_id=1, block_size=3, block_val_dim=None
+        d0 = SparseIndex(
+            id=0, size=2, axis=0, other_id=1, block_size=3, block_axis=None
         )
-        d1 = SparseDimension(
-            id=1, size=2, val_dim=0, other_id=0, block_size=4, block_val_dim=1
+        d1 = SparseIndex(
+            id=1, size=2, axis=0, other_id=0, block_size=4, block_axis=1
         )
 
         st = SparseTensor((d0,), (d1,), val)
@@ -87,11 +87,11 @@ class TestDenseNones(unittest.TestCase):
         keys = self.get_keys()
         val = jrand.normal(keys[0], (2, 3))
 
-        d0 = SparseDimension(
-            id=0, size=2, val_dim=0, other_id=1, block_size=3, block_val_dim=1
+        d0 = SparseIndex(
+            id=0, size=2, axis=0, other_id=1, block_size=3, block_axis=1
         )
-        d1 = SparseDimension(
-            id=1, size=2, val_dim=0, other_id=0, block_size=4, block_val_dim=None
+        d1 = SparseIndex(
+            id=1, size=2, axis=0, other_id=0, block_size=4, block_axis=None
         )
 
         st = SparseTensor((d0,), (d1,), val)
@@ -110,11 +110,11 @@ class TestDenseNones(unittest.TestCase):
         keys = self.get_keys()
         val = jrand.normal(keys[0], (2,))
 
-        d0 = SparseDimension(
-            id=0, size=2, val_dim=0, other_id=1, block_size=3, block_val_dim=None
+        d0 = SparseIndex(
+            id=0, size=2, axis=0, other_id=1, block_size=3, block_axis=None
         )
-        d1 = SparseDimension(
-            id=1, size=2, val_dim=0, other_id=0, block_size=4, block_val_dim=None
+        d1 = SparseIndex(
+            id=1, size=2, axis=0, other_id=0, block_size=4, block_axis=None
         )
 
         st = SparseTensor((d0,), (d1,), val)
@@ -133,11 +133,11 @@ class TestDenseNones(unittest.TestCase):
         keys = self.get_keys()
         val = jrand.normal(keys[0], (3, 4))
 
-        d0 = SparseDimension(
-            id=0, size=2, val_dim=None, other_id=1, block_size=3, block_val_dim=0
+        d0 = SparseIndex(
+            id=0, size=2, axis=None, other_id=1, block_size=3, block_axis=0
         )
-        d1 = SparseDimension(
-            id=1, size=2, val_dim=None, other_id=0, block_size=4, block_val_dim=1
+        d1 = SparseIndex(
+            id=1, size=2, axis=None, other_id=0, block_size=4, block_axis=1
         )
 
         st = SparseTensor((d0,), (d1,), val)
@@ -152,11 +152,11 @@ class TestDenseNones(unittest.TestCase):
         self.assertTrue(jnp.allclose(recovered, dense_ref))
 
     def test_block_diagonal_2d_densification_all_none(self):
-        d0 = SparseDimension(
-            id=0, size=2, val_dim=None, other_id=1, block_size=3, block_val_dim=None
+        d0 = SparseIndex(
+            id=0, size=2, axis=None, other_id=1, block_size=3, block_axis=None
         )
-        d1 = SparseDimension(
-            id=1, size=2, val_dim=None, other_id=0, block_size=4, block_val_dim=None
+        d1 = SparseIndex(
+            id=1, size=2, axis=None, other_id=0, block_size=4, block_axis=None
         )
 
         st = SparseTensor((d0,), (d1,), None)
@@ -171,8 +171,8 @@ class TestDenseNones(unittest.TestCase):
         self.assertTrue(jnp.allclose(recovered, dense_ref))
 
     def test_pure_diagonal_2d_densification(self):
-        d0 = SparseDimension(id=0, size=2, val_dim=None, other_id=1)
-        d1 = SparseDimension(id=1, size=2, val_dim=None, other_id=0)
+        d0 = SparseIndex(id=0, size=2, axis=None, other_id=1)
+        d1 = SparseIndex(id=1, size=2, axis=None, other_id=0)
 
         st = SparseTensor((d0,), (d1,), None)
 
@@ -186,12 +186,12 @@ class TestDenseNones(unittest.TestCase):
         keys = self.get_keys()
         val = jrand.normal(keys[0], (2, 4))
 
-        d0 = SparseDimension(
-            id=0, size=2, val_dim=0, other_id=2, block_size=3, block_val_dim=None
+        d0 = SparseIndex(
+            id=0, size=2, axis=0, other_id=2, block_size=3, block_axis=None
         )
-        d1 = DenseDimension(id=1, size=3, val_dim=None)
-        d2 = SparseDimension(
-            id=2, size=2, val_dim=0, other_id=0, block_size=4, block_val_dim=1
+        d1 = DenseIndex(id=1, size=3, axis=None)
+        d2 = SparseIndex(
+            id=2, size=2, axis=0, other_id=0, block_size=4, block_axis=1
         )
 
         st = SparseTensor((d0, d1), (d2,), val)
@@ -209,14 +209,14 @@ class TestDenseNones(unittest.TestCase):
         keys = self.get_keys()
         val = jrand.normal(keys[0], (2, 3))
 
-        d0 = SparseDimension(
-            id=0, size=2, val_dim=0, other_id=2, block_size=2, block_val_dim=None
+        d0 = SparseIndex(
+            id=0, size=2, axis=0, other_id=2, block_size=2, block_axis=None
         )
-        d1 = SparseDimension(id=1, size=3, val_dim=1, other_id=3)
-        d2 = SparseDimension(
-            id=2, size=2, val_dim=0, other_id=0, block_size=3, block_val_dim=None
+        d1 = SparseIndex(id=1, size=3, axis=1, other_id=3)
+        d2 = SparseIndex(
+            id=2, size=2, axis=0, other_id=0, block_size=3, block_axis=None
         )
-        d3 = SparseDimension(id=3, size=3, val_dim=1, other_id=1)
+        d3 = SparseIndex(id=3, size=3, axis=1, other_id=1)
 
         st = SparseTensor((d0, d1), (d2, d3), val)
 
@@ -233,15 +233,15 @@ class TestDenseNones(unittest.TestCase):
         self.assertTrue(jnp.allclose(recovered, dense_ref))
 
     def test_mixed_diagonal_5d_densification(self):
-        d0 = SparseDimension(
-            id=0, size=2, val_dim=None, other_id=3, block_size=2, block_val_dim=None
+        d0 = SparseIndex(
+            id=0, size=2, axis=None, other_id=3, block_size=2, block_axis=None
         )
-        d1 = SparseDimension(id=1, size=3, val_dim=None, other_id=4)
-        d2 = DenseDimension(id=2, size=4, val_dim=None)
-        d3 = SparseDimension(
-            id=3, size=2, val_dim=None, other_id=0, block_size=2, block_val_dim=None
+        d1 = SparseIndex(id=1, size=3, axis=None, other_id=4)
+        d2 = DenseIndex(id=2, size=4, axis=None)
+        d3 = SparseIndex(
+            id=3, size=2, axis=None, other_id=0, block_size=2, block_axis=None
         )
-        d4 = SparseDimension(id=4, size=3, val_dim=None, other_id=1)
+        d4 = SparseIndex(id=4, size=3, axis=None, other_id=1)
 
         st = SparseTensor((d0, d1, d2), (d3, d4), None)
 
@@ -257,20 +257,20 @@ class TestDenseNones(unittest.TestCase):
         self.assertTrue(jnp.allclose(recovered, dense_ref))
 
     def test_mixed_diagonal_6d_densification(self):
-        d0 = SparseDimension(
-            id=0, size=2, val_dim=None, other_id=3, block_size=2, block_val_dim=None
+        d0 = SparseIndex(
+            id=0, size=2, axis=None, other_id=3, block_size=2, block_axis=None
         )
-        d1 = SparseDimension(
-            id=1, size=2, val_dim=None, other_id=4, block_size=3, block_val_dim=None
+        d1 = SparseIndex(
+            id=1, size=2, axis=None, other_id=4, block_size=3, block_axis=None
         )
-        d2 = SparseDimension(id=2, size=3, val_dim=None, other_id=5)
-        d3 = SparseDimension(
-            id=3, size=2, val_dim=None, other_id=0, block_size=4, block_val_dim=None
+        d2 = SparseIndex(id=2, size=3, axis=None, other_id=5)
+        d3 = SparseIndex(
+            id=3, size=2, axis=None, other_id=0, block_size=4, block_axis=None
         )
-        d4 = SparseDimension(
-            id=4, size=2, val_dim=None, other_id=1, block_size=2, block_val_dim=None
+        d4 = SparseIndex(
+            id=4, size=2, axis=None, other_id=1, block_size=2, block_axis=None
         )
-        d5 = SparseDimension(id=5, size=3, val_dim=None, other_id=2)
+        d5 = SparseIndex(id=5, size=3, axis=None, other_id=2)
 
         st = SparseTensor((d0, d1, d2), (d3, d4, d5), None)
 
