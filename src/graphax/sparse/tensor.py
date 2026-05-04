@@ -20,14 +20,14 @@ from graphax.sparse.ops.utils import (
     _sort_val,
     _arr2st,
     _swap_back_axes,
-    _materialize_dimensions
+    _materialize_indexes
 )
 from graphax.sparse.ops.dense import dense
 from graphax.sparse.ops.transpose import transpose
 from graphax.sparse.ops.matmul import matmul
 from graphax.sparse.ops.elementwise import elementwise
 
-from graphax.sparse.dimensions import Dimension, DenseDimension, SparseDimension
+from graphax.sparse.indexes import Index, DenseIndex, SparseIndex
 
 
 Transform = Callable[["SparseTensor", "SparseTensor", Array], "SparseTensor"]
@@ -167,15 +167,15 @@ class SparseTensor(SparseMathMixin):
     and element-wise operations while avoiding premature dense materializations.
 
     Attributes:
-        out_dims (tuple[Dimension, ...]): Dimensions mapped to the output/batch subspace.
-        primal_dims (tuple[Dimension, ...]): Dimensions mapped to the contractible/inner subspace.
+        out_dims (tuple[Index, ...]): Indexes mapped to the output/batch subspace.
+        primal_dims (tuple[Index, ...]): Indexes mapped to the contractible/inner subspace.
         val (Array | None): The underlying physical JAX array storing the compressed non-zero values.
             If None, the tensor represents a uniform grid initialized by `fill_value`.
         scalar_mult (Array): A global scalar multiplier to scale the tensor's values without reallocating `val`.
         fill_value (Array): The structural background value (typically 0) of the sparse regions.
     """
-    out_dims: tuple[Dimension, ...]
-    primal_dims: tuple[Dimension, ...]
+    out_dims: tuple[Index, ...]
+    primal_dims: tuple[Index, ...]
     val: Array | None
     scalar_mult: Array
     fill_value: Array
@@ -184,8 +184,8 @@ class SparseTensor(SparseMathMixin):
 
     def __init__(
         self,
-        out_dims: Sequence[Dimension],
-        primal_dims: Sequence[Dimension],
+        out_dims: Sequence[Index],
+        primal_dims: Sequence[Index],
         val: Array | None,
         scalar_mult: Array | None = None,
         fill_value: Array | None = None,
@@ -305,7 +305,7 @@ class SparseTensor(SparseMathMixin):
     def sparse_pairs(self, key: Literal["out", "primal"] = "out") -> dict[int, int]:
         res = {}
         for d in self.out_dims:
-            if isinstance(d, SparseDimension):
+            if isinstance(d, SparseIndex):
                 if key == "out":
                     res[d.id] = d.other_id
                 elif key == "primal":
@@ -315,13 +315,13 @@ class SparseTensor(SparseMathMixin):
     @property
     def sparse_shape(self) -> tuple[int, ...]:
         sparse_dims = []
-        seen_val_dims = set()
+        seen_axiss = set()
         for d in self.dims:
-            if isinstance(d, SparseDimension) and d.val_dim is not None:
-                if d.val_dim not in seen_val_dims:
+            if isinstance(d, SparseIndex) and d.axis is not None:
+                if d.axis not in seen_axiss:
                     sparse_dims.append(d)
-                    seen_val_dims.add(d.val_dim)
-        sparse_dims.sort(key=lambda d: d.val_dim)
+                    seen_axiss.add(d.axis)
+        sparse_dims.sort(key=lambda d: d.axis)
         return tuple(d.size for d in sparse_dims)
 
     @property
@@ -336,10 +336,10 @@ class SparseTensor(SparseMathMixin):
     def dense_shape(self) -> tuple[int, ...]:
         dense_dims_meta = []
         for d in self.dims:
-            if isinstance(d, DenseDimension) and d.val_dim is not None:
-                dense_dims_meta.append((d.val_dim, d.size))
-            if isinstance(d, SparseDimension) and d.block_val_dim is not None:
-                dense_dims_meta.append((d.block_val_dim, d.block_size))
+            if isinstance(d, DenseIndex) and d.axis is not None:
+                dense_dims_meta.append((d.axis, d.size))
+            if isinstance(d, SparseIndex) and d.block_axis is not None:
+                dense_dims_meta.append((d.block_axis, d.block_size))
         dense_dims_meta.sort(key=lambda x: x[0])
         return tuple(x[1] for x in dense_dims_meta)
 
@@ -364,7 +364,7 @@ class SparseTensor(SparseMathMixin):
         )
 
     @property
-    def dims(self) -> tuple[Dimension, ...]:
+    def dims(self) -> tuple[Index, ...]:
         return self.out_dims + self.primal_dims
 
     @property
@@ -378,7 +378,7 @@ class SparseTensor(SparseMathMixin):
     @property
     def batch_size(self) -> int:
         for d in self.dims:
-            if isinstance(d, SparseDimension) and d.val_dim is not None:
+            if isinstance(d, SparseIndex) and d.axis is not None:
                 return d.size
         return 1
 
@@ -426,8 +426,8 @@ class SparseTensor(SparseMathMixin):
         val: Array | None = None,
         scalar_mult: Array | None = None,
         fill_value: Array | None = None,
-        out_dims: Sequence[Dimension] | None = None,
-        primal_dims: Sequence[Dimension] | None = None,
+        out_dims: Sequence[Index] | None = None,
+        primal_dims: Sequence[Index] | None = None,
         deep=False,
     ):
         return _copy(
@@ -741,7 +741,7 @@ def get_valid_pairings(
                 break
                 
     if target_dim is None:
-        raise ValueError(f"Dimension ID {dim_id} not found in SparseTensor.")
+        raise ValueError(f"Index ID {dim_id} not found in SparseTensor.")
 
     # If the target itself is already paired, return empty
     if grouping_vector is not None and target_dim_pos < len(grouping_vector):
@@ -759,14 +759,14 @@ def get_valid_pairings(
     # 3. Identify valid partners
     valid_ids = []
 
-    if isinstance(target_dim, SparseDimension):
+    if isinstance(target_dim, SparseIndex):
         # Sparse dimensions are locked to their other_id
         valid_ids = [target_dim.other_id]
     else:
         # Dense dimensions scan the opposite side
         opposite_dims = st.primal_dims if is_out_dim else st.out_dims
         for d in opposite_dims:
-            if isinstance(d, DenseDimension) and math.gcd(target_dim.logical_size, d.logical_size) > 1:
+            if isinstance(d, DenseIndex) and math.gcd(target_dim.logical_size, d.logical_size) > 1:
                 valid_ids.append(d.id)
 
     # 4. Filter against the grouping vector
@@ -825,9 +825,9 @@ def apply_dynamic_sparsity(
         
         # Prevent breaking existing external pairs
         conflict = False
-        if isinstance(d1, SparseDimension) and getattr(d1, 'other_id', None) != d2.id:
+        if isinstance(d1, SparseIndex) and getattr(d1, 'other_id', None) != d2.id:
             conflict = True
-        if isinstance(d2, SparseDimension) and getattr(d2, 'other_id', None) != d1.id:
+        if isinstance(d2, SparseIndex) and getattr(d2, 'other_id', None) != d1.id:
             conflict = True
             
         if conflict:
@@ -852,8 +852,8 @@ def apply_dynamic_sparsity(
         factor = factors[gid]
         size = math.gcd(d1.logical_size, d2.logical_size) if factor == -1 else factor
         
-        v1 = getattr(d1, 'val_dim', None)
-        v2 = getattr(d2, 'val_dim', None)
+        v1 = getattr(d1, 'axis', None)
+        v2 = getattr(d2, 'axis', None)
         if v1 is not None and v1 >= st.val.ndim: v1 = None
         if v2 is not None and v2 >= st.val.ndim: v2 = None
         
@@ -877,18 +877,18 @@ def apply_dynamic_sparsity(
     axes_to_drop = list(set(axes_to_drop))
     remaining_axes = [i for i in range(st.val.ndim) if i not in seen_axes and i not in axes_to_drop]
     
-    val_dim_map = {}
-    current_val_dim = 0
+    axis_map = {}
+    current_axis = 0
     
     # Paired extractions collapse into a single target axis
     for i in range(0, len(unique_front), 2):
-        val_dim_map[unique_front[i]] = current_val_dim
-        val_dim_map[unique_front[i+1]] = current_val_dim
-        current_val_dim += 1
+        axis_map[unique_front[i]] = current_axis
+        axis_map[unique_front[i+1]] = current_axis
+        current_axis += 1
         
     for ax in remaining_axes:
-        val_dim_map[ax] = current_val_dim
-        current_val_dim += 1
+        axis_map[ax] = current_axis
+        current_axis += 1
         
     # 3. Vectorized Array Extraction
     perm = tuple(unique_front) + tuple(remaining_axes) + tuple(axes_to_drop)
@@ -904,7 +904,7 @@ def apply_dynamic_sparsity(
         for _ in range(len(axes_to_drop)):
             val_diagonal = val_diagonal[..., 0]
 
-    # 4. Reconstruct Dimensions enforcing exact shared assignments
+    # 4. Reconstruct Indexes enforcing exact shared assignments
     new_out_dims = list(st.out_dims)
     new_primal_dims = list(st.primal_dims)
     touched_out = set()
@@ -919,8 +919,8 @@ def apply_dynamic_sparsity(
         b1 = d1.logical_size // size
         b2 = d2.logical_size // size
         
-        v1 = getattr(d1, 'val_dim', None)
-        v2 = getattr(d2, 'val_dim', None)
+        v1 = getattr(d1, 'axis', None)
+        v2 = getattr(d2, 'axis', None)
         if v1 is not None and v1 >= st.val.ndim: v1 = None
         if v2 is not None and v2 >= st.val.ndim: v2 = None
         
@@ -929,12 +929,12 @@ def apply_dynamic_sparsity(
         else:
             # Force both halves to adopt the exact same physical axis mappings
             old_v = v1 if v1 is not None else v2
-            nv = val_dim_map.get(old_v) if old_v is not None else None
+            nv = axis_map.get(old_v) if old_v is not None else None
 
         def _update_dim(d, other_d, b_size):
-            old_b = getattr(d, 'block_val_dim', None)
+            old_b = getattr(d, 'block_axis', None)
             if old_b is not None and old_b >= st.val.ndim: old_b = None
-            nb = val_dim_map.get(old_b) if (factor != 0 and old_b is not None) else None
+            nb = axis_map.get(old_b) if (factor != 0 and old_b is not None) else None
             
             # FIX: Route the primary physical axis to the block if the outer size is 1
             actual_nv = nv if size > 1 else None
@@ -942,11 +942,11 @@ def apply_dynamic_sparsity(
             if size == 1 and b_size > 1 and nv is not None:
                 actual_nb = nv
                 
-            return SparseDimension(
-                id=d.id, size=size, val_dim=actual_nv,
+            return SparseIndex(
+                id=d.id, size=size, axis=actual_nv,
                 other_id=other_d.id,
                 block_size=b_size if b_size > 1 else None,
-                block_val_dim=actual_nb if b_size > 1 else None
+                block_axis=actual_nb if b_size > 1 else None
             )
 
         if is_out1: 
@@ -964,14 +964,14 @@ def apply_dynamic_sparsity(
             touched_primal.add(idx2)
 
     def _remap_untouched(d):
-        old_v = getattr(d, 'val_dim', None)
-        old_b = getattr(d, 'block_val_dim', None)
-        nv = val_dim_map.get(old_v) if old_v is not None else None
-        nb = val_dim_map.get(old_b) if old_b is not None else None
+        old_v = getattr(d, 'axis', None)
+        old_b = getattr(d, 'block_axis', None)
+        nv = axis_map.get(old_v) if old_v is not None else None
+        nb = axis_map.get(old_b) if old_b is not None else None
         
-        if isinstance(d, SparseDimension):
-            return replace(d, val_dim=nv, block_val_dim=nb)
-        return replace(d, val_dim=nv)
+        if isinstance(d, SparseIndex):
+            return replace(d, axis=nv, block_axis=nb)
+        return replace(d, axis=nv)
 
     final_out = tuple(_remap_untouched(d) if i not in touched_out else new_out_dims[i] for i, d in enumerate(st.out_dims))
     final_primal = tuple(_remap_untouched(d) if i not in touched_primal else new_primal_dims[i] for i, d in enumerate(st.primal_dims))
@@ -982,12 +982,12 @@ def apply_dynamic_sparsity(
     seen_target = set()
     
     for d in final_dims:
-        if getattr(d, 'val_dim', None) is not None and d.val_dim not in seen_target:
-            target_perm.append(d.val_dim)
-            seen_target.add(d.val_dim)
-        if getattr(d, 'block_val_dim', None) is not None and d.block_val_dim not in seen_target:
-            target_perm.append(d.block_val_dim)
-            seen_target.add(d.block_val_dim)
+        if getattr(d, 'axis', None) is not None and d.axis not in seen_target:
+            target_perm.append(d.axis)
+            seen_target.add(d.axis)
+        if getattr(d, 'block_axis', None) is not None and d.block_axis not in seen_target:
+            target_perm.append(d.block_axis)
+            seen_target.add(d.block_axis)
             
     for i in range(val_diagonal.ndim):
         if i not in seen_target:
@@ -998,14 +998,14 @@ def apply_dynamic_sparsity(
         val_diagonal = jnp.transpose(val_diagonal, target_perm)
         inv_perm = {old: new for new, old in enumerate(target_perm)}
         
-        def _reorder_val_dim(d):
-            nv = inv_perm.get(getattr(d, 'val_dim', None)) if getattr(d, 'val_dim', None) is not None else None
-            if isinstance(d, SparseDimension):
-                nb = inv_perm.get(getattr(d, 'block_val_dim', None)) if getattr(d, 'block_val_dim', None) is not None else None
-                return replace(d, val_dim=nv, block_val_dim=nb)
-            return replace(d, val_dim=nv)
+        def _reorder_axis(d):
+            nv = inv_perm.get(getattr(d, 'axis', None)) if getattr(d, 'axis', None) is not None else None
+            if isinstance(d, SparseIndex):
+                nb = inv_perm.get(getattr(d, 'block_axis', None)) if getattr(d, 'block_axis', None) is not None else None
+                return replace(d, axis=nv, block_axis=nb)
+            return replace(d, axis=nv)
             
-        final_out = tuple(_reorder_val_dim(d) for d in final_out)
-        final_primal = tuple(_reorder_val_dim(d) for d in final_primal)
+        final_out = tuple(_reorder_axis(d) for d in final_out)
+        final_primal = tuple(_reorder_axis(d) for d in final_primal)
 
     return SparseTensor(final_out, final_primal, val_diagonal, st.scalar_mult, sort_val=False, check_consistency=False)

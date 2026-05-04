@@ -15,7 +15,7 @@ from functools import partial
 from graphax.sparse.ops.utils import _arr2st, _is_sparse
 from graphax.sparse.ops.layout import generate_block_permutation, generate_grouped_permutation
 
-from graphax.sparse.dimensions import Dimension, SparseDimension, DenseDimension
+from graphax.sparse.indexes import Index, SparseIndex, DenseIndex
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
@@ -40,27 +40,27 @@ PairingType: TypeAlias = Literal[
 
 
 @dataclass(frozen=True)
-class DimensionPairData:
-    """Core length and val_dim information for a pair of dimensions."""
+class IndexPairData:
+    """Core length and axis information for a pair of dimensions."""
 
     outer_len: int
     block_len: int
     shared_block_len: int
-    outer_val_dim: int | None = None
-    block_val_dim: int | None = None
-    shared_block_val_dim: int | None = None
-    dim: Dimension | None = None
-    shared_dim: Dimension | None = None
+    outer_axis: int | None = None
+    block_axis: int | None = None
+    shared_block_axis: int | None = None
+    dim: Index | None = None
+    shared_dim: Index | None = None
 
 
 @dataclass(frozen=True)
-class DimensionPair:
+class IndexPair:
     """Consolidated metadata for a pair of interacting dimensions."""
 
     pairing_type: PairingType
     logical_element_count: int
-    lhs: DimensionPairData
-    rhs: DimensionPairData
+    lhs: IndexPairData
+    rhs: IndexPairData
 
 
 @dataclass(frozen=True)
@@ -69,7 +69,7 @@ class MatmulContext:
 
     lhs: SparseTensor
     rhs: SparseTensor
-    pairs: list[DimensionPair]
+    pairs: list[IndexPair]
     rhs_id_offset: int
 
     @property
@@ -102,6 +102,11 @@ def matmul(
     if not _is_sparse(rhs):
         assert _is_sparse(lhs)
         rhs = _arr2st(rhs, out_ndim=len(lhs.primal_dims))
+
+    if not lhs.dims and not rhs.dims:
+        l_val = lhs.val if lhs.val is not None else jnp.array(1.0, dtype=lhs.dtype)
+        r_val = rhs.val if rhs.val is not None else jnp.array(1.0, dtype=rhs.dtype)
+        return SparseTensor((), (), l_val * r_val)
 
     rhs_out_dims, rhs_primal_dims, rhs_id_offset = _align_tensor_ids(lhs, rhs)
     rhs_dims = rhs_out_dims + rhs_primal_dims
@@ -146,11 +151,11 @@ def matmul(
 
 
 def _resolve_matched_dims(
-    lhs_out_dim: Dimension | None,
-    lhs_primal_dim: Dimension | None,
-    rhs_out_dim: Dimension | None,
-    rhs_primal_dim: Dimension | None,
-) -> DimensionPair | None:
+    lhs_out_dim: Index | None,
+    lhs_primal_dim: Index | None,
+    rhs_out_dim: Index | None,
+    rhs_primal_dim: Index | None,
+) -> IndexPair | None:
     if (
         lhs_out_dim
         and rhs_out_dim
@@ -172,10 +177,10 @@ def _resolve_matched_dims(
         r_block_len, r_block_v = _get_dim_vals(rhs_out_dim, False)
         r_shared_len, r_shared_v = _get_dim_vals(rhs_primal_dim, False)
 
-        return DimensionPair(
+        return IndexPair(
             pairing_type="batch_sparse",
             logical_element_count=1,
-            lhs=DimensionPairData(
+            lhs=IndexPairData(
                 l_out_len,
                 l_block_len,
                 l_shared_len,
@@ -185,7 +190,7 @@ def _resolve_matched_dims(
                 lhs_out_dim,
                 lhs_primal_dim,
             ),
-            rhs=DimensionPairData(
+            rhs=IndexPairData(
                 r_out_len,
                 r_block_len,
                 r_shared_len,
@@ -199,35 +204,35 @@ def _resolve_matched_dims(
     elif lhs_out_dim and rhs_out_dim:
         l_len, l_v = _get_dim_vals(lhs_out_dim, False)
         r_len, r_v = _get_dim_vals(rhs_out_dim, False)
-        return DimensionPair(
+        return IndexPair(
             pairing_type="batch_out",
             logical_element_count=1,
-            lhs=DimensionPairData(l_len, 1, 1, l_v, None, None, lhs_out_dim),
-            rhs=DimensionPairData(r_len, 1, 1, r_v, None, None, rhs_out_dim),
+            lhs=IndexPairData(l_len, 1, 1, l_v, None, None, lhs_out_dim),
+            rhs=IndexPairData(r_len, 1, 1, r_v, None, None, rhs_out_dim),
         )
     elif lhs_primal_dim and rhs_primal_dim:
         l_len, l_v = _get_dim_vals(lhs_primal_dim, False)
         r_len, r_v = _get_dim_vals(rhs_primal_dim, False)
-        return DimensionPair(
+        return IndexPair(
             pairing_type="batch_primal",
             logical_element_count=1,
-            lhs=DimensionPairData(l_len, 1, 1, None, None, l_v, None, lhs_primal_dim),
-            rhs=DimensionPairData(r_len, 1, 1, None, None, r_v, None, rhs_primal_dim),
+            lhs=IndexPairData(l_len, 1, 1, None, None, l_v, None, lhs_primal_dim),
+            rhs=IndexPairData(r_len, 1, 1, None, None, r_v, None, rhs_primal_dim),
         )
     return None
 
 
 def _resolve_unmatched_lhs_dims(
-    lhs_out_dim: Dimension | None, lhs_primal_dim: Dimension | None
-) -> DimensionPair | None:
+    lhs_out_dim: Index | None, lhs_primal_dim: Index | None
+) -> IndexPair | None:
     if lhs_out_dim and lhs_primal_dim:
         l_out_len, _ = _get_dim_vals(lhs_out_dim, True)
         l_block_len, l_block_v = _get_dim_vals(lhs_out_dim, False)
         l_shared_len, l_shared_v = _get_dim_vals(lhs_primal_dim, False)
-        return DimensionPair(
+        return IndexPair(
             pairing_type="spatial_sparse_lhs",
             logical_element_count=1,
-            lhs=DimensionPairData(
+            lhs=IndexPairData(
                 l_out_len,
                 l_block_len,
                 l_shared_len,
@@ -237,39 +242,39 @@ def _resolve_unmatched_lhs_dims(
                 lhs_out_dim,
                 lhs_primal_dim,
             ),
-            rhs=DimensionPairData(1, 1, 1),
+            rhs=IndexPairData(1, 1, 1),
         )
     elif lhs_out_dim:
         l_len, l_v = _get_dim_vals(lhs_out_dim, False)
-        return DimensionPair(
+        return IndexPair(
             pairing_type="spatial_out_lhs",
             logical_element_count=1,
-            lhs=DimensionPairData(1, l_len, 1, None, l_v, None, lhs_out_dim),
-            rhs=DimensionPairData(1, 1, 1),
+            lhs=IndexPairData(1, l_len, 1, None, l_v, None, lhs_out_dim),
+            rhs=IndexPairData(1, 1, 1),
         )
     elif lhs_primal_dim:
         l_len, l_v = _get_dim_vals(lhs_primal_dim, False)
-        return DimensionPair(
+        return IndexPair(
             pairing_type="spatial_primal_lhs",
             logical_element_count=1,
-            lhs=DimensionPairData(1, 1, l_len, None, None, l_v, None, lhs_primal_dim),
-            rhs=DimensionPairData(1, 1, 1),
+            lhs=IndexPairData(1, 1, l_len, None, None, l_v, None, lhs_primal_dim),
+            rhs=IndexPairData(1, 1, 1),
         )
     return None
 
 
 def _resolve_unmatched_rhs_dims(
-    rhs_out_dim: Dimension | None, rhs_primal_dim: Dimension | None
-) -> DimensionPair | None:
+    rhs_out_dim: Index | None, rhs_primal_dim: Index | None
+) -> IndexPair | None:
     if rhs_out_dim and rhs_primal_dim:
         r_out_len, _ = _get_dim_vals(rhs_primal_dim, True)
         r_block_len, r_block_v = _get_dim_vals(rhs_out_dim, False)
         r_shared_len, r_shared_v = _get_dim_vals(rhs_primal_dim, False)
-        return DimensionPair(
+        return IndexPair(
             pairing_type="spatial_sparse_rhs",
             logical_element_count=1,
-            lhs=DimensionPairData(1, 1, 1),
-            rhs=DimensionPairData(
+            lhs=IndexPairData(1, 1, 1),
+            rhs=IndexPairData(
                 r_out_len,
                 r_block_len,
                 r_shared_len,
@@ -282,31 +287,31 @@ def _resolve_unmatched_rhs_dims(
         )
     elif rhs_out_dim:
         r_len, r_v = _get_dim_vals(rhs_out_dim, False)
-        return DimensionPair(
+        return IndexPair(
             pairing_type="spatial_out_rhs",
             logical_element_count=1,
-            lhs=DimensionPairData(1, 1, 1),
-            rhs=DimensionPairData(1, r_len, 1, None, r_v, None, rhs_out_dim),
+            lhs=IndexPairData(1, 1, 1),
+            rhs=IndexPairData(1, r_len, 1, None, r_v, None, rhs_out_dim),
         )
     elif rhs_primal_dim:
         r_len, r_v = _get_dim_vals(rhs_primal_dim, False)
-        return DimensionPair(
+        return IndexPair(
             pairing_type="spatial_primal_rhs",
             logical_element_count=1,
-            lhs=DimensionPairData(1, 1, 1),
-            rhs=DimensionPairData(1, 1, r_len, None, None, r_v, None, rhs_primal_dim),
+            lhs=IndexPairData(1, 1, 1),
+            rhs=IndexPairData(1, 1, r_len, None, None, r_v, None, rhs_primal_dim),
         )
     return None
 
 
 def _align_tensor_ids(
     lhs: SparseTensor, rhs: SparseTensor
-) -> tuple[tuple[Dimension, ...], tuple[Dimension, ...], int]:
+) -> tuple[tuple[Index, ...], tuple[Index, ...], int]:
     rhs_id_offset = max([d.id for d in lhs.dims] + [-1]) + 1
 
-    def offset_rhs(d: Dimension) -> Dimension:
+    def offset_rhs(d: Index) -> Index:
         kwargs: dict[str, Any] = {"id": d.id + rhs_id_offset}
-        if isinstance(d, SparseDimension):
+        if isinstance(d, SparseIndex):
             kwargs["other_id"] = d.other_id + rhs_id_offset
         return replace(d, **kwargs)
 
@@ -316,46 +321,46 @@ def _align_tensor_ids(
 
 
 def _get_dim_vals(
-    dim: Dimension | None, is_outer: bool = False
+    dim: Index | None, is_outer: bool = False
 ) -> tuple[int, int | None]:
     if not dim:
         return 1, None
 
-    if isinstance(dim, DenseDimension):
-        return (1, None) if is_outer else (dim.size, dim.val_dim)
-    # SparseDimension
-    assert isinstance(dim, SparseDimension)
+    if isinstance(dim, DenseIndex):
+        return (1, None) if is_outer else (dim.size, dim.axis)
+    # SparseIndex
+    assert isinstance(dim, SparseIndex)
     if is_outer:
-        return dim.size, dim.val_dim
+        return dim.size, dim.axis
     bs = dim.block_size if dim.block_size is not None else 1
-    return bs, dim.block_val_dim
+    return bs, dim.block_axis
 
 
-def _get_sparse_outer_v(dim: Dimension | None, sibling: Dimension | None) -> int | None:
+def _get_sparse_outer_v(dim: Index | None, sibling: Index | None) -> int | None:
     if dim is None:
         return None
-    if dim.val_dim is not None:
-        return dim.val_dim
+    if dim.axis is not None:
+        return dim.axis
     if (
         sibling is not None
-        and isinstance(dim, SparseDimension)
-        and isinstance(sibling, SparseDimension)
+        and isinstance(dim, SparseIndex)
+        and isinstance(sibling, SparseIndex)
     ):
         if dim.other_id == sibling.id:
-            return sibling.val_dim
+            return sibling.axis
     return None
 
 
 def _extract_topo_info(
-    d: Dimension,
-    dim_map: dict[int, Dimension],
+    d: Index,
+    dim_map: dict[int, Index],
     processed_set: set[int],
-    target_list: Sequence[Dimension],
-) -> tuple[tuple[Dimension | None, Dimension | None], int]:
+    target_list: Sequence[Index],
+) -> tuple[tuple[Index | None, Index | None], int]:
     if d.id in processed_set:
         return (None, None), -1
 
-    if not isinstance(d, SparseDimension):
+    if not isinstance(d, SparseIndex):
         return ((d, None) if d in target_list else (None, d)), d.id
 
     other = dim_map.get(d.other_id)
@@ -366,11 +371,11 @@ def _extract_topo_info(
 
 
 def _get_unprocessed_topos(
-    dims_list: Sequence[Dimension],
-    dim_map: dict[int, Dimension],
+    dims_list: Sequence[Index],
+    dim_map: dict[int, Index],
     processed_set: set[int],
-    target_list: Sequence[Dimension],
-) -> list[tuple[Dimension | None, Dimension | None]]:
+    target_list: Sequence[Index],
+) -> list[tuple[Index | None, Index | None]]:
     topos = []
     seen = set()
     for d in dims_list:
@@ -387,11 +392,11 @@ def _get_unprocessed_topos(
 
 
 def _resolve_contract_pair(
-    lhs_primal_dim: Dimension,
-    rhs_out_dim: Dimension,
-    lhs_out_map: dict[int, Dimension],
-    rhs_primal_map: dict[int, Dimension],
-) -> tuple[DimensionPair, list[int]]:
+    lhs_primal_dim: Index,
+    rhs_out_dim: Index,
+    lhs_out_map: dict[int, Index],
+    rhs_primal_map: dict[int, Index],
+) -> tuple[IndexPair, list[int]]:
     if lhs_primal_dim.logical_size != rhs_out_dim.logical_size:
         raise ValueError(
             f"Contraction dimensions must have the same logical size. "
@@ -400,12 +405,12 @@ def _resolve_contract_pair(
 
     lhs_out_dim = (
         lhs_out_map.get(getattr(lhs_primal_dim, "other_id", -1))
-        if isinstance(lhs_primal_dim, SparseDimension)
+        if isinstance(lhs_primal_dim, SparseIndex)
         else None
     )
     rhs_primal_dim = (
         rhs_primal_map.get(getattr(rhs_out_dim, "other_id", -1))
-        if isinstance(rhs_out_dim, SparseDimension)
+        if isinstance(rhs_out_dim, SparseIndex)
         else None
     )
 
@@ -422,12 +427,12 @@ def _resolve_contract_pair(
     r_block_len, r_block_v = _get_dim_vals(rhs_out_dim, False)
     r_shared_len, r_shared_v = _get_dim_vals(rhs_primal_dim, False)
 
-    meta = DimensionPair(
+    meta = IndexPair(
         pairing_type="contract",
         logical_element_count=getattr(
             lhs_primal_dim, "block_size", getattr(lhs_primal_dim, "size", 1)
         ),
-        lhs=DimensionPairData(
+        lhs=IndexPairData(
             l_out_len,
             l_block_len,
             l_shared_len,
@@ -437,7 +442,7 @@ def _resolve_contract_pair(
             lhs_out_dim,
             lhs_primal_dim,
         ),
-        rhs=DimensionPairData(
+        rhs=IndexPairData(
             r_out_len,
             r_block_len,
             r_shared_len,
@@ -452,10 +457,10 @@ def _resolve_contract_pair(
 
 
 def _resolve_broadcast_topos(
-    lhs_topos: list[tuple[Dimension | None, Dimension | None]],
-    rhs_topos: list[tuple[Dimension | None, Dimension | None]],
+    lhs_topos: list[tuple[Index | None, Index | None]],
+    rhs_topos: list[tuple[Index | None, Index | None]],
     rhs_id_offset: int,
-) -> list[DimensionPair]:
+) -> list[IndexPair]:
     pairs_meta = []
     remaining_rhs = list(rhs_topos)
 
@@ -487,9 +492,9 @@ def _resolve_broadcast_topos(
 
 
 def _find_matching_rhs_topo(
-    lhs_out_dim: Dimension | None,
-    lhs_primal_dim: Dimension | None,
-    rhs_topos: list[tuple[Dimension | None, Dimension | None]],
+    lhs_out_dim: Index | None,
+    lhs_primal_dim: Index | None,
+    rhs_topos: list[tuple[Index | None, Index | None]],
     rhs_id_offset: int,
 ) -> int:
     for i, (rhs_out_dim, rhs_primal_dim) in enumerate(rhs_topos):
@@ -510,10 +515,10 @@ def _find_matching_rhs_topo(
 
 def _build_matmul_topology(
     lhs: SparseTensor,
-    rhs_out_dims: tuple[Dimension, ...],
-    rhs_primal_dims: tuple[Dimension, ...],
+    rhs_out_dims: tuple[Index, ...],
+    rhs_primal_dims: tuple[Index, ...],
     rhs_id_offset: int,
-) -> list[DimensionPair]:
+) -> list[IndexPair]:
     lhs_out_map = {d.id: d for d in lhs.out_dims}
     rhs_primal_map = {d.id: d for d in rhs_primal_dims}
     rhs_dims = rhs_out_dims + rhs_primal_dims
@@ -606,7 +611,7 @@ def _prepare_physical_array(
 
 
 def _prepare_physical_arrays(
-    lhs_val: Array, rhs_val: Array, pairs_meta: list[DimensionPair]
+    lhs_val: Array, rhs_val: Array, pairs_meta: list[IndexPair]
 ) -> tuple[Array, Array]:
     def get_axes_and_lens(
         is_lhs: bool,
@@ -615,7 +620,7 @@ def _prepare_physical_arrays(
     ]:
         if is_lhs:
             axes = [
-                (p.lhs.outer_val_dim, p.lhs.block_val_dim, p.lhs.shared_block_val_dim)
+                (p.lhs.outer_axis, p.lhs.block_axis, p.lhs.shared_block_axis)
                 for p in pairs_meta
             ]
             lens = [
@@ -624,7 +629,7 @@ def _prepare_physical_arrays(
             ]
         else:
             axes = [
-                (p.rhs.outer_val_dim, p.rhs.block_val_dim, p.rhs.shared_block_val_dim)
+                (p.rhs.outer_axis, p.rhs.block_axis, p.rhs.shared_block_axis)
                 for p in pairs_meta
             ]
             lens = [
@@ -641,7 +646,7 @@ def _prepare_physical_arrays(
 
 
 def _calculate_contraction_factors(
-    pairs: list[DimensionPair],
+    pairs: list[IndexPair],
 ) -> tuple[list[int], list[int], list[int], float]:
     shared_tiling_factors, total_tiled_lengths, block_split_factors = [], [], []
     scalar_multiplier = 1.0
@@ -696,7 +701,7 @@ def _calculate_contraction_perms(num_pairs: int) -> tuple[list[int], list[int]]:
 def _prepare_contraction_views(
     lhs_val: Array,
     rhs_val: Array,
-    pairs_meta: list[DimensionPair],
+    pairs_meta: list[IndexPair],
     shared_tiling_factors: list[int],
     total_tiled_lengths: list[int],
     block_split_factors: list[int],
@@ -824,7 +829,7 @@ def _prepare_contraction_views(
 
 
 def _calculate_tiled_index(
-    i: int, p: DimensionPair, gcd_len: int, lcm_len: int
+    i: int, p: IndexPair, gcd_len: int, lcm_len: int
 ) -> tuple[np.ndarray, int]:
     a, b = p.lhs.outer_len, p.rhs.outer_len
     if gcd_len == lcm_len:
@@ -841,7 +846,7 @@ def _calculate_tiled_index(
 
 def _reduce_contraction_grid(
     res_view: Array,
-    pairs_meta: list[DimensionPair],
+    pairs_meta: list[IndexPair],
     shared_tiling_factors: list[int],
     total_tiled_lengths: list[int],
     final_lhs_block_lens: list[int],
@@ -894,7 +899,7 @@ def _reduce_contraction_grid(
 
 
 def _collect_dot_general_axes(
-    num_dimension_pairs: int, pairs_meta: list[DimensionPair]
+    num_dimension_pairs: int, pairs_meta: list[IndexPair]
 ) -> tuple[tuple[list[int], list[int]], tuple[list[int], list[int]]]:
     contract_lhs, contract_rhs = [], []
     batch_lhs, batch_rhs = (
@@ -936,7 +941,7 @@ def _finalize_contraction_output(
     num_dimension_pairs: int,
     res_raw: Array,
     total_tiled_lengths: list[int],
-    pairs_meta: list[DimensionPair],
+    pairs_meta: list[IndexPair],
     block_split_factors: list[int],
     shared_tiling_factors: list[int],
     lhs_bc_shape: list[int],
@@ -1071,7 +1076,7 @@ def _finalize_contraction_output(
 
 
 def _execute_block_sparse_contraction(
-    lhs_val: Array, rhs_val: Array, pairs_meta: list[DimensionPair], count: bool = False
+    lhs_val: Array, rhs_val: Array, pairs_meta: list[IndexPair], count: bool = False
 ) -> tuple[Array, list[int], list[int], list[int], float]:
     num_dimension_pairs = len(pairs_meta)
     N = num_dimension_pairs
@@ -1171,16 +1176,16 @@ def _resolve_output_shape_and_axes(
     ctx: MatmulContext, res: ContractionResult
 ) -> tuple[list[int], OutputAxisMap, list[int]]:
     reshaped_output_shape: list[int] = []
-    shared_val_axis_map: dict[int, int] = {}
-    lhs_val_axis_map: dict[int, int] = {}
-    rhs_val_axis_map: dict[int, int] = {}
+    shared_axis_map: dict[int, int] = {}
+    lhs_axis_map: dict[int, int] = {}
+    rhs_axis_map: dict[int, int] = {}
     squeeze_axes: list[int] = []
     current_physical_axis = 0
 
     # 1. Shared axes
     for i, factor in enumerate(res.shared_tiling_factors):
         reshaped_output_shape.append(factor)
-        shared_val_axis_map[i] = current_physical_axis
+        shared_axis_map[i] = current_physical_axis
         current_physical_axis += 1
 
     # 2. LHS axes
@@ -1188,14 +1193,14 @@ def _resolve_output_shape_and_axes(
         factor = p.lhs.outer_len // res.shared_tiling_factors[i]
         if p.pairing_type == "spatial_sparse_lhs":
             reshaped_output_shape.extend([factor, res.lhs_block_lens[i]])
-            squeeze_axes.append(shared_val_axis_map[i])
-            shared_val_axis_map[i] = current_physical_axis
+            squeeze_axes.append(shared_axis_map[i])
+            shared_axis_map[i] = current_physical_axis
             current_physical_axis += 1
-            lhs_val_axis_map[i] = current_physical_axis
+            lhs_axis_map[i] = current_physical_axis
             current_physical_axis += 1
         else:
             reshaped_output_shape.append(factor * res.lhs_block_lens[i])
-            lhs_val_axis_map[i] = current_physical_axis
+            lhs_axis_map[i] = current_physical_axis
             current_physical_axis += 1
 
     # 3. RHS axes
@@ -1203,14 +1208,14 @@ def _resolve_output_shape_and_axes(
         factor = p.rhs.outer_len // res.shared_tiling_factors[i]
         if p.pairing_type == "spatial_sparse_rhs":
             reshaped_output_shape.extend([factor, res.rhs_block_lens[i]])
-            squeeze_axes.append(shared_val_axis_map[i])
-            shared_val_axis_map[i] = current_physical_axis
+            squeeze_axes.append(shared_axis_map[i])
+            shared_axis_map[i] = current_physical_axis
             current_physical_axis += 1
-            rhs_val_axis_map[i] = current_physical_axis
+            rhs_axis_map[i] = current_physical_axis
             current_physical_axis += 1
         else:
             reshaped_output_shape.append(factor * res.rhs_block_lens[i])
-            rhs_val_axis_map[i] = current_physical_axis
+            rhs_axis_map[i] = current_physical_axis
             current_physical_axis += 1
 
     # 4. Append leftover unmapped dense axes at the end
@@ -1220,19 +1225,19 @@ def _resolve_output_shape_and_axes(
     reshaped_output_shape.extend(leftover_axes)
 
     axis_map = OutputAxisMap(
-        shared=shared_val_axis_map, lhs=lhs_val_axis_map, rhs=rhs_val_axis_map
+        shared=shared_axis_map, lhs=lhs_axis_map, rhs=rhs_axis_map
     )
     return reshaped_output_shape, axis_map, squeeze_axes
 
 
 def _build_output_tensor(
     ctx: MatmulContext,
-    rhs_dims: tuple[Dimension, ...],
+    rhs_dims: tuple[Index, ...],
     res: ContractionResult,
     count: bool = False,
 ) -> tuple[SparseTensor, tuple[int, int, int]]:
     from graphax.sparse.tensor import SparseTensor
-    from graphax.sparse.dimensions import DenseDimension, SparseDimension
+    from graphax.sparse.indexes import DenseIndex, SparseIndex
 
     reshaped_output_shape, axis_map, squeeze_axes = _resolve_output_shape_and_axes(
         ctx, res
@@ -1253,25 +1258,25 @@ def _build_output_tensor(
             i
         ]
 
-        shared_val_axis = axis_map.shared[i]
-        lhs_val_axis = axis_map.lhs[i]
-        rhs_val_axis = axis_map.rhs[i]
+        shared_axis = axis_map.shared[i]
+        lhs_axis = axis_map.lhs[i]
+        rhs_axis = axis_map.rhs[i]
 
         pres_shared = (
-            pm.lhs.outer_val_dim is not None or pm.rhs.outer_val_dim is not None
+            pm.lhs.outer_axis is not None or pm.rhs.outer_axis is not None
         )
-        pres_lhs = pm.lhs.outer_val_dim is not None or pm.lhs.block_val_dim is not None
+        pres_lhs = pm.lhs.outer_axis is not None or pm.lhs.block_axis is not None
         pres_rhs = (
-            pm.rhs.outer_val_dim is not None
-            or getattr(pm.rhs, "shared_block_val_dim", None) is not None
+            pm.rhs.outer_axis is not None
+            or getattr(pm.rhs, "shared_block_axis", None) is not None
         )
 
         any_val_present = (
             pres_shared
             or pres_lhs
             or pres_rhs
-            or pm.lhs.shared_block_val_dim is not None
-            or getattr(pm.rhs, "block_val_dim", None) is not None
+            or pm.lhs.shared_block_axis is not None
+            or getattr(pm.rhs, "block_axis", None) is not None
         )
         if any_val_present:
             pres_shared = pres_shared or shared_factor > 1
@@ -1307,18 +1312,18 @@ def _build_output_tensor(
             inner_pres,
         ):
             if outer_sz == 1:
-                return DenseDimension(
-                    dim_id, inner_sz, val_dim=inner_val if inner_pres else None
+                return DenseIndex(
+                    dim_id, inner_sz, axis=inner_val if inner_pres else None
                 )
             bs = inner_sz if inner_sz > 1 else None
             bv = inner_val if inner_pres and inner_sz > 1 else None
-            return SparseDimension(
+            return SparseIndex(
                 dim_id,
                 outer_sz,
-                val_dim=outer_val if outer_pres else None,
+                axis=outer_val if outer_pres else None,
                 other_id=other_id,
                 block_size=bs,
-                block_val_dim=bv,
+                block_axis=bv,
             )
 
         if ptype == "contract":
@@ -1327,83 +1332,83 @@ def _build_output_tensor(
                     l_id,
                     rs_id,
                     shared_factor,
-                    shared_val_axis,
+                    shared_axis,
                     pres_shared,
                     final_lhs_block_size,
-                    lhs_val_axis,
+                    lhs_axis,
                     pres_lhs,
                 )
                 primal_dim = _build_sparse(
                     rs_id,
                     l_id,
                     shared_factor,
-                    shared_val_axis,
+                    shared_axis,
                     pres_shared,
                     final_rhs_block_size,
-                    rhs_val_axis,
+                    rhs_axis,
                     pres_rhs,
                 )
             elif pm.lhs.dim:
-                out_dim = DenseDimension(
+                out_dim = DenseIndex(
                     l_id,
                     final_lhs_block_size,
-                    val_dim=lhs_val_axis if pres_lhs else None,
+                    axis=lhs_axis if pres_lhs else None,
                 )
             elif pm.rhs.shared_dim:
-                primal_dim = DenseDimension(
+                primal_dim = DenseIndex(
                     rs_id,
                     final_rhs_block_size,
-                    val_dim=rhs_val_axis if pres_rhs else None,
+                    axis=rhs_axis if pres_rhs else None,
                 )
         elif ptype == "batch_out":
-            out_dim = DenseDimension(
+            out_dim = DenseIndex(
                 l_id if pm.lhs.dim else ls_id,
                 shared_factor,
-                val_dim=shared_val_axis if pres_shared else None,
+                axis=shared_axis if pres_shared else None,
             )
         elif ptype == "batch_primal":
-            primal_dim = DenseDimension(
+            primal_dim = DenseIndex(
                 l_id if pm.lhs.dim else ls_id,
                 shared_factor,
-                val_dim=shared_val_axis if pres_shared else None,
+                axis=shared_axis if pres_shared else None,
             )
         elif ptype == "spatial_out_lhs":
-            out_dim = DenseDimension(
-                l_id, final_lhs_block_size, val_dim=lhs_val_axis if pres_lhs else None
+            out_dim = DenseIndex(
+                l_id, final_lhs_block_size, axis=lhs_axis if pres_lhs else None
             )
         elif ptype == "spatial_out_rhs":
-            out_pres = getattr(pm.rhs, "block_val_dim", None) is not None
-            out_dim = DenseDimension(
-                r_id, final_rhs_block_size, val_dim=rhs_val_axis if out_pres else None
+            out_pres = getattr(pm.rhs, "block_axis", None) is not None
+            out_dim = DenseIndex(
+                r_id, final_rhs_block_size, axis=rhs_axis if out_pres else None
             )
         elif ptype == "spatial_primal_lhs":
-            prim_pres = pm.lhs.shared_block_val_dim is not None
-            primal_dim = DenseDimension(
-                ls_id, final_lhs_block_size, val_dim=lhs_val_axis if prim_pres else None
+            prim_pres = pm.lhs.shared_block_axis is not None
+            primal_dim = DenseIndex(
+                ls_id, final_lhs_block_size, axis=lhs_axis if prim_pres else None
             )
         elif ptype == "spatial_primal_rhs":
-            primal_dim = DenseDimension(
-                rs_id, final_rhs_block_size, val_dim=rhs_val_axis if pres_rhs else None
+            primal_dim = DenseIndex(
+                rs_id, final_rhs_block_size, axis=rhs_axis if pres_rhs else None
             )
         elif ptype == "batch_sparse":
             out_dim = _build_sparse(
                 l_id,
                 rs_id,
                 shared_factor,
-                shared_val_axis,
+                shared_axis,
                 pres_shared,
                 final_lhs_block_size,
-                lhs_val_axis,
+                lhs_axis,
                 pres_lhs,
             )
             primal_dim = _build_sparse(
                 rs_id,
                 l_id,
                 shared_factor,
-                shared_val_axis,
+                shared_axis,
                 pres_shared,
                 final_rhs_block_size,
-                rhs_val_axis,
+                rhs_axis,
                 pres_rhs,
             )
         elif ptype == "spatial_sparse_lhs":
@@ -1411,14 +1416,14 @@ def _build_output_tensor(
                 l_id,
                 ls_id,
                 pm.lhs.outer_len,
-                shared_val_axis,
+                shared_axis,
                 pres_shared,
                 pm.lhs.block_len,
-                lhs_val_axis,
+                lhs_axis,
                 pres_lhs,
             )
             prim_inner_pres = (
-                pm.lhs.shared_block_val_dim is not None
+                pm.lhs.shared_block_axis is not None
                 if pm.lhs.outer_len == 1
                 else pres_rhs
             )
@@ -1426,32 +1431,32 @@ def _build_output_tensor(
                 ls_id,
                 l_id,
                 pm.lhs.outer_len,
-                shared_val_axis,
+                shared_axis,
                 pres_shared,
                 pm.lhs.shared_block_len,
-                rhs_val_axis,
+                rhs_axis,
                 prim_inner_pres,
             )
         elif ptype == "spatial_sparse_rhs":
-            out_inner_pres = getattr(pm.rhs, "block_val_dim", None) is not None
+            out_inner_pres = getattr(pm.rhs, "block_axis", None) is not None
             out_dim = _build_sparse(
                 r_id,
                 rs_id,
                 pm.rhs.outer_len,
-                shared_val_axis,
+                shared_axis,
                 pres_shared,
                 pm.rhs.block_len,
-                lhs_val_axis,
+                lhs_axis,
                 out_inner_pres,
             )
             primal_dim = _build_sparse(
                 rs_id,
                 r_id,
                 pm.rhs.outer_len,
-                shared_val_axis,
+                shared_axis,
                 pres_shared,
                 pm.rhs.shared_block_len,
-                rhs_val_axis,
+                rhs_axis,
                 pres_rhs,
             )
 
@@ -1462,10 +1467,10 @@ def _build_output_tensor(
 
     used_axes = set()
     for d in out_dims + primal_dims:
-        if d.val_dim is not None:
-            used_axes.add(d.val_dim)
-        if getattr(d, "block_val_dim", None) is not None:
-            used_axes.add(d.block_val_dim)
+        if d.axis is not None:
+            used_axes.add(d.axis)
+        if getattr(d, "block_axis", None) is not None:
+            used_axes.add(d.block_axis)
 
     for i in range(len(ctx.pairs)):
         for ax in (axis_map.shared[i], axis_map.lhs[i], axis_map.rhs[i]):
@@ -1505,10 +1510,10 @@ def _build_output_tensor(
             return [
                 replace(
                     d,
-                    val_dim=shift_ax(d.val_dim),
+                    axis=shift_ax(d.axis),
                     **(
-                        {"block_val_dim": shift_ax(d.block_val_dim)}
-                        if isinstance(d, SparseDimension)
+                        {"block_axis": shift_ax(d.block_axis)}
+                        if isinstance(d, SparseIndex)
                         else {}
                     ),
                 )
@@ -1524,9 +1529,9 @@ def _build_output_tensor(
     final_primal_dims = tuple(sorted(primal_dims, key=lambda d: d.id))
     id_map = {d.id: i for i, d in enumerate(final_out_dims + final_primal_dims)}
 
-    def finalize_dim(d: Dimension, new_id: int) -> Dimension:
+    def finalize_dim(d: Index, new_id: int) -> Index:
         kwargs = {"id": new_id}
-        if isinstance(d, SparseDimension):
+        if isinstance(d, SparseIndex):
             kwargs["other_id"] = id_map.get(d.other_id, d.other_id)
         return replace(d, **kwargs)
 
@@ -1537,9 +1542,9 @@ def _build_output_tensor(
     )
 
     has_val = any(
-        d.val_dim is not None for d in final_out_dims + final_primal_dims
+        d.axis is not None for d in final_out_dims + final_primal_dims
     ) or any(
-        isinstance(d, SparseDimension) and d.block_val_dim is not None
+        isinstance(d, SparseIndex) and d.block_axis is not None
         for d in final_out_dims + final_primal_dims
     )
 

@@ -17,7 +17,7 @@ from utils import (
 )
 
 from graphax.sparse.tensor import (
-    SparseDimension,
+    SparseIndex,
     SparseTensor,
     _arr2st,
 )

@@ -4,7 +4,7 @@ import unittest
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-from graphax.sparse.tensor import SparseTensor, DenseDimension, SparseDimension, _arr2st
+from graphax.sparse.tensor import SparseTensor, DenseIndex, SparseIndex, _arr2st
 from graphax.sparse.ops.elementwise import elementwise
 
 from jax_memory_monitor.jax_peak_memory_monitor import PeakMemoryMonitor
@@ -277,23 +277,23 @@ def manual_06(a, b):
 
     return SparseTensor(
         (
-            SparseDimension(
+            SparseIndex(
                 0,
                 n_unified,
-                val_dim=0,
+                axis=0,
                 other_id=1,
                 block_size=lcm_block,
-                block_val_dim=1,
+                block_axis=1,
             ),
         ),
         (
-            SparseDimension(
+            SparseIndex(
                 1,
                 n_unified,
-                val_dim=0,
+                axis=0,
                 other_id=0,
                 block_size=lcm_block,
-                block_val_dim=2,
+                block_axis=2,
             ),
         ),
         out_macro,
@@ -312,8 +312,8 @@ def manual_08(a, b):
     s3 = b.primal_dims[1].size
     R_val = jnp.expand_dims(a.val, 2) * jnp.expand_dims(b.val, 1)  # (s1, s2, s3)
     return SparseTensor(
-        (DenseDimension(0, s1, 0), SparseDimension(1, s2, val_dim=1, other_id=2)),
-        (SparseDimension(2, s2, val_dim=1, other_id=1), DenseDimension(3, s3, 2)),
+        (DenseIndex(0, s1, 0), SparseIndex(1, s2, axis=1, other_id=2)),
+        (SparseIndex(2, s2, axis=1, other_id=1), DenseIndex(3, s3, 2)),
         R_val,
         sort_val=False,
     )
@@ -325,11 +325,11 @@ def manual_09(a, b):
     s3 = b.primal_dims[1].size
     R_val = jnp.expand_dims(a.val, 2) * jnp.expand_dims(b.val, 0)
     return SparseTensor(
-        (SparseDimension(0, s1, val_dim=0, other_id=1),),
+        (SparseIndex(0, s1, axis=0, other_id=1),),
         (
-            SparseDimension(1, s1, val_dim=0, other_id=0),
-            DenseDimension(2, s2, 1),
-            DenseDimension(3, s3, 2),
+            SparseIndex(1, s1, axis=0, other_id=0),
+            DenseIndex(2, s2, 1),
+            DenseIndex(3, s3, 2),
         ),
         R_val,
         sort_val=False,
@@ -342,8 +342,8 @@ def manual_10(a, b):
     s3 = b.primal_dims[1].size
     R_val = jnp.expand_dims(a.val, 2) * jnp.expand_dims(b.val, 1)  # (s1, s2, s3)
     return SparseTensor(
-        (SparseDimension(0, s1, val_dim=0, other_id=2), DenseDimension(1, s2, 1)),
-        (SparseDimension(2, s1, val_dim=0, other_id=0), DenseDimension(3, s3, 2)),
+        (SparseIndex(0, s1, axis=0, other_id=2), DenseIndex(1, s2, 1)),
+        (SparseIndex(2, s1, axis=0, other_id=0), DenseIndex(3, s3, 2)),
         R_val,
         sort_val=False,
     )
@@ -355,13 +355,13 @@ def manual_11(a, b):
     R_val = a.val @ b.val
     return SparseTensor(
         (
-            SparseDimension(
-                0, s1, val_dim=0, other_id=1, block_size=s2, block_val_dim=1
+            SparseIndex(
+                0, s1, axis=0, other_id=1, block_size=s2, block_axis=1
             ),
         ),
         (
-            SparseDimension(
-                1, s1, val_dim=0, other_id=0, block_size=s2, block_val_dim=2
+            SparseIndex(
+                1, s1, axis=0, other_id=0, block_size=s2, block_axis=2
             ),
         ),
         R_val,
@@ -376,11 +376,11 @@ def manual_12(a, b):
     R_val = jnp.expand_dims(a.val, 2) * jnp.expand_dims(b.val, 1)  # (s1, s2, s3)
     return SparseTensor(
         (
-            SparseDimension(0, s1, val_dim=0, other_id=3),
-            DenseDimension(1, s2, 1),
-            DenseDimension(2, s3, 2),
+            SparseIndex(0, s1, axis=0, other_id=3),
+            DenseIndex(1, s2, 1),
+            DenseIndex(2, s3, 2),
         ),
-        (SparseDimension(3, s1, val_dim=0, other_id=0),),
+        (SparseIndex(3, s1, axis=0, other_id=0),),
         R_val,
         sort_val=False,
     )
@@ -393,11 +393,11 @@ def manual_13(a, b):
     R_val = jax.lax.dot_general(a.val, b.val, (((3,), (3,)), ((0, 1, 2), (0, 1, 2))))
     return SparseTensor(
         (
-            DenseDimension(0, s1, 0),
-            DenseDimension(1, s2, 1),
-            SparseDimension(2, s3, val_dim=2, other_id=3),
+            DenseIndex(0, s1, 0),
+            DenseIndex(1, s2, 1),
+            SparseIndex(2, s3, axis=2, other_id=3),
         ),
-        (SparseDimension(3, s3, val_dim=2, other_id=2),),
+        (SparseIndex(3, s3, axis=2, other_id=2),),
         R_val,
         sort_val=False,
     )
@@ -408,8 +408,8 @@ def manual_14(a, b):
     s2 = a.dims[1].size
     s3 = b.primal_dims[1].size
     return SparseTensor(
-        (SparseDimension(0, s1, val_dim=0, other_id=2), DenseDimension(1, s2, None)),
-        (SparseDimension(2, s1, val_dim=0, other_id=0), DenseDimension(3, s3, 1)),
+        (SparseIndex(0, s1, axis=0, other_id=2), DenseIndex(1, s2, None)),
+        (SparseIndex(2, s1, axis=0, other_id=0), DenseIndex(3, s3, 1)),
         b.val,
         sort_val=False,
     )
@@ -419,8 +419,8 @@ def manual_15(a, b):
     s1 = a.dims[0].size
     R_val = jnp.sum(a.val * b.val, axis=1)
     return SparseTensor(
-        (SparseDimension(0, s1, val_dim=0, other_id=1),),
-        (SparseDimension(1, s1, val_dim=0, other_id=0),),
+        (SparseIndex(0, s1, axis=0, other_id=1),),
+        (SparseIndex(1, s1, axis=0, other_id=0),),
         R_val,
         sort_val=False,
     )
@@ -433,11 +433,11 @@ def manual_16(a, b):
     R_val = jax.lax.dot_general(a.val, b.val, (((3,), (3,)), ((0, 1, 2), (0, 1, 2))))
     return SparseTensor(
         (
-            DenseDimension(0, s1, 0),
-            DenseDimension(1, s2, 1),
-            SparseDimension(2, s3, val_dim=2, other_id=3),
+            DenseIndex(0, s1, 0),
+            DenseIndex(1, s2, 1),
+            SparseIndex(2, s3, axis=2, other_id=3),
         ),
-        (SparseDimension(3, s3, val_dim=2, other_id=2),),
+        (SparseIndex(3, s3, axis=2, other_id=2),),
         R_val,
         sort_val=False,
     )
@@ -451,13 +451,13 @@ def manual_17(a, b):
     R_val = a.val @ b.val
     return SparseTensor(
         (
-            SparseDimension(
-                0, s1, val_dim=0, other_id=1, block_size=s2, block_val_dim=1
+            SparseIndex(
+                0, s1, axis=0, other_id=1, block_size=s2, block_axis=1
             ),
         ),
         (
-            SparseDimension(
-                1, s1, val_dim=0, other_id=0, block_size=s4, block_val_dim=2
+            SparseIndex(
+                1, s1, axis=0, other_id=0, block_size=s4, block_axis=2
             ),
         ),
         R_val,
@@ -471,8 +471,8 @@ def manual_18(a, b):
     s3 = b.primal_dims[1].size
     R_val = jnp.expand_dims(a.val, 2) * jnp.expand_dims(b.val, 1)  # (s1, s2, s3)
     return SparseTensor(
-        (DenseDimension(0, s1, 0), SparseDimension(1, s2, val_dim=1, other_id=2)),
-        (SparseDimension(2, s2, val_dim=1, other_id=1), DenseDimension(3, s3, 2)),
+        (DenseIndex(0, s1, 0), SparseIndex(1, s2, axis=1, other_id=2)),
+        (SparseIndex(2, s2, axis=1, other_id=1), DenseIndex(3, s3, 2)),
         R_val,
         sort_val=False,
     )
@@ -487,12 +487,12 @@ def manual_19(a, b):
     R_val = jax.lax.dot_general(a.val, b.val, (((4,), (3,)), ((0, 1, 2), (0, 1, 2))))
     return SparseTensor(
         (
-            DenseDimension(0, s1, 0),
-            DenseDimension(1, s2, 1),
-            SparseDimension(2, s3, val_dim=2, other_id=4),
-            DenseDimension(3, s4, 3),
+            DenseIndex(0, s1, 0),
+            DenseIndex(1, s2, 1),
+            SparseIndex(2, s3, axis=2, other_id=4),
+            DenseIndex(3, s4, 3),
         ),
-        (SparseDimension(4, s3, val_dim=2, other_id=2), DenseDimension(5, s6, 4)),
+        (SparseIndex(4, s3, axis=2, other_id=2), DenseIndex(5, s6, 4)),
         R_val,
         sort_val=False,
     )
@@ -504,8 +504,8 @@ def manual_matmul_aligned(a, b):
     s4 = b.primal_dims[1].size
     res_val = jax.lax.dot_general(a.val, b.val, (((2,), (1,)), ((0,), (0,))))
     return SparseTensor(
-        (SparseDimension(0, s1, val_dim=0, other_id=2), DenseDimension(1, s2, 1)),
-        (SparseDimension(2, s1, val_dim=0, other_id=0), DenseDimension(3, s4, 2)),
+        (SparseIndex(0, s1, axis=0, other_id=2), DenseIndex(1, s2, 1)),
+        (SparseIndex(2, s1, axis=0, other_id=0), DenseIndex(3, s4, 2)),
         res_val,
         sort_val=False,
     )
@@ -531,8 +531,8 @@ def manual_matmul_unaligned(a, b):
 
     # Unaligned matmul results in a dense tensor in this case
     return SparseTensor(
-        (DenseDimension(0, s3, 0), DenseDimension(1, s2, 1)),
-        (DenseDimension(2, s1, 2), DenseDimension(3, s4, 3)),
+        (DenseIndex(0, s3, 0), DenseIndex(1, s2, 1)),
+        (DenseIndex(2, s1, 2), DenseIndex(3, s4, 3)),
         res_val,
         sort_val=False,
     )
@@ -674,20 +674,20 @@ class TestSmokeScreen(unittest.TestCase):
 
         a = SparseTensor(
             (
-                SparseDimension(0, s1, val_dim=0, other_id=3),
-                DenseDimension(1, s2, 1),
-                DenseDimension(2, s3, 2),
+                SparseIndex(0, s1, axis=0, other_id=3),
+                DenseIndex(1, s2, 1),
+                DenseIndex(2, s3, 2),
             ),
-            (SparseDimension(3, s1, val_dim=0, other_id=0),),
+            (SparseIndex(3, s1, axis=0, other_id=0),),
             self._n((s1, s2, s3), 1),
         )
         b = SparseTensor(
             (
-                SparseDimension(0, s1, val_dim=0, other_id=3),
-                DenseDimension(1, s2, 1),
-                DenseDimension(2, s3, 2),
+                SparseIndex(0, s1, axis=0, other_id=3),
+                DenseIndex(1, s2, 1),
+                DenseIndex(2, s3, 2),
             ),
-            (SparseDimension(3, s1, val_dim=0, other_id=0),),
+            (SparseIndex(3, s1, axis=0, other_id=0),),
             self._n((s1, s2, s3), 2),
         )
 
@@ -711,31 +711,31 @@ class TestSmokeScreen(unittest.TestCase):
 
         a = SparseTensor(
             (
-                SparseDimension(
-                    0, s1, val_dim=0, other_id=1, block_size=s2, block_val_dim=1
+                SparseIndex(
+                    0, s1, axis=0, other_id=1, block_size=s2, block_axis=1
                 ),
-                DenseDimension(2, s3, 2),
+                DenseIndex(2, s3, 2),
             ),
             (
-                SparseDimension(
-                    1, s1, val_dim=0, other_id=0, block_size=s4, block_val_dim=3
+                SparseIndex(
+                    1, s1, axis=0, other_id=0, block_size=s4, block_axis=3
                 ),
-                DenseDimension(3, s5, 4),
+                DenseIndex(3, s5, 4),
             ),
             self._n((s1, s2, s3, s4, s5), 1),
         )
         b = SparseTensor(
             (
-                SparseDimension(
-                    0, s1, val_dim=0, other_id=1, block_size=s2, block_val_dim=1
+                SparseIndex(
+                    0, s1, axis=0, other_id=1, block_size=s2, block_axis=1
                 ),
-                DenseDimension(2, s3, 2),
+                DenseIndex(2, s3, 2),
             ),
             (
-                SparseDimension(
-                    1, s1, val_dim=0, other_id=0, block_size=s4, block_val_dim=3
+                SparseIndex(
+                    1, s1, axis=0, other_id=0, block_size=s4, block_axis=3
                 ),
-                DenseDimension(3, s5, 4),
+                DenseIndex(3, s5, 4),
             ),
             self._n((s1, s2, s3, s4, s5), 2),
         )
@@ -762,13 +762,13 @@ class TestSmokeScreen(unittest.TestCase):
 
         a = SparseTensor(
             (
-                SparseDimension(
-                    0, s1, val_dim=0, other_id=1, block_size=s2, block_val_dim=1
+                SparseIndex(
+                    0, s1, axis=0, other_id=1, block_size=s2, block_axis=1
                 ),
             ),
             (
-                SparseDimension(
-                    1, s1, val_dim=0, other_id=0, block_size=s3, block_val_dim=2
+                SparseIndex(
+                    1, s1, axis=0, other_id=0, block_size=s3, block_axis=2
                 ),
             ),
             self._n((s1, s2, s3), 1, dtype=jnp.bool_),
@@ -776,13 +776,13 @@ class TestSmokeScreen(unittest.TestCase):
         )
         b = SparseTensor(
             (
-                SparseDimension(
-                    0, s4, val_dim=0, other_id=1, block_size=s5, block_val_dim=1
+                SparseIndex(
+                    0, s4, axis=0, other_id=1, block_size=s5, block_axis=1
                 ),
             ),
             (
-                SparseDimension(
-                    1, s4, val_dim=0, other_id=0, block_size=s6, block_val_dim=2
+                SparseIndex(
+                    1, s4, axis=0, other_id=0, block_size=s6, block_axis=2
                 ),
             ),
             self._n((s4, s5, s6), 2, dtype=jnp.bool_),
@@ -802,13 +802,13 @@ class TestSmokeScreen(unittest.TestCase):
             s2 *= 125 * SCALE
 
         a = SparseTensor(
-            (DenseDimension(0, s1, 0), SparseDimension(1, s2, val_dim=1, other_id=2)),
-            (SparseDimension(2, s2, val_dim=1, other_id=1),),
+            (DenseIndex(0, s1, 0), SparseIndex(1, s2, axis=1, other_id=2)),
+            (SparseIndex(2, s2, axis=1, other_id=1),),
             self._n((s1, s2), 1),
         )
         b = SparseTensor(
-            (DenseDimension(0, s1, 0), SparseDimension(1, s2, val_dim=1, other_id=2)),
-            (SparseDimension(2, s2, val_dim=1, other_id=1),),
+            (DenseIndex(0, s1, 0), SparseIndex(1, s2, axis=1, other_id=2)),
+            (SparseIndex(2, s2, axis=1, other_id=1),),
             self._n((s1, s2), 2),
         )
 
@@ -825,13 +825,13 @@ class TestSmokeScreen(unittest.TestCase):
             s2 *= 100 * SCALE
 
         a = SparseTensor(
-            (SparseDimension(0, s1, val_dim=0, other_id=2), DenseDimension(1, s2, 1)),
-            (SparseDimension(2, s1, val_dim=0, other_id=0),),
+            (SparseIndex(0, s1, axis=0, other_id=2), DenseIndex(1, s2, 1)),
+            (SparseIndex(2, s1, axis=0, other_id=0),),
             self._n((s1, s2), 1),
         )
         b = SparseTensor(
-            (SparseDimension(0, s1, val_dim=0, other_id=2), DenseDimension(1, s2, 1)),
-            (SparseDimension(2, s1, val_dim=0, other_id=0),),
+            (SparseIndex(0, s1, axis=0, other_id=2), DenseIndex(1, s2, 1)),
+            (SparseIndex(2, s1, axis=0, other_id=0),),
             self._n((s1, s2), 2),
         )
 
@@ -853,26 +853,26 @@ class TestSmokeScreen(unittest.TestCase):
 
         a = SparseTensor(
             (
-                SparseDimension(
-                    0, s1, val_dim=0, other_id=1, block_size=s2, block_val_dim=1
+                SparseIndex(
+                    0, s1, axis=0, other_id=1, block_size=s2, block_axis=1
                 ),
             ),
             (
-                SparseDimension(
-                    1, s1, val_dim=0, other_id=0, block_size=s2, block_val_dim=2
+                SparseIndex(
+                    1, s1, axis=0, other_id=0, block_size=s2, block_axis=2
                 ),
             ),
             jnp.abs(self._n((s1, s2, s2), 1)),
         )
         b = SparseTensor(
             (
-                SparseDimension(
-                    0, s3, val_dim=0, other_id=1, block_size=s4, block_val_dim=1
+                SparseIndex(
+                    0, s3, axis=0, other_id=1, block_size=s4, block_axis=1
                 ),
             ),
             (
-                SparseDimension(
-                    1, s3, val_dim=0, other_id=0, block_size=s4, block_val_dim=2
+                SparseIndex(
+                    1, s3, axis=0, other_id=0, block_size=s4, block_axis=2
                 ),
             ),
             jnp.abs(self._n((s3, s4, s4), 2)),
@@ -900,13 +900,13 @@ class TestSmokeScreen(unittest.TestCase):
             s2 *= 110 * SCALE
 
         a = SparseTensor(
-            (DenseDimension(0, s1, 0), SparseDimension(1, s2, val_dim=1, other_id=2)),
-            (SparseDimension(2, s2, val_dim=1, other_id=1),),
+            (DenseIndex(0, s1, 0), SparseIndex(1, s2, axis=1, other_id=2)),
+            (SparseIndex(2, s2, axis=1, other_id=1),),
             self._n((s1, s2), 1),
         )
         b = SparseTensor(
-            (DenseDimension(0, s1, 0), SparseDimension(1, s2, val_dim=1, other_id=2)),
-            (SparseDimension(2, s2, val_dim=1, other_id=1),),
+            (DenseIndex(0, s1, 0), SparseIndex(1, s2, axis=1, other_id=2)),
+            (SparseIndex(2, s2, axis=1, other_id=1),),
             self._n((s1, s2), 2),
         )
 
@@ -925,13 +925,13 @@ class TestSmokeScreen(unittest.TestCase):
             s3 *= 28 * SCALE
 
         a = SparseTensor(
-            (DenseDimension(0, s1, 0), SparseDimension(1, s2, val_dim=1, other_id=2)),
-            (SparseDimension(2, s2, val_dim=1, other_id=1),),
+            (DenseIndex(0, s1, 0), SparseIndex(1, s2, axis=1, other_id=2)),
+            (SparseIndex(2, s2, axis=1, other_id=1),),
             self._n((s1, s2), 1),
         )
         b = SparseTensor(
-            (SparseDimension(0, s2, val_dim=0, other_id=1),),
-            (SparseDimension(1, s2, val_dim=0, other_id=0), DenseDimension(2, s3, 1)),
+            (SparseIndex(0, s2, axis=0, other_id=1),),
+            (SparseIndex(1, s2, axis=0, other_id=0), DenseIndex(2, s3, 1)),
             self._n((s2, s3), 2),
         )
 
@@ -954,13 +954,13 @@ class TestSmokeScreen(unittest.TestCase):
             s5 *= 25 * SCALE
 
         a = SparseTensor(
-            (SparseDimension(0, s1, val_dim=0, other_id=1),),
-            (SparseDimension(1, s1, val_dim=0, other_id=0), DenseDimension(2, s2, 1)),
+            (SparseIndex(0, s1, axis=0, other_id=1),),
+            (SparseIndex(1, s1, axis=0, other_id=0), DenseIndex(2, s2, 1)),
             self._n((s1, s2), 1),
         )
         b = SparseTensor(
-            (SparseDimension(0, s4, val_dim=0, other_id=1),),
-            (SparseDimension(1, s4, val_dim=0, other_id=0), DenseDimension(2, s5, 1)),
+            (SparseIndex(0, s4, axis=0, other_id=1),),
+            (SparseIndex(1, s4, axis=0, other_id=0), DenseIndex(2, s5, 1)),
             self._n((s4, s5), 2),
         )
 
@@ -981,13 +981,13 @@ class TestSmokeScreen(unittest.TestCase):
             s4 *= 26 * SCALE
 
         a = SparseTensor(
-            (SparseDimension(0, s1, val_dim=0, other_id=2), DenseDimension(1, s2, 1)),
-            (SparseDimension(2, s1, val_dim=0, other_id=0),),
+            (SparseIndex(0, s1, axis=0, other_id=2), DenseIndex(1, s2, 1)),
+            (SparseIndex(2, s1, axis=0, other_id=0),),
             self._n((s1, s2), 1),
         )
         b = SparseTensor(
-            (SparseDimension(0, s3, val_dim=0, other_id=1),),
-            (SparseDimension(1, s3, val_dim=0, other_id=0), DenseDimension(2, s4, 1)),
+            (SparseIndex(0, s3, axis=0, other_id=1),),
+            (SparseIndex(1, s3, axis=0, other_id=0), DenseIndex(2, s4, 1)),
             self._n((s3, s4), 2),
         )
 
@@ -1007,26 +1007,26 @@ class TestSmokeScreen(unittest.TestCase):
 
         a = SparseTensor(
             (
-                SparseDimension(
-                    0, s1, val_dim=0, other_id=1, block_size=s2, block_val_dim=1
+                SparseIndex(
+                    0, s1, axis=0, other_id=1, block_size=s2, block_axis=1
                 ),
             ),
             (
-                SparseDimension(
-                    1, s1, val_dim=0, other_id=0, block_size=s3, block_val_dim=2
+                SparseIndex(
+                    1, s1, axis=0, other_id=0, block_size=s3, block_axis=2
                 ),
             ),
             self._n((s1, s2, s3), 1),
         )
         b = SparseTensor(
             (
-                SparseDimension(
-                    0, s1, val_dim=0, other_id=1, block_size=s3, block_val_dim=1
+                SparseIndex(
+                    0, s1, axis=0, other_id=1, block_size=s3, block_axis=1
                 ),
             ),
             (
-                SparseDimension(
-                    1, s1, val_dim=0, other_id=0, block_size=s2, block_val_dim=2
+                SparseIndex(
+                    1, s1, axis=0, other_id=0, block_size=s2, block_axis=2
                 ),
             ),
             self._n((s1, s3, s2), 2),
@@ -1047,13 +1047,13 @@ class TestSmokeScreen(unittest.TestCase):
             s3 *= 19 * SCALE
 
         a = SparseTensor(
-            (SparseDimension(0, s1, val_dim=0, other_id=2), DenseDimension(1, s2, 1)),
-            (SparseDimension(2, s1, val_dim=0, other_id=0),),
+            (SparseIndex(0, s1, axis=0, other_id=2), DenseIndex(1, s2, 1)),
+            (SparseIndex(2, s1, axis=0, other_id=0),),
             self._n((s1, s2), 1),
         )
         b = SparseTensor(
-            (DenseDimension(2, s3, 1), SparseDimension(0, s1, val_dim=0, other_id=1)),
-            (SparseDimension(1, s1, val_dim=0, other_id=0),),
+            (DenseIndex(2, s3, 1), SparseIndex(0, s1, axis=0, other_id=1)),
+            (SparseIndex(1, s1, axis=0, other_id=0),),
             self._n((s1, s3), 2),
         )
 
@@ -1075,21 +1075,21 @@ class TestSmokeScreen(unittest.TestCase):
 
         a = SparseTensor(
             (
-                DenseDimension(0, s1, 0),
-                DenseDimension(1, s2, 1),
-                SparseDimension(2, s3, val_dim=2, other_id=3),
+                DenseIndex(0, s1, 0),
+                DenseIndex(1, s2, 1),
+                SparseIndex(2, s3, axis=2, other_id=3),
             ),
-            (SparseDimension(3, s3, val_dim=2, other_id=2), DenseDimension(4, s4, 3)),
+            (SparseIndex(3, s3, axis=2, other_id=2), DenseIndex(4, s4, 3)),
             self._n((s1, s2, s3, s4), 1),
         )
         b = SparseTensor(
             (
-                DenseDimension(0, s1, 0),
-                DenseDimension(1, s2, 1),
-                SparseDimension(2, s3, val_dim=2, other_id=4),
-                DenseDimension(3, s4, 3),
+                DenseIndex(0, s1, 0),
+                DenseIndex(1, s2, 1),
+                SparseIndex(2, s3, axis=2, other_id=4),
+                DenseIndex(3, s4, 3),
             ),
-            (SparseDimension(4, s3, val_dim=2, other_id=2),),
+            (SparseIndex(4, s3, axis=2, other_id=2),),
             self._n((s1, s2, s3, s4), 2),
         )
 
@@ -1109,15 +1109,15 @@ class TestSmokeScreen(unittest.TestCase):
 
         a = SparseTensor(
             (
-                SparseDimension(0, s1, val_dim=None, other_id=2),
-                DenseDimension(1, s2, None),
+                SparseIndex(0, s1, axis=None, other_id=2),
+                DenseIndex(1, s2, None),
             ),
-            (SparseDimension(2, s1, val_dim=None, other_id=0),),
+            (SparseIndex(2, s1, axis=None, other_id=0),),
             val=None,
         )
         b = SparseTensor(
-            (SparseDimension(0, s1, val_dim=0, other_id=1),),
-            (SparseDimension(1, s1, val_dim=0, other_id=0), DenseDimension(2, s3, 1)),
+            (SparseIndex(0, s1, axis=0, other_id=1),),
+            (SparseIndex(1, s1, axis=0, other_id=0), DenseIndex(2, s3, 1)),
             self._n((s1, s3), 2),
         )
 
@@ -1134,13 +1134,13 @@ class TestSmokeScreen(unittest.TestCase):
             s2 *= 60 * SCALE
 
         a = SparseTensor(
-            (SparseDimension(0, s1, val_dim=0, other_id=2),),
-            (DenseDimension(1, s2, 1), SparseDimension(2, s1, val_dim=0, other_id=0)),
+            (SparseIndex(0, s1, axis=0, other_id=2),),
+            (DenseIndex(1, s2, 1), SparseIndex(2, s1, axis=0, other_id=0)),
             self._n((s1, s2), 1),
         )
         b = SparseTensor(
-            (DenseDimension(0, s2, 1), SparseDimension(1, s1, val_dim=0, other_id=2)),
-            (SparseDimension(2, s1, val_dim=0, other_id=1),),
+            (DenseIndex(0, s2, 1), SparseIndex(1, s1, axis=0, other_id=2)),
+            (SparseIndex(2, s1, axis=0, other_id=1),),
             self._n((s1, s2), 2),
         )
 
@@ -1162,21 +1162,21 @@ class TestSmokeScreen(unittest.TestCase):
 
         a = SparseTensor(
             (
-                DenseDimension(0, s1, 0),
-                DenseDimension(1, s2, 1),
-                SparseDimension(2, s3, val_dim=2, other_id=3),
+                DenseIndex(0, s1, 0),
+                DenseIndex(1, s2, 1),
+                SparseIndex(2, s3, axis=2, other_id=3),
             ),
-            (SparseDimension(3, s3, val_dim=2, other_id=2), DenseDimension(4, s4, 3)),
+            (SparseIndex(3, s3, axis=2, other_id=2), DenseIndex(4, s4, 3)),
             self._n((s1, s2, s3, s4), 1),
         )
         b = SparseTensor(
             (
-                DenseDimension(0, s1, 0),
-                DenseDimension(1, s2, 1),
-                SparseDimension(2, s3, val_dim=2, other_id=4),
-                DenseDimension(3, s4, 3),
+                DenseIndex(0, s1, 0),
+                DenseIndex(1, s2, 1),
+                SparseIndex(2, s3, axis=2, other_id=4),
+                DenseIndex(3, s4, 3),
             ),
-            (SparseDimension(4, s3, val_dim=2, other_id=2),),
+            (SparseIndex(4, s3, axis=2, other_id=2),),
             self._n((s1, s2, s3, s4), 2),
         )
 
@@ -1198,26 +1198,26 @@ class TestSmokeScreen(unittest.TestCase):
 
         a = SparseTensor(
             (
-                SparseDimension(
-                    0, s1, val_dim=0, other_id=1, block_size=s2, block_val_dim=1
+                SparseIndex(
+                    0, s1, axis=0, other_id=1, block_size=s2, block_axis=1
                 ),
             ),
             (
-                SparseDimension(
-                    1, s1, val_dim=0, other_id=0, block_size=s3, block_val_dim=2
+                SparseIndex(
+                    1, s1, axis=0, other_id=0, block_size=s3, block_axis=2
                 ),
             ),
             self._n((s1, s2, s3), 1),
         )
         b = SparseTensor(
             (
-                SparseDimension(
-                    0, s1, val_dim=0, other_id=1, block_size=s3, block_val_dim=1
+                SparseIndex(
+                    0, s1, axis=0, other_id=1, block_size=s3, block_axis=1
                 ),
             ),
             (
-                SparseDimension(
-                    1, s1, val_dim=0, other_id=0, block_size=s4, block_val_dim=2
+                SparseIndex(
+                    1, s1, axis=0, other_id=0, block_size=s4, block_axis=2
                 ),
             ),
             self._n((s1, s3, s4), 2),
@@ -1238,13 +1238,13 @@ class TestSmokeScreen(unittest.TestCase):
             s3 *= 10 * SCALE
 
         a = SparseTensor(
-            (DenseDimension(0, s1, 0), SparseDimension(1, s2, val_dim=1, other_id=2)),
-            (SparseDimension(2, s2, val_dim=1, other_id=1),),
+            (DenseIndex(0, s1, 0), SparseIndex(1, s2, axis=1, other_id=2)),
+            (SparseIndex(2, s2, axis=1, other_id=1),),
             self._n((s1, s2), 1),
         )
         b = SparseTensor(
-            (SparseDimension(0, s2, val_dim=0, other_id=1),),
-            (SparseDimension(1, s2, val_dim=0, other_id=0), DenseDimension(2, s3, 1)),
+            (SparseIndex(0, s2, axis=0, other_id=1),),
+            (SparseIndex(1, s2, axis=0, other_id=0), DenseIndex(2, s3, 1)),
             self._n((s2, s3), 2),
         )
 
@@ -1270,22 +1270,22 @@ class TestSmokeScreen(unittest.TestCase):
 
         a = SparseTensor(
             (
-                DenseDimension(0, s1, 0),
-                DenseDimension(1, s2, 1),
-                SparseDimension(2, s3, val_dim=2, other_id=4),
-                DenseDimension(3, s4, 3),
+                DenseIndex(0, s1, 0),
+                DenseIndex(1, s2, 1),
+                SparseIndex(2, s3, axis=2, other_id=4),
+                DenseIndex(3, s4, 3),
             ),
-            (SparseDimension(4, s3, val_dim=2, other_id=2), DenseDimension(5, s5, 4)),
+            (SparseIndex(4, s3, axis=2, other_id=2), DenseIndex(5, s5, 4)),
             self._n((s1, s2, s3, s4, s5), 1),
         )
         b = SparseTensor(
             (
-                DenseDimension(0, s1, 0),
-                DenseDimension(1, s2, 1),
-                SparseDimension(2, s3, val_dim=2, other_id=4),
-                DenseDimension(3, s5, 3),
+                DenseIndex(0, s1, 0),
+                DenseIndex(1, s2, 1),
+                SparseIndex(2, s3, axis=2, other_id=4),
+                DenseIndex(3, s5, 3),
             ),
-            (SparseDimension(4, s3, val_dim=2, other_id=2), DenseDimension(5, s6, 4)),
+            (SparseIndex(4, s3, axis=2, other_id=2), DenseIndex(5, s6, 4)),
             self._n((s1, s2, s3, s5, s6), 2),
         )
 
@@ -1314,35 +1314,35 @@ class TestSmokeScreen(unittest.TestCase):
 
     def _get_chained_tensors(self, s1, s2, s3, s4, s5, s6, s7):
         a1 = SparseTensor(
-            (SparseDimension(0, s1, val_dim=0, other_id=2), DenseDimension(1, s2, 1)),
-            (SparseDimension(2, s1, val_dim=0, other_id=0), DenseDimension(3, s3, 2)),
+            (SparseIndex(0, s1, axis=0, other_id=2), DenseIndex(1, s2, 1)),
+            (SparseIndex(2, s1, axis=0, other_id=0), DenseIndex(3, s3, 2)),
             self._n((s1, s2, s3), 1),
         )
         a2 = SparseTensor(
-            (SparseDimension(0, s3, val_dim=0, other_id=3), DenseDimension(1, s2, 1)),
-            (DenseDimension(2, s1, 2), SparseDimension(3, s3, val_dim=0, other_id=0)),
+            (SparseIndex(0, s3, axis=0, other_id=3), DenseIndex(1, s2, 1)),
+            (DenseIndex(2, s1, 2), SparseIndex(3, s3, axis=0, other_id=0)),
             self._n((s3, s2, s1), 1),
         )
         b = SparseTensor(
-            (SparseDimension(0, s1, val_dim=0, other_id=2), DenseDimension(1, s3, 1)),
-            (SparseDimension(2, s1, val_dim=0, other_id=0), DenseDimension(3, s4, 2)),
+            (SparseIndex(0, s1, axis=0, other_id=2), DenseIndex(1, s3, 1)),
+            (SparseIndex(2, s1, axis=0, other_id=0), DenseIndex(3, s4, 2)),
             self._n((s1, s3, s4), 2),
         )
         c1 = SparseTensor(
-            (SparseDimension(0, s1, val_dim=0, other_id=2), DenseDimension(1, s2, 1)),
-            (SparseDimension(2, s1, val_dim=0, other_id=0), DenseDimension(3, s4, 2)),
+            (SparseIndex(0, s1, axis=0, other_id=2), DenseIndex(1, s2, 1)),
+            (SparseIndex(2, s1, axis=0, other_id=0), DenseIndex(3, s4, 2)),
             self._n((s1, s2, s4), 3),
         )
         c2 = SparseTensor(
             (
-                SparseDimension(0, s5, val_dim=0, other_id=2, block_size=s6),
-                DenseDimension(1, s2, 1),
+                SparseIndex(0, s5, axis=0, other_id=2, block_size=s6),
+                DenseIndex(1, s2, 1),
             ),
             (
-                SparseDimension(
-                    2, s5, val_dim=0, other_id=0, block_size=s7, block_val_dim=2
+                SparseIndex(
+                    2, s5, axis=0, other_id=0, block_size=s7, block_axis=2
                 ),
-                DenseDimension(3, s4, 3),
+                DenseIndex(3, s4, 3),
             ),
             self._n((s5, s2, s7, s4), 3),
         )

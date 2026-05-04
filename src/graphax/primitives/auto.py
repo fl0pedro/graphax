@@ -11,12 +11,17 @@ from jax import Array
 from jax._src.pjit import jit_p
 from jax.typing import ArrayLike
 
-from .sparse.tensor import (
-    DenseDimension,
-    SparseDimension,
+from ..sparse.tensor import (
+    DenseIndex,
+    SparseIndex,
     SparseTensor,
-    _materialize_dimensions,
+    _materialize_indexes,
     _swap_back_axes,
+)
+from .base import (
+    elemental_rules,
+    elemental_only_rules,
+    multi_output_elemental_only_rules,
 )
 
 
@@ -71,15 +76,15 @@ def make_parallel_jacobian(i, primals, val_out, elemental):
         elif primal_size == 0:
             # Handling broadcast of singletons
             out_dims = [
-                DenseDimension(i, e, i) for i, e in enumerate(get_shape(val_out))
+                DenseIndex(i, e, i) for i, e in enumerate(get_shape(val_out))
             ]
             primal_dims = []
         else:
             out_dims = [
-                SparseDimension(i, e, i, out_size + i) for i, e in enumerate(out_shape)
+                SparseIndex(i, e, i, out_size + i) for i, e in enumerate(out_shape)
             ]
             primal_dims = [
-                SparseDimension(out_size + i, e, i, i) for i, e in enumerate(out_shape)
+                SparseIndex(out_size + i, e, i, i) for i, e in enumerate(out_shape)
             ]
     elif len(primals) == 2:
         if primal_size == 0 and out_size == 0:
@@ -89,7 +94,7 @@ def make_parallel_jacobian(i, primals, val_out, elemental):
         elif primal_size == 0:
             # Handling broadcast of singletons
             out_dims = [
-                DenseDimension(i, e, i) for i, e in enumerate(get_shape(val_out))
+                DenseIndex(i, e, i) for i, e in enumerate(get_shape(val_out))
             ]
             primal_dims = []
         elif get_shape(primals[i]) != get_shape(val_out):
@@ -100,22 +105,22 @@ def make_parallel_jacobian(i, primals, val_out, elemental):
                 out_size = len(out_dims)
                 primal_size = len(primal_dims)
                 if ps != os:
-                    val_dim = sum([1 for d in out_dims if d.val_dim is not None])
-                    out_dims.append(DenseDimension(i, os, val_dim))
+                    axis = sum([1 for d in out_dims if d.axis is not None])
+                    out_dims.append(DenseIndex(i, os, axis))
                     primal_dims.append(
-                        DenseDimension(out_size + primal_size + 1, ps, None)
+                        DenseIndex(out_size + primal_size + 1, ps, None)
                     )
                 else:
-                    val_dim = sum([1 for d in out_dims if d.size is not None])
+                    axis = sum([1 for d in out_dims if d.size is not None])
                     out_dims.append(
-                        SparseDimension(i, os, val_dim, out_size + primal_size + 1)
+                        SparseIndex(i, os, axis, out_size + primal_size + 1)
                     )
                     primal_dims.append(
-                        SparseDimension(out_size + primal_size + 1, os, val_dim, i)
+                        SparseIndex(out_size + primal_size + 1, os, axis, i)
                     )
                 for j, d in enumerate(primal_dims[:-1]):
                     primal_dims[j] = replace(d, id=d.id + 1)
-                    if isinstance(d, SparseDimension):
+                    if isinstance(d, SparseIndex):
                         _d = out_dims[d.other_id]
                         out_dims[d.other_id] = replace(_d, other_id=_d.other_id + 1)
             return SparseTensor(out_dims, primal_dims, elemental, sort_val=False)
@@ -126,21 +131,21 @@ def make_parallel_jacobian(i, primals, val_out, elemental):
                     elemental
                 )  # TODO dirty quick fix that needs to be properly addressed
             out_dims = [
-                SparseDimension(i, e, None, out_size + i)
+                SparseIndex(i, e, None, out_size + i)
                 for i, e in enumerate(get_shape(primal))
             ]
             primal_dims = [
-                SparseDimension(out_size + i, e, None, i)
+                SparseIndex(out_size + i, e, None, i)
                 for i, e in enumerate(get_shape(primal))
             ]
         else:
             elemental = jnp.broadcast_to(elemental, get_shape(primal))
             out_dims = [
-                SparseDimension(i, e, i, out_size + i)
+                SparseIndex(i, e, i, out_size + i)
                 for i, e in enumerate(get_shape(primal))
             ]
             primal_dims = [
-                SparseDimension(out_size + i, e, i, i)
+                SparseIndex(out_size + i, e, i, i)
                 for i, e in enumerate(get_shape(primal))
             ]
     else:
@@ -151,7 +156,8 @@ def make_parallel_jacobian(i, primals, val_out, elemental):
     return SparseTensor(out_dims, primal_dims, elemental, sort_val=False)
 
 
-elemental_rules = {}
+# elemental_rules is imported from .base — registrations below populate the
+# shared registry that core.py reads.
 
 
 def defelemental(primitive, elementalrule):
@@ -425,15 +431,15 @@ def select_elemental_rule(primals, **params):
     out_size = get_ndim(val_out)
     out_dtype = getattr(val_out, "dtype", jnp.float32)
 
-    from .sparse.tensor import DenseDimension, SparseDimension, SparseTensor
+    from ..sparse.tensor import DenseIndex, SparseIndex, SparseTensor
 
     elementals_out = []
     # Predicate Jacobian is zero
     pred_shape = get_shape(pred)
     pred_st = SparseTensor.zeros(
-        [DenseDimension(i, s, i) for i, s in enumerate(out_shape)],
+        [DenseIndex(i, s, i) for i, s in enumerate(out_shape)],
         [
-            DenseDimension(out_size + i, s, i + out_size)
+            DenseIndex(out_size + i, s, i + out_size)
             for i, s in enumerate(pred_shape)
         ],
         out_dtype,
@@ -451,15 +457,15 @@ def select_elemental_rule(primals, **params):
             primal_dims = []
         elif case_shape == out_shape:
             out_dims = [
-                SparseDimension(i, s, i, out_size + i) for i, s in enumerate(out_shape)
+                SparseIndex(i, s, i, out_size + i) for i, s in enumerate(out_shape)
             ]
             primal_dims = [
-                SparseDimension(out_size + i, s, i, i) for i, s in enumerate(case_shape)
+                SparseIndex(out_size + i, s, i, i) for i, s in enumerate(case_shape)
             ]
         else:
-            out_dims = [DenseDimension(i, s, i) for i, s in enumerate(out_shape)]
+            out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
             primal_dims = [
-                DenseDimension(i + out_size, s, i + out_size)
+                DenseIndex(i + out_size, s, i + out_size)
                 for i, s in enumerate(case_shape)
             ]
         elementals_out.append(SparseTensor(out_dims, primal_dims, indicator))
@@ -487,7 +493,7 @@ def reduce_sum_elemental_rule(primals, **params):
     new_out_dims, new_primal_dims, shape = [], [], []
     if axes is None:
         axes = tuple(range(primal.ndim))
-        new_out_dims.append(DenseDimension(0, 1, 0))
+        new_out_dims.append(DenseIndex(0, 1, 0))
     elif isinstance(axes, int):
         axes = (axes,)
     l = get_ndim(val_out)  # TODO rename l, bad name...
@@ -496,13 +502,13 @@ def reduce_sum_elemental_rule(primals, **params):
         if i in axes:
             # idx = len(new_out_dims) + len(new_primal_dims)
             # idx = max(idx, 1) if val_out.ndim > 0 else idx
-            new_primal_dims.append(DenseDimension(l + i, size, count))
+            new_primal_dims.append(DenseIndex(l + i, size, count))
             shape.append(size)
             count += 1
         else:
             ll = len(new_out_dims)
-            new_out_dims.append(SparseDimension(ll, size, None, l + i))
-            new_primal_dims.append(SparseDimension(l + i, size, None, ll))
+            new_out_dims.append(SparseIndex(ll, size, None, l + i))
+            new_primal_dims.append(SparseIndex(l + i, size, None, ll))
 
     val = jnp.ones(shape, dtype=jnp.float32)
     return val_out, [SparseTensor(new_out_dims, new_primal_dims, val)]
@@ -521,7 +527,7 @@ def reduce_max_elemental_rule(primals, **params):
     new_out_dims, new_primal_dims, _shape = [], [], []
     if axes is None:
         axes = tuple(range(primal.ndim))
-        new_out_dims.append(DenseDimension(0, 1, 0))
+        new_out_dims.append(DenseIndex(0, 1, 0))
     elif isinstance(axes, int):
         axes = (axes,)
 
@@ -531,12 +537,12 @@ def reduce_max_elemental_rule(primals, **params):
             shape.insert(i, 1)
             idx = len(new_out_dims) + len(new_primal_dims)
             idx = max(idx, 1) if val_out.ndim > 0 else idx
-            new_primal_dims.append(DenseDimension(idx, size, i))
+            new_primal_dims.append(DenseIndex(idx, size, i))
             _shape.append(size)
         else:
             ll = len(new_out_dims)
-            new_out_dims.append(SparseDimension(ll, size, i, l + i))
-            new_primal_dims.append(SparseDimension(l + i, size, i, ll))
+            new_out_dims.append(SparseIndex(ll, size, i, l + i))
+            new_primal_dims.append(SparseIndex(l + i, size, i, ll))
 
     _val_out = val_out.reshape(shape)
     new_val = primal == _val_out
@@ -561,7 +567,7 @@ def reduce_min_elemental_rule(primals, **params):
     new_out_dims, new_primal_dims, _shape = [], [], []
     if axes is None:
         axes = tuple(range(primal.ndim))
-        new_out_dims.append(DenseDimension(0, 1, 0))
+        new_out_dims.append(DenseIndex(0, 1, 0))
     elif isinstance(axes, int):
         axes = (axes,)
 
@@ -571,13 +577,13 @@ def reduce_min_elemental_rule(primals, **params):
         if i in axes:
             idx = len(new_out_dims) + len(new_primal_dims)
             idx = max(idx, 1) if val_out.ndim > 0 else idx
-            new_primal_dims.append(DenseDimension(idx, size, i))
+            new_primal_dims.append(DenseIndex(idx, size, i))
             _shape.append(size)
             count += 1
         else:
             ll = len(new_out_dims)
-            new_out_dims.append(SparseDimension(ll, size, i, l + i))
-            new_primal_dims.append(SparseDimension(l + i, size, i, ll))
+            new_out_dims.append(SparseIndex(ll, size, i, l + i))
+            new_primal_dims.append(SparseIndex(l + i, size, i, ll))
 
     new_val = primal == val_out
     # NOTE: Normalization is important if the minimum is not unique
@@ -605,7 +611,7 @@ def reduce_elemental_rule(primals, agg, **params):
     new_out_dims, new_primal_dims, _shape = [], [], []
     if axes is None:
         axes = tuple(range(primal.ndim))
-        new_out_dims.append(DenseDimension(0, 1, 0))
+        new_out_dims.append(DenseIndex(0, 1, 0))
     elif isinstance(axes, int):
         axes = (axes,)
 
@@ -619,13 +625,13 @@ def reduce_elemental_rule(primals, agg, **params):
                 idx = len(new_out_dims) + len(new_primal_dims)
                 idx = max(idx, 1) if val_out.ndim > 0 else idx
 
-            new_primal_dims.append(DenseDimension(idx, size, i))
+            new_primal_dims.append(DenseIndex(idx, size, i))
             _shape.append(size)
         else:
             ll = len(new_out_dims)
             val = None if "sum" else i
-            new_out_dims.append(SparseDimension(ll, size, val, l + i))
-            new_primal_dims.append(SparseDimension(l + i, size, val, ll))
+            new_out_dims.append(SparseIndex(ll, size, val, l + i))
+            new_primal_dims.append(SparseIndex(l + i, size, val, ll))
 
     if agg == "sum":
         new_val = jnp.ones(_shape, dtype=jnp.float32)
@@ -673,7 +679,7 @@ def dot_general_elemental_rule(primals, **params):
         other_lid = lid + len(out_shape)
         if lid in lhs_contracting_dims:
             dim = rhs_contracting_dims[i]
-            lhs_primal_dims.append(DenseDimension(other_lid, rhs_shape[dim], dim))
+            lhs_primal_dims.append(DenseIndex(other_lid, rhs_shape[dim], dim))
             i += 1
         else:
             if lid in lhs_batch_dims:
@@ -682,24 +688,24 @@ def dot_general_elemental_rule(primals, **params):
 
                 lhs_out_dims.insert(
                     batch_dim_counter,
-                    SparseDimension(batch_dim_counter, ld, dim, other_lid),
+                    SparseIndex(batch_dim_counter, ld, dim, other_lid),
                 )
                 lhs_primal_dims.append(
-                    SparseDimension(other_lid, ld, dim, batch_dim_counter)
+                    SparseIndex(other_lid, ld, dim, batch_dim_counter)
                 )
                 batch_dim_counter += 1
                 for _idx in range(batch_dim_counter, len(lhs_out_dims)):
                     d = lhs_out_dims[_idx]
                     lhs_out_dims[_idx] = replace(d, id=d.id + 1)
-                    if isinstance(d, SparseDimension):
+                    if isinstance(d, SparseIndex):
                         _d_idx = d.other_id - num_out_dims
                         _d = lhs_primal_dims[_d_idx]
                         lhs_primal_dims[_d_idx] = replace(_d, other_id=_d.other_id + 1)
             else:
                 _lid = len(lhs_out_dims)
-                lhs_out_dims.append(SparseDimension(_lid, ld, None, other_lid))
-                lhs_primal_dims.append(SparseDimension(other_lid, ld, None, _lid))
-                rhs_out_dims.append(DenseDimension(len(rhs_out_dims), ld, lid))
+                lhs_out_dims.append(SparseIndex(_lid, ld, None, other_lid))
+                lhs_primal_dims.append(SparseIndex(other_lid, ld, None, _lid))
+                rhs_out_dims.append(DenseIndex(len(rhs_out_dims), ld, lid))
 
     j, jj = 0, 0
     batch_dim_counter = 0
@@ -707,7 +713,7 @@ def dot_general_elemental_rule(primals, **params):
         other_rid = rid + len(out_shape)
         if rid in rhs_contracting_dims:
             dim = lhs_contracting_dims[j]
-            rhs_primal_dims.append(DenseDimension(other_rid, lhs_shape[dim], dim))
+            rhs_primal_dims.append(DenseIndex(other_rid, lhs_shape[dim], dim))
             j += 1
         else:
             if rid in rhs_batch_dims:
@@ -715,24 +721,24 @@ def dot_general_elemental_rule(primals, **params):
                 jj += 1
                 rhs_out_dims.insert(
                     batch_dim_counter,
-                    SparseDimension(batch_dim_counter, rd, dim, other_rid),
+                    SparseIndex(batch_dim_counter, rd, dim, other_rid),
                 )
                 rhs_primal_dims.append(
-                    SparseDimension(other_rid, rd, dim, batch_dim_counter)
+                    SparseIndex(other_rid, rd, dim, batch_dim_counter)
                 )
                 batch_dim_counter += 1
                 for _idx in range(batch_dim_counter, len(rhs_out_dims)):
                     d = rhs_out_dims[_idx]
                     rhs_out_dims[_idx] = replace(d, id=d.id + 1)
-                    if isinstance(d, SparseDimension):
+                    if isinstance(d, SparseIndex):
                         _d_idx = d.other_id - num_out_dims
                         _d = rhs_primal_dims[_d_idx]
                         rhs_primal_dims[_d_idx] = replace(_d, other_id=_d.other_id + 1)
             else:
                 _rid = len(rhs_out_dims)
-                rhs_out_dims.append(SparseDimension(_rid, rd, None, other_rid))
-                rhs_primal_dims.append(SparseDimension(other_rid, rd, None, _rid))
-                lhs_out_dims.append(DenseDimension(len(lhs_out_dims), rd, rid))
+                rhs_out_dims.append(SparseIndex(_rid, rd, None, other_rid))
+                rhs_primal_dims.append(SparseIndex(other_rid, rd, None, _rid))
+                lhs_out_dims.append(DenseIndex(len(lhs_out_dims), rd, rid))
 
     # Initialize with sort_val=False to strictly preserve the logical ID order
     lhs_tensor = SparseTensor(lhs_out_dims, lhs_primal_dims, rhs, sort_val=False)
@@ -775,10 +781,10 @@ def conv_general_dilated_elemental_rule(primals, **params):
     num_out_dims = len(out_shape)
 
     # --- Jacobian w.r.t. lhs (activations) ---
-    # Batch dim: SparseDimension pair
-    # Output feature dim (from rhs): DenseDimension in out
-    # Input feature dim (contracted): DenseDimension in primal
-    # Spatial dims: DenseDimension (windowed relationship)
+    # Batch dim: SparseIndex pair
+    # Output feature dim (from rhs): DenseIndex in out
+    # Input feature dim (contracted): DenseIndex in primal
+    # Spatial dims: DenseIndex (windowed relationship)
     # Value: rhs (weights)
     lhs_out_dims, lhs_primal_dims = [], []
 
@@ -786,23 +792,23 @@ def conv_general_dilated_elemental_rule(primals, **params):
     out_batch_dim = out_spec[0]
     batch_size = lhs_shape[lhs_batch_dim]
 
-    # Batch: SparseDimension pair
-    lhs_out_dims.append(SparseDimension(0, batch_size, None, num_out_dims))
-    # Non-batch out dims: DenseDimension
+    # Batch: SparseIndex pair
+    lhs_out_dims.append(SparseIndex(0, batch_size, None, num_out_dims))
+    # Non-batch out dims: DenseIndex
     out_val_idx = 0
     for i, s in enumerate(out_shape):
         if i == out_batch_dim:
             continue
-        lhs_out_dims.append(DenseDimension(len(lhs_out_dims), s, out_val_idx))
+        lhs_out_dims.append(DenseIndex(len(lhs_out_dims), s, out_val_idx))
         out_val_idx += 1
     # Primal batch dim
-    lhs_primal_dims.append(SparseDimension(num_out_dims, batch_size, None, 0))
-    # Non-batch primal dims: DenseDimension
+    lhs_primal_dims.append(SparseIndex(num_out_dims, batch_size, None, 0))
+    # Non-batch primal dims: DenseIndex
     for i, s in enumerate(lhs_shape):
         if i == lhs_batch_dim:
             continue
         lhs_primal_dims.append(
-            DenseDimension(num_out_dims + len(lhs_primal_dims), s, out_val_idx)
+            DenseIndex(num_out_dims + len(lhs_primal_dims), s, out_val_idx)
         )
         out_val_idx += 1
 
@@ -810,9 +816,9 @@ def conv_general_dilated_elemental_rule(primals, **params):
 
     # --- Jacobian w.r.t. rhs (weights) ---
     # No batch dim in rhs typically, but output has batch.
-    # Output batch dim: DenseDimension (from lhs)
-    # Output feature dim: SparseDimension pair with rhs output feature
-    # Spatial/channel dims: DenseDimension
+    # Output batch dim: DenseIndex (from lhs)
+    # Output feature dim: SparseIndex pair with rhs output feature
+    # Spatial/channel dims: DenseIndex
     # Value: lhs (activations)
     rhs_out_dims, rhs_primal_dims = [], []
 
@@ -820,23 +826,23 @@ def conv_general_dilated_elemental_rule(primals, **params):
     out_feature_dim = out_spec[1]
     feature_size = rhs_shape[rhs_out_feature_dim]
 
-    # Output feature: SparseDimension pair
-    rhs_out_dims.append(SparseDimension(0, feature_size, None, num_out_dims))
-    # Non-feature out dims: DenseDimension
+    # Output feature: SparseIndex pair
+    rhs_out_dims.append(SparseIndex(0, feature_size, None, num_out_dims))
+    # Non-feature out dims: DenseIndex
     rhs_out_val_idx = 0
     for i, s in enumerate(out_shape):
         if i == out_feature_dim:
             continue
-        rhs_out_dims.append(DenseDimension(len(rhs_out_dims), s, rhs_out_val_idx))
+        rhs_out_dims.append(DenseIndex(len(rhs_out_dims), s, rhs_out_val_idx))
         rhs_out_val_idx += 1
     # Primal feature dim
-    rhs_primal_dims.append(SparseDimension(num_out_dims, feature_size, None, 0))
-    # Non-feature primal dims: DenseDimension
+    rhs_primal_dims.append(SparseIndex(num_out_dims, feature_size, None, 0))
+    # Non-feature primal dims: DenseIndex
     for i, s in enumerate(rhs_shape):
         if i == rhs_out_feature_dim:
             continue
         rhs_primal_dims.append(
-            DenseDimension(num_out_dims + len(rhs_primal_dims), s, rhs_out_val_idx)
+            DenseIndex(num_out_dims + len(rhs_primal_dims), s, rhs_out_val_idx)
         )
         rhs_out_val_idx += 1
 
@@ -884,22 +890,22 @@ def pad_elemental_rule(primals, **params):
 
     new_out_dims = []
     new_primal_dims = []
-    val_dim_count = 0
+    axis_count = 0
     padded_axes = []
 
     for i, (lo, hi, interior) in enumerate(padding_config):
         is_identity = lo == 0 and hi == 0 and interior == 0
         if is_identity:
             ll = len(new_out_dims)
-            new_out_dims.append(SparseDimension(ll, x_shape[i], None, out_ndim + i))
-            new_primal_dims.append(SparseDimension(out_ndim + i, x_shape[i], None, ll))
+            new_out_dims.append(SparseIndex(ll, x_shape[i], None, out_ndim + i))
+            new_primal_dims.append(SparseIndex(out_ndim + i, x_shape[i], None, ll))
         else:
-            out_vd = val_dim_count
-            new_out_dims.append(DenseDimension(len(new_out_dims), out_shape[i], out_vd))
-            val_dim_count += 1
-            primal_vd = val_dim_count
-            new_primal_dims.append(DenseDimension(out_ndim + i, x_shape[i], primal_vd))
-            val_dim_count += 1
+            out_vd = axis_count
+            new_out_dims.append(DenseIndex(len(new_out_dims), out_shape[i], out_vd))
+            axis_count += 1
+            primal_vd = axis_count
+            new_primal_dims.append(DenseIndex(out_ndim + i, x_shape[i], primal_vd))
+            axis_count += 1
             padded_axes.append((i, out_shape[i], x_shape[i], lo, hi, interior))
 
     if len(padded_axes) == 0:
@@ -929,7 +935,7 @@ def pad_elemental_rule(primals, **params):
             for i, (lo, hi, interior) in enumerate(padding_config)
         )
         pad_mask = pad_mask.at[slices_obj].set(0.0)
-        p_out_dims = [DenseDimension(i, s, i) for i, s in enumerate(out_shape)]
+        p_out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
         tensors_out.append(SparseTensor(p_out_dims, [], pad_mask))
 
     return val_out, tensors_out
@@ -955,7 +961,7 @@ def reduce_window_sum_elemental_rule(primals, **params):
 
     new_out_dims = []
     new_primal_dims = []
-    val_dim_count = 0
+    axis_count = 0
     windowed_axes = []
 
     for i in range(x_ndim):
@@ -977,15 +983,15 @@ def reduce_window_sum_elemental_rule(primals, **params):
 
         if is_passthrough:
             ll = len(new_out_dims)
-            new_out_dims.append(SparseDimension(ll, x_shape[i], None, out_ndim + i))
-            new_primal_dims.append(SparseDimension(out_ndim + i, x_shape[i], None, ll))
+            new_out_dims.append(SparseIndex(ll, x_shape[i], None, out_ndim + i))
+            new_primal_dims.append(SparseIndex(out_ndim + i, x_shape[i], None, ll))
         else:
-            out_vd = val_dim_count
-            new_out_dims.append(DenseDimension(len(new_out_dims), out_shape[i], out_vd))
-            val_dim_count += 1
-            primal_vd = val_dim_count
-            new_primal_dims.append(DenseDimension(out_ndim + i, x_shape[i], primal_vd))
-            val_dim_count += 1
+            out_vd = axis_count
+            new_out_dims.append(DenseIndex(len(new_out_dims), out_shape[i], out_vd))
+            axis_count += 1
+            primal_vd = axis_count
+            new_primal_dims.append(DenseIndex(out_ndim + i, x_shape[i], primal_vd))
+            axis_count += 1
             windowed_axes.append((i, out_shape[i], x_shape[i], wd, ws, pad_lo, bd, wid))
 
     if len(windowed_axes) == 0:
@@ -1022,7 +1028,7 @@ def reduce_window_elemental_rule(primals, **params):
 
     new_out_dims = []
     new_primal_dims = []
-    val_dim_count = 0
+    axis_count = 0
     passthrough_axes = []
     windowed_axes = []
 
@@ -1046,19 +1052,19 @@ def reduce_window_elemental_rule(primals, **params):
         if is_passthrough:
             ll = len(new_out_dims)
             new_out_dims.append(
-                SparseDimension(ll, x_shape[i], val_dim_count, out_ndim + i)
+                SparseIndex(ll, x_shape[i], axis_count, out_ndim + i)
             )
             new_primal_dims.append(
-                SparseDimension(out_ndim + i, x_shape[i], val_dim_count, ll)
+                SparseIndex(out_ndim + i, x_shape[i], axis_count, ll)
             )
             passthrough_axes.append(i)
         else:
-            out_vd = val_dim_count
-            new_out_dims.append(DenseDimension(len(new_out_dims), out_shape[i], out_vd))
-            val_dim_count += 1
-            primal_vd = val_dim_count
-            new_primal_dims.append(DenseDimension(out_ndim + i, x_shape[i], primal_vd))
-            val_dim_count += 1
+            out_vd = axis_count
+            new_out_dims.append(DenseIndex(len(new_out_dims), out_shape[i], out_vd))
+            axis_count += 1
+            primal_vd = axis_count
+            new_primal_dims.append(DenseIndex(out_ndim + i, x_shape[i], primal_vd))
+            axis_count += 1
             windowed_axes.append((i, out_shape[i], x_shape[i], wd, ws, pad_lo, bd, wid))
 
     # Build the indicator value: x == broadcast(val_out)
@@ -1091,9 +1097,9 @@ def reduce_window_elemental_rule(primals, **params):
 
     tensors = [x_tensor]
     if not isinstance(init_value, (float, int, complex)):
-        init_out_dims = [DenseDimension(i, s, i) for i, s in enumerate(out_shape)]
+        init_out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
         init_primal_dims = [
-            DenseDimension(i + len(out_shape), s, i + len(out_shape))
+            DenseIndex(i + len(out_shape), s, i + len(out_shape))
             for i, s in enumerate(init_value.shape)
         ]
         init_tensor = SparseTensor(
@@ -1132,15 +1138,15 @@ class JacobianTransform:
             f"inverse_transform={self.inverse_transform})"
         )
 
-    def apply(self, tensor: SparseTensor, iota: jnp.ndarray) -> SparseTensor:
+    def apply(self, tensor: SparseTensor) -> SparseTensor:
         if self.transform is None:
             raise NotImplementedError("Transform not implemented!")
-        return self.transform(tensor, iota)
+        return self.transform(tensor)
 
-    def apply_inverse(self, tensor: SparseTensor, iota: jnp.ndarray) -> SparseTensor:
+    def apply_inverse(self, tensor: SparseTensor) -> SparseTensor:
         if self.inverse_transform is None:
             raise NotImplementedError("Inverse transform not implemented!")
-        return self.inverse_transform(tensor, iota)
+        return self.inverse_transform(tensor)
 
 
 def _inverse_permutation(permutation):
@@ -1296,7 +1302,7 @@ def transpose_elemental_rule(primals, **params):
     val_out = lax.transpose_p.bind(*primals, **params)
     permutation = params["permutation"]
 
-    def transpose_transform(pre, iota):
+    def transpose_transform(pre):
         new_out_dims = []
         new_primal_dims = list(pre.primal_dims)
         counter = 0
@@ -1305,7 +1311,7 @@ def transpose_elemental_rule(primals, **params):
         for p in permutation:
             d = pre.out_dims[p]
             new_out_dims.append(replace(d, id=counter))
-            if isinstance(new_out_dims[-1], SparseDimension):
+            if isinstance(new_out_dims[-1], SparseIndex):
                 other_id = d.other_id
                 new_primal_dims[other_id - l] = replace(
                     new_primal_dims[other_id - l], other_id=counter
@@ -1313,10 +1319,16 @@ def transpose_elemental_rule(primals, **params):
             counter += 1
 
         return _swap_back_axes(
-            SparseTensor(tuple(new_out_dims), tuple(new_primal_dims), pre.val)
+            SparseTensor(
+                tuple(new_out_dims),
+                tuple(new_primal_dims),
+                pre.val,
+                scalar_mult=pre.scalar_mult,
+                fill_value=pre.fill_value,
+            )
         )
 
-    def inverse_transpose_transform(post, iota):
+    def inverse_transpose_transform(post):
         new_out_dims = list(post.out_dims)
         new_primal_dims = []
         counter = len(post.out_dims)
@@ -1325,7 +1337,7 @@ def transpose_elemental_rule(primals, **params):
         for p in inv_permutation:
             d = post.primal_dims[p]
             new_primal_dims.append(replace(d, id=counter))
-            if isinstance(new_primal_dims[-1], SparseDimension):
+            if isinstance(new_primal_dims[-1], SparseIndex):
                 other_id = d.other_id
                 new_out_dims[other_id] = replace(
                     new_out_dims[other_id], other_id=counter
@@ -1333,7 +1345,13 @@ def transpose_elemental_rule(primals, **params):
             counter += 1
 
         return _swap_back_axes(
-            SparseTensor(tuple(new_out_dims), tuple(new_primal_dims), post.val)
+            SparseTensor(
+                tuple(new_out_dims),
+                tuple(new_primal_dims),
+                post.val,
+                scalar_mult=post.scalar_mult,
+                fill_value=post.fill_value,
+            )
         )
 
     transform = JacobianTransform(transpose_transform, inverse_transpose_transform)
@@ -1346,38 +1364,38 @@ elemental_rules[lax.transpose_p] = transpose_elemental_rule
 def reshape_elemental_rule(primals, **params):
     val_out = lax.reshape_p.bind(*primals, **params)
 
-    def reshape_transform(pre, iota):
-        full_val = pre.dense(iota)
+    def reshape_transform(pre):
+        full_val = pre.dense()
         new_shape = []
         new_out_dims = []
         new_primal_dims = []
         counter = 0
 
         for s in val_out.shape:
-            new_out_dims.append(DenseDimension(counter, s, counter))
+            new_out_dims.append(DenseIndex(counter, s, counter))
             new_shape.append(s)
             counter += 1
 
         for d in pre.primal_dims:
-            new_primal_dims.append(DenseDimension(counter, d.size, counter))
+            new_primal_dims.append(DenseIndex(counter, d.size, counter))
             new_shape.append(d.size)
             counter += 1
 
         full_val = full_val.reshape(new_shape)
         return SparseTensor(new_out_dims, new_primal_dims, full_val)
 
-    def inverse_reshape_transform(post, iota):
+    def inverse_reshape_transform(post):
         full_val = jnp.array(post)
         new_shape = []
         new_out_dims = []
         new_primal_dims = []
         counter = 0
         for d in post.out_dims:
-            new_out_dims.append(DenseDimension(counter, d.size, counter))
+            new_out_dims.append(DenseIndex(counter, d.size, counter))
             new_shape.append(d.size)
             counter += 1
         for s in primals[0].shape:
-            new_primal_dims.append(DenseDimension(counter, s, counter))
+            new_primal_dims.append(DenseIndex(counter, s, counter))
             new_shape.append(s)
             counter += 1
         full_val = full_val.reshape(new_shape)
@@ -1391,7 +1409,7 @@ elemental_rules[lax.reshape_p] = reshape_elemental_rule
 
 
 def make_slice_transform(start_indices, limit_indices, out_shape):
-    def slice_transform(pre, iota):
+    def slice_transform(pre):
         s_idx = list(start_indices)
         l_idx = list(limit_indices)
         full_val = jnp.array(pre)
@@ -1400,11 +1418,11 @@ def make_slice_transform(start_indices, limit_indices, out_shape):
         counter = 0
 
         for s in out_shape:
-            new_out_dims.append(DenseDimension(counter, s, counter))
+            new_out_dims.append(DenseIndex(counter, s, counter))
             counter += 1
 
         for d in pre.primal_dims:
-            new_primal_dims.append(DenseDimension(counter, d.size, counter))
+            new_primal_dims.append(DenseIndex(counter, d.size, counter))
             s_idx.append(0)
             l_idx.append(d.size)
             counter += 1
@@ -1416,18 +1434,18 @@ def make_slice_transform(start_indices, limit_indices, out_shape):
 
 
 def make_inverse_slice_transform(start_indices, limit_indices, primal0_shape):
-    def inverse_slice_transform(post, iota):
+    def inverse_slice_transform(post):
         full_val = jnp.array(post)
         new_out_dims = []
         new_primal_dims = []
         counter = 0
 
         for d in post.out_dims:
-            new_out_dims.append(DenseDimension(counter, d.size, counter))
+            new_out_dims.append(DenseIndex(counter, d.size, counter))
             counter += 1
 
         for s in primal0_shape:
-            new_primal_dims.append(DenseDimension(counter, s, counter))
+            new_primal_dims.append(DenseIndex(counter, s, counter))
             counter += 1
 
         new_shape = [d.size for d in new_out_dims] + [d.size for d in new_primal_dims]
@@ -1517,9 +1535,9 @@ def dynamic_update_slice_elemental_rule(primals, **params):
     mask = jnp.ones(op_shape, dtype=jnp.float32)
     slices_obj = tuple(slice(s, s + sz) for s, sz in zip(start_list, up_shape))
     mask = mask.at[slices_obj].set(0.0)
-    op_out_dims = [SparseDimension(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
+    op_out_dims = [SparseIndex(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
     op_primal_dims = [
-        SparseDimension(ndim + i, s, i, i) for i, s in enumerate(op_shape)
+        SparseIndex(ndim + i, s, i, i) for i, s in enumerate(op_shape)
     ]
     op_tensor = SparseTensor(op_out_dims, op_primal_dims, mask)
 
@@ -1565,38 +1583,38 @@ def gather_elemental_rule(primals, **params):
 
     out_dims = []
     primal_dims = []
-    val_dim_count = 0
+    axis_count = 0
 
-    batch_val_dims = {}
+    batch_axiss = {}
     for bd in batch_dims:
-        batch_val_dims[bd] = val_dim_count
-        val_dim_count += 1
+        batch_axiss[bd] = axis_count
+        axis_count += 1
 
-    collapsed_val_dims = {}
+    collapsed_axiss = {}
     for cd in collapsed_slice_dims:
-        collapsed_val_dims[cd] = val_dim_count
-        val_dim_count += 1
+        collapsed_axiss[cd] = axis_count
+        axis_count += 1
 
     for i in range(out_ndim):
         if i in offset_dims:
             offset_pos = list(offset_dims).index(i)
             paired_op = non_collapsed[offset_pos]
             out_dims.append(
-                SparseDimension(i, out_shape[i], None, out_ndim + paired_op)
+                SparseIndex(i, out_shape[i], None, out_ndim + paired_op)
             )
         else:
-            out_dims.append(DenseDimension(i, out_shape[i], batch_val_dims[i]))
+            out_dims.append(DenseIndex(i, out_shape[i], batch_axiss[i]))
 
     for j in range(op_ndim):
         if j in collapsed_slice_dims:
             primal_dims.append(
-                DenseDimension(out_ndim + j, op_shape[j], collapsed_val_dims[j])
+                DenseIndex(out_ndim + j, op_shape[j], collapsed_axiss[j])
             )
         else:
             nc_pos = non_collapsed.index(j)
             paired_out = offset_dims[nc_pos]
             primal_dims.append(
-                SparseDimension(out_ndim + j, op_shape[j], None, paired_out)
+                SparseIndex(out_ndim + j, op_shape[j], None, paired_out)
             )
 
     val_shape = [out_shape[bd] for bd in batch_dims] + [
@@ -1713,9 +1731,9 @@ def scatter_add_elemental_rule(primals, **params):
     ndim = get_ndim(val_out)
 
     # d/d(operand) = identity
-    op_out_dims = [SparseDimension(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
+    op_out_dims = [SparseIndex(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
     op_primal_dims = [
-        SparseDimension(ndim + i, s, i, i) for i, s in enumerate(op_shape)
+        SparseIndex(ndim + i, s, i, i) for i, s in enumerate(op_shape)
     ]
     op_tensor = SparseTensor(
         op_out_dims, op_primal_dims, jnp.ones(out_shape, dtype=jnp.float32)
@@ -1723,9 +1741,9 @@ def scatter_add_elemental_rule(primals, **params):
 
     # d/d(updates) = one-hot embedding (coeff = 1)
     jac = _build_scatter_update_jac(indices, out_shape, up_shape, params)
-    up_out_dims = [DenseDimension(i, s, i) for i, s in enumerate(out_shape)]
+    up_out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
     up_primal_dims = [
-        DenseDimension(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
+        DenseIndex(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
     ]
     up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac)
 
@@ -1746,9 +1764,9 @@ def scatter_sub_elemental_rule(primals, **params):
     ndim = get_ndim(val_out)
 
     # d/d(operand) = identity
-    op_out_dims = [SparseDimension(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
+    op_out_dims = [SparseIndex(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
     op_primal_dims = [
-        SparseDimension(ndim + i, s, i, i) for i, s in enumerate(op_shape)
+        SparseIndex(ndim + i, s, i, i) for i, s in enumerate(op_shape)
     ]
     op_tensor = SparseTensor(
         op_out_dims, op_primal_dims, jnp.ones(out_shape, dtype=jnp.float32)
@@ -1756,9 +1774,9 @@ def scatter_sub_elemental_rule(primals, **params):
 
     # d/d(updates) = -1 × one-hot embedding
     jac = _build_scatter_update_jac(indices, out_shape, up_shape, params, coeff=-1.0)
-    up_out_dims = [DenseDimension(i, s, i) for i, s in enumerate(out_shape)]
+    up_out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
     up_primal_dims = [
-        DenseDimension(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
+        DenseIndex(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
     ]
     up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac)
 
@@ -1780,17 +1798,17 @@ def scatter_set_elemental_rule(primals, **params):
 
     # d/d(operand) = identity * (1 - mask) — zeroed at overwritten positions
     mask = _build_scatter_mask(indices, out_shape, up_shape, params)
-    op_out_dims = [SparseDimension(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
+    op_out_dims = [SparseIndex(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
     op_primal_dims = [
-        SparseDimension(ndim + i, s, i, i) for i, s in enumerate(op_shape)
+        SparseIndex(ndim + i, s, i, i) for i, s in enumerate(op_shape)
     ]
     op_tensor = SparseTensor(op_out_dims, op_primal_dims, 1.0 - mask)
 
     # d/d(updates) = one-hot embedding (coeff = 1)
     jac = _build_scatter_update_jac(indices, out_shape, up_shape, params)
-    up_out_dims = [DenseDimension(i, s, i) for i, s in enumerate(out_shape)]
+    up_out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
     up_primal_dims = [
-        DenseDimension(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
+        DenseIndex(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
     ]
     up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac)
 
@@ -1822,9 +1840,9 @@ def scatter_mul_elemental_rule(primals, **params):
         )
         op_coeff = op_coeff.at[out_idx].set(float(updates[up_idx]))
 
-    op_out_dims = [SparseDimension(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
+    op_out_dims = [SparseIndex(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
     op_primal_dims = [
-        SparseDimension(ndim + i, s, i, i) for i, s in enumerate(op_shape)
+        SparseIndex(ndim + i, s, i, i) for i, s in enumerate(op_shape)
     ]
     op_tensor = SparseTensor(op_out_dims, op_primal_dims, op_coeff)
 
@@ -1843,9 +1861,9 @@ def scatter_mul_elemental_rule(primals, **params):
         full_idx = tuple(out_idx) + tuple(up_idx)
         jac2 = jac2.at[full_idx].set(float(operand[out_idx]))
 
-    up_out_dims = [DenseDimension(i, s, i) for i, s in enumerate(out_shape)]
+    up_out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
     up_primal_dims = [
-        DenseDimension(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
+        DenseIndex(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
     ]
     up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac2)
 
@@ -1877,9 +1895,9 @@ def scatter_min_elemental_rule(primals, **params):
         indicator = float(operand[out_idx] <= updates[up_idx])
         op_coeff = op_coeff.at[out_idx].set(indicator)
 
-    op_out_dims = [SparseDimension(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
+    op_out_dims = [SparseIndex(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
     op_primal_dims = [
-        SparseDimension(ndim + i, s, i, i) for i, s in enumerate(op_shape)
+        SparseIndex(ndim + i, s, i, i) for i, s in enumerate(op_shape)
     ]
     op_tensor = SparseTensor(op_out_dims, op_primal_dims, op_coeff)
 
@@ -1894,9 +1912,9 @@ def scatter_min_elemental_rule(primals, **params):
         full_idx = tuple(out_idx) + tuple(up_idx)
         jac = jac.at[full_idx].set(indicator)
 
-    up_out_dims = [DenseDimension(i, s, i) for i, s in enumerate(out_shape)]
+    up_out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
     up_primal_dims = [
-        DenseDimension(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
+        DenseIndex(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
     ]
     up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac)
 
@@ -1928,9 +1946,9 @@ def scatter_max_elemental_rule(primals, **params):
         indicator = float(operand[out_idx] >= updates[up_idx])
         op_coeff = op_coeff.at[out_idx].set(indicator)
 
-    op_out_dims = [SparseDimension(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
+    op_out_dims = [SparseIndex(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
     op_primal_dims = [
-        SparseDimension(ndim + i, s, i, i) for i, s in enumerate(op_shape)
+        SparseIndex(ndim + i, s, i, i) for i, s in enumerate(op_shape)
     ]
     op_tensor = SparseTensor(op_out_dims, op_primal_dims, op_coeff)
 
@@ -1945,9 +1963,9 @@ def scatter_max_elemental_rule(primals, **params):
         full_idx = tuple(out_idx) + tuple(up_idx)
         jac = jac.at[full_idx].set(indicator)
 
-    up_out_dims = [DenseDimension(i, s, i) for i, s in enumerate(out_shape)]
+    up_out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
     up_primal_dims = [
-        DenseDimension(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
+        DenseIndex(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
     ]
     up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac)
 
@@ -1962,28 +1980,28 @@ def broadcast_elemental_rule(primals, **params):
     dims = sorted(params["broadcast_dimensions"])
     shape = params["shape"]
 
-    def broadcast_transform(pre, iota):
+    def broadcast_transform(pre):
         # We need a robust way to shift IDs that preserves partner relationships.
         l_old = len(pre.out_dims)
         p_old = len(pre.primal_dims)
         
         insert_dims = sorted([i for i, s in enumerate(shape) if i not in dims])
         
-        # 1. Create the new out_dims list with DenseDimensions inserted
+        # 1. Create the new out_dims list with DenseIndexes inserted
         # We'll use temporary IDs to keep track of logical partners
         new_out_dims = []
         old_to_new_id = {}
         
-        # Track which val_dims already exist to allocate expansion axes safely
-        existing_val_dims = [d.val_dim for d in (pre.out_dims + pre.primal_dims) if d.val_dim is not None]
-        next_val_dim = (max(existing_val_dims) + 1) if existing_val_dims else 0
+        # Track which axiss already exist to allocate expansion axes safely
+        existing_axiss = [d.axis for d in (pre.out_dims + pre.primal_dims) if d.axis is not None]
+        next_axis = (max(existing_axiss) + 1) if existing_axiss else 0
 
         curr_old_idx = 0
         for i in range(len(shape)):
             if i in insert_dims:
                 # New dimension
-                new_out_dims.append(DenseDimension(i, shape[i], next_val_dim))
-                next_val_dim += 1
+                new_out_dims.append(DenseIndex(i, shape[i], next_axis))
+                next_axis += 1
             else:
                 # Existing dimension
                 d_old = pre.out_dims[curr_old_idx]
@@ -2001,7 +2019,7 @@ def broadcast_elemental_rule(primals, **params):
             
         # 3. Fix all other_ids using the mapping table
         def fix_partners(ds):
-            return [replace(d, other_id=old_to_new_id[d.other_id]) if isinstance(d, SparseDimension) else d for d in ds]
+            return [replace(d, other_id=old_to_new_id[d.other_id]) if isinstance(d, SparseIndex) else d for d in ds]
             
         new_out_dims = fix_partners(new_out_dims)
         new_primal_dims = fix_partners(new_primal_dims)
@@ -2015,8 +2033,8 @@ def broadcast_elemental_rule(primals, **params):
         # 5. Compute new physical array shape and mapping
         new_phys_to_size = {}
         for d in list(new_out_dims) + list(new_primal_dims):
-            if d.val_dim is not None:
-                new_phys_to_size[d.val_dim] = d.size
+            if d.axis is not None:
+                new_phys_to_size[d.axis] = d.size
         
         sorted_new_phys = sorted(new_phys_to_size.keys())
         broadcast_shape = [new_phys_to_size[ax] for ax in sorted_new_phys]
@@ -2028,14 +2046,14 @@ def broadcast_elemental_rule(primals, **params):
         for i, pos in enumerate(dims):
             d_old = pre.out_dims[i]
             d_new = new_out_dims[pos]
-            if d_old.val_dim is not None:
-                broadcast_dimensions[d_old.val_dim] = new_phys_to_idx[d_new.val_dim]
+            if d_old.axis is not None:
+                broadcast_dimensions[d_old.axis] = new_phys_to_idx[d_new.axis]
         
         # Match old primal_dims to new ones
         for i, d_old in enumerate(pre.primal_dims):
             d_new = new_primal_dims[i]
-            if d_old.val_dim is not None:
-                broadcast_dimensions[d_old.val_dim] = new_phys_to_idx[d_new.val_dim]
+            if d_old.axis is not None:
+                broadcast_dimensions[d_old.axis] = new_phys_to_idx[d_new.axis]
         
         # Robust Rank Alignment:
         # Identify axes that are unmapped in pre.val. If they are size 1, squeeze them.
@@ -2056,7 +2074,7 @@ def broadcast_elemental_rule(primals, **params):
         try:
             if len(final_broadcast_dims) > 0 or val_to_broadcast.shape == ():
                 new_val = lax.broadcast_in_dim(
-                    val_to_broadcast, shape=broadcast_shape, 
+                    val_to_broadcast, shape=broadcast_shape,
                     broadcast_dimensions=tuple(final_broadcast_dims)
                 )
             else:
@@ -2069,25 +2087,31 @@ def broadcast_elemental_rule(primals, **params):
                 # Last resort identity
                 new_val = val_to_broadcast
 
-        return SparseTensor(new_out_dims, new_primal_dims, new_val)
+        return SparseTensor(
+            new_out_dims,
+            new_primal_dims,
+            new_val,
+            scalar_mult=pre.scalar_mult,
+            fill_value=pre.fill_value,
+        )
 
-    def inverse_broadcast_transform(post, iota):
+    def inverse_broadcast_transform(post):
         rm_dims = [d for d in range(val_out.ndim) if d not in dims]
         new_out_dims = list(copy.deepcopy(post.out_dims))
         new_primal_dims = list(copy.deepcopy(post.primal_dims))
         _rm_dims = []
         counter = 0
         for dim in rm_dims:
-            if new_primal_dims[dim - counter].val_dim is not None:
-                _rm_dims.append(new_primal_dims[dim - counter].val_dim)
-            if isinstance(new_primal_dims[dim - counter], DenseDimension):
+            if new_primal_dims[dim - counter].axis is not None:
+                _rm_dims.append(new_primal_dims[dim - counter].axis)
+            if isinstance(new_primal_dims[dim - counter], DenseIndex):
                 has_smaller_dims = (
                     sum(
-                        [1 for d in new_primal_dims[: dim + 1] if d.val_dim is not None]
+                        [1 for d in new_primal_dims[: dim + 1] if d.axis is not None]
                     )
                     > 0
                 )
-                old_val_dim = new_primal_dims[dim - counter].val_dim
+                old_axis = new_primal_dims[dim - counter].axis
                 new_primal_dims[dim - counter] = None
                 for i in range(dim - counter + 1, len(new_primal_dims)):
                     pd = new_primal_dims[i]
@@ -2096,11 +2120,11 @@ def broadcast_elemental_rule(primals, **params):
                     new_primal_dims[i] = replace(
                         pd,
                         id=pd.id - 1,
-                        val_dim=pd.val_dim - 1
-                        if pd.val_dim is not None and old_val_dim is not None
-                        else pd.val_dim,
+                        axis=pd.axis - 1
+                        if pd.axis is not None and old_axis is not None
+                        else pd.axis,
                     )
-                    if isinstance(pd, SparseDimension):
+                    if isinstance(pd, SparseIndex):
                         _d = new_out_dims[pd.other_id]
                         new_out_dims[pd.other_id] = replace(
                             _d, other_id=_d.other_id - 1
@@ -2112,10 +2136,10 @@ def broadcast_elemental_rule(primals, **params):
                 id = d.id
                 other_id = d.other_id
                 old_dim = new_out_dims[other_id]
-                new_out_dims[other_id] = DenseDimension(old_dim.id, old_dim.size, None)
+                new_out_dims[other_id] = DenseIndex(old_dim.id, old_dim.size, None)
                 has_smaller_dims = (
                     sum(
-                        [1 for d in new_primal_dims[: dim + 1] if d.val_dim is not None]
+                        [1 for d in new_primal_dims[: dim + 1] if d.axis is not None]
                     )
                     > 0
                 )
@@ -2123,7 +2147,7 @@ def broadcast_elemental_rule(primals, **params):
                 for i, d in enumerate(new_out_dims):
                     if d.id > id:
                         new_out_dims[i] = replace(d, id=d.id - 1)
-                        if isinstance(new_out_dims[i], SparseDimension):
+                        if isinstance(new_out_dims[i], SparseIndex):
                             _d = new_primal_dims[
                                 new_out_dims[i].other_id - len(pre.out_dims)
                             ]
@@ -2133,14 +2157,14 @@ def broadcast_elemental_rule(primals, **params):
                 for i, d in enumerate(new_primal_dims):
                     if d.id > id:
                         new_primal_dims[i] = replace(d, id=d.id - 1)
-                        if isinstance(new_primal_dims[i], SparseDimension):
+                        if isinstance(new_primal_dims[i], SparseIndex):
                             _d = new_out_dims[new_primal_dims[i].other_id]
                             new_out_dims[new_primal_dims[i].other_id] = replace(
                                 _d, other_id=_d.other_id - 1
                             )
-                        if d.val_dim is not None and has_smaller_dims:
+                        if d.axis is not None and has_smaller_dims:
                             new_primal_dims[i] = replace(
-                                new_primal_dims[i], val_dim=d.val_dim - 1
+                                new_primal_dims[i], axis=d.axis - 1
                             )
             counter += 1
 
@@ -2153,7 +2177,13 @@ def broadcast_elemental_rule(primals, **params):
                 new_val = jnp.sum(post.val, axis=tuple(_rm_dims))
         else:
             new_val = post.val
-        return SparseTensor(new_out_dims, new_primal_dims, new_val)
+        return SparseTensor(
+            new_out_dims,
+            new_primal_dims,
+            new_val,
+            scalar_mult=post.scalar_mult,
+            fill_value=post.fill_value,
+        )
 
     transform = JacobianTransform(broadcast_transform, inverse_broadcast_transform)
     return val_out, [SparseTensor([], [], None, pre_transforms=[transform])]
@@ -2165,7 +2195,7 @@ elemental_rules[lax.broadcast_in_dim_p] = broadcast_elemental_rule
 def squeeze_elemental_rule(primals, **params):
     val_out = lax.squeeze_p.bind(*primals, **params)
 
-    def squeeze_transform(pre, iota):
+    def squeeze_transform(pre):
         dims = sorted(params["dimensions"])
         new_out_dims = list(copy.deepcopy(pre.out_dims))
         new_primal_dims = list(copy.deepcopy(pre.primal_dims))
@@ -2174,13 +2204,13 @@ def squeeze_elemental_rule(primals, **params):
 
         for id in dims:
             idx = [j for j, d in enumerate(new_out_dims) if d.id == id][0]
-            val_dim = new_out_dims[idx].val_dim
-            squeeze_dims.append(val_dim)
+            axis = new_out_dims[idx].axis
+            squeeze_dims.append(axis)
 
-            if isinstance(new_out_dims[idx], SparseDimension):
+            if isinstance(new_out_dims[idx], SparseIndex):
 
                 def _check(d, id):
-                    if isinstance(d, SparseDimension):
+                    if isinstance(d, SparseIndex):
                         return d.other_id == id
                     else:
                         return False
@@ -2189,7 +2219,7 @@ def squeeze_elemental_rule(primals, **params):
                     0
                 ]
                 other_dim = new_primal_dims[other_idx]
-                new_primal_dims[other_idx] = DenseDimension(
+                new_primal_dims[other_idx] = DenseIndex(
                     other_dim.id, other_dim.size, None
                 )
 
@@ -2198,22 +2228,22 @@ def squeeze_elemental_rule(primals, **params):
 
         out_ids = [d.id for d in new_out_dims]
         primal_ids = [d.id for d in new_primal_dims]
-        new_val_dims = [d.val_dim for d in new_out_dims if d.val_dim is not None]
-        new_val_dims += [
-            d.val_dim
+        new_axiss = [d.axis for d in new_out_dims if d.axis is not None]
+        new_axiss += [
+            d.axis
             for d in new_primal_dims
-            if isinstance(d, DenseDimension) and d.val_dim is not None
+            if isinstance(d, DenseIndex) and d.axis is not None
         ]
 
         for i, d in enumerate(new_out_dims):
             new_out_dims[i] = replace(
                 d,
                 id=out_ids.index(d.id),
-                val_dim=new_val_dims.index(d.val_dim)
-                if d.val_dim is not None
+                axis=new_axiss.index(d.axis)
+                if d.axis is not None
                 else None,
             )
-            if isinstance(new_out_dims[i], SparseDimension):
+            if isinstance(new_out_dims[i], SparseIndex):
                 new_out_dims[i] = replace(
                     new_out_dims[i],
                     other_id=len(new_out_dims)
@@ -2224,11 +2254,11 @@ def squeeze_elemental_rule(primals, **params):
             new_primal_dims[i] = replace(
                 d,
                 id=len(new_out_dims) + primal_ids.index(d.id),
-                val_dim=new_val_dims.index(d.val_dim)
-                if d.val_dim is not None
+                axis=new_axiss.index(d.axis)
+                if d.axis is not None
                 else None,
             )
-            if isinstance(new_primal_dims[i], SparseDimension):
+            if isinstance(new_primal_dims[i], SparseIndex):
                 new_primal_dims[i] = replace(
                     new_primal_dims[i],
                     other_id=out_ids.index(new_primal_dims[i].other_id),
@@ -2239,39 +2269,51 @@ def squeeze_elemental_rule(primals, **params):
             new_val = jnp.squeeze(pre.val, axis=tuple(squeeze_dims))
         else:
             new_val = pre.val
-        return SparseTensor(new_out_dims, new_primal_dims, new_val)
+        return SparseTensor(
+            new_out_dims,
+            new_primal_dims,
+            new_val,
+            scalar_mult=pre.scalar_mult,
+            fill_value=pre.fill_value,
+        )
 
-    def inverse_squeeze_transform(post, iota):
+    def inverse_squeeze_transform(post):
         new_dims = params["dimensions"]
         new_out_dims = list(copy.deepcopy(post.out_dims))
         new_primal_dims = list(copy.deepcopy(post.primal_dims))
         for dim in new_dims:
-            val_dim = sum([1 for d in new_out_dims if d.val_dim is not None])
-            val_dim += sum(
+            axis = sum([1 for d in new_out_dims if d.axis is not None])
+            axis += sum(
                 [
                     1
                     for d in new_primal_dims[:dim]
-                    if d.val_dim is not None and isinstance(d, DenseDimension)
+                    if d.axis is not None and isinstance(d, DenseIndex)
                 ]
             )
-            new_primal_dims.insert(dim, DenseDimension(dim, 1, val_dim))
+            new_primal_dims.insert(dim, DenseIndex(dim, 1, axis))
             for i in range(dim + 1, len(new_primal_dims)):
                 d = new_primal_dims[i]
                 new_primal_dims[i] = replace(
                     d,
                     id=d.id + 1,
-                    val_dim=d.val_dim + 1 if d.val_dim is not None else None,
+                    axis=d.axis + 1 if d.axis is not None else None,
                 )
-                if isinstance(d, SparseDimension):
+                if isinstance(d, SparseIndex):
                     _d = new_out_dims[d.other_id]
                     new_out_dims[d.other_id] = replace(
                         _d,
                         other_id=_d.other_id + 1,
-                        val_dim=_d.val_dim + 1 if _d.val_dim is not None else None,
+                        axis=_d.axis + 1 if _d.axis is not None else None,
                     )
 
         new_val = jnp.expand_dims(post.val, axis=new_dims)
-        return SparseTensor(new_out_dims, new_primal_dims, new_val)
+        return SparseTensor(
+            new_out_dims,
+            new_primal_dims,
+            new_val,
+            scalar_mult=post.scalar_mult,
+            fill_value=post.fill_value,
+        )
 
     transform = JacobianTransform(squeeze_transform, inverse_squeeze_transform)
     return val_out, [SparseTensor([], [], None, pre_transforms=[transform])]
@@ -2292,7 +2334,7 @@ def concatenate_elemental_rule(primals, **params):
         slices[idx] = [_count, count]
         _count = count
 
-    def concatenate_transform(primal, pre, iota):
+    def concatenate_transform(primal, pre):
         new_out_dims = list(copy.deepcopy(pre.out_dims))
         new_primal_dims = list(copy.deepcopy(pre.primal_dims))
         l = len(pre.out_dims)
@@ -2302,67 +2344,64 @@ def concatenate_elemental_rule(primals, **params):
         primal_idx = [idx for idx, p in enumerate(primals) if p is primal][0]
         idx, _idx = slices[primal_idx]
 
-        if isinstance(d, DenseDimension):
-            if d.val_dim is not None:
+        if isinstance(d, DenseIndex):
+            if d.axis is not None:
                 _size = val_out.shape[dim]
                 lshape = list(pre.val.shape)
                 rshape = list(pre.val.shape)
-                lshape[d.val_dim] = idx
-                rshape[d.val_dim] = val_out.shape[dim] - _idx
+                lshape[d.axis] = idx
+                rshape[d.axis] = val_out.shape[dim] - _idx
                 lcat_zeros = jnp.zeros(lshape)
                 rcat_zeros = jnp.zeros(rshape)
 
                 new_val = jnp.concatenate(
-                    [lcat_zeros, pre.val, rcat_zeros], axis=d.val_dim
+                    [lcat_zeros, pre.val, rcat_zeros], axis=d.axis
                 )
 
                 new_out_dims[dim] = replace(new_out_dims[dim], size=new_val.shape[dim])
             else:
                 raise NotImplementedError(
-                    "DenseDimension without `val_dim` not yet supported!"
+                    "DenseIndex without `axis` not yet supported!"
                 )
         else:
             other_id = d.other_id
-            if d.val_dim is not None:
+            if d.axis is not None:
                 _d = new_primal_dims[d.other_id - l]
 
-                val_dim = sum([1 for d_i in new_out_dims if d_i.val_dim is not None])
-                val_dim += sum(
+                axis = sum([1 for d_i in new_out_dims if d_i.axis is not None])
+                axis += sum(
                     [
                         1
                         for d_i in new_primal_dims[: other_id - l]
-                        if d_i.val_dim is not None and isinstance(d_i, DenseDimension)
+                        if d_i.axis is not None and isinstance(d_i, DenseIndex)
                     ]
                 )
 
                 for _idx_d in range(dim + 1, len(new_primal_dims)):
                     pd = new_primal_dims[_idx_d]
-                    if isinstance(pd, DenseDimension) and pd.val_dim is not None:
-                        new_primal_dims[_idx_d] = replace(pd, val_dim=pd.val_dim + 1)
+                    if isinstance(pd, DenseIndex) and pd.axis is not None:
+                        new_primal_dims[_idx_d] = replace(pd, axis=pd.axis + 1)
 
-                new_val = _materialize_dimensions(pre, [d.id])
+                new_val = _materialize_indexes(pre, [d.id])
 
-                if iota.shape[0] < d.size or iota.shape[1] < d.size:
-                    sub_iota = jnp.eye(d.size, dtype=jnp.float32)
-                else:
-                    sub_iota = lax.slice(iota, [0, 0], [d.size, d.size])
+                sub_iota = jnp.eye(d.size, dtype=jnp.float32)
 
                 shape = [1 for _ in range(pre.val.ndim)]
-                shape[_d.val_dim] = _d.size
-                shape.insert(val_dim, d.size)
+                shape[_d.axis] = _d.size
+                shape.insert(axis, d.size)
                 sub_iota = sub_iota.reshape(shape)
 
                 new_val = new_val * sub_iota
 
                 _size = val_out.shape[dim]
                 _shape = list(new_val.shape)
-                _shape[d.val_dim] = _size
-                _shape[val_dim] = d.size
+                _shape[d.axis] = _size
+                _shape[axis] = d.size
                 zeros = jnp.zeros(_shape, dtype=jnp.float32)
 
                 scatter_indices = [0 for _ in _shape]
-                scatter_indices[d.val_dim] = idx
-                scatter_indices[val_dim] = 0
+                scatter_indices[d.axis] = idx
+                scatter_indices[axis] = 0
 
                 update_window_dims = tuple(n for n in range(len(_shape)))
 
@@ -2380,58 +2419,55 @@ def concatenate_elemental_rule(primals, **params):
                     unique_indices=True,
                 )
 
-                new_out_dims[dim] = DenseDimension(id, val_out.shape[dim], d.val_dim)
-                new_primal_dims[other_id - l] = DenseDimension(
-                    other_id, d.size, val_dim
+                new_out_dims[dim] = DenseIndex(id, val_out.shape[dim], d.axis)
+                new_primal_dims[other_id - l] = DenseIndex(
+                    other_id, d.size, axis
                 )
             else:
                 _d = new_primal_dims[d.other_id - l]
                 _size = val_out.shape[dim]
 
-                out_val_dim = sum(
-                    [1 for d_i in new_out_dims[:dim] if d_i.val_dim is not None]
+                out_axis = sum(
+                    [1 for d_i in new_out_dims[:dim] if d_i.axis is not None]
                 )
 
-                primal_val_dim = sum(
-                    [1 for d_i in new_out_dims if d_i.val_dim is not None]
+                primal_axis = sum(
+                    [1 for d_i in new_out_dims if d_i.axis is not None]
                 )
-                primal_val_dim += sum(
+                primal_axis += sum(
                     [
                         1
                         for d_i in new_primal_dims[: other_id - l]
-                        if d_i.val_dim is not None and isinstance(d_i, DenseDimension)
+                        if d_i.axis is not None and isinstance(d_i, DenseIndex)
                     ]
                 )
-                primal_val_dim = max(1, primal_val_dim)
+                primal_axis = max(1, primal_axis)
 
                 for _idx_d in range(dim + 1, len(new_primal_dims)):
                     pd = new_primal_dims[_idx_d]
-                    if isinstance(pd, DenseDimension) and pd.val_dim is not None:
-                        new_primal_dims[_idx_d] = replace(pd, val_dim=pd.val_dim + 1)
+                    if isinstance(pd, DenseIndex) and pd.axis is not None:
+                        new_primal_dims[_idx_d] = replace(pd, axis=pd.axis + 1)
 
                 if pre.val.shape != ():
-                    new_val = _materialize_dimensions(pre, [d.id, d.other_id])
+                    new_val = _materialize_indexes(pre, [d.id, d.other_id])
                 else:
                     new_val = pre.val
 
-                if iota.shape[0] < d.size or iota.shape[1] < d.size:
-                    sub_iota = jnp.eye(d.size, dtype=jnp.float32)
-                else:
-                    sub_iota = lax.slice(iota, [0, 0], [d.size, d.size])
+                sub_iota = jnp.eye(d.size, dtype=jnp.float32)
 
                 shape = [1 for _ in range(pre.val.ndim)]
-                shape.insert(out_val_dim, _d.size)
-                shape.insert(primal_val_dim, d.size)
+                shape.insert(out_axis, _d.size)
+                shape.insert(primal_axis, d.size)
 
                 new_val = new_val * sub_iota
 
                 _shape = list(pre.val.shape)
-                _shape.insert(out_val_dim, _size)
-                _shape.insert(primal_val_dim, _d.size)
+                _shape.insert(out_axis, _size)
+                _shape.insert(primal_axis, _d.size)
                 zeros = jnp.zeros(_shape, dtype=jnp.float32)
 
                 scatter_dims = lax.ScatterDimensionNumbers(
-                    [out_val_dim, primal_val_dim], [], [out_val_dim, primal_val_dim]
+                    [out_axis, primal_axis], [], [out_axis, primal_axis]
                 )
                 new_val = lax.scatter(
                     zeros,
@@ -2442,14 +2478,20 @@ def concatenate_elemental_rule(primals, **params):
                     unique_indices=True,
                 )
 
-                new_out_dims[dim] = DenseDimension(id, val_out.shape[dim], out_val_dim)
-                new_primal_dims[other_id - l] = DenseDimension(
-                    other_id, d.size, primal_val_dim
+                new_out_dims[dim] = DenseIndex(id, val_out.shape[dim], out_axis)
+                new_primal_dims[other_id - l] = DenseIndex(
+                    other_id, d.size, primal_axis
                 )
 
-        return SparseTensor(new_out_dims, new_primal_dims, new_val)
+        return SparseTensor(
+            new_out_dims,
+            new_primal_dims,
+            new_val,
+            scalar_mult=pre.scalar_mult,
+            fill_value=pre.fill_value,
+        )
 
-    def inverse_concatenate_transform(primal, post, iota):
+    def inverse_concatenate_transform(primal, post):
         new_out_dims = list(copy.deepcopy(post.out_dims))
         new_primal_dims = list(copy.deepcopy(post.primal_dims))
 
@@ -2458,129 +2500,129 @@ def concatenate_elemental_rule(primals, **params):
         d = None
         if len(new_primal_dims) > 0:
             d = new_primal_dims[dim]
-        if isinstance(d, DenseDimension):
-            if d.val_dim is not None:
+        if isinstance(d, DenseIndex):
+            if d.axis is not None:
                 new_val = lax.slice_in_dim(
-                    post.val, *slices[primal_idx], axis=d.val_dim
+                    post.val, *slices[primal_idx], axis=d.axis
                 )
-                new_primal_dims[dim] = replace(d, size=new_val.shape[d.val_dim])
+                new_primal_dims[dim] = replace(d, size=new_val.shape[d.axis])
             else:
                 raise NotImplementedError(
-                    "DenseDimension without `val_dim` not yet supported!"
+                    "DenseIndex without `axis` not yet supported!"
                 )
-        elif isinstance(d, SparseDimension):
+        elif isinstance(d, SparseIndex):
             _d = new_out_dims[d.other_id]
-            if d.val_dim is not None:
-                new_out_dims[d.other_id] = DenseDimension(_d.id, _d.size, _d.val_dim)
+            if d.axis is not None:
+                new_out_dims[d.other_id] = DenseIndex(_d.id, _d.size, _d.axis)
                 size = slices[primal_idx][1] - slices[primal_idx][0]
 
-                val_dim = sum([1 for d_i in new_out_dims if d_i.val_dim is not None])
-                val_dim += sum(
+                axis = sum([1 for d_i in new_out_dims if d_i.axis is not None])
+                axis += sum(
                     [
                         1
                         for d_i in new_primal_dims[:dim]
-                        if d_i.val_dim is not None and isinstance(d_i, DenseDimension)
+                        if d_i.axis is not None and isinstance(d_i, DenseIndex)
                     ]
                 )
-                new_primal_dims[dim] = DenseDimension(_d.other_id, size, val_dim)
+                new_primal_dims[dim] = DenseIndex(_d.other_id, size, axis)
 
                 for _idx_d in range(dim + 1, len(new_primal_dims)):
                     pd = new_primal_dims[_idx_d]
-                    if isinstance(pd, DenseDimension) and pd.val_dim is not None:
-                        new_primal_dims[_idx_d] = replace(pd, val_dim=pd.val_dim + 1)
+                    if isinstance(pd, DenseIndex) and pd.axis is not None:
+                        new_primal_dims[_idx_d] = replace(pd, axis=pd.axis + 1)
 
-                new_val = _materialize_dimensions(post, [d.id])
+                new_val = _materialize_indexes(post, [d.id])
 
-                if iota.shape[0] < d.size or iota.shape[1] < d.size:
-                    sub_iota = jnp.eye(d.size, dtype=jnp.float32)
-                else:
-                    sub_iota = lax.slice(iota, [0, 0], [d.size, d.size])
+                sub_iota = jnp.eye(d.size, dtype=jnp.float32)
 
                 shape = [1 for _ in range(post.val.ndim)]
-                shape[_d.val_dim] = _d.size
-                shape.insert(val_dim, d.size)
+                shape[_d.axis] = _d.size
+                shape.insert(axis, d.size)
                 sub_iota = sub_iota.reshape(shape)
 
                 new_val = new_val * sub_iota
 
-                new_val = lax.slice_in_dim(new_val, *slices[primal_idx], axis=val_dim)
+                new_val = lax.slice_in_dim(new_val, *slices[primal_idx], axis=axis)
                 new_primal_dims[dim] = replace(
                     new_primal_dims[dim],
-                    size=new_val.shape[new_primal_dims[dim].val_dim],
+                    size=new_val.shape[new_primal_dims[dim].axis],
                 )
                 new_out_dims[d.other_id] = replace(
                     new_out_dims[d.other_id],
-                    size=new_val.shape[new_out_dims[d.other_id].val_dim],
+                    size=new_val.shape[new_out_dims[d.other_id].axis],
                 )
             else:
                 raise NotImplementedError("Finish the implementation!")
                 _d = new_out_dims[d.other_id]
-                if d.val_dim is not None:
+                if d.axis is not None:
                     size = slices[primal_idx][1] - slices[primal_idx][0]
 
-                    out_val_dim = sum(
+                    out_axis = sum(
                         [
                             1
                             for d_i in new_out_dims[: d.other_id]
-                            if d_i.val_dim is not None
+                            if d_i.axis is not None
                         ]
                     )
-                    primal_val_dim = sum(
-                        [1 for d_i in new_out_dims if d_i.val_dim is not None]
+                    primal_axis = sum(
+                        [1 for d_i in new_out_dims if d_i.axis is not None]
                     )
-                    primal_val_dim += sum(
+                    primal_axis += sum(
                         [
                             1
                             for d_i in new_primal_dims[:dim]
-                            if d_i.val_dim is not None and type(d_i) is DenseDimension
+                            if d_i.axis is not None and type(d_i) is DenseIndex
                         ]
                     )
 
-                    new_out_dims[d.other_id] = DenseDimension(
-                        _d.id, _d.size, out_val_dim
+                    new_out_dims[d.other_id] = DenseIndex(
+                        _d.id, _d.size, out_axis
                     )
-                    new_primal_dims[dim] = DenseDimension(
-                        _d.other_id, size, primal_val_dim
+                    new_primal_dims[dim] = DenseIndex(
+                        _d.other_id, size, primal_axis
                     )
 
                     for _idx_d in range(d.other_id, len(new_out_dims)):
                         od = new_out_dims[_idx_d]
-                        if type(od) is DenseDimension and od.val_dim is not None:
-                            new_out_dims[_idx_d] = replace(od, val_dim=od.val_dim + 1)
+                        if type(od) is DenseIndex and od.axis is not None:
+                            new_out_dims[_idx_d] = replace(od, axis=od.axis + 1)
 
                     for _idx_d in range(dim + 1, len(new_primal_dims)):
                         pd = new_primal_dims[_idx_d]
-                        if type(pd) is DenseDimension and pd.val_dim is not None:
+                        if type(pd) is DenseIndex and pd.axis is not None:
                             new_primal_dims[_idx_d] = replace(
-                                pd, val_dim=pd.val_dim + 1
+                                pd, axis=pd.axis + 1
                             )
 
-                    new_val = _materialize_dimensions(post, [d.id, d.other_id])
+                    new_val = _materialize_indexes(post, [d.id, d.other_id])
 
-                    if iota.shape[0] < d.size or iota.shape[1] < d.size:
-                        sub_iota = jnp.eye(d.size, dtype=jnp.float32)
-                    else:
-                        sub_iota = lax.slice(iota, [0, 0], [d.size, d.size])
+                    sub_iota = jnp.eye(d.size, dtype=jnp.float32)
 
                     shape = [1 for _ in range(post.val.ndim)]
-                    shape.insert(out_val_dim, _d.size)
-                    shape.insert(primal_val_dim, size)
+                    shape.insert(out_axis, _d.size)
+                    shape.insert(primal_axis, size)
                     sub_iota = sub_iota.reshape(shape)
 
                     new_val = new_val * sub_iota
 
                     new_val = lax.slice_in_dim(
-                        new_val, *slices[primal_idx], axis=primal_val_dim
+                        new_val, *slices[primal_idx], axis=primal_axis
                     )
                     new_primal_dims[dim] = replace(
                         new_primal_dims[dim],
-                        size=new_val.shape[new_primal_dims[dim].val_dim],
+                        size=new_val.shape[new_primal_dims[dim].axis],
                     )
                     new_out_dims[d.other_id] = replace(
                         new_out_dims[d.other_id],
-                        size=new_val.shape[new_out_dims[d.other_id].val_dim],
+                        size=new_val.shape[new_out_dims[d.other_id].axis],
                     )
-        return SparseTensor(new_out_dims, new_primal_dims, new_val)
+        return SparseTensor(
+            new_out_dims,
+            new_primal_dims,
+            new_val,
+            scalar_mult=post.scalar_mult,
+            fill_value=post.fill_value,
+        )
 
     return val_out, [
         SparseTensor(
@@ -2605,21 +2647,33 @@ def convert_element_type_rule(primals, **params):
     val_out = lax.convert_element_type_p.bind(*primals, **params)
     new_dtype = params["new_dtype"]
 
-    def convert_element_type_transform(pre, iota):
+    def convert_element_type_transform(pre):
         new_pre_val = (
             None if pre.val is None else lax.convert_element_type(pre.val, new_dtype)
         )
         new_out_dims = copy.deepcopy(pre.out_dims)
         new_primal_dims = copy.deepcopy(pre.primal_dims)
-        return SparseTensor(new_out_dims, new_primal_dims, new_pre_val)
+        return SparseTensor(
+            new_out_dims,
+            new_primal_dims,
+            new_pre_val,
+            scalar_mult=lax.convert_element_type(pre.scalar_mult, new_dtype),
+            fill_value=lax.convert_element_type(pre.fill_value, new_dtype),
+        )
 
-    def inverse_convert_element_type_transform(post, iota):
+    def inverse_convert_element_type_transform(post):
         new_post_val = (
             None if post.val is None else lax.convert_element_type(post.val, new_dtype)
         )
         new_out_dims = copy.deepcopy(post.out_dims)
         new_primal_dims = copy.deepcopy(post.primal_dims)
-        return SparseTensor(new_out_dims, new_primal_dims, new_post_val)
+        return SparseTensor(
+            new_out_dims,
+            new_primal_dims,
+            new_post_val,
+            scalar_mult=lax.convert_element_type(post.scalar_mult, new_dtype),
+            fill_value=lax.convert_element_type(post.fill_value, new_dtype),
+        )
 
     transform = JacobianTransform(
         convert_element_type_transform, inverse_convert_element_type_transform
@@ -2653,14 +2707,14 @@ def linear_solve_elemental_rule(primals, **params):
     b_out_dims = []
     b_primal_dims = []
 
-    # Batch dims map strictly 1-to-1 (SparseDimensions)
+    # Batch dims map strictly 1-to-1 (SparseIndexes)
     for i, s in enumerate(batch_dims):
-        b_out_dims.append(SparseDimension(i, s, None, num_out_dims + i))
-        b_primal_dims.append(SparseDimension(num_out_dims + i, s, None, i))
+        b_out_dims.append(SparseIndex(i, s, None, num_out_dims + i))
+        b_primal_dims.append(SparseIndex(num_out_dims + i, s, None, i))
 
     # Matrix dims are dense within the block
-    b_out_dims.append(DenseDimension(num_batch, N, 0))
-    b_primal_dims.append(DenseDimension(num_out_dims + num_batch, N, 1))
+    b_out_dims.append(DenseIndex(num_batch, N, 0))
+    b_primal_dims.append(DenseIndex(num_out_dims + num_batch, N, 1))
 
     b_tensor = _swap_back_axes(SparseTensor(b_out_dims, b_primal_dims, A_inv))
 
@@ -2673,15 +2727,15 @@ def linear_solve_elemental_rule(primals, **params):
     A_out_dims = []
     A_primal_dims = []
 
-    # Batch dims map strictly 1-to-1 (SparseDimensions)
+    # Batch dims map strictly 1-to-1 (SparseIndexes)
     for i, s in enumerate(batch_dims):
-        A_out_dims.append(SparseDimension(i, s, None, num_out_dims + i))
-        A_primal_dims.append(SparseDimension(num_out_dims + i, s, None, i))
+        A_out_dims.append(SparseIndex(i, s, None, num_out_dims + i))
+        A_primal_dims.append(SparseIndex(num_out_dims + i, s, None, i))
 
     # The resulting tensor has one dense output dim and two dense primal dims
-    A_out_dims.append(DenseDimension(num_batch, N, 0))
-    A_primal_dims.append(DenseDimension(num_out_dims + num_batch, N, 1))
-    A_primal_dims.append(DenseDimension(num_out_dims + num_batch + 1, N, 2))
+    A_out_dims.append(DenseIndex(num_batch, N, 0))
+    A_primal_dims.append(DenseIndex(num_out_dims + num_batch, N, 1))
+    A_primal_dims.append(DenseIndex(num_out_dims + num_batch + 1, N, 2))
 
     A_tensor = _swap_back_axes(SparseTensor(A_out_dims, A_primal_dims, J_A_val))
 
@@ -2707,24 +2761,24 @@ def top_k_elemental_rule(primals, **params):
     val_ndim = len(val_shape)
     n = x_shape[-1]
 
-    # Batch dims are diagonal (SparseDimension) with val_dim referencing
+    # Batch dims are diagonal (SparseIndex) with axis referencing
     # the batch axes of the indicator tensor.
     # The indicator tensor has shape (*batch, k, n).
     out_dims = []
     primal_dims = []
     batch_shape = x_shape[:-1]
-    val_dim_count = 0
+    axis_count = 0
 
     for i, s in enumerate(batch_shape):
-        out_dims.append(SparseDimension(i, s, val_dim_count, val_ndim + i))
-        primal_dims.append(SparseDimension(val_ndim + i, s, val_dim_count, i))
-        val_dim_count += 1
+        out_dims.append(SparseIndex(i, s, axis_count, val_ndim + i))
+        primal_dims.append(SparseIndex(val_ndim + i, s, axis_count, i))
+        axis_count += 1
 
     # Last out dim (k) and last primal dim (n) are dense
-    out_dims.append(DenseDimension(val_ndim - 1, k, val_dim_count))
-    val_dim_count += 1
-    primal_dims.append(DenseDimension(val_ndim + x_ndim - 1, n, val_dim_count))
-    val_dim_count += 1
+    out_dims.append(DenseIndex(val_ndim - 1, k, axis_count))
+    axis_count += 1
+    primal_dims.append(DenseIndex(val_ndim + x_ndim - 1, n, axis_count))
+    axis_count += 1
 
     # Build indicator: val[..., i, j] = 1 if indices[..., i] == j
     j_range = jnp.arange(n)
@@ -2787,7 +2841,7 @@ def pjit_elemental_rule(primals, **params):
     jaxpr_outvars = jaxpr.jaxpr.outvars
     jaxpr_invars = [jaxpr.jaxpr.invars[i] for i in argnums]
 
-    from .sparse.tensor import DenseDimension, SparseTensor
+    from ..sparse.tensor import DenseIndex, SparseTensor
 
     def ensure_st(j, out_var, in_var):
         if j is not None:
@@ -2795,9 +2849,9 @@ def pjit_elemental_rule(primals, **params):
         out_shape = out_var.aval.shape
         in_shape = in_var.aval.shape
         out_size = len(out_shape)
-        out_dims = [DenseDimension(i, s, i) for i, s in enumerate(out_shape)]
+        out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
         primal_dims = [
-            DenseDimension(out_size + i, s, i + out_size)
+            DenseIndex(out_size + i, s, i + out_size)
             for i, s in enumerate(in_shape)
         ]
         return SparseTensor.zeros(out_dims, primal_dims, out_var.aval.dtype)
@@ -2853,10 +2907,10 @@ def psum_elemental_rule(primals, **params):
     out_ndim = len(out_shape)
 
     out_dims = [
-        SparseDimension(i, s, None, out_ndim + i) for i, s in enumerate(out_shape)
+        SparseIndex(i, s, None, out_ndim + i) for i, s in enumerate(out_shape)
     ]
     primal_dims = [
-        SparseDimension(out_ndim + i, s, None, i) for i, s in enumerate(x_shape)
+        SparseIndex(out_ndim + i, s, None, i) for i, s in enumerate(x_shape)
     ]
 
     tensor = SparseTensor(out_dims, primal_dims, jnp.array(1.0, dtype=jnp.float32))
@@ -2880,35 +2934,35 @@ def all_gather_elemental_rule(primals, **params):
     primal_dims = []
     for i in range(out_ndim):
         if i < x_ndim and x_shape[i] == out_shape[i]:
-            out_dims.append(SparseDimension(i, out_shape[i], None, out_ndim + i))
-            primal_dims.append(SparseDimension(out_ndim + i, x_shape[i], None, i))
+            out_dims.append(SparseIndex(i, out_shape[i], None, out_ndim + i))
+            primal_dims.append(SparseIndex(out_ndim + i, x_shape[i], None, i))
         elif i < x_ndim:
             out_dims.append(
-                DenseDimension(
+                DenseIndex(
                     i,
                     out_shape[i],
-                    len([d for d in out_dims if isinstance(d, DenseDimension)]),
+                    len([d for d in out_dims if isinstance(d, DenseIndex)]),
                 )
             )
             primal_dims.append(
-                DenseDimension(
+                DenseIndex(
                     out_ndim + i,
                     x_shape[i],
                     len(
                         [
                             d
                             for d in out_dims + primal_dims
-                            if isinstance(d, DenseDimension)
+                            if isinstance(d, DenseIndex)
                         ]
                     ),
                 )
             )
         else:
             out_dims.append(
-                DenseDimension(
+                DenseIndex(
                     i,
                     out_shape[i],
-                    len([d for d in out_dims if isinstance(d, DenseDimension)]),
+                    len([d for d in out_dims if isinstance(d, DenseIndex)]),
                 )
             )
 
@@ -2930,10 +2984,10 @@ def reduce_scatter_elemental_rule(primals, **params):
     out_ndim = len(out_shape)
 
     out_dims = [
-        SparseDimension(i, s, None, out_ndim + i) for i, s in enumerate(out_shape)
+        SparseIndex(i, s, None, out_ndim + i) for i, s in enumerate(out_shape)
     ]
     primal_dims = [
-        SparseDimension(out_ndim + i, s, None, i) for i, s in enumerate(x_shape)
+        SparseIndex(out_ndim + i, s, None, i) for i, s in enumerate(x_shape)
     ]
 
     tensor = SparseTensor(out_dims, primal_dims, jnp.array(1.0, dtype=jnp.float32))
@@ -2954,10 +3008,10 @@ def all_to_all_elemental_rule(primals, **params):
     out_ndim = len(out_shape)
 
     out_dims = [
-        SparseDimension(i, s, None, out_ndim + i) for i, s in enumerate(out_shape)
+        SparseIndex(i, s, None, out_ndim + i) for i, s in enumerate(out_shape)
     ]
     primal_dims = [
-        SparseDimension(out_ndim + i, s, None, i) for i, s in enumerate(x_shape)
+        SparseIndex(out_ndim + i, s, None, i) for i, s in enumerate(x_shape)
     ]
 
     tensor = SparseTensor(out_dims, primal_dims, jnp.array(1.0, dtype=jnp.float32))
@@ -2999,21 +3053,21 @@ def triangular_solve_elemental_rule(primals, **params):
     b_out_dims = []
     b_primal_dims = []
     for i, s in enumerate(batch_dims):
-        b_out_dims.append(SparseDimension(i, s, None, num_out_dims + i))
-        b_primal_dims.append(SparseDimension(num_out_dims + i, s, None, i))
+        b_out_dims.append(SparseIndex(i, s, None, num_out_dims + i))
+        b_primal_dims.append(SparseIndex(num_out_dims + i, s, None, i))
 
     if len(out_shape) == num_batch + 2:
-        b_out_dims.append(DenseDimension(num_batch, N, 0))
+        b_out_dims.append(DenseIndex(num_batch, N, 0))
         b_out_dims.append(
-            SparseDimension(num_batch + 1, nrhs, None, num_out_dims + num_batch + 1)
+            SparseIndex(num_batch + 1, nrhs, None, num_out_dims + num_batch + 1)
         )
-        b_primal_dims.append(DenseDimension(num_out_dims + num_batch, N, 1))
+        b_primal_dims.append(DenseIndex(num_out_dims + num_batch, N, 1))
         b_primal_dims.append(
-            SparseDimension(num_out_dims + num_batch + 1, nrhs, None, num_batch + 1)
+            SparseIndex(num_out_dims + num_batch + 1, nrhs, None, num_batch + 1)
         )
     else:
-        b_out_dims.append(DenseDimension(num_batch, N, 0))
-        b_primal_dims.append(DenseDimension(num_out_dims + num_batch, N, 1))
+        b_out_dims.append(DenseIndex(num_batch, N, 0))
+        b_primal_dims.append(DenseIndex(num_out_dims + num_batch, N, 1))
 
     b_tensor = _swap_back_axes(SparseTensor(b_out_dims, b_primal_dims, A_inv))
 
@@ -3042,18 +3096,18 @@ def triangular_solve_elemental_rule(primals, **params):
     A_out_dims = []
     A_primal_dims = []
     for i, s in enumerate(batch_dims):
-        A_out_dims.append(SparseDimension(i, s, None, num_out_dims + i))
-        A_primal_dims.append(SparseDimension(num_out_dims + i, s, None, i))
+        A_out_dims.append(SparseIndex(i, s, None, num_out_dims + i))
+        A_primal_dims.append(SparseIndex(num_out_dims + i, s, None, i))
 
     if len(out_shape) == num_batch + 2:
-        A_out_dims.append(DenseDimension(num_batch, N, 0))
-        A_out_dims.append(DenseDimension(num_batch + 1, nrhs, 1))
-        A_primal_dims.append(DenseDimension(num_out_dims + num_batch, N, 2))
-        A_primal_dims.append(DenseDimension(num_out_dims + num_batch + 1, N, 3))
+        A_out_dims.append(DenseIndex(num_batch, N, 0))
+        A_out_dims.append(DenseIndex(num_batch + 1, nrhs, 1))
+        A_primal_dims.append(DenseIndex(num_out_dims + num_batch, N, 2))
+        A_primal_dims.append(DenseIndex(num_out_dims + num_batch + 1, N, 3))
     else:
-        A_out_dims.append(DenseDimension(num_batch, N, 0))
-        A_primal_dims.append(DenseDimension(num_out_dims + num_batch, N, 1))
-        A_primal_dims.append(DenseDimension(num_out_dims + num_batch + 1, N, 2))
+        A_out_dims.append(DenseIndex(num_batch, N, 0))
+        A_primal_dims.append(DenseIndex(num_out_dims + num_batch, N, 1))
+        A_primal_dims.append(DenseIndex(num_out_dims + num_batch + 1, N, 2))
 
     A_tensor = _swap_back_axes(SparseTensor(A_out_dims, A_primal_dims, J_A_val))
     return val_out, [A_tensor, b_tensor]
@@ -3102,16 +3156,16 @@ def cholesky_elemental_rule(primals, **params):
     primal_dims = []
     vd = 0
     for i, s in enumerate(batch_dims):
-        out_dims.append(SparseDimension(i, s, vd, num_out_dims + i))
-        primal_dims.append(SparseDimension(num_out_dims + i, s, vd, i))
+        out_dims.append(SparseIndex(i, s, vd, num_out_dims + i))
+        primal_dims.append(SparseIndex(num_out_dims + i, s, vd, i))
         vd += 1
-    out_dims.append(DenseDimension(num_batch, N, vd))
+    out_dims.append(DenseIndex(num_batch, N, vd))
     vd += 1
-    out_dims.append(DenseDimension(num_batch + 1, N, vd))
+    out_dims.append(DenseIndex(num_batch + 1, N, vd))
     vd += 1
-    primal_dims.append(DenseDimension(num_out_dims + num_batch, N, vd))
+    primal_dims.append(DenseIndex(num_out_dims + num_batch, N, vd))
     vd += 1
-    primal_dims.append(DenseDimension(num_out_dims + num_batch + 1, N, vd))
+    primal_dims.append(DenseIndex(num_out_dims + num_batch + 1, N, vd))
     vd += 1
 
     tensor = _swap_back_axes(SparseTensor(out_dims, primal_dims, J))
@@ -3146,14 +3200,14 @@ def eigh_elemental_rule(primals, **params):
     w_primal_dims = []
     vd = 0
     for i, s in enumerate(batch_dims):
-        w_out_dims.append(SparseDimension(i, s, vd, w_ndim + i))
-        w_primal_dims.append(SparseDimension(w_ndim + i, s, vd, i))
+        w_out_dims.append(SparseIndex(i, s, vd, w_ndim + i))
+        w_primal_dims.append(SparseIndex(w_ndim + i, s, vd, i))
         vd += 1
-    w_out_dims.append(DenseDimension(num_batch, N, vd))
+    w_out_dims.append(DenseIndex(num_batch, N, vd))
     vd += 1
-    w_primal_dims.append(DenseDimension(w_ndim + num_batch, N, vd))
+    w_primal_dims.append(DenseIndex(w_ndim + num_batch, N, vd))
     vd += 1
-    w_primal_dims.append(DenseDimension(w_ndim + num_batch + 1, N, vd))
+    w_primal_dims.append(DenseIndex(w_ndim + num_batch + 1, N, vd))
     vd += 1
     w_tensor = _swap_back_axes(SparseTensor(w_out_dims, w_primal_dims, J_w))
 
@@ -3170,16 +3224,16 @@ def eigh_elemental_rule(primals, **params):
     V_primal_dims = []
     vd = 0
     for i, s in enumerate(batch_dims):
-        V_out_dims.append(SparseDimension(i, s, vd, V_ndim + i))
-        V_primal_dims.append(SparseDimension(V_ndim + i, s, vd, i))
+        V_out_dims.append(SparseIndex(i, s, vd, V_ndim + i))
+        V_primal_dims.append(SparseIndex(V_ndim + i, s, vd, i))
         vd += 1
-    V_out_dims.append(DenseDimension(num_batch, N, vd))
+    V_out_dims.append(DenseIndex(num_batch, N, vd))
     vd += 1
-    V_out_dims.append(DenseDimension(num_batch + 1, N, vd))
+    V_out_dims.append(DenseIndex(num_batch + 1, N, vd))
     vd += 1
-    V_primal_dims.append(DenseDimension(V_ndim + num_batch, N, vd))
+    V_primal_dims.append(DenseIndex(V_ndim + num_batch, N, vd))
     vd += 1
-    V_primal_dims.append(DenseDimension(V_ndim + num_batch + 1, N, vd))
+    V_primal_dims.append(DenseIndex(V_ndim + num_batch + 1, N, vd))
     vd += 1
     V_tensor = _swap_back_axes(SparseTensor(V_out_dims, V_primal_dims, J_V))
 
@@ -3229,14 +3283,14 @@ def svd_elemental_rule(primals, **params):
     s_primal_dims = []
     vd = 0
     for i, sz in enumerate(batch_dims):
-        s_out_dims.append(SparseDimension(i, sz, vd, s_ndim + i))
-        s_primal_dims.append(SparseDimension(s_ndim + i, sz, vd, i))
+        s_out_dims.append(SparseIndex(i, sz, vd, s_ndim + i))
+        s_primal_dims.append(SparseIndex(s_ndim + i, sz, vd, i))
         vd += 1
-    s_out_dims.append(DenseDimension(num_batch, K, vd))
+    s_out_dims.append(DenseIndex(num_batch, K, vd))
     vd += 1
-    s_primal_dims.append(DenseDimension(s_ndim + num_batch, M, vd))
+    s_primal_dims.append(DenseIndex(s_ndim + num_batch, M, vd))
     vd += 1
-    s_primal_dims.append(DenseDimension(s_ndim + num_batch + 1, N, vd))
+    s_primal_dims.append(DenseIndex(s_ndim + num_batch + 1, N, vd))
     vd += 1
     s_tensor = _swap_back_axes(SparseTensor(s_out_dims, s_primal_dims, J_s))
 
@@ -3313,16 +3367,16 @@ def svd_elemental_rule(primals, **params):
     U_primal_dims = []
     vd = 0
     for i, sz in enumerate(batch_dims):
-        U_out_dims.append(SparseDimension(i, sz, vd, U_ndim + i))
-        U_primal_dims.append(SparseDimension(U_ndim + i, sz, vd, i))
+        U_out_dims.append(SparseIndex(i, sz, vd, U_ndim + i))
+        U_primal_dims.append(SparseIndex(U_ndim + i, sz, vd, i))
         vd += 1
-    U_out_dims.append(DenseDimension(num_batch, M, vd))
+    U_out_dims.append(DenseIndex(num_batch, M, vd))
     vd += 1
-    U_out_dims.append(DenseDimension(num_batch + 1, K, vd))
+    U_out_dims.append(DenseIndex(num_batch + 1, K, vd))
     vd += 1
-    U_primal_dims.append(DenseDimension(U_ndim + num_batch, M, vd))
+    U_primal_dims.append(DenseIndex(U_ndim + num_batch, M, vd))
     vd += 1
-    U_primal_dims.append(DenseDimension(U_ndim + num_batch + 1, N, vd))
+    U_primal_dims.append(DenseIndex(U_ndim + num_batch + 1, N, vd))
     vd += 1
     U_tensor = _swap_back_axes(SparseTensor(U_out_dims, U_primal_dims, J_U))
 
@@ -3332,16 +3386,16 @@ def svd_elemental_rule(primals, **params):
     Vt_primal_dims = []
     vd = 0
     for i, sz in enumerate(batch_dims):
-        Vt_out_dims.append(SparseDimension(i, sz, vd, Vt_ndim + i))
-        Vt_primal_dims.append(SparseDimension(Vt_ndim + i, sz, vd, i))
+        Vt_out_dims.append(SparseIndex(i, sz, vd, Vt_ndim + i))
+        Vt_primal_dims.append(SparseIndex(Vt_ndim + i, sz, vd, i))
         vd += 1
-    Vt_out_dims.append(DenseDimension(num_batch, K, vd))
+    Vt_out_dims.append(DenseIndex(num_batch, K, vd))
     vd += 1
-    Vt_out_dims.append(DenseDimension(num_batch + 1, N, vd))
+    Vt_out_dims.append(DenseIndex(num_batch + 1, N, vd))
     vd += 1
-    Vt_primal_dims.append(DenseDimension(Vt_ndim + num_batch, M, vd))
+    Vt_primal_dims.append(DenseIndex(Vt_ndim + num_batch, M, vd))
     vd += 1
-    Vt_primal_dims.append(DenseDimension(Vt_ndim + num_batch + 1, N, vd))
+    Vt_primal_dims.append(DenseIndex(Vt_ndim + num_batch + 1, N, vd))
     vd += 1
     Vt_tensor = _swap_back_axes(SparseTensor(Vt_out_dims, Vt_primal_dims, J_Vt))
 
@@ -3419,16 +3473,16 @@ def qr_elemental_rule(primals, **params):
     Q_primal_dims = []
     vd = 0
     for i, s in enumerate(batch_dims):
-        Q_out_dims.append(SparseDimension(i, s, vd, Q_ndim + i))
-        Q_primal_dims.append(SparseDimension(Q_ndim + i, s, vd, i))
+        Q_out_dims.append(SparseIndex(i, s, vd, Q_ndim + i))
+        Q_primal_dims.append(SparseIndex(Q_ndim + i, s, vd, i))
         vd += 1
-    Q_out_dims.append(DenseDimension(num_batch, M, vd))
+    Q_out_dims.append(DenseIndex(num_batch, M, vd))
     vd += 1
-    Q_out_dims.append(DenseDimension(num_batch + 1, K, vd))
+    Q_out_dims.append(DenseIndex(num_batch + 1, K, vd))
     vd += 1
-    Q_primal_dims.append(DenseDimension(Q_ndim + num_batch, M, vd))
+    Q_primal_dims.append(DenseIndex(Q_ndim + num_batch, M, vd))
     vd += 1
-    Q_primal_dims.append(DenseDimension(Q_ndim + num_batch + 1, N, vd))
+    Q_primal_dims.append(DenseIndex(Q_ndim + num_batch + 1, N, vd))
     vd += 1
     Q_tensor = _swap_back_axes(SparseTensor(Q_out_dims, Q_primal_dims, dq))
 
@@ -3438,16 +3492,16 @@ def qr_elemental_rule(primals, **params):
     R_primal_dims = []
     vd = 0
     for i, s in enumerate(batch_dims):
-        R_out_dims.append(SparseDimension(i, s, vd, R_ndim + i))
-        R_primal_dims.append(SparseDimension(R_ndim + i, s, vd, i))
+        R_out_dims.append(SparseIndex(i, s, vd, R_ndim + i))
+        R_primal_dims.append(SparseIndex(R_ndim + i, s, vd, i))
         vd += 1
-    R_out_dims.append(DenseDimension(num_batch, K, vd))
+    R_out_dims.append(DenseIndex(num_batch, K, vd))
     vd += 1
-    R_out_dims.append(DenseDimension(num_batch + 1, N, vd))
+    R_out_dims.append(DenseIndex(num_batch + 1, N, vd))
     vd += 1
-    R_primal_dims.append(DenseDimension(R_ndim + num_batch, M, vd))
+    R_primal_dims.append(DenseIndex(R_ndim + num_batch, M, vd))
     vd += 1
-    R_primal_dims.append(DenseDimension(R_ndim + num_batch + 1, N, vd))
+    R_primal_dims.append(DenseIndex(R_ndim + num_batch + 1, N, vd))
     vd += 1
     R_tensor = _swap_back_axes(SparseTensor(R_out_dims, R_primal_dims, dr))
 
@@ -3482,33 +3536,33 @@ def tridiagonal_solve_elemental_rule(primals, **params):
     # b_tensor is identical to A_inv with specific tensor axes
     b_out_dims = []
     b_primal_dims = []
-    b_out_dims.append(DenseDimension(0, N, 0))
-    b_out_dims.append(SparseDimension(1, nrhs, None, x_ndim + 1))
-    b_primal_dims.append(DenseDimension(x_ndim, N, 1))
-    b_primal_dims.append(SparseDimension(x_ndim + 1, nrhs, None, 1))
+    b_out_dims.append(DenseIndex(0, N, 0))
+    b_out_dims.append(SparseIndex(1, nrhs, None, x_ndim + 1))
+    b_primal_dims.append(DenseIndex(x_ndim, N, 1))
+    b_primal_dims.append(SparseIndex(x_ndim + 1, nrhs, None, 1))
     b_tensor = _swap_back_axes(SparseTensor(b_out_dims, b_primal_dims, A_inv))
 
     # Analytical J_d = -A_inv[i, k] * x[k, j]
     J_d = -jnp.einsum("ik,kj->kij", A_inv, x)
 
-    d_out_dims = [DenseDimension(0, N, 0), DenseDimension(1, nrhs, 1)]
-    d_primal_dims = [DenseDimension(x_ndim, N, 2)]
+    d_out_dims = [DenseIndex(0, N, 0), DenseIndex(1, nrhs, 1)]
+    d_primal_dims = [DenseIndex(x_ndim, N, 2)]
     d_tensor = _swap_back_axes(SparseTensor(d_out_dims, d_primal_dims, J_d))
 
     # Analytical J_dl = -A_inv[:, k] * x[k-1, :]
     shifted_x_dl = jnp.concatenate([jnp.zeros_like(x[:1]), x[:-1]], axis=0)
     J_dl = -jnp.einsum("ik,kj->kij", A_inv, shifted_x_dl)
 
-    dl_out_dims = [DenseDimension(0, N, 0), DenseDimension(1, nrhs, 1)]
-    dl_primal_dims = [DenseDimension(x_ndim, N, 2)]
+    dl_out_dims = [DenseIndex(0, N, 0), DenseIndex(1, nrhs, 1)]
+    dl_primal_dims = [DenseIndex(x_ndim, N, 2)]
     dl_tensor = _swap_back_axes(SparseTensor(dl_out_dims, dl_primal_dims, J_dl))
 
     # Analytical J_du = -A_inv[:, k-1] * x[k, :] (shift A_inv instead of x for correct index matching)
     shifted_x_du = jnp.concatenate([x[1:], jnp.zeros_like(x[:1])], axis=0)
     J_du = -jnp.einsum("ik,kj->kij", A_inv, shifted_x_du)
 
-    du_out_dims = [DenseDimension(0, N, 0), DenseDimension(1, nrhs, 1)]
-    du_primal_dims = [DenseDimension(x_ndim, N, 2)]
+    du_out_dims = [DenseIndex(0, N, 0), DenseIndex(1, nrhs, 1)]
+    du_primal_dims = [DenseIndex(x_ndim, N, 2)]
     du_tensor = _swap_back_axes(SparseTensor(du_out_dims, du_primal_dims, J_du))
 
     return val_out, [dl_tensor, d_tensor, du_tensor, b_tensor]
@@ -3578,17 +3632,17 @@ def lu_elemental_rule(primals, **params):
     lu_out_dims, lu_primal_dims = [], []
     vd = 0
     for i, s in enumerate(batch_dims):
-        lu_out_dims.append(SparseDimension(i, s, vd, lu_ndim + i))
-        lu_primal_dims.append(SparseDimension(lu_ndim + i, s, vd, i))
+        lu_out_dims.append(SparseIndex(i, s, vd, lu_ndim + i))
+        lu_primal_dims.append(SparseIndex(lu_ndim + i, s, vd, i))
         vd += 1
 
-    lu_out_dims.append(DenseDimension(num_batch, N, vd))
+    lu_out_dims.append(DenseIndex(num_batch, N, vd))
     vd += 1
-    lu_out_dims.append(DenseDimension(num_batch + 1, N, vd))
+    lu_out_dims.append(DenseIndex(num_batch + 1, N, vd))
     vd += 1
-    lu_primal_dims.append(DenseDimension(lu_ndim + num_batch, N, vd))
+    lu_primal_dims.append(DenseIndex(lu_ndim + num_batch, N, vd))
     vd += 1
-    lu_primal_dims.append(DenseDimension(lu_ndim + num_batch + 1, N, vd))
+    lu_primal_dims.append(DenseIndex(lu_ndim + num_batch + 1, N, vd))
     vd += 1
 
     lu_tensor = _swap_back_axes(SparseTensor(lu_out_dims, lu_primal_dims, J_lu))
@@ -3638,15 +3692,15 @@ def eig_elemental_rule(primals, **params):
     w_out_dims, w_primal_dims = [], []
     vd = 0
     for i, s in enumerate(batch_dims):
-        w_out_dims.append(SparseDimension(i, s, vd, w_ndim + i))
-        w_primal_dims.append(SparseDimension(w_ndim + i, s, vd, i))
+        w_out_dims.append(SparseIndex(i, s, vd, w_ndim + i))
+        w_primal_dims.append(SparseIndex(w_ndim + i, s, vd, i))
         vd += 1
 
-    w_out_dims.append(DenseDimension(num_batch, N, vd))
+    w_out_dims.append(DenseIndex(num_batch, N, vd))
     vd += 1
-    w_primal_dims.append(DenseDimension(w_ndim + num_batch, N, vd))
+    w_primal_dims.append(DenseIndex(w_ndim + num_batch, N, vd))
     vd += 1
-    w_primal_dims.append(DenseDimension(w_ndim + num_batch + 1, N, vd))
+    w_primal_dims.append(DenseIndex(w_ndim + num_batch + 1, N, vd))
     vd += 1
     w_tensor = _swap_back_axes(SparseTensor(w_out_dims, w_primal_dims, J_w))
 
@@ -3665,17 +3719,17 @@ def eig_elemental_rule(primals, **params):
         V_out_dims, V_primal_dims = [], []
         vd = 0
         for i, s in enumerate(batch_dims):
-            V_out_dims.append(SparseDimension(i, s, vd, V_ndim + i))
-            V_primal_dims.append(SparseDimension(V_ndim + i, s, vd, i))
+            V_out_dims.append(SparseIndex(i, s, vd, V_ndim + i))
+            V_primal_dims.append(SparseIndex(V_ndim + i, s, vd, i))
             vd += 1
 
-        V_out_dims.append(DenseDimension(num_batch, N, vd))
+        V_out_dims.append(DenseIndex(num_batch, N, vd))
         vd += 1
-        V_out_dims.append(DenseDimension(num_batch + 1, N, vd))
+        V_out_dims.append(DenseIndex(num_batch + 1, N, vd))
         vd += 1
-        V_primal_dims.append(DenseDimension(V_ndim + num_batch, N, vd))
+        V_primal_dims.append(DenseIndex(V_ndim + num_batch, N, vd))
         vd += 1
-        V_primal_dims.append(DenseDimension(V_ndim + num_batch + 1, N, vd))
+        V_primal_dims.append(DenseIndex(V_ndim + num_batch + 1, N, vd))
         vd += 1
         V_tensor = _swap_back_axes(SparseTensor(V_out_dims, V_primal_dims, J_V))
 
@@ -3692,17 +3746,17 @@ def eig_elemental_rule(primals, **params):
         vl_out_dims, vl_primal_dims = [], []
         vd = 0
         for i, s in enumerate(batch_dims):
-            vl_out_dims.append(SparseDimension(i, s, vd, vl_ndim + i))
-            vl_primal_dims.append(SparseDimension(vl_ndim + i, s, vd, i))
+            vl_out_dims.append(SparseIndex(i, s, vd, vl_ndim + i))
+            vl_primal_dims.append(SparseIndex(vl_ndim + i, s, vd, i))
             vd += 1
 
-        vl_out_dims.append(DenseDimension(num_batch, N, vd))
+        vl_out_dims.append(DenseIndex(num_batch, N, vd))
         vd += 1
-        vl_out_dims.append(DenseDimension(num_batch + 1, N, vd))
+        vl_out_dims.append(DenseIndex(num_batch + 1, N, vd))
         vd += 1
-        vl_primal_dims.append(DenseDimension(vl_ndim + num_batch, N, vd))
+        vl_primal_dims.append(DenseIndex(vl_ndim + num_batch, N, vd))
         vd += 1
-        vl_primal_dims.append(DenseDimension(vl_ndim + num_batch + 1, N, vd))
+        vl_primal_dims.append(DenseIndex(vl_ndim + num_batch + 1, N, vd))
         vd += 1
         vl_tensor = _swap_back_axes(SparseTensor(vl_out_dims, vl_primal_dims, J_vl))
 

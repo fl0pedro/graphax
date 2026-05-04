@@ -5,8 +5,8 @@ import jax.numpy as jnp
 
 from graphax.sparse.tensor import (
     SparseTensor,
-    DenseDimension,
-    SparseDimension,
+    DenseIndex,
+    SparseIndex,
 )
 from graphax.sparse.ops import dense
 
@@ -14,60 +14,60 @@ from graphax.sparse.ops import dense
 class TestSelfDenseNones(unittest.TestCase):
     def st_2d(self):
         return SparseTensor(
-            (SparseDimension(0, 100, None, 1),),
-            (SparseDimension(1, 100, None, 0),),
+            (SparseIndex(0, 100, None, 1),),
+            (SparseIndex(1, 100, None, 0),),
             None,
         )
 
     def bst_2d(self):
         return SparseTensor(
-            (SparseDimension(0, 4, None, 1, 5),),
-            (SparseDimension(1, 4, None, 0, 5),),
+            (SparseIndex(0, 4, None, 1, 5),),
+            (SparseIndex(1, 4, None, 0, 5),),
             None,
         )
 
     def bst_3d(self):
         return SparseTensor(
-            (SparseDimension(0, 3, None, 2, 4),),
-            (DenseDimension(1, 5, None), SparseDimension(2, 3, None, 0, 6)),
+            (SparseIndex(0, 3, None, 2, 4),),
+            (DenseIndex(1, 5, None), SparseIndex(2, 3, None, 0, 6)),
             None,
         )
 
     def bst_3d_val_dense(self):
         x = jnp.arange(5)
         return SparseTensor(
-            (SparseDimension(0, 3, None, 2, 4),),
-            (DenseDimension(1, 5, 0), SparseDimension(2, 3, None, 0, 6)),
+            (SparseIndex(0, 3, None, 2, 4),),
+            (DenseIndex(1, 5, 0), SparseIndex(2, 3, None, 0, 6)),
             x,
         )
 
     def st_4d(self):
         return SparseTensor(
-            (SparseDimension(0, 3, None, 2), SparseDimension(1, 4, None, 3)),
-            (SparseDimension(2, 3, None, 0), SparseDimension(3, 4, None, 1)),
+            (SparseIndex(0, 3, None, 2), SparseIndex(1, 4, None, 3)),
+            (SparseIndex(2, 3, None, 0), SparseIndex(3, 4, None, 1)),
             None,
         )
 
     def st_4d_val_sparse_1(self):
         x = jnp.arange(3).reshape(3, 1, 1)
         return SparseTensor(
-            (SparseDimension(0, 3, 0, 2), SparseDimension(1, 4, None, 3)),
-            (SparseDimension(2, 3, 0, 0), SparseDimension(3, 4, None, 1)),
+            (SparseIndex(0, 3, 0, 2), SparseIndex(1, 4, None, 3)),
+            (SparseIndex(2, 3, 0, 0), SparseIndex(3, 4, None, 1)),
             x,
         )
 
     def st_4d_val_sparse_2(self):
         x = jnp.arange(4).reshape(4, 1, 1)
         return SparseTensor(
-            (SparseDimension(0, 3, None, 2), SparseDimension(1, 4, 0, 3)),
-            (SparseDimension(2, 3, None, 0), SparseDimension(3, 4, 0, 1)),
+            (SparseIndex(0, 3, None, 2), SparseIndex(1, 4, 0, 3)),
+            (SparseIndex(2, 3, None, 0), SparseIndex(3, 4, 0, 1)),
             x,
         )
 
     def bst_4d_1(self):
         return SparseTensor(
-            (SparseDimension(0, 3, None, 2, 5), SparseDimension(1, 4, None, 3, 6)),
-            (SparseDimension(2, 3, None, 0, 7), SparseDimension(3, 4, None, 1, 8)),
+            (SparseIndex(0, 3, None, 2, 5), SparseIndex(1, 4, None, 3, 6)),
+            (SparseIndex(2, 3, None, 0, 7), SparseIndex(3, 4, None, 1, 8)),
             None,
         )
 
@@ -75,12 +75,12 @@ class TestSelfDenseNones(unittest.TestCase):
         x = jnp.arange(3 * 5 * 7).reshape(3, 5, 7)
         return SparseTensor(
             (
-                SparseDimension(0, 3, 0, 2, 5, 1),
-                SparseDimension(1, 4, None, 3, 6, None),
+                SparseIndex(0, 3, 0, 2, 5, 1),
+                SparseIndex(1, 4, None, 3, 6, None),
             ),
             (
-                SparseDimension(2, 3, 0, 0, 7, 2),
-                SparseDimension(3, 4, None, 1, 8, None),
+                SparseIndex(2, 3, 0, 0, 7, 2),
+                SparseIndex(3, 4, None, 1, 8, None),
             ),
             x,
         )
@@ -89,60 +89,60 @@ class TestSelfDenseNones(unittest.TestCase):
         x = jnp.arange(4 * 6 * 8).reshape(4, 6, 8)
         return SparseTensor(
             (
-                SparseDimension(0, 3, None, 2, 5, None),
-                SparseDimension(1, 4, 0, 3, 6, 1),
+                SparseIndex(0, 3, None, 2, 5, None),
+                SparseIndex(1, 4, 0, 3, 6, 1),
             ),
             (
-                SparseDimension(2, 3, None, 0, 7, None),
-                SparseDimension(3, 4, 0, 1, 8, 2),
+                SparseIndex(2, 3, None, 0, 7, None),
+                SparseIndex(3, 4, 0, 1, 8, 2),
             ),
             x,
         )
 
     def bst_4d_2(self):
         return SparseTensor(
-            (SparseDimension(0, 3, None, 2, 4), DenseDimension(1, 5, None)),
-            (SparseDimension(2, 3, None, 0, 6), DenseDimension(3, 7, None)),
+            (SparseIndex(0, 3, None, 2, 4), DenseIndex(1, 5, None)),
+            (SparseIndex(2, 3, None, 0, 6), DenseIndex(3, 7, None)),
             None,
         )
 
     def bst_4d_2_val_sparse(self):
         x = jnp.arange(3 * 4 * 6).reshape(3, 4, 6)
         return SparseTensor(
-            (SparseDimension(0, 3, 0, 2, 4, 1), DenseDimension(1, 5, None)),
-            (SparseDimension(2, 3, 0, 0, 6, 2), DenseDimension(3, 7, None)),
+            (SparseIndex(0, 3, 0, 2, 4, 1), DenseIndex(1, 5, None)),
+            (SparseIndex(2, 3, 0, 0, 6, 2), DenseIndex(3, 7, None)),
             x,
         )
 
     def bst_4d_2_val_dense_1(self):
         x = jnp.arange(5)
         return SparseTensor(
-            (SparseDimension(0, 3, None, 2, 4), DenseDimension(1, 5, 0)),
-            (SparseDimension(2, 3, None, 0, 6), DenseDimension(3, 7, None)),
+            (SparseIndex(0, 3, None, 2, 4), DenseIndex(1, 5, 0)),
+            (SparseIndex(2, 3, None, 0, 6), DenseIndex(3, 7, None)),
             x,
         )
 
     def bst_4d_2_val_dense_2(self):
         x = jnp.arange(7)
         return SparseTensor(
-            (SparseDimension(0, 3, None, 2, 4), DenseDimension(1, 5, None)),
-            (SparseDimension(2, 3, None, 0, 6), DenseDimension(3, 7, 0)),
+            (SparseIndex(0, 3, None, 2, 4), DenseIndex(1, 5, None)),
+            (SparseIndex(2, 3, None, 0, 6), DenseIndex(3, 7, 0)),
             x,
         )
 
     def bst_4d_2_val_dense_3(self):
         x = jnp.arange(5 * 7).reshape(5, 7)
         return SparseTensor(
-            (SparseDimension(0, 3, None, 2, 4), DenseDimension(1, 5, 0)),
-            (SparseDimension(2, 3, None, 0, 6), DenseDimension(3, 7, 1)),
+            (SparseIndex(0, 3, None, 2, 4), DenseIndex(1, 5, 0)),
+            (SparseIndex(2, 3, None, 0, 6), DenseIndex(3, 7, 1)),
             x,
         )
 
     def bst_4d_2_val_sparse_and_dense(self):
         x = jnp.arange(3 * 4 * 6 * 7).reshape(3, 4, 6, 7)
         return SparseTensor(
-            (SparseDimension(0, 3, 0, 2, 4, 1), DenseDimension(1, 5, None)),
-            (SparseDimension(2, 3, 0, 0, 6, 2), DenseDimension(3, 7, 3)),
+            (SparseIndex(0, 3, 0, 2, 4, 1), DenseIndex(1, 5, None)),
+            (SparseIndex(2, 3, 0, 0, 6, 2), DenseIndex(3, 7, 3)),
             x,
         )
 
@@ -183,7 +183,7 @@ class TestSelfDenseNones(unittest.TestCase):
                 self.assertEqual(len(st.dims), len(res.dims))
                 if res.val is not None:
                     self.assertEqual(st.shape, res.val.shape)
-                self.assertTrue(all(isinstance(d, DenseDimension) for d in res.dims))
+                self.assertTrue(all(isinstance(d, DenseIndex) for d in res.dims))
 
     def test_dense_twice(self):
         for fixture_fn in self.get_all_fixtures():
@@ -197,7 +197,7 @@ class TestSelfDenseNones(unittest.TestCase):
         for fixture_fn in self.get_all_fixtures():
             with self.subTest(fixture=fixture_fn.__name__):
                 st = fixture_fn()
-                axes = [d.id for d in st.dims if d.val_dim is None]
+                axes = [d.id for d in st.dims if d.axis is None]
 
                 for r in range(len(axes)):
                     for axis in combinations(axes, r):
@@ -215,7 +215,7 @@ class TestSelfDenseNones(unittest.TestCase):
         for fixture_fn in self.get_all_fixtures():
             with self.subTest(fixture=fixture_fn.__name__):
                 st = fixture_fn()
-                axes = [d.id for d in st.dims if d.val_dim is None]
+                axes = [d.id for d in st.dims if d.axis is None]
                 for r in range(len(axes)):
                     for axis in combinations(axes, r):
                         res = dense(st, axes=axis, hard=True)

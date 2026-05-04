@@ -7,11 +7,11 @@ import jax.numpy as jnp
 
 from graphax.sparse.ops.dense import dense
 
-from graphax.sparse.dimensions import Dimension, SparseDimension, DenseDimension
+from graphax.sparse.indexes import Index, SparseIndex, DenseIndex
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
-from graphax.sparse.dimensions import Dimension, SparseDimension, DenseDimension
+from graphax.sparse.indexes import Index, SparseIndex, DenseIndex
 
 
 def _get_full_permutation(
@@ -59,7 +59,7 @@ def _ensure_valid_sparsity(
 
     axes_to_densify = []
     for i, dim in enumerate(tensor.dims):
-        if isinstance(dim, SparseDimension):
+        if isinstance(dim, SparseIndex):
             other_pos = dim_id_to_index[dim.other_id]
             # If both ends of a sparse pair end up on the same side (both out or both primal),
             # they must be densified to maintain the invariant that sparse dimensions

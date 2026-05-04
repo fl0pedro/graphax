@@ -5,7 +5,7 @@ import jax.random as jrand
 import unittest
 from chex import Array
 
-from graphax.sparse.dimensions import DenseDimension, SparseDimension
+from graphax.sparse.indexes import DenseIndex, SparseIndex
 from graphax.sparse.tensor import SparseTensor
 from graphax.sparse.ops.utils import _arr2st
 
@@ -72,7 +72,7 @@ def verify_dimensions(out_dims, primal_dims, val=None):
     ids = [d.id for d in dims]
     assert len(ids) == len(set(ids))
 
-    sparse_dims = {d.id: d for d in dims if isinstance(d, SparseDimension)}
+    sparse_dims = {d.id: d for d in dims if isinstance(d, SparseIndex)}
     for d in sparse_dims.values():
         assert d.other_id in sparse_dims
         other = sparse_dims[d.other_id]
@@ -105,7 +105,7 @@ def validate_sparse_tensor(st):
     assert st.shape == st.out_shape + st.primal_shape
 
     for d in st.dims:
-        if isinstance(d, SparseDimension):
+        if isinstance(d, SparseIndex):
             assert d.logical_size == d.size * (d.block_size or 1)
         else:
             assert d.logical_size == d.size
@@ -139,18 +139,18 @@ def generate_dimension_specs(
         return blocks_shape[phys] if phys is not None else 1
 
     def make_sparse(id, other_id, sparse_idx, dense_idx):
-        return SparseDimension(
+        return SparseIndex(
             id,
             get_sparse_size(sparse_idx),
-            val_dim=map_sparse(sparse_idx),
+            axis=map_sparse(sparse_idx),
             other_id=other_id,
             block_size=get_block_size(dense_idx),
-            block_val_dim=map_dense(dense_idx),
+            block_axis=map_dense(dense_idx),
         )
 
     def make_dense(id, dense_idx):
-        return DenseDimension(
-            id, get_block_size(dense_idx), val_dim=map_dense(dense_idx)
+        return DenseIndex(
+            id, get_block_size(dense_idx), axis=map_dense(dense_idx)
         )
 
     specs = []
@@ -284,18 +284,18 @@ def drop_physical_axes(st, axes_to_drop):
 
     new_dims = []
     for d in st.dims:
-        if isinstance(d, SparseDimension):
-            new_d = SparseDimension(
+        if isinstance(d, SparseIndex):
+            new_d = SparseIndex(
                 d.id,
                 d.size,
-                val_dim=map_dim_idx(d.val_dim),
+                axis=map_dim_idx(d.axis),
                 other_id=d.other_id,
                 block_size=d.block_size,
-                block_val_dim=map_dim_idx(d.block_val_dim),
+                block_axis=map_dim_idx(d.block_axis),
             )
             new_dims.append(new_d)
         else:
-            new_d = DenseDimension(d.id, d.size, val_dim=map_dim_idx(d.val_dim))
+            new_d = DenseIndex(d.id, d.size, axis=map_dim_idx(d.axis))
             new_dims.append(new_d)
 
     n_out = len(st.out_dims)
@@ -503,18 +503,18 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(compute_physical_shape(st), val.shape)
 
     def test_verify_dimensions(self):
-        d1 = DenseDimension(0, 2, 0)
-        d2 = DenseDimension(1, 2, 1)
+        d1 = DenseIndex(0, 2, 0)
+        d2 = DenseIndex(1, 2, 1)
         verify_dimensions([d1], [d2])
 
         with self.assertRaises(AssertionError):
             verify_dimensions([d1], [d1])
 
-        s1 = SparseDimension(0, 2, 0, 1)
+        s1 = SparseIndex(0, 2, 0, 1)
         with self.assertRaises(AssertionError):
             verify_dimensions([s1], [])
 
-        s2 = SparseDimension(1, 3, 1, 0)
+        s2 = SparseIndex(1, 3, 1, 0)
         with self.assertRaises(AssertionError):
             verify_dimensions([s1], [s2])
 
@@ -543,16 +543,16 @@ class TestUtils(unittest.TestCase):
 
     def test_drop_physical_axes(self):
         val = jnp.arange(24).reshape(2, 3, 4)
-        d0 = DenseDimension(0, 2, 0)
-        d1 = DenseDimension(1, 3, 1)
-        d2 = DenseDimension(2, 4, 2)
+        d0 = DenseIndex(0, 2, 0)
+        d1 = DenseIndex(1, 3, 1)
+        d2 = DenseIndex(2, 4, 2)
         st = SparseTensor([d0], [d1, d2], val)
 
         st_drop = drop_physical_axes(st, {1})
         self.assertEqual(st_drop.val.shape, (2, 4))
-        self.assertEqual(st_drop.out_dims[0].val_dim, 0)
-        self.assertIsNone(st_drop.primal_dims[0].val_dim)
-        self.assertEqual(st_drop.primal_dims[1].val_dim, 1)
+        self.assertEqual(st_drop.out_dims[0].axis, 0)
+        self.assertIsNone(st_drop.primal_dims[0].axis)
+        self.assertEqual(st_drop.primal_dims[1].axis, 1)
 
         expected = val[:, 0, :]
         self.assertTrue(jnp.array_equal(st_drop.val, expected))

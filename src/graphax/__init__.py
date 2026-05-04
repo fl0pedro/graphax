@@ -1,9 +1,9 @@
 import sys
 
-from .core import jacve, tree_allclose
-from .equinox_bindings import filter_jacve
+from .core import jacve, set_pjit_elimination_order
 
-# from .sparse import sparse_tensor_zeros_like
+# from .sparse import sparse_tensor_zeros_like  # custom_elemental,
+from .utils import tree_allclose
 
 if sys.version_info[:2] >= (3, 8):
     # TODO: Import directly (no need for conditional) when `python_requires = >= 3.8`
