@@ -780,20 +780,329 @@ def get_valid_pairings(
 
     return valid_ids
 
+def _shift_axis_after_changes(old_pos: int | None, axis_changes: list[tuple[int, int]]) -> int | None:
+    """Apply a sequence of (delete, insert) axis edits to a single position.
+
+    `axis_changes` is a list of operations applied in order. Each entry is
+    `(removed_pos, inserted_pos)`: the axis at ``removed_pos`` was removed
+    (use ``-1`` if no removal happened), and a new axis was inserted at
+    ``inserted_pos`` (use ``-1`` if no insertion happened).
+
+    Returns the new physical position of the axis that originally lived at
+    ``old_pos``, or ``None`` if it was deleted along the way.
+    """
+    if old_pos is None:
+        return None
+    pos = old_pos
+    for removed, inserted in axis_changes:
+        if removed >= 0:
+            if pos == removed:
+                return None  # axis was dropped
+            if pos > removed:
+                pos -= 1
+        if inserted >= 0:
+            if pos >= inserted:
+                pos += 1
+    return pos
+
+
+def _apply_zero_factor(
+    st: SparseTensor,
+    is_out1: bool, idx1: int,
+    is_out2: bool, idx2: int,
+) -> SparseTensor:
+    """``factor == 0``: zero out the (idx1, idx2) pair.
+
+    The diagonal contribution of these axes vanishes — convert each to a
+    DenseIndex with size=0 (or, when one axis is implicit, just drop the
+    other physical axis with ``[..., 0]``-indexing as the legacy code did).
+    """
+    out_len = len(st.out_dims)
+    d1 = st.out_dims[idx1] if is_out1 else st.primal_dims[idx1]
+    d2 = st.out_dims[idx2] if is_out2 else st.primal_dims[idx2]
+
+    v1 = getattr(d1, "axis", None)
+    v2 = getattr(d2, "axis", None)
+    if v1 is not None and v1 >= st.val.ndim:
+        v1 = None
+    if v2 is not None and v2 >= st.val.ndim:
+        v2 = None
+
+    val = st.val
+    drops = sorted({v for v in (v1, v2) if v is not None}, reverse=True)
+    axis_changes = []
+    for ax in drops:
+        val = val[..., 0] if ax == val.ndim - 1 else jnp.take(val, 0, axis=ax)
+        axis_changes.append((ax, -1))
+
+    def _drop(d):
+        return DenseIndex(id=d.id, size=d.logical_size, axis=None)
+
+    new_out = list(st.out_dims)
+    new_primal = list(st.primal_dims)
+    if is_out1:
+        new_out[idx1] = _drop(d1)
+    else:
+        new_primal[idx1] = _drop(d1)
+    if is_out2:
+        new_out[idx2] = _drop(d2)
+    else:
+        new_primal[idx2] = _drop(d2)
+
+    def _shift_other(d, dim_obj):
+        if dim_obj in (d1, d2):
+            return d
+        old_v = getattr(d, "axis", None)
+        old_b = getattr(d, "block_axis", None)
+        nv = _shift_axis_after_changes(old_v, axis_changes)
+        nb = _shift_axis_after_changes(old_b, axis_changes)
+        if isinstance(d, SparseIndex):
+            return replace(d, axis=nv, block_axis=nb)
+        return replace(d, axis=nv)
+
+    new_out = [_shift_other(d, d) for d in new_out]
+    new_primal = [_shift_other(d, d) for d in new_primal]
+    return SparseTensor(new_out, new_primal, val, st.scalar_mult, sort_val=False, check_consistency=False)
+
+
+def _apply_block_diagonal(
+    st: SparseTensor,
+    is_out1: bool, idx1: int,
+    is_out2: bool, idx2: int,
+    size: int, b1: int, b2: int,
+) -> SparseTensor:
+    """Apply a single ``(idx1, idx2, size, b1, b2)`` block-diagonal rule.
+
+    The two paired physical axes (one of size ``size*b1`` for the lhs side,
+    one of size ``size*b2`` for the rhs side) are reshaped to ``(size, b1)``
+    and ``(size, b2)``; then the diagonal along the two ``size`` axes is
+    taken so the result keeps a single ``size`` axis. The ``b1`` and ``b2``
+    axes survive as the SparseIndex block axes — that's what the matmul
+    needs to broadcast and reduce a true block-diagonal.
+
+    The general case shifts every other axis ``p`` of the source val by
+    ``+1`` if ``p > min(v1, v2)``, since net we add one new physical axis
+    (lose two via diagonal, gain three via reshape+diagonal-result). The
+    K axis lands at ``min(v1, v2)`` and ``b1``/``b2`` at the next slots.
+
+    Special cases handled inline:
+    * ``size == 1``: factor=1 ⇒ no real diagonalisation; return ``st`` so we
+      never construct a degenerate ``SparseIndex(size=1, block_size=N)``.
+    * ``b1 == b2 == 1`` (full diagonal): no block axes, just collapse the
+      two source axes into one.
+    * One of ``v1``/``v2`` is implicit (axis is None or out of range): just
+      reshape the explicit side to expose the block axis. Nothing to take a
+      diagonal against on the implicit side.
+    """
+    if size == 1:
+        return st  # no-op
+
+    d1 = st.out_dims[idx1] if is_out1 else st.primal_dims[idx1]
+    d2 = st.out_dims[idx2] if is_out2 else st.primal_dims[idx2]
+
+    if isinstance(d1, SparseIndex) and getattr(d1, "other_id", None) != d2.id:
+        return st
+    if isinstance(d2, SparseIndex) and getattr(d2, "other_id", None) != d1.id:
+        return st
+
+    v1 = getattr(d1, "axis", None)
+    v2 = getattr(d2, "axis", None)
+    if v1 is not None and v1 >= st.val.ndim:
+        v1 = None
+    if v2 is not None and v2 >= st.val.ndim:
+        v2 = None
+
+    val = st.val
+    new_K_axis: int | None = None
+    new_b1_axis: int | None = None
+    new_b2_axis: int | None = None
+    other_shift_threshold: int | None = None  # other axes >= this shift by +1
+
+    if v1 is None and v2 is None:
+        # Pure broadcast case: nothing to reshape. Both halves of the new
+        # SparseIndex pair will have axis=None (the matmul handles the
+        # broadcast via _get_dim_vals returning size=1 for outer).
+        pass
+    elif v1 is None or v2 is None:
+        # Only one physical axis exists for this pair; we still need to
+        # split it into (size, b) so the matmul has a separate block axis.
+        v_present = v1 if v1 is not None else v2
+        b_present = b1 if v1 is not None else b2
+        new_shape = list(val.shape)
+        new_shape[v_present] = size
+        new_shape.insert(v_present + 1, b_present)
+        val = val.reshape(new_shape)
+        new_K_axis = v_present
+        if v1 is not None:
+            new_b1_axis = v_present + 1 if b1 > 1 else None
+        else:
+            new_b2_axis = v_present + 1 if b2 > 1 else None
+        other_shift_threshold = v_present + 1
+    elif v1 == v2:
+        # Same physical axis: this happens when we re-sparsify an already
+        # paired SparseIndex (e.g. the val carries a true diagonal of the
+        # 4×4 logical matrix in a single physical axis of size 4). The
+        # matmul `_prepare_physical_array` can't handle two metadata axes
+        # pointing to the same physical position with non-1 sizes, so a
+        # block-diagonal re-interpretation here would just trip the same
+        # duplicate-perm bug we're fixing elsewhere. Bail out and keep the
+        # existing pairing — the call still succeeds, just at the prior
+        # sparsity level.
+        return st
+    else:
+        # The interesting case: both axes explicit and distinct. Reshape +
+        # diagonal + permute. Process the higher position first so the
+        # lower index is still valid.
+        new_shape = list(val.shape)
+        if v1 < v2:
+            lo, hi = v1, v2
+            lo_b, hi_b = b1, b2
+            lo_is_v1 = True
+        else:
+            lo, hi = v2, v1
+            lo_b, hi_b = b2, b1
+            lo_is_v1 = False
+        new_shape[hi] = size
+        new_shape.insert(hi + 1, hi_b)
+        new_shape[lo] = size
+        new_shape.insert(lo + 1, lo_b)
+        val = val.reshape(new_shape)
+        # In val_reshaped: lo's K is at lo, lo_b is at lo+1, hi's K is at
+        # hi+1 (one insert before it), hi_b is at hi+2.
+        lo_K, lo_b_pos = lo, lo + 1
+        hi_K, hi_b_pos = hi + 1, hi + 2
+
+        val = jnp.diagonal(val, axis1=lo_K, axis2=hi_K)
+        # diagonal removes lo_K and hi_K, places the diag axis at the end.
+        diag_pos = val.ndim - 1
+        target_K = lo
+        # In post-diagonal val, lo_b dropped from lo+1 to lo (because lo_K
+        # at position lo got removed). hi_b dropped from hi+2 to hi (lo_K
+        # removed at position lo, hi_K removed at position hi+1 — both
+        # below hi+2).
+        lo_b_post_diag = lo_b_pos - 1  # = lo
+        hi_b_post_diag = hi_b_pos - 2  # = hi
+        # Permute K from end to target_K. Axes at positions [target_K,
+        # diag_pos-1] shift +1.
+        if diag_pos != target_K:
+            perm = list(range(val.ndim))
+            perm.pop(diag_pos)
+            perm.insert(target_K, diag_pos)
+            val = jnp.transpose(val, perm)
+
+            def _shift_for_permute(p):
+                if p < target_K:
+                    return p
+                if p < diag_pos:
+                    return p + 1
+                return target_K  # never used (diag pos is removed)
+
+            lo_b_final = _shift_for_permute(lo_b_post_diag)
+            hi_b_final = _shift_for_permute(hi_b_post_diag)
+        else:
+            lo_b_final = lo_b_post_diag
+            hi_b_final = hi_b_post_diag
+
+        new_K_axis = target_K
+        if lo_is_v1:
+            new_b1_axis = lo_b_final if b1 > 1 else None
+            new_b2_axis = hi_b_final if b2 > 1 else None
+        else:
+            new_b2_axis = lo_b_final if b2 > 1 else None
+            new_b1_axis = hi_b_final if b1 > 1 else None
+        # OTHER axes (positions in original val that aren't v1 or v2):
+        # reshape (+1 if pos > v1, +1 if pos > v2), diagonal removes 2
+        # axes (-1 each), permute inserts diag (+1 if pos >= target_K).
+        # Net: pos < target_K → unchanged; pos > target_K → +1; the special
+        # cases p == v1 and p == v2 are the split axes (handled above and
+        # don't appear among "other" axes).
+        other_shift_threshold = target_K + 1
+
+    def _shift_other(p):
+        if p is None or other_shift_threshold is None:
+            return p
+        return p + 1 if p >= other_shift_threshold else p
+
+    def _build(d, other_d, axis, block_axis, b_size):
+        return SparseIndex(
+            id=d.id,
+            size=size,
+            axis=axis,
+            other_id=other_d.id,
+            block_size=b_size if b_size > 1 else None,
+            block_axis=block_axis if b_size > 1 else None,
+        )
+
+    new_d1 = _build(d1, d2, new_K_axis, new_b1_axis, b1)
+    new_d2 = _build(d2, d1, new_K_axis, new_b2_axis, b2)
+
+    def _remap_other(d):
+        old_v = getattr(d, "axis", None)
+        old_b = getattr(d, "block_axis", None)
+        nv = _shift_other(old_v)
+        nb = _shift_other(old_b)
+        if isinstance(d, SparseIndex):
+            return replace(d, axis=nv, block_axis=nb)
+        return replace(d, axis=nv)
+
+    new_out = list(st.out_dims)
+    new_primal = list(st.primal_dims)
+    for i, d in enumerate(st.out_dims):
+        if i == idx1 and is_out1:
+            new_out[i] = new_d1
+        elif i == idx2 and is_out2:
+            new_out[i] = new_d2
+        else:
+            new_out[i] = _remap_other(d)
+    for i, d in enumerate(st.primal_dims):
+        if i == idx1 and not is_out1:
+            new_primal[i] = new_d1
+        elif i == idx2 and not is_out2:
+            new_primal[i] = new_d2
+        else:
+            new_primal[i] = _remap_other(d)
+
+    return SparseTensor(new_out, new_primal, val, st.scalar_mult, sort_val=False, check_consistency=False)
+
+
 @partial(jax.jit, static_argnums=1)
 def apply_dynamic_sparsity(
-    st: SparseTensor, 
-    sp_rules: tuple[tuple[int, ...], ...]
+    st: SparseTensor,
+    sp_rules: tuple[tuple[int, ...], ...],
 ) -> SparseTensor:
+    """Apply a list of sparsification rules.
+
+    Each rule is ``(idx1, idx2[, factor])``. ``factor`` chooses how the pair
+    is decomposed:
+
+    * ``factor == -1``  — collapse to ``gcd(N1, N2)``-diagonal (the default
+      sparse case used by every legacy caller).
+    * ``factor ==  0``  — zero the pair out (drop both axes).
+    * ``factor ==  1``  — no-op (1 outer block ⇒ dense). The rule is
+      silently dropped instead of producing a degenerate
+      ``SparseIndex(size=1, block_size=N)`` that the matmul cannot consume.
+    * ``factor ==  K``  with ``K > 1``, ``K | N1`` and ``K | N2`` — produce
+      a true block-diagonal: ``SparseIndex(size=K, block_size=N/K)`` with
+      both ``axis`` and ``block_axis`` pointing to dedicated physical axes
+      in the val (the val is reshaped to expose the block axis).
+    * ``factor ==  K`` that does *not* divide both dims — fall back to
+      ``factor == -1`` so the call cannot crash. The alphagrad env masks
+      these out at policy time, but this fallback keeps direct API calls
+      safe too.
+
+    Multiple rules are processed sequentially; each one only sees the
+    intermediate result of the previous rule, so rules can safely operate
+    on different axes of the same SparseTensor.
+    """
     if not sp_rules or st.val is None:
         return st
 
     out_len = len(st.out_dims)
     total_ndim = out_len + len(st.primal_dims)
-    
-    valid_pairs = {}
-    factors = {}
-    
+
+    valid_pairs: dict[int, tuple[tuple[bool, int], tuple[bool, int]]] = {}
+    factors: dict[int, int] = {}
+
     for group_id, rule in enumerate(sp_rules):
         if len(rule) == 2:
             idx1, idx2 = rule
@@ -802,7 +1111,7 @@ def apply_dynamic_sparsity(
             idx1, idx2, factor = rule
         else:
             continue
-            
+
         if idx1 < total_ndim and idx2 < total_ndim:
             is_out1 = idx1 < out_len
             is_out2 = idx2 < out_len
@@ -811,201 +1120,60 @@ def apply_dynamic_sparsity(
             valid_pairs[group_id] = ((is_out1, rel_idx1), (is_out2, rel_idx2))
             factors[group_id] = factor
 
-    filtered_pairs = {}
-    used_axes = set()
+    # Drop conflicts and reused-axis rules (same as before).
+    filtered_pairs: dict[int, tuple[tuple[bool, int], tuple[bool, int]]] = {}
+    used_axes: set[int] = set()
     for gid, ((is_out1, idx1), (is_out2, idx2)) in valid_pairs.items():
         abs_idx1 = idx1 if is_out1 else idx1 + out_len
         abs_idx2 = idx2 if is_out2 else idx2 + out_len
-        
+
         if abs_idx1 in used_axes or abs_idx2 in used_axes or abs_idx1 == abs_idx2:
             continue
-            
+
         d1 = st.out_dims[idx1] if is_out1 else st.primal_dims[idx1]
         d2 = st.out_dims[idx2] if is_out2 else st.primal_dims[idx2]
-        
-        # Prevent breaking existing external pairs
+
         conflict = False
-        if isinstance(d1, SparseIndex) and getattr(d1, 'other_id', None) != d2.id:
+        if isinstance(d1, SparseIndex) and getattr(d1, "other_id", None) != d2.id:
             conflict = True
-        if isinstance(d2, SparseIndex) and getattr(d2, 'other_id', None) != d1.id:
+        if isinstance(d2, SparseIndex) and getattr(d2, "other_id", None) != d1.id:
             conflict = True
-            
         if conflict:
             continue
-            
+
         used_axes.add(abs_idx1)
         used_axes.add(abs_idx2)
         filtered_pairs[gid] = ((is_out1, idx1), (is_out2, idx2))
-        
+
     if not filtered_pairs:
         return st
 
-    # 1. Determine axes to extract and drop
-    axes_to_front = []
-    axes_to_drop = []
-    idx_arrays = []
-
+    # Apply each rule in sequence — the helpers track axis-position shifts
+    # so subsequent rules act on the right physical axes.
+    new_st = st
     for gid, ((is_out1, idx1), (is_out2, idx2)) in filtered_pairs.items():
-        d1 = st.out_dims[idx1] if is_out1 else st.primal_dims[idx1]
-        d2 = st.out_dims[idx2] if is_out2 else st.primal_dims[idx2]
-        
         factor = factors[gid]
-        size = math.gcd(d1.logical_size, d2.logical_size) if factor == -1 else factor
-        
-        v1 = getattr(d1, 'axis', None)
-        v2 = getattr(d2, 'axis', None)
-        if v1 is not None and v1 >= st.val.ndim: v1 = None
-        if v2 is not None and v2 >= st.val.ndim: v2 = None
-        
+        d1 = new_st.out_dims[idx1] if is_out1 else new_st.primal_dims[idx1]
+        d2 = new_st.out_dims[idx2] if is_out2 else new_st.primal_dims[idx2]
+        N1 = d1.logical_size
+        N2 = d2.logical_size
+
         if factor == 0:
-            if v1 is not None: axes_to_drop.append(v1)
-            if v2 is not None: axes_to_drop.append(v2)
+            new_st = _apply_zero_factor(new_st, is_out1, idx1, is_out2, idx2)
+            continue
+
+        if factor == -1:
+            size = math.gcd(N1, N2)
+        elif factor > 0 and N1 % factor == 0 and N2 % factor == 0:
+            size = factor
         else:
-            # FIX 1: Only extract if they are distinct physical axes!
-            if v1 is not None and v2 is not None and v1 != v2:
-                axes_to_front.extend([v1, v2])
-                idx_arrays.append(jnp.arange(size))
+            # Bad factor — fall back to gcd so the call doesn't crash.
+            size = math.gcd(N1, N2)
 
-    # 2. Build explicit map of physical axes
-    seen_axes = set()
-    unique_front = []
-    for ax in axes_to_front:
-        if ax not in seen_axes:
-            unique_front.append(ax)
-            seen_axes.add(ax)
-            
-    axes_to_drop = list(set(axes_to_drop))
-    remaining_axes = [i for i in range(st.val.ndim) if i not in seen_axes and i not in axes_to_drop]
-    
-    axis_map = {}
-    current_axis = 0
-    
-    # Paired extractions collapse into a single target axis
-    for i in range(0, len(unique_front), 2):
-        axis_map[unique_front[i]] = current_axis
-        axis_map[unique_front[i+1]] = current_axis
-        current_axis += 1
-        
-    for ax in remaining_axes:
-        axis_map[ax] = current_axis
-        current_axis += 1
-        
-    # 3. Vectorized Array Extraction
-    perm = tuple(unique_front) + tuple(remaining_axes) + tuple(axes_to_drop)
-    val_transposed = jnp.transpose(st.val, perm)
-    
-    if idx_arrays:
-        mesh_indices = jnp.ix_(*idx_arrays) 
-        val_diagonal = val_transposed[tuple(idx for pair in mesh_indices for idx in (pair, pair))]
-    else:
-        val_diagonal = val_transposed
+        b1 = N1 // size
+        b2 = N2 // size
+        new_st = _apply_block_diagonal(
+            new_st, is_out1, idx1, is_out2, idx2, size, b1, b2
+        )
 
-    if axes_to_drop:
-        for _ in range(len(axes_to_drop)):
-            val_diagonal = val_diagonal[..., 0]
-
-    # 4. Reconstruct Indexes enforcing exact shared assignments
-    new_out_dims = list(st.out_dims)
-    new_primal_dims = list(st.primal_dims)
-    touched_out = set()
-    touched_primal = set()
-
-    for gid, ((is_out1, idx1), (is_out2, idx2)) in filtered_pairs.items():
-        d1 = st.out_dims[idx1] if is_out1 else st.primal_dims[idx1]
-        d2 = st.out_dims[idx2] if is_out2 else st.primal_dims[idx2]
-        
-        factor = factors[gid]
-        size = math.gcd(d1.logical_size, d2.logical_size) if factor == -1 else factor
-        b1 = d1.logical_size // size
-        b2 = d2.logical_size // size
-        
-        v1 = getattr(d1, 'axis', None)
-        v2 = getattr(d2, 'axis', None)
-        if v1 is not None and v1 >= st.val.ndim: v1 = None
-        if v2 is not None and v2 >= st.val.ndim: v2 = None
-        
-        if factor == 0:
-            nv = None
-        else:
-            # Force both halves to adopt the exact same physical axis mappings
-            old_v = v1 if v1 is not None else v2
-            nv = axis_map.get(old_v) if old_v is not None else None
-
-        def _update_dim(d, other_d, b_size):
-            old_b = getattr(d, 'block_axis', None)
-            if old_b is not None and old_b >= st.val.ndim: old_b = None
-            nb = axis_map.get(old_b) if (factor != 0 and old_b is not None) else None
-            
-            # FIX: Route the primary physical axis to the block if the outer size is 1
-            actual_nv = nv if size > 1 else None
-            actual_nb = nb
-            if size == 1 and b_size > 1 and nv is not None:
-                actual_nb = nv
-                
-            return SparseIndex(
-                id=d.id, size=size, axis=actual_nv,
-                other_id=other_d.id,
-                block_size=b_size if b_size > 1 else None,
-                block_axis=actual_nb if b_size > 1 else None
-            )
-
-        if is_out1: 
-            new_out_dims[idx1] = _update_dim(d1, d2, b1)
-            touched_out.add(idx1)
-        else: 
-            new_primal_dims[idx1] = _update_dim(d1, d2, b1)
-            touched_primal.add(idx1)
-            
-        if is_out2: 
-            new_out_dims[idx2] = _update_dim(d2, d1, b2)
-            touched_out.add(idx2)
-        else: 
-            new_primal_dims[idx2] = _update_dim(d2, d1, b2)
-            touched_primal.add(idx2)
-
-    def _remap_untouched(d):
-        old_v = getattr(d, 'axis', None)
-        old_b = getattr(d, 'block_axis', None)
-        nv = axis_map.get(old_v) if old_v is not None else None
-        nb = axis_map.get(old_b) if old_b is not None else None
-        
-        if isinstance(d, SparseIndex):
-            return replace(d, axis=nv, block_axis=nb)
-        return replace(d, axis=nv)
-
-    final_out = tuple(_remap_untouched(d) if i not in touched_out else new_out_dims[i] for i, d in enumerate(st.out_dims))
-    final_primal = tuple(_remap_untouched(d) if i not in touched_primal else new_primal_dims[i] for i, d in enumerate(st.primal_dims))
-
-    # 5. Lock Canonical Physical Ordering
-    final_dims = final_out + final_primal
-    target_perm = []
-    seen_target = set()
-    
-    for d in final_dims:
-        if getattr(d, 'axis', None) is not None and d.axis not in seen_target:
-            target_perm.append(d.axis)
-            seen_target.add(d.axis)
-        if getattr(d, 'block_axis', None) is not None and d.block_axis not in seen_target:
-            target_perm.append(d.block_axis)
-            seen_target.add(d.block_axis)
-            
-    for i in range(val_diagonal.ndim):
-        if i not in seen_target:
-            target_perm.append(i)
-            seen_target.add(i)
-            
-    if target_perm != list(range(val_diagonal.ndim)):
-        val_diagonal = jnp.transpose(val_diagonal, target_perm)
-        inv_perm = {old: new for new, old in enumerate(target_perm)}
-        
-        def _reorder_axis(d):
-            nv = inv_perm.get(getattr(d, 'axis', None)) if getattr(d, 'axis', None) is not None else None
-            if isinstance(d, SparseIndex):
-                nb = inv_perm.get(getattr(d, 'block_axis', None)) if getattr(d, 'block_axis', None) is not None else None
-                return replace(d, axis=nv, block_axis=nb)
-            return replace(d, axis=nv)
-            
-        final_out = tuple(_reorder_axis(d) for d in final_out)
-        final_primal = tuple(_reorder_axis(d) for d in final_primal)
-
-    return SparseTensor(final_out, final_primal, val_diagonal, st.scalar_mult, sort_val=False, check_consistency=False)
+    return new_st

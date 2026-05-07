@@ -2,20 +2,22 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from functools import partial
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
-from functools import partial
 
+from graphax.sparse.indexes import DenseIndex, Index, SparseIndex
+from graphax.sparse.ops.layout import (
+    generate_block_permutation,
+    generate_grouped_permutation,
+)
 from graphax.sparse.ops.utils import _arr2st, _is_sparse
-from graphax.sparse.ops.layout import generate_block_permutation, generate_grouped_permutation
-
-from graphax.sparse.indexes import Index, SparseIndex, DenseIndex
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
@@ -94,8 +96,15 @@ def matmul(
 ) -> SparseTensor | Array:
     from graphax.sparse.tensor import SparseTensor
 
+    # Fast paths must respect `count`: when set, always return `(out, counts)`
+    # so the caller can unpack it uniformly. The dense / scalar paths perform
+    # a single elementwise product or matmul and report zero adds/muls/fmas
+    # (the counts the caller really cares about come from the block-sparse
+    # contraction below).
+    _zero_counts = (0, 0, 0)
     if not _is_sparse(lhs) and not _is_sparse(rhs):
-        return jnp.matmul(lhs, rhs)
+        out = jnp.matmul(lhs, rhs)
+        return (out, _zero_counts) if count is not False else out
     if not _is_sparse(lhs):
         assert _is_sparse(rhs)
         lhs = _arr2st(lhs, out_ndim=lhs.ndim - len(rhs.out_dims))
@@ -106,7 +115,8 @@ def matmul(
     if not lhs.dims and not rhs.dims:
         l_val = lhs.val if lhs.val is not None else jnp.array(1.0, dtype=lhs.dtype)
         r_val = rhs.val if rhs.val is not None else jnp.array(1.0, dtype=rhs.dtype)
-        return SparseTensor((), (), l_val * r_val)
+        out = SparseTensor((), (), l_val * r_val)
+        return (out, _zero_counts) if count is not False else out
 
     rhs_out_dims, rhs_primal_dims, rhs_id_offset = _align_tensor_ids(lhs, rhs)
     rhs_dims = rhs_out_dims + rhs_primal_dims
@@ -320,9 +330,7 @@ def _align_tensor_ids(
     return rhs_out_dims, rhs_primal_dims, rhs_id_offset
 
 
-def _get_dim_vals(
-    dim: Index | None, is_outer: bool = False
-) -> tuple[int, int | None]:
+def _get_dim_vals(dim: Index | None, is_outer: bool = False) -> tuple[int, int | None]:
     if not dim:
         return 1, None
 
@@ -396,7 +404,7 @@ def _resolve_contract_pair(
     rhs_out_dim: Index,
     lhs_out_map: dict[int, Index],
     rhs_primal_map: dict[int, Index],
-) -> tuple[IndexPair, list[int]]:
+) -> tuple[IndexPair, list[int], list[int]]:
     if lhs_primal_dim.logical_size != rhs_out_dim.logical_size:
         raise ValueError(
             f"Contraction dimensions must have the same logical size. "
@@ -414,11 +422,13 @@ def _resolve_contract_pair(
         else None
     )
 
-    ids = [lhs_primal_dim.id, rhs_out_dim.id]
+    lhs_ids = [lhs_primal_dim.id]
     if lhs_out_dim:
-        ids.append(lhs_out_dim.id)
+        lhs_ids.append(lhs_out_dim.id)
+    
+    rhs_ids = [rhs_out_dim.id]
     if rhs_primal_dim:
-        ids.append(rhs_primal_dim.id)
+        rhs_ids.append(rhs_primal_dim.id)
 
     l_out_len, _ = _get_dim_vals(lhs_out_dim, True)
     r_out_len, _ = _get_dim_vals(rhs_primal_dim, True)
@@ -427,11 +437,15 @@ def _resolve_contract_pair(
     r_block_len, r_block_v = _get_dim_vals(rhs_out_dim, False)
     r_shared_len, r_shared_v = _get_dim_vals(rhs_primal_dim, False)
 
+    if hasattr(lhs_primal_dim, "block_size") and lhs_primal_dim.block_size is not None:
+        logical_element_count = lhs_primal_dim.block_size
+    elif hasattr(lhs_primal_dim, "size") and lhs_primal_dim.size is not None:
+        logical_element_count = lhs_primal_dim.size
+    else:
+        logical_element_count = 1
     meta = IndexPair(
         pairing_type="contract",
-        logical_element_count=getattr(
-            lhs_primal_dim, "block_size", getattr(lhs_primal_dim, "size", 1)
-        ),
+        logical_element_count=logical_element_count,
         lhs=IndexPairData(
             l_out_len,
             l_block_len,
@@ -453,7 +467,7 @@ def _resolve_contract_pair(
             rhs_primal_dim,
         ),
     )
-    return meta, ids
+    return meta, lhs_ids, rhs_ids
 
 
 def _resolve_broadcast_topos(
@@ -530,15 +544,10 @@ def _build_matmul_topology(
     pairs_meta, processed_lhs_dims, processed_rhs_dims = [], set(), set()
 
     for lp, ro in zip(lhs_contract, rhs_contract):
-        meta, ids = _resolve_contract_pair(lp, ro, lhs_out_map, rhs_primal_map)
+        meta, lhs_ids, rhs_ids = _resolve_contract_pair(lp, ro, lhs_out_map, rhs_primal_map)
         pairs_meta.append(meta)
-        processed_lhs_dims.update(ids[: len(ids) // 2 + 1])
-        processed_lhs_dims.add(lp.id)
-        processed_rhs_dims.add(ro.id)
-        if meta.lhs.dim:
-            processed_lhs_dims.add(meta.lhs.dim.id)
-        if meta.rhs.shared_dim:
-            processed_rhs_dims.add(meta.rhs.shared_dim.id)
+        processed_lhs_dims.update(lhs_ids)
+        processed_rhs_dims.update(rhs_ids)
 
     lhs_topos = _get_unprocessed_topos(
         lhs.dims, {d.id: d for d in lhs.dims}, processed_lhs_dims, lhs.out_dims
@@ -1224,9 +1233,7 @@ def _resolve_output_shape_and_axes(
     leftover_axes = list(res.grid.shape[5 * ctx.num_pairs :])
     reshaped_output_shape.extend(leftover_axes)
 
-    axis_map = OutputAxisMap(
-        shared=shared_axis_map, lhs=lhs_axis_map, rhs=rhs_axis_map
-    )
+    axis_map = OutputAxisMap(shared=shared_axis_map, lhs=lhs_axis_map, rhs=rhs_axis_map)
     return reshaped_output_shape, axis_map, squeeze_axes
 
 
@@ -1236,8 +1243,8 @@ def _build_output_tensor(
     res: ContractionResult,
     count: bool = False,
 ) -> tuple[SparseTensor, tuple[int, int, int]]:
-    from graphax.sparse.tensor import SparseTensor
     from graphax.sparse.indexes import DenseIndex, SparseIndex
+    from graphax.sparse.tensor import SparseTensor
 
     reshaped_output_shape, axis_map, squeeze_axes = _resolve_output_shape_and_axes(
         ctx, res
@@ -1262,9 +1269,7 @@ def _build_output_tensor(
         lhs_axis = axis_map.lhs[i]
         rhs_axis = axis_map.rhs[i]
 
-        pres_shared = (
-            pm.lhs.outer_axis is not None or pm.rhs.outer_axis is not None
-        )
+        pres_shared = pm.lhs.outer_axis is not None or pm.rhs.outer_axis is not None
         pres_lhs = pm.lhs.outer_axis is not None or pm.lhs.block_axis is not None
         pres_rhs = (
             pm.rhs.outer_axis is not None

@@ -478,6 +478,12 @@ def _checkify_order(
     - "fwd", "forward": [1, 2, 3, ...]
     - "rev", "reverse": [..., 3, 2, 1]
 
+    For explicit (numeric) orders, the input is filtered to keep only valid
+    vertex IDs in their supplied relative order. Partial orders are
+    supported: any eliminable vertex not listed in ``order`` is simply left
+    in the graph after elimination — useful for staged / triplet-based
+    elimination strategies. JAX scalar arrays are converted to Python ints.
+
     Args:
         order (EliminationOrder): The elimination order to check.
         jaxpr (core.Jaxpr): The jaxpr we want to differentiate.
@@ -506,16 +512,21 @@ def _checkify_order(
             ][::-1]
         else:
             raise ValueError(f"{order} is not a valid order identifier!")
-    else:
-        vertex_set = set(
-            [i for i, eqn in enumerate(jaxpr.eqns, start=1) if _should_eliminate(eqn)]
-        )
 
-        set_from_order = set(order)
-        missing_vertices = vertex_set.difference(set_from_order)
-        if len(missing_vertices) > 0:
-            raise ValueError(f"Supplied order is missing vertices {missing_vertices}!")
-    return order
+    # Numeric (explicit) order. Coerce array-like / JAX-scalar inputs to a
+    # plain list of Python ints so downstream comparisons against the
+    # eliminable-vertex set work uniformly.
+    if hasattr(order, "tolist"):
+        order = order.tolist()
+    order = [int(o) for o in order]
+
+    vertex_set = {
+        i for i, eqn in enumerate(jaxpr.eqns, start=1) if _should_eliminate(eqn)
+    }
+    # Keep the supplied relative order, dropping anything that isn't an
+    # eliminable vertex. Partial orders are valid: any vertex absent from
+    # ``order`` is simply not eliminated.
+    return [o for o in order if o in vertex_set]
 
 
 def _build_graph(
