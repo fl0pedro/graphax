@@ -56,10 +56,10 @@ def dense(tensor: SparseTensor, axes: Sequence[int] | None = None, hard: bool = 
             tensor = _copy(tensor, val=_materialize_compressed(tensor))
         else:
             # Requested axes don't touch the compressed pair → keep
-            # ``compressed_val`` as-is. For the 2-D case there are no other axes
-            # to densify; just return the tensor unchanged. For higher-rank
-            # cases this preserves the M× compression on the pair and lets the
-            # caller densify only the leftover dims via a future recursion.
+            # ``compressed_val`` as-is and short-circuit. NOTE: the returned
+            # tensor still has ``val is None`` (compressed-only); downstream
+            # callers must tolerate that (e.g. via ``_resolve_val``) rather
+            # than blindly multiplying ``tensor.val`` by ``scalar_mult``.
             return tensor
 
     logical_indices = set(range(tensor.ndim)) if axes is None else set(axes)
@@ -105,7 +105,9 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
             return jnp.broadcast_to(tensor.fill_value * tensor.scalar_mult, tensor.shape)
         v = tensor.val
         perm = [d.axis for d in tensor.dims if d.axis is not None]
-        if perm and sorted(perm) == list(range(len(perm))) and perm != list(range(len(perm))):
+        if (perm and len(perm) == v.ndim
+                and sorted(perm) == list(range(len(perm)))
+                and perm != list(range(len(perm)))):
             v = v.transpose(perm)
         v = v * tensor.scalar_mult
         # Broadcast back up to the logical shape: a SparseTensor can carry a
@@ -154,7 +156,12 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
             ]
             return dense_pair.transpose(target_axes)
 
-    return dense(tensor, hard=True).val * tensor.scalar_mult
+    from .utils import _resolve_val
+    densified = dense(tensor, hard=True)
+    val = _resolve_val(densified.val)
+    if val is None:
+        return jnp.broadcast_to(densified.fill_value * tensor.scalar_mult, densified.shape)
+    return val * tensor.scalar_mult
 
 
 # --- Internals -----------------------------------------------------------
@@ -246,9 +253,50 @@ def _prepare_values_for_scattering(values, scatter_axes, fill_value):
     unique_perm = list(dict.fromkeys(scatter_axes + other_axes))
     values = values.transpose(unique_perm)
     num_scatter = len(scatter_axes)
-    s_shape, t_shape = values.shape[:num_scatter], values.shape[num_scatter:]
-    values = _densify_diagonal_scatter(values.reshape((-1,) + t_shape), fill_value)
-    values = values.reshape(s_shape + s_shape + t_shape)
+    # Densify each sparse pair INDEPENDENTLY by scattering its axis to
+    # ``(N_i, N_i)`` one at a time. Linearizing all pairs into a single
+    # ``B = prod(N_i)`` diagonal would (a) waste memory in the trailing
+    # block-diag axes and (b) corrupt block-axis layouts because the
+    # resulting reshape can't simultaneously place the same physical
+    # block axis at both an out-side and a primal-side position.
+    #
+    # Invariant after densifying ``i`` pairs:
+    #   axes[0..i-1]                     = out copies (in scatter_axes order)
+    #   axes[i..num_scatter-1]           = pairs not yet densified (original order)
+    #   axes[num_scatter..num_scatter+i-1] = primal copies (in scatter_axes order)
+    #   axes[num_scatter+i..]            = trailing axes (original order)
+    for i in range(num_scatter):
+        # The next pair to densify currently sits at axis ``i`` (its "out"
+        # slot). Move it to position 0 so ``_densify_diagonal_scatter`` can
+        # operate on the leading axis.
+        if i != 0:
+            perm = [i] + [a for a in range(values.ndim) if a != i]
+            values = values.transpose(perm)
+        values = _densify_diagonal_scatter(values, fill_value)
+        # ``_densify_diagonal_scatter`` produced shape ``(N, N, *rest)``.
+        # Place the new "out" copy at position ``i`` (its final slot) and
+        # the new "primal" copy at position ``num_scatter + i`` (slot for
+        # the i-th primal copy) without disturbing the relative order of
+        # the as-yet-undensified scatter axes or the trailing axes.
+        ndim = values.ndim
+        # Current layout: [N_out (axis 0), N_primal (axis 1), <i-1 already-done out copies that got pushed to indices 2..i>, <undensified pairs at i+1..num_scatter>, <i-1 already-done primal copies>, <trailing>].
+        # We want: [<already-done out 0..i-1 at 0..i-1>, N_out at i, <undensified at i+1..num_scatter>, <already-done primal 0..i-1>, N_primal at num_scatter+i, <trailing>].
+        # Build the target permutation explicitly.
+        # After the transpose at the start of this iteration, values has the
+        # invariant for "i pairs processed before this iteration":
+        #   pre-densify shape: [pair_i (was axis i, moved to 0), out_0..out_{i-1} (at 1..i), undensified_{i+1}..{num_scatter-1} (at i+1..num_scatter-1), primal_0..primal_{i-1} (at num_scatter..num_scatter+i-1), trailing (at num_scatter+i..)].
+        # _densify produced: [out_i (0), primal_i (1), out_0..out_{i-1} (2..i+1), undensified (i+2..num_scatter), primal_0..primal_{i-1} (num_scatter+1..num_scatter+i), trailing (num_scatter+i+1..)].
+        # Target order: [out_0..out_{i-1} (2..i+1), out_i (0), undensified (i+2..num_scatter), primal_0..primal_{i-1} (num_scatter+1..num_scatter+i), primal_i (1), trailing (num_scatter+i+1..)]
+        target = (
+            list(range(2, i + 2))                       # out_0..out_{i-1}
+            + [0]                                       # out_i
+            + list(range(i + 2, num_scatter + 1))       # undensified pairs
+            + list(range(num_scatter + 1, num_scatter + i + 1))  # primal_0..primal_{i-1}
+            + [1]                                       # primal_i
+            + list(range(num_scatter + i + 1, ndim))    # trailing
+        )
+        if target != list(range(ndim)):
+            values = values.transpose(target)
     phys_map = {old: (i, num_scatter + i) for i, old in enumerate(scatter_axes)}
     for i, old in enumerate(other_axes):
         phys_map[old] = 2 * num_scatter + i
@@ -325,12 +373,20 @@ def _reconstruct_logical_dimensions(logical_dims, logical_to_physical):
 
 
 def _densify_diagonal_scatter(val: Array, fill_value: Array) -> Array:
-    """Place ``val[i, ...]`` on the diagonal of a ``(B, B, *trailing)`` grid, with
-    ``fill_value`` everywhere off-diagonal. Implemented as a single broadcast+select
-    fusion (no scatter) so XLA can fold it into a downstream consumer."""
-    B = val.shape[0]
+    """Place ``val[i, ...]`` on the diagonal of a single sparse pair.
+
+    Returns a ``(n_diag, n_diag, *trailing)`` grid where the leading axis of
+    ``val`` (size ``n_diag``) is replicated to a diagonal and ``fill_value``
+    is placed everywhere off-diagonal. Implemented as a single broadcast+select
+    fusion (no scatter) so XLA can fold it into a downstream consumer.
+
+    Called once per sparse pair from ``_prepare_values_for_scattering`` — each
+    call materializes ONE pair's diagonal independently, so callers with
+    multiple sparse pairs invoke this in a loop rather than linearizing all
+    pairs into a single combined diagonal."""
+    n_diag = val.shape[0]
     fv = jnp.asarray(fill_value, dtype=val.dtype)
-    eye_mask = jnp.eye(B, dtype=jnp.bool_)
+    eye_mask = jnp.eye(n_diag, dtype=jnp.bool_)
     eye_mask = eye_mask[(slice(None), slice(None)) + (None,) * (val.ndim - 1)]
-    val_b = jnp.broadcast_to(val[:, None], (B, B) + val.shape[1:])
+    val_b = jnp.broadcast_to(val[:, None], (n_diag, n_diag) + val.shape[1:])
     return jnp.where(eye_mask, val_b, fv)
