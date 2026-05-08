@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from abc import ABC
 from dataclasses import dataclass
+# `typing.override` requires Python 3.12+ (matches pyproject.toml `requires-python = "==3.12.*"`).
 from typing import override
 
 
-@dataclass(slots=True)
-class Index(ABC):
+@dataclass(frozen=True)
+class Index:
     id: int
     size: int
     axis: int | None
@@ -24,12 +24,12 @@ class Index(ABC):
         return (self.size,)
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True)
 class DenseIndex(Index):
     pass
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True)
 class SparseIndex(Index):
     other_id: int
     block_size: int | None = None
@@ -37,8 +37,7 @@ class SparseIndex(Index):
 
     @override
     def __post_init__(self):
-        if self.size < 0:
-            raise ValueError(f"Index size must be non-negative, got {self.size}")
+        super().__post_init__()
         if self.block_size is not None and self.block_size <= 0:
             raise ValueError(
                 f"SparseIndex block_size must be positive, got {self.block_size}"
