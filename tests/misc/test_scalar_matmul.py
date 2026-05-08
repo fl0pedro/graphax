@@ -50,3 +50,19 @@ def test_scalar_at_scalar_via_jacve():
     veres = jax.jit(jacve(f, order="rev", argnums=(0, 1)))(x, y)
     refres = jax.jit(jax.jacrev(f, argnums=(0, 1)))(x, y)
     assert bool(tree_allclose(veres, refres))
+
+
+def test_scalar_at_scalar_both_val_none_composes_scalar_mult():
+    """Both operands have ``val=None`` and non-1 ``scalar_mult`` — the
+    composed multiplier must be ``lhs.scalar_mult * rhs.scalar_mult``,
+    not silently reset to 1. Vertex elimination chains structural-identity
+    Jacobians (e.g. ``-1 * sin'(x)`` ∘ another scalar Jacobian) this way,
+    and dropping the multipliers makes the chained Jacobian wrong by a
+    factor of the missing scalars."""
+    a = SparseTensor((), (), None, scalar_mult=jnp.array(2.0))
+    b = SparseTensor((), (), None, scalar_mult=jnp.array(3.0))
+    res = a @ b
+    # Composed effective scalar = 2.0 * 3.0 = 6.0; with val=None the value
+    # rides entirely on ``scalar_mult``.
+    assert res.val is None
+    assert float(res.scalar_mult) == 6.0

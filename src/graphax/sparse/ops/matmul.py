@@ -166,14 +166,15 @@ def _align_tensor_ids(lhs, rhs):
 
 def _unprocessed_topos(dims, dim_map, processed, target_list):
     """List of (out_dim, primal_dim) topo pairs for dims not yet consumed."""
+    target_ids = {d.id for d in target_list}
     def info(d):
         if d.id in processed: return (None, None), -1
         if not isinstance(d, SparseIndex):
-            return ((d, None) if d in target_list else (None, d)), d.id
+            return ((d, None) if d.id in target_ids else (None, d)), d.id
         other = dim_map.get(d.other_id)
         if not other or other.id in processed:
-            return ((d, None) if d in target_list else (None, d)), d.id
-        return ((d, other) if d in target_list else (other, d)), other.id
+            return ((d, None) if d.id in target_ids else (None, d)), d.id
+        return ((d, other) if d.id in target_ids else (other, d)), other.id
     out, seen = [], set()
     for d in dims:
         if d.id in seen: continue
@@ -190,11 +191,12 @@ def _resolve_contract_pair(lp, ro, lhs_out_map, rhs_primal_map):
         raise ValueError(f"Contraction size mismatch: {lp.logical_size} vs {ro.logical_size}")
     lo = lhs_out_map.get(getattr(lp, "other_id", -1)) if isinstance(lp, SparseIndex) else None
     rp = rhs_primal_map.get(getattr(ro, "other_id", -1)) if isinstance(ro, SparseIndex) else None
-    ids = [lp.id, ro.id]
-    if lo: ids.append(lo.id)
-    if rp: ids.append(rp.id)
+    lhs_ids = [lp.id]
+    if lo: lhs_ids.append(lo.id)
+    rhs_ids = [ro.id]
+    if rp: rhs_ids.append(rp.id)
     return (Pair("contract", getattr(lp, "block_size", getattr(lp, "size", 1)),
-                 *_full_pair_data(lo, lp, ro, rp, swap_rhs=True)), ids)
+                 *_full_pair_data(lo, lp, ro, rp, swap_rhs=True)), lhs_ids, rhs_ids)
 
 
 def _resolve_broadcast_topos(lhs_topos, rhs_topos, offset):
@@ -227,10 +229,9 @@ def _build_matmul_topology(lhs, rhs_out_dims, rhs_primal_dims, rhs_id_offset):
     rhs_contract = list(rhs_out_dims[-n_contract:] if n_contract > 0 else [])
     pairs, processed_l, processed_r = [], set(), set()
     for lp, ro in zip(lhs_contract, rhs_contract):
-        meta, ids = _resolve_contract_pair(lp, ro, lhs_out_map, rhs_primal_map)
+        meta, lhs_ids, rhs_ids = _resolve_contract_pair(lp, ro, lhs_out_map, rhs_primal_map)
         pairs.append(meta)
-        processed_l.update(ids[: len(ids) // 2 + 1])
-        processed_l.add(lp.id); processed_r.add(ro.id)
+        processed_l.update(lhs_ids); processed_r.update(rhs_ids)
         if meta.lhs.dim: processed_l.add(meta.lhs.dim.id)
         if meta.rhs.shared_dim: processed_r.add(meta.rhs.shared_dim.id)
     lhs_topos = _unprocessed_topos(lhs.dims, {d.id: d for d in lhs.dims}, processed_l, lhs.out_dims)
@@ -276,6 +277,17 @@ def _contraction_perms(N):
     return perm_l, perm_r
 
 
+def _as_shape(view, target_shape, *, mode):
+    """No-op if ``view`` already has ``target_shape``; otherwise apply the
+    requested transformation. ``mode`` is ``"broadcast"`` (introduce missing
+    1-len axes via ``jnp.broadcast_to``) or ``"reshape"`` (collapse axes the
+    sizes already line up for)."""
+    target = tuple(target_shape)
+    if view.shape == target:
+        return view
+    return jnp.broadcast_to(view, target) if mode == "broadcast" else view.reshape(target)
+
+
 def _prepare_contraction_views(lhs_val, rhs_val, pairs, shared, total, split):
     N = len(pairs)
     lhs_leftover, rhs_leftover = list(lhs_val.shape[3 * N:]), list(rhs_val.shape[3 * N:])
@@ -305,12 +317,12 @@ def _prepare_contraction_views(lhs_val, rhs_val, pairs, shared, total, split):
                     + [p.lhs.block_len for p in pairs] + split + lhs_leftover)
     rhs_unmerged = ([v for i, p in enumerate(pairs) for v in (p.rhs.outer_len, total[i] // p.rhs.outer_len)]
                     + split + [p.rhs.shared_block_len for p in pairs] + rhs_leftover)
-    if lhs_view.shape != tuple(lhs_unmerged): lhs_view = jnp.broadcast_to(lhs_view, tuple(lhs_unmerged))
-    if rhs_view.shape != tuple(rhs_unmerged): rhs_view = jnp.broadcast_to(rhs_view, tuple(rhs_unmerged))
+    lhs_view = _as_shape(lhs_view, lhs_unmerged, mode="broadcast")
+    rhs_view = _as_shape(rhs_view, rhs_unmerged, mode="broadcast")
     lhs_merged = list(total) + [p.lhs.block_len for p in pairs] + split + lhs_leftover
     rhs_merged = list(total) + split + [p.rhs.shared_block_len for p in pairs] + rhs_leftover
-    if lhs_view.shape != tuple(lhs_merged): lhs_view = lhs_view.reshape(lhs_merged)
-    if rhs_view.shape != tuple(rhs_merged): rhs_view = rhs_view.reshape(rhs_merged)
+    lhs_view = _as_shape(lhs_view, lhs_merged, mode="reshape")
+    rhs_view = _as_shape(rhs_view, rhs_merged, mode="reshape")
     lhs_bc, rhs_bc = [], []
     for i, p in enumerate(pairs):
         lhs_bc.extend([p.lhs.outer_len, p.lhs.block_len, (total[i] // p.lhs.outer_len) * split[i]])
@@ -595,8 +607,12 @@ def _build_output_tensor(ctx, rhs_dims, res):
     )
     if cv_st is not None:
         return cv_st
+    out_dtype = values.dtype if values is not None else jnp.asarray(final_mult).dtype
+    # transforms intentionally not propagated through matmul; callers in
+    # core.py unload pre/post transforms before the matmul and reattach
+    # fresh ones to the result.
     return SparseTensor(final_out, final_primal, values,
-                        scalar_mult=jnp.array(final_mult, dtype=ctx.lhs.dtype),
+                        scalar_mult=jnp.asarray(final_mult).astype(out_dtype),
                         sort_val=True,
                         zero_fill=True)
 
@@ -721,11 +737,14 @@ def _try_compressed_block_banded(ctx, final_out, final_primal, values, final_mul
     # SparseTensor wraps it behind two full-size ``DenseIndex``s — same dim
     # structure ``from_compressed`` uses for the BlockBanded fallback path.
     full = M_new * B_new
+    # transforms intentionally not propagated through matmul; callers in
+    # core.py unload pre/post transforms before the matmul and reattach
+    # fresh ones to the result.
     return SparseTensor(
         (DenseIndex(o.id, full, axis=0),),
         (DenseIndex(p.id, full, axis=1),),
         val=None, compressed_val=bb,
-        scalar_mult=jnp.array(final_mult, dtype=ctx.lhs.dtype),
+        scalar_mult=jnp.asarray(final_mult).astype(values.dtype),
         sort_val=False, check_consistency=False, zero_fill=True,
     )
 
@@ -817,9 +836,22 @@ def _matmul_via_densify(lhs, rhs):
     if perm != list(range(len(perm))):
         result = jnp.transpose(result, perm)
 
-    out_dims = tuple(DenseIndex(i, sizes_slots[a][0], axis=i) for i, a in enumerate(out_axes))
-    primal_dims = tuple(DenseIndex(len(out_axes) + i, sizes_slots[a][0], axis=len(out_axes) + i)
-                        for i, a in enumerate(primal_axes))
+    # Output dim ids are ``range(0, n_out + n_primal)`` — the same convention
+    # ``_build_output_tensor`` finalizes the tiled path to (it allocates
+    # ``next_id = max(input_ids) + 1`` only intermediately, then
+    # ``finalize`` renumbers everything to ``range(...)``). Keeping both
+    # paths on the same convention means downstream code joining by id sees
+    # one topology regardless of which fast path fired.
+    out_dims = tuple(
+        DenseIndex(i, sizes_slots[a][0], axis=i) for i, a in enumerate(out_axes)
+    )
+    primal_dims = tuple(
+        DenseIndex(len(out_axes) + i, sizes_slots[a][0], axis=len(out_axes) + i)
+        for i, a in enumerate(primal_axes)
+    )
+    # transforms intentionally not propagated through matmul; callers in
+    # core.py unload pre/post transforms before the matmul and reattach
+    # fresh ones to the result.
     return SparseTensor(out_dims, primal_dims, result,
                         fill_value=jnp.array(0, dtype=result.dtype),
                         sort_val=False, check_consistency=False,
@@ -843,6 +875,8 @@ def _try_aligned_pair_matmul(lhs, rhs):
     LCM / topology work in ``_execute_block_sparse_contraction`` is wasted
     effort here. Returns ``None`` when conditions don't apply.
     """
+    if not _is_zero_fill(lhs) or not _is_zero_fill(rhs):
+        return None  # implicit positions contribute under non-zero fill
     if lhs.val is None or rhs.val is None:
         return None
     if len(lhs.dims) != 2 or len(rhs.dims) != 2:
@@ -903,6 +937,9 @@ def _try_aligned_pair_matmul(lhs, rhs):
                                  block_size=B_b_w, block_axis=2)
     s_mult = (lhs.scalar_mult * rhs.scalar_mult).astype(result.dtype)
     from graphax.sparse.tensor import SparseTensor
+    # transforms intentionally not propagated through matmul; callers in
+    # core.py unload pre/post transforms before the matmul and reattach
+    # fresh ones to the result.
     return SparseTensor(
         (new_out,), (new_primal,), result,
         scalar_mult=s_mult,
@@ -1003,6 +1040,8 @@ def _reshape_to_canonical_layout(
     batch_l = [e[0] for e in batch_entries]
     lhs_kept_v = sorted(set(range(lhs_ndim)) - set(contract_l) - set(batch_l))
     rhs_kept_v = sorted(set(range(rhs_ndim)) - set(contract_r) - {e[1] for e in batch_entries})
+    lhs_kept_pos = {ax: pos for pos, ax in enumerate(lhs_kept_v)}
+    rhs_kept_pos = {ax: pos for pos, ax in enumerate(rhs_kept_v)}
     n_batch, n_lhs_kept = len(batch_entries), len(lhs_kept_v)
     N = len(pairs)
     # Map each pair to its position in the dot_general result (or None for
@@ -1015,10 +1054,10 @@ def _reshape_to_canonical_layout(
     for i, p in enumerate(pairs):
         if (p.pairing_type in ("contract", "spatial_out_lhs")
                 and p.lhs.block_len > 1 and p.lhs.block_axis is not None):
-            pair_lhs_block_ax[i] = n_batch + lhs_kept_v.index(p.lhs.block_axis)
+            pair_lhs_block_ax[i] = n_batch + lhs_kept_pos[p.lhs.block_axis]
         if (p.pairing_type in ("contract", "spatial_primal_rhs")
                 and p.rhs.shared_block_len > 1 and p.rhs.shared_block_axis is not None):
-            pair_rhs_shared_ax[i] = n_batch + n_lhs_kept + rhs_kept_v.index(p.rhs.shared_block_axis)
+            pair_rhs_shared_ax[i] = n_batch + n_lhs_kept + rhs_kept_pos[p.rhs.shared_block_axis]
     perm = [a for a in (pair_outer_ax + pair_lhs_block_ax + pair_rhs_shared_ax) if a is not None]
     if len(perm) != result.ndim:
         return None
@@ -1197,15 +1236,20 @@ def matmul(lhs, rhs, count: bool = False):
     # that need the tiled path's id-aware topology resolver. ``_is_zero_fill``
     # checks the static ``_zero_fill`` flag (set at ``SparseTensor`` ctor time)
     # so this stays jit-friendly.
-    if (
-        (not _is_zero_fill(lhs) or not _is_zero_fill(rhs))
-        and _densify_is_safe(lhs, rhs)
-    ):
-        _record_path("densify")
-        out = _matmul_via_densify(lhs, rhs)
-        if count:
-            return out, _compute_matmul_count(lhs, rhs, out)
-        return out
+    has_nonzero_fill = not _is_zero_fill(lhs) or not _is_zero_fill(rhs)
+    if has_nonzero_fill:
+        if _densify_is_safe(lhs, rhs):
+            _record_path("densify")
+            out = _matmul_via_densify(lhs, rhs)
+            if count:
+                return out, _compute_matmul_count(lhs, rhs, out)
+            return out
+        # Tiled / aligned-pair / dot_general fast paths assume zero fill;
+        # falling through silently mislabels the result as ``zero_fill=True``.
+        raise NotImplementedError(
+            "matmul of operands with non-zero fill_value and incompatible "
+            "logical sizes is not supported; reorder dim ids first"
+        )
     aligned = _try_aligned_pair_matmul(lhs, rhs)
     if aligned is not None:
         _record_path("aligned_pair")
@@ -1256,27 +1300,34 @@ def _scalar_matmul(lhs, rhs):
 
     Vertex-elimination composes scalar edges via this path. The general
     matmul pipeline assumes at least one contracting pair, so we short-
-    circuit here. ``val=None`` is treated as the multiplicative identity
-    (a pure structural-identity scalar tensor)."""
+    circuit here. ``val=None`` denotes structural-identity *value* (the
+    edge has no per-element data), but ``scalar_mult`` is still a real
+    multiplier on the implicit identity and must compose through the
+    matmul (e.g. ``-1 * sin'(x)`` ∘ another scalar Jacobian)."""
     from graphax.sparse.tensor import SparseTensor
 
     lv = lhs.val
     rv = rhs.val
+    composed_mult = lhs.scalar_mult * rhs.scalar_mult
     if lv is None and rv is None:
         new_val = None
+        new_mult = composed_mult
     elif lv is None:
-        new_val = rv * rhs.scalar_mult * lhs.scalar_mult
+        new_val = rv * composed_mult
+        new_mult = jnp.array(1.0, dtype=new_val.dtype)
     elif rv is None:
-        new_val = lv * lhs.scalar_mult * rhs.scalar_mult
+        new_val = lv * composed_mult
+        new_mult = jnp.array(1.0, dtype=new_val.dtype)
     else:
         new_val = (lv * lhs.scalar_mult) * (rv * rhs.scalar_mult)
+        new_mult = jnp.array(1.0, dtype=new_val.dtype)
 
     fill = lhs.fill_value * rhs.fill_value
     return SparseTensor(
         (),
         (),
         new_val,
-        scalar_mult=jnp.array(1.0, dtype=lhs.dtype),
+        scalar_mult=new_mult,
         fill_value=fill,
         sort_val=False,
         check_consistency=False,
