@@ -1,3 +1,4 @@
+import os
 import unittest
 import jax.numpy as jnp
 import jax.random as jrand
@@ -10,6 +11,8 @@ from utils import (
 )
 
 from graphax.sparse.tensor import SparseTensor
+
+EXHAUSTIVE = os.getenv("EXHAUSTIVE", "0") == "1"
 
 
 def gen_blocks(key, n_blocks, block_shape):
@@ -65,6 +68,7 @@ class TestMatmulDiffBlocks(unittest.TestCase):
         ):
             run_matmul_blocks_test(self, tensor_a, tensor_b)
 
+    @unittest.skipUnless(EXHAUSTIVE, "set EXHAUSTIVE=1 to run exhaustive sweeps")
     def test_exhaustive_divisible_blocks(self):
         cases = generate_cases(
             seed=0, n_blocks_a=4, base_shape_a=2, n_blocks_b=2, base_shape_b=4
@@ -72,6 +76,7 @@ class TestMatmulDiffBlocks(unittest.TestCase):
         for ndim, direction, ta, tb in cases:
             self._run_matmul_test(ndim, direction, ta, tb)
 
+    @unittest.skipUnless(EXHAUSTIVE, "set EXHAUSTIVE=1 to run exhaustive sweeps")
     def test_exhaustive_gcd_common_factor(self):
         cases = generate_cases(
             seed=1, n_blocks_a=3, base_shape_a=4, n_blocks_b=2, base_shape_b=6
@@ -79,6 +84,7 @@ class TestMatmulDiffBlocks(unittest.TestCase):
         for ndim, direction, ta, tb in cases:
             self._run_matmul_test(ndim, direction, ta, tb)
 
+    @unittest.skipUnless(EXHAUSTIVE, "set EXHAUSTIVE=1 to run exhaustive sweeps")
     def test_exhaustive_coprime_blocks(self):
         cases = generate_cases(
             seed=2, n_blocks_a=4, base_shape_a=3, n_blocks_b=3, base_shape_b=4

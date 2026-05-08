@@ -1,3 +1,4 @@
+import os
 import unittest
 from itertools import product
 
@@ -20,9 +21,12 @@ from graphax.sparse.tensor import (
     SparseIndex,
     SparseTensor,
     _arr2st,
+    _matmul,
 )
 
 from graphax.sparse.ops.matmul import matmul
+
+EXHAUSTIVE = os.getenv("EXHAUSTIVE", "0") == "1"
 
 DATA = create_block_test_data()
 
@@ -98,7 +102,7 @@ class TestMatmulBlocks(unittest.TestCase):
                             else r_arr
                         )
 
-                        res_matmul = matmul(lhs, rhs)
+                        res_matmul = _matmul(lhs, rhs)
                         reference = matmul_reference(lhs, rhs)
 
                         expected_out = lhs_shape[:-n_contract]
@@ -121,7 +125,7 @@ class TestMatmulBlocks(unittest.TestCase):
         st = _arr2st(arr, out_ndim=1)
 
         lhs = jnp.array([[2.0, 3.0, 4.0]])
-        res_matmul = matmul(lhs, st)
+        res_matmul = _matmul(lhs, st)
         reference = matmul_reference(lhs, st)
 
         assert_matmul_result(
@@ -132,6 +136,7 @@ class TestMatmulBlocks(unittest.TestCase):
             res_matmul.val.shape if res_matmul.val is not None else None,
         )
 
+    @unittest.skipUnless(EXHAUSTIVE, "set EXHAUSTIVE=1 to run exhaustive sweeps")
     def test_exhaustive_matmul_blocks(self):
         def generate_exhaustive_cases():
             cases = []
@@ -170,10 +175,8 @@ class TestMatmulBlocks(unittest.TestCase):
     def test_matmul_dense_dense(self):
         a = jnp.arange(6).reshape(2, 3)
         b = jnp.arange(12).reshape(3, 4)
-        # Convert at least one to SparseTensor as required by matmul
-        sta = _arr2st(a, out_ndim=1)
-        res = matmul(sta, b)
-        self.assertTrue(jnp.allclose(res.dense(), a @ b))
+        res = matmul(a, b)
+        self.assertTrue(jnp.allclose(res, a @ b))
 
     def test_matmul_implicit_value(self):
         st1 = _arr2st(jnp.arange(4).reshape(2, 2))

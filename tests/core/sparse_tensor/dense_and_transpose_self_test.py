@@ -5,11 +5,11 @@ import jax.numpy as jnp
 from graphax.sparse.tensor import (
     DenseIndex,
     SparseIndex,
+    _dense,
     SparseTensor,
 )
 from utils import matmul_reference
 from dataclasses import replace
-from graphax.sparse.ops import dense as _dense
 
 
 class TestSelfDenseAndTranspose(unittest.TestCase):
