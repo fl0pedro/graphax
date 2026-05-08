@@ -49,11 +49,15 @@ NamedTuples are JAX pytrees out of the box, so all three round-trip through
 
 from __future__ import annotations
 
+import math
 from typing import Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
-from jax import Array
+from jax import Array, lax
+
+
+_BLOCK_BANDED_BROADCAST_LIMIT = 10**8
 
 
 # ----------------------------------------------------------------------------
@@ -85,6 +89,21 @@ def _block_diag_per_meta(blocks: Array, fill: Array) -> Array:
     if L:
         mask = mask[(..., *((None,) * len(L)))]
     return jnp.where(mask, gathered, fill)
+
+
+def _to_meta_blocks(blocks_obj, op_default: Callable) -> Array:
+    """Shared meta-block materialization for ``UnionBlocks`` and
+    ``IntersectionBlocks``.
+
+    Both store dual ``(M, n, Bh, Bw, *L)`` buffers and combine them via a
+    binary ``op`` whose only difference is the default (``jnp.add`` vs
+    ``jnp.multiply``). ``op_default`` documents that default at the call
+    site; the runtime op comes from ``blocks_obj.op``.
+    """
+    del op_default
+    lhs_meta = _block_diag_per_meta(blocks_obj.lhs, blocks_obj.fill_lhs)
+    rhs_meta = _block_diag_per_meta(blocks_obj.rhs, blocks_obj.fill_rhs)
+    return blocks_obj.op(lhs_meta, rhs_meta)
 
 
 def _stitch_meta(per_meta: Array, fill: Array) -> Array:
@@ -174,9 +193,7 @@ class UnionBlocks(NamedTuple):
         — M× less storage than ``to_dense`` and lets every downstream sparse
         op (matmul / elementwise) leverage the block-diagonal fast path
         instead of touching the M²-many zero meta-blocks."""
-        lhs_meta = _block_diag_per_meta(self.lhs, self.fill_lhs)
-        rhs_meta = _block_diag_per_meta(self.rhs, self.fill_rhs)
-        return self.op(lhs_meta, rhs_meta)
+        return _to_meta_blocks(self, jnp.add)
 
     def to_dense(self) -> Array:
         """Materialize the *fully* dense ``(M*LCM_h, M*LCM_w, *L)`` form.
@@ -207,7 +224,7 @@ class UnionBlocks(NamedTuple):
         op: Callable = jnp.add,
     ) -> "UnionBlocks":
         lhs_shape, rhs_shape = meta
-        lhs_size = int(jnp.prod(jnp.array(lhs_shape)))
+        lhs_size = math.prod(lhs_shape)
         return cls(
             lhs=flat[:lhs_size].reshape(lhs_shape),
             rhs=flat[lhs_size:].reshape(rhs_shape),
@@ -263,9 +280,7 @@ class IntersectionBlocks(NamedTuple):
     def to_meta_blocks(self) -> Array:
         """``(M, LCM_h, LCM_w, *L)`` per-meta-block contributions; see
         :meth:`UnionBlocks.to_meta_blocks` — only the binary ``op`` differs."""
-        lhs_meta = _block_diag_per_meta(self.lhs, self.fill_lhs)
-        rhs_meta = _block_diag_per_meta(self.rhs, self.fill_rhs)
-        return self.op(lhs_meta, rhs_meta)
+        return _to_meta_blocks(self, jnp.multiply)
 
     def to_dense(self) -> Array:
         """Fully-dense ``(M*LCM_h, M*LCM_w, *L)`` form. Prefer
@@ -360,9 +375,14 @@ class BlockBanded(NamedTuple):
         if B != B_:
             raise ValueError(f"banded blocks must be square, got ({B}, {B_})")
         if W % 2 == 0:
-            raise ValueError(f"data axis 1 must be 2w+1 (odd); got {W}")
+            raise ValueError(
+                f"BlockBanded data axis 1 must be 2w+1 (odd); got data.shape[1]={W}"
+            )
         w = (W - 1) // 2
         L_pad = (None,) * len(L)
+
+        if math.prod((M, M, W, B, B, *L)) > _BLOCK_BANDED_BROADCAST_LIMIT:
+            return self._to_dense_per_band(M, W, B, w, L)
 
         # Step 1: tile data across a new meta-col axis (pure broadcast, no copy).
         data_bcast = jnp.broadcast_to(
@@ -393,6 +413,38 @@ class BlockBanded(NamedTuple):
             in_band = in_band[(..., *L_pad)]
         return jnp.where(in_band, out_meta, self.fill_value)
 
+    def _to_dense_per_band(
+        self, M: int, W: int, B: int, w: int, L: tuple[int, ...]
+    ) -> Array:
+        """Per-band ``lax.fori_loop`` fallback for the dense materialization.
+
+        The broadcast path's logical intermediate is ``(M, M, W, B, B, *L)`` —
+        for ``M`` in the thousands the static shape exceeds practical limits
+        even though XLA fuses the ``where+sum`` at runtime. This path iterates
+        the ``M`` rows of each band and writes them into the result via
+        ``lax.dynamic_update_slice``, never materializing the ``M × M`` square.
+        """
+        out = jnp.full((M * B, M * B, *L), self.fill_value, dtype=self.data.dtype)
+        zero_idx = (jnp.int32(0),) * len(L)
+
+        def body(k, acc):
+            for b in range(W):
+                col = k + (b - w)
+                in_range = jnp.logical_and(col >= 0, col < M)
+                row_start = jnp.int32(k * B)
+                col_start = jnp.int32(col * B)
+                block = self.data[k, b]
+                existing = lax.dynamic_slice(
+                    acc, (row_start, col_start) + zero_idx, (B, B, *L)
+                )
+                replacement = jnp.where(in_range, block, existing)
+                acc = lax.dynamic_update_slice(
+                    acc, replacement, (row_start, col_start) + zero_idx
+                )
+            return acc
+
+        return lax.fori_loop(0, M, body, out)
+
 
 # ----------------------------------------------------------------------------
 #  PyTree registration: ``op`` is static (Callable, hashable), buffers are leaves
@@ -401,7 +453,7 @@ class BlockBanded(NamedTuple):
 # breaks ``jax.jit`` round-trips (functions aren't valid jax types). Override
 # with a custom split that pushes ``op`` into the static aux_data — same
 # treatment elementwise.py uses for its op closures.
-def _union_flatten(ub):
+def _blocks_flatten(ub):
     return (ub.lhs, ub.rhs, ub.fill_lhs, ub.fill_rhs), (ub.op,)
 
 
@@ -413,5 +465,5 @@ def _intersection_unflatten(aux, children):
     return IntersectionBlocks(*children, op=aux[0])
 
 
-jax.tree_util.register_pytree_node(UnionBlocks, _union_flatten, _union_unflatten)
-jax.tree_util.register_pytree_node(IntersectionBlocks, _union_flatten, _intersection_unflatten)
+jax.tree_util.register_pytree_node(UnionBlocks, _blocks_flatten, _union_unflatten)
+jax.tree_util.register_pytree_node(IntersectionBlocks, _blocks_flatten, _intersection_unflatten)
