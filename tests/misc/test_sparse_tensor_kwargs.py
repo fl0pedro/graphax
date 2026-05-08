@@ -13,11 +13,13 @@ silently put `[transform]` into the **scalar_mult** slot instead of
 no-op edges replaced real Jacobian transforms — manifesting as wildly wrong
 Jacobian shapes and silently-incorrect numerical results.
 
-The fix: always pass `pre_transforms=[...]` / `post_transforms=[...]` as
-keyword args. This test pins that contract on the current `__init__`.
+The fix: ``__init__`` makes everything after ``val`` keyword-only with a
+``*,`` barrier, so the old positional misalignment now raises ``TypeError``
+at the call site. This test pins the migration so a future refactor can't
+silently re-introduce the trap.
 """
 
-import jax.numpy as jnp
+import pytest
 
 from graphax.sparse.tensor import SparseTensor
 
@@ -37,16 +39,11 @@ def test_post_transforms_kwarg_lands_in_post_transforms():
     assert st.post_transforms == (sentinel,)
 
 
-def test_positional_fourth_arg_is_scalar_mult_not_transforms():
-    """Document the trap: 4th positional is scalar_mult, NOT pre_transforms.
-
-    If someone reverts to the upstream-style positional call, they'll
-    misinterpret a list of transforms as a scalar — this test verifies which
-    slot the 4th positional truly maps to so the trap is explicit.
-    """
-    st = SparseTensor([], [], None, jnp.array(5.0))
-    assert float(st.scalar_mult) == 5.0
-    # And pre_transforms / post_transforms stayed empty (didn't accidentally
-    # absorb anything).
-    assert st.pre_transforms == ()
-    assert st.post_transforms == ()
+def test_old_master_positional_signature_raises_typeerror():
+    """The old upstream signature ``SparseTensor(out, primal, val, pre, post)``
+    must now raise TypeError — that's the migration guarantee."""
+    sentinel = object()
+    with pytest.raises(TypeError):
+        SparseTensor([], [], None, [sentinel])
+    with pytest.raises(TypeError):
+        SparseTensor([], [], None, [sentinel], [sentinel])

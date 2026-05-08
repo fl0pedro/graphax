@@ -5,7 +5,7 @@ from abc import ABC
 from dataclasses import dataclass, replace
 from functools import partial
 from math import prod
-from typing import Callable, Literal, override
+from typing import Any, Callable, Literal, override
 from collections.abc import Sequence
 
 import jax
@@ -19,12 +19,13 @@ from graphax.sparse.ops.utils import (
     _assert_sparse_tensor_consistency,
     _copy,
     _sort_val,
+    _arr2st,
     _materialize_indexes,
     _swap_back_axes,
 )
-from graphax.sparse.ops.dense import dense
+from graphax.sparse.ops.dense import dense, dense as _dense
 from graphax.sparse.ops.transpose import transpose
-from graphax.sparse.ops.matmul import matmul
+from graphax.sparse.ops.matmul import matmul, matmul as _matmul
 from graphax.sparse.ops.elementwise import elementwise
 
 from graphax.sparse.indexes import Index, DenseIndex, SparseIndex
@@ -52,6 +53,11 @@ Transform = Callable[["SparseTensor", "SparseTensor", Array], "SparseTensor"]
 
 class SparseMathMixin:
     """Mixin for SparseTensor to handle math operations."""
+
+    # ``__eq__`` returns a SparseTensor (elementwise), not a bool, so the
+    # default identity-based ``__hash__`` would silently make instances
+    # hashable in inconsistent ways. Mark explicitly unhashable.
+    __hash__ = None
 
     def __matmul__(self, other):
         return matmul(self, other)
@@ -152,7 +158,10 @@ class SparseMathMixin:
         return elementwise(self, other, jax.lax.ge)
 
     def __neg__(self):
-        return self.copy(scalar_mult=-self.scalar_mult)
+        return self.copy(
+            scalar_mult=-self.scalar_mult,
+            fill_value=-self.fill_value,
+        )
 
     def __pos__(self):
         return self.copy()
@@ -161,6 +170,7 @@ class SparseMathMixin:
         return self.copy(
             val=jnp.abs(self.val) if self.val is not None else None,
             scalar_mult=jnp.abs(self.scalar_mult),
+            fill_value=jnp.abs(self.fill_value),
         )
 
     def __invert__(self):
@@ -172,6 +182,7 @@ class SparseMathMixin:
         return self.copy(
             val=jnp.round(self.val, ndigits) if self.val is not None else None,
             scalar_mult=jnp.round(self.scalar_mult, ndigits),
+            fill_value=jnp.round(self.fill_value, ndigits),
         )
 
 
@@ -206,6 +217,7 @@ class SparseTensor(SparseMathMixin):
         out_dims: Sequence[Index],
         primal_dims: Sequence[Index],
         val: Array | None,
+        *,
         scalar_mult: Array | None = None,
         fill_value: Array | None = None,
         dtype: DTypeLike | None = None,
@@ -226,11 +238,7 @@ class SparseTensor(SparseMathMixin):
         # bool/int val isn't silently widened to float32). The float32 default
         # only applies when neither ``val`` nor ``compressed_val`` is given —
         # i.e. a structure-only tensor whose fill_value defines the dtype.
-        # Also accept any falsy ``dtype`` (e.g. an accidentally-positional
-        # empty tuple from a caller mismatching ``__init__``'s positional
-        # order — historically that's how ``pre_transforms=()`` could land in
-        # this slot) and fall back to inference.
-        if not dtype:
+        if dtype is None:
             if val is not None:
                 dtype = val.dtype
             elif compressed_val is not None:
@@ -239,7 +247,7 @@ class SparseTensor(SparseMathMixin):
                     if buf is not None:
                         dtype = buf.dtype
                         break
-                if not dtype:
+                if dtype is None:
                     dtype = jnp.dtype("float32")
             else:
                 dtype = jnp.dtype("float32")
@@ -268,7 +276,7 @@ class SparseTensor(SparseMathMixin):
             val = val.astype(dtype)
 
         if fill_value is None:
-            fill_value = jnp.array(0, dtype=dtype or jnp.float32)
+            fill_value = jnp.array(0, dtype=dtype)
 
         self.out_dims = tuple(out_dims)
         self.primal_dims = tuple(primal_dims)
@@ -292,6 +300,15 @@ class SparseTensor(SparseMathMixin):
 
         self._dynamic_keys = tuple(kwargs.keys())
         for k, v in kwargs.items():
+            # JAX requires aux_data values to be hashable for jit cache keying;
+            # ``**kwargs`` ride along in aux_data via ``tree_flatten``.
+            try:
+                hash(v)
+            except TypeError as e:
+                raise TypeError(
+                    f"SparseTensor **kwargs values must be hashable (jit aux_data): "
+                    f"{k}={v!r} ({e})"
+                )
             setattr(self, k, v)
 
         if check_consistency:
@@ -377,6 +394,14 @@ class SparseTensor(SparseMathMixin):
 
         meta = getattr(compressed_val, "meta_block_shape", None)
         out_id, primal_id = dim_ids
+        # ``_assert_sparse_tensor_consistency`` requires the produced IDs to be
+        # a contiguous 0..N-1 sequence; with non-default ``dim_ids`` (e.g.
+        # ``(5, 7)``) the trailing leftover IDs would land non-contiguous.
+        if sorted(dim_ids) != [0, 1]:
+            raise ValueError(
+                f"from_compressed: dim_ids must be a permutation of (0, 1) to "
+                f"keep produced IDs contiguous; got {dim_ids!r}"
+            )
 
         if meta is not None:
             # Meta-block-diagonal storage: pair of SparseIndexes over M
@@ -384,7 +409,7 @@ class SparseTensor(SparseMathMixin):
             M, H_meta, W_meta = meta
             val = compressed_val.to_meta_blocks()   # (M, H_meta, W_meta, *L)
             leftover_dims = tuple(
-                DenseIndex(max(dim_ids) + 1 + i, s, axis=3 + i)
+                DenseIndex(2 + i, s, axis=3 + i)
                 for i, s in enumerate(val.shape[3:])
             )
             n_left = len(leftover_dims) // 2
@@ -406,7 +431,7 @@ class SparseTensor(SparseMathMixin):
         # densification, expose as two DenseIndexes over the full shape.
         H, W, *L = compressed_val.shape
         leftover_dims = tuple(
-            DenseIndex(max(dim_ids) + 1 + i, s, axis=2 + i)
+            DenseIndex(2 + i, s, axis=2 + i)
             for i, s in enumerate(L)
         )
         return cls(
@@ -463,12 +488,12 @@ class SparseTensor(SparseMathMixin):
     @property
     def sparse_shape(self) -> tuple[int, ...]:
         sparse_dims = []
-        seen_axiss = set()
+        seen_axes = set()
         for d in self.dims:
             if isinstance(d, SparseIndex) and d.axis is not None:
-                if d.axis not in seen_axiss:
+                if d.axis not in seen_axes:
                     sparse_dims.append(d)
-                    seen_axiss.add(d.axis)
+                    seen_axes.add(d.axis)
         sparse_dims.sort(key=lambda d: d.axis)
         return tuple(d.size for d in sparse_dims)
 
@@ -576,19 +601,6 @@ class SparseTensor(SparseMathMixin):
         # Infer from scalar_mult or fill_value if val is None
         return self.fill_value.dtype
 
-    def astype(
-        self, dtype: DTypeLike, copy: bool = True, **kwargs: Any
-    ) -> SparseTensor:
-        new_val = self.val.astype(dtype, **kwargs) if self.val is not None else None
-        new_fill = self.fill_value.astype(dtype)
-        # Use dtype for scalar_mult to ensure consistency
-        new_scalar_mult = (
-            self.scalar_mult.astype(dtype)
-            if self.scalar_mult.dtype != jnp.bool_
-            else self.scalar_mult
-        )
-        return self.copy(val=new_val, fill_value=new_fill, scalar_mult=new_scalar_mult)
-
     def copy(
         self,
         val: Array | None = None,
@@ -599,48 +611,42 @@ class SparseTensor(SparseMathMixin):
 
     # Low priority TODO: axis, and other args
     def all(self) -> Array:
-        return jnp.array(
-            (
-                (self.val is not None and jnp.all(self.val * self.scalar_mult))
-                or (self.val is None and self.scalar_mult)
-            )
-            and self.fill_value * self.scalar_mult
-        )
+        val_part = jnp.all(self.val * self.scalar_mult) if self.val is not None else True
+        return jnp.logical_and(val_part, self.fill_value * self.scalar_mult != 0)
 
     def any(self) -> Array:
-        return jnp.array(
-            (
-                (self.val is not None and jnp.any(self.val * self.scalar_mult))
-                or (self.val is None and self.scalar_mult)
-            )
-            or self.fill_value * self.scalar_mult
-        )
+        val_part = jnp.any(self.val * self.scalar_mult) if self.val is not None else False
+        return jnp.logical_or(val_part, self.fill_value * self.scalar_mult != 0)
 
     def sum(self) -> Array:
+        if self.val is None:
+            return self.fill_value * self.scalar_mult * self.size
         return jnp.sum(self.val * self.scalar_mult) + (
             self.fill_value * self.scalar_mult
-        ) * (self.size - (self.val.size if self.val is not None else 0))
+        ) * (self.size - self.val.size)
 
     def prod(self) -> Array:
+        if self.val is None:
+            return (self.fill_value * self.scalar_mult) ** self.size
         return jnp.prod(self.val * self.scalar_mult) * (
             self.fill_value * self.scalar_mult
-        ) ** (self.size - (self.val.size if self.val is not None else 0))
+        ) ** (self.size - self.val.size)
 
     def max(self) -> Array:
-        return (
-            max(jnp.max(self.val if self.val is not None else 1), self.fill_value)
-            * self.scalar_mult
-        )
+        if self.val is None:
+            return self.fill_value * self.scalar_mult
+        return jnp.maximum(jnp.max(self.val), self.fill_value) * self.scalar_mult
 
     def min(self) -> Array:
-        return (
-            min(jnp.min(self.val if self.val is not None else 1), self.fill_value)
-            * self.scalar_mult
-        )
+        if self.val is None:
+            return self.fill_value * self.scalar_mult
+        return jnp.minimum(jnp.min(self.val), self.fill_value) * self.scalar_mult
 
-    def mean(self) -> Array: ...
+    def mean(self) -> Array:
+        return self.sum() / self.size
 
-    def std(self) -> Array: ...
+    def std(self) -> Array:
+        raise NotImplementedError("std not yet implemented for SparseTensor")
 
     def dot(self, other) -> SparseTensor:
         return self @ other
@@ -668,7 +674,15 @@ class SparseTensor(SparseMathMixin):
         return complex(self.dense())
 
     def __len__(self):
-        return self.val.shape[0] if self.val is not None else 0
+        if self.val is not None:
+            return self.val.shape[0]
+        # Structurally non-empty but ``val=None``: report the first logical
+        # dim's size (out_dims preferred, then primal_dims).
+        if self.out_dims:
+            return self.out_dims[0].logical_size
+        if self.primal_dims:
+            return self.primal_dims[0].logical_size
+        return 0
 
     # TODO make __iter__ return an iterable of sparse tensors along the sparse component?
     def __iter__(self):
@@ -682,12 +696,19 @@ class SparseTensor(SparseMathMixin):
         return self.copy()
 
     def __deepcopy__(self, memo=None):
-        return self.copy(deep=True)
+        return self.copy()
 
     def astype(self, dtype: DTypeLike, **kwargs) -> SparseTensor:
+        # Skip ``astype(...)`` on a boolean ``scalar_mult`` to avoid widening
+        # the structural ``True``/``False`` flag back to a numeric type.
+        new_scalar_mult = (
+            self.scalar_mult
+            if self.scalar_mult.dtype == jnp.bool_
+            else self.scalar_mult.astype(dtype, **kwargs)
+        )
         return self.copy(
             val=self.val.astype(dtype, **kwargs) if self.val is not None else None,
-            scalar_mult=self.scalar_mult.astype(dtype, **kwargs),
+            scalar_mult=new_scalar_mult,
             fill_value=self.fill_value.astype(dtype, **kwargs),
         )
 
@@ -736,26 +757,29 @@ class SparseTensor(SparseMathMixin):
         return self._target_arr.sharding
 
     def devices(self):
-        if hasattr(self._target_arr, "devices"):
-            return self._target_arr.devices()
+        arr = self._target_arr
+        if hasattr(arr, "devices"):
+            return arr.devices()
         raise AttributeError(
-            f"'{type(self._target_arr).__name__}' object has no attribute 'devices'"
+            f"'{type(arr).__name__}' object has no attribute 'devices'"
         )
 
     @property
     def device(self):
-        if hasattr(self._target_arr, "device"):
-            return self._target_arr.device
+        arr = self._target_arr
+        if hasattr(arr, "device"):
+            return arr.device
         raise AttributeError(
-            f"'{type(self._target_arr).__name__}' object has no attribute 'device'"
+            f"'{type(arr).__name__}' object has no attribute 'device'"
         )
 
     @property
     def platform(self):
-        if hasattr(self._target_arr, "platform"):
-            return self._target_arr.platform
+        arr = self._target_arr
+        if hasattr(arr, "platform"):
+            return arr.platform
         raise AttributeError(
-            f"'{type(self._target_arr).__name__}' object has no attribute 'platform'"
+            f"'{type(arr).__name__}' object has no attribute 'platform'"
         )
 
     @property
@@ -772,8 +796,9 @@ class SparseTensor(SparseMathMixin):
 
     @property
     def is_ready(self):
-        if hasattr(self._target_arr, "is_ready"):
-            return self._target_arr.is_ready()
+        arr = self._target_arr
+        if hasattr(arr, "is_ready"):
+            return arr.is_ready()
         return True
 
     @property
@@ -782,44 +807,50 @@ class SparseTensor(SparseMathMixin):
 
     @property
     def addressable_data(self):
-        if hasattr(self._target_arr, "addressable_data"):
-            return self._target_arr.addressable_data()
+        arr = self._target_arr
+        if hasattr(arr, "addressable_data"):
+            return arr.addressable_data()
         return None
 
     @property
     def addressable_shards(self):
-        if hasattr(self._target_arr, "addressable_shards"):
-            return self._target_arr.addressable_shards()
+        arr = self._target_arr
+        if hasattr(arr, "addressable_shards"):
+            return arr.addressable_shards()
         return None
 
     @property
     def global_shards(self):
-        if hasattr(self._target_arr, "global_shards"):
-            return self._target_arr.global_shards()
+        arr = self._target_arr
+        if hasattr(arr, "global_shards"):
+            return arr.global_shards()
         return None
 
     @property
     def unsafe_buffer_pointer(self):
-        if hasattr(self._target_arr, "unsafe_buffer_pointer"):
-            return self._target_arr.unsafe_buffer_pointer()
+        arr = self._target_arr
+        if hasattr(arr, "unsafe_buffer_pointer"):
+            return arr.unsafe_buffer_pointer()
         raise AttributeError(
-            f"'{type(self._target_arr).__name__}' object has no attribute 'unsafe_buffer_pointer'"
+            f"'{type(arr).__name__}' object has no attribute 'unsafe_buffer_pointer'"
         )
 
     @property
     def device_buffer(self):
-        if hasattr(self._target_arr, "device_buffer"):
-            return self._target_arr.device_buffer()
+        arr = self._target_arr
+        if hasattr(arr, "device_buffer"):
+            return arr.device_buffer()
         raise AttributeError(
-            f"'{type(self._target_arr).__name__}' object has no attribute 'device_buffer'"
+            f"'{type(arr).__name__}' object has no attribute 'device_buffer'"
         )
 
     @property
     def device_buffers(self):
-        if hasattr(self._target_arr, "device_buffers"):
-            return self._target_arr.device_buffers()
+        arr = self._target_arr
+        if hasattr(arr, "device_buffers"):
+            return arr.device_buffers()
         raise AttributeError(
-            f"'{type(self._target_arr).__name__}' object has no attribute 'device_buffers'"
+            f"'{type(arr).__name__}' object has no attribute 'device_buffers'"
         )
 
     @property
@@ -827,15 +858,25 @@ class SparseTensor(SparseMathMixin):
         return getattr(self._target_arr, "traceback", None)
 
     def delete(self):
-        if hasattr(self._target_arr, "delete"):
-            self._target_arr.delete()
+        # NOTE: ``_target_arr`` re-materializes ``compressed_val`` on every
+        # access, so for compressed storage this only deletes a fresh temporary
+        # — the underlying ``compressed_val`` buffers are NOT freed.
+        if self.compressed_val is not None:
+            raise NotImplementedError(
+                "delete() does not free compressed_val buffers; "
+                "drop the SparseTensor reference to release storage"
+            )
+        arr = self._target_arr
+        if hasattr(arr, "delete"):
+            arr.delete()
 
     def copy_to_host_async(self):
-        if hasattr(self._target_arr, "copy_to_host_async"):
-            self._target_arr.copy_to_host_async()
+        arr = self._target_arr
+        if hasattr(arr, "copy_to_host_async"):
+            arr.copy_to_host_async()
 
     def clone(self):
-        return self.copy(deep=True)
+        return self.copy()
 
     def to_device(self, device):
         return self.copy(
@@ -862,18 +903,6 @@ class SparseTensor(SparseMathMixin):
 
     def on_device_size_in_bytes(self):
         return self._target_arr.on_device_size_in_bytes()
-
-
-from graphax.sparse.ops.utils import (
-    _assert_sparse_tensor_consistency,
-    _copy,
-    _sort_val,
-    _arr2st,
-)
-from graphax.sparse.ops.dense import dense, dense as _dense
-from graphax.sparse.ops.transpose import transpose
-from graphax.sparse.ops.matmul import matmul, matmul as _matmul
-from graphax.sparse.ops.elementwise import elementwise
 
 
 # === graphax-specific extensions ========================================
@@ -1033,7 +1062,9 @@ def _apply_zero_factor(
     new_out = [_shift_other(d, d) for d in new_out]
     new_primal = [_shift_other(d, d) for d in new_primal]
     return SparseTensor(
-        new_out, new_primal, val, st.scalar_mult, sort_val=False, check_consistency=False
+        new_out, new_primal, val,
+        scalar_mult=st.scalar_mult,
+        sort_val=False, check_consistency=False,
     )
 
 
@@ -1195,7 +1226,9 @@ def _apply_block_diagonal(
             new_primal[i] = _remap_other(d)
 
     return SparseTensor(
-        new_out, new_primal, val, st.scalar_mult, sort_val=False, check_consistency=False
+        new_out, new_primal, val,
+        scalar_mult=st.scalar_mult,
+        sort_val=False, check_consistency=False,
     )
 
 

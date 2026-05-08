@@ -85,7 +85,9 @@ def dense(tensor: SparseTensor, axes: Sequence[int] | None = None, hard: bool = 
     return SparseTensor(
         tuple(result_dims[: len(tensor.out_dims)]),
         tuple(result_dims[len(tensor.out_dims):]),
-        values, tensor.scalar_mult, tensor.fill_value,
+        values,
+        scalar_mult=tensor.scalar_mult,
+        fill_value=tensor.fill_value,
         sort_val=False, check_consistency=False,
         zero_fill=getattr(tensor, "_zero_fill", None),
     )
