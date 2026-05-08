@@ -3,7 +3,7 @@ import sys
 from . import instrumentation
 from .core import jacve, set_pjit_elimination_order
 
-# from .sparse import sparse_tensor_zeros_like  # custom_elemental,
+from .sparse import sparse_tensor_zeros_like
 from .utils import tree_allclose
 
 if sys.version_info[:2] >= (3, 8):

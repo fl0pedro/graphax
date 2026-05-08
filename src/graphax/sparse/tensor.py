@@ -1331,3 +1331,8 @@ def apply_dynamic_sparsity(
         )
 
     return new_st
+
+
+def sparse_tensor_zeros_like(st: SparseTensor) -> SparseTensor:
+    """Return a copy of ``st`` whose ``val`` is zero everywhere."""
+    return _copy(st, val=jnp.zeros_like(st.val))

@@ -1,1 +1,1 @@
-# from .tensor import sparse_tensor_zeros_like
+from .tensor import SparseTensor, sparse_tensor_zeros_like
