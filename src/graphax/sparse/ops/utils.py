@@ -1,11 +1,21 @@
+"""Shared helpers used across the ``ops`` package.
+
+* Type / consistency: ``_is_sparse``, ``_assert_sparse_tensor_consistency``.
+* Shared primitives (used by both elementwise and matmul):
+    ``_val_or_one``, ``_prepare_physical_array``, ``_is_zero_fill``.
+* Construction / mutation: ``_arr2st``, ``_copy``, ``_sort_val``.
+"""
 from __future__ import annotations
 
-import jax.numpy as jnp
-from jax import Array
-from typing import TYPE_CHECKING, Any, Sequence
-from itertools import chain, count
-from dataclasses import replace
 import copy
+from dataclasses import replace
+from itertools import count
+from typing import TYPE_CHECKING, Any, Sequence
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax import Array
 
 from graphax.sparse.indexes import Index, DenseIndex, SparseIndex
 
@@ -21,38 +31,141 @@ def _is_sparse(obj) -> bool:
     return False
 
 
+# --- Shared primitives (elementwise + matmul) ----------------------------
+def _resolve_val(val):
+    """Materialize the dense form of ``val`` if it's one of the compressed-storage
+    pytrees (``UnionBlocks`` / ``IntersectionBlocks`` / ``BlockBanded``).
+
+    These types expose a ``to_dense()`` method that produces a gather-free
+    broadcast+select+sum chain — XLA fuses it forward into a downstream
+    consumer's operand-fetch (SMEM, no HBM materialization). For plain
+    ``Array`` (or ``None``) ``val`` this is a no-op.
+    """
+    if val is None or isinstance(val, jax.Array):
+        return val
+    to_dense = getattr(val, "to_dense", None)
+    return to_dense() if callable(to_dense) else val
+
+
+def _materialize_compressed(tensor):
+    """Materialize ``tensor.compressed_val`` to the form the dim structure expects.
+
+    When the compressed pytree exposes a ``meta_block_shape`` (Union /
+    Intersection / BlockBanded(w=0)) and the host ``SparseTensor``'s dim
+    structure is a meta-block-diagonal sparse pair, we go through
+    ``to_meta_blocks()`` — shape ``(M, H_meta, W_meta, *L)``, M× less HBM
+    bandwidth than the full dense form, and the resulting ``val`` lines up
+    exactly with the sparse-pair layout so every downstream op stays on the
+    block-diagonal fast path.
+
+    Otherwise we fall back to ``to_dense()`` (the SparseTensor's dim structure
+    is a pair of full-size ``DenseIndex``s, e.g. for ``BlockBanded(w>0)``).
+    """
+    cv = tensor.compressed_val
+    if cv is None:
+        return tensor.val
+    meta = getattr(cv, "meta_block_shape", None)
+    if meta is not None and _has_meta_block_diag_dims(tensor, meta):
+        return cv.to_meta_blocks()
+    return cv.to_dense()
+
+
+def _has_meta_block_diag_dims(tensor, meta_block_shape) -> bool:
+    """``True`` iff the host SparseTensor's first out_dim/primal_dim form a
+    meta-block-diagonal sparse pair sized to host ``compressed_val.to_meta_blocks()``."""
+    M, H_meta, W_meta = meta_block_shape
+    if not tensor.out_dims or not tensor.primal_dims:
+        return False
+    o, p = tensor.out_dims[0], tensor.primal_dims[0]
+    return (
+        isinstance(o, SparseIndex) and isinstance(p, SparseIndex)
+        and o.size == M and p.size == M
+        and o.block_size == H_meta and p.block_size == W_meta
+        and o.other_id == p.id and p.other_id == o.id
+    )
+
+
+def _val_or_one(tensor: SparseTensor) -> Array:
+    """A tensor's stored value, or a scalar 1 in its dtype if the tensor carries pure structure.
+
+    If the tensor's ``val`` is one of the compressed-storage pytrees, the
+    dense form is materialized as a fused JAX expression — XLA folds the
+    densification into the consuming kernel."""
+    val = _resolve_val(tensor.val)
+    return val if val is not None else jnp.array(1.0, dtype=tensor.dtype)
+
+
+def _prepare_physical_array(val: Array, axis_axes: Sequence[int | None]) -> Array:
+    """Transpose ``val`` so that each entry of ``axis_axes`` (a flat list of source axiss,
+    ``None`` for synthetic axes) lands at its position index in the result; trailing axes
+    preserved in their original order. Used by both elementwise (per pair-axis) and matmul
+    (per ``PairData`` triple)."""
+    valid = tuple(i for i, v in enumerate(axis_axes) if v is not None and v < val.ndim)
+    src = tuple(axis_axes[i] for i in valid)
+    leftover = [v for v in range(val.ndim) if v not in src]
+    full_src = src + tuple(leftover)
+    full_tgt = valid + tuple(len(axis_axes) + i for i in range(len(leftover)))
+    N = len(axis_axes) + len(leftover)
+    if full_src == full_tgt and N == val.ndim:
+        return val
+    perm = [-1] * N
+    for s, t in zip(full_src, full_tgt):
+        perm[t] = s
+    ones_idx = val.ndim
+    for i in range(N):
+        if perm[i] == -1:
+            perm[i] = ones_idx; ones_idx += 1
+    if ones_idx > val.ndim:
+        val = val.reshape(val.shape + (1,) * (ones_idx - val.ndim))
+    if perm != list(range(N)):
+        val = val.transpose(perm)
+    return val
+
+
+def _is_zero_fill(tensor: SparseTensor) -> bool:
+    """True iff ``tensor.fill_value`` is statically known to be zero.
+
+    Reads the cached ``_zero_fill`` flag set at ``SparseTensor`` construction
+    time and propagated through the pytree's static aux_data. This flag is
+    available even inside ``jit`` (where the actual ``fill_value`` becomes a
+    tracer with no concrete value), letting matmul / elementwise statically
+    branch between the fast tiled path (``fill = 0``) and the densify fallback
+    (``fill ≠ 0``) without paying for a runtime check.
+
+    Falls back to inspecting ``fill_value`` directly when the flag is missing
+    (e.g. a tensor produced before the static-flag mechanism was added)."""
+    flag = getattr(tensor, "_zero_fill", None)
+    if flag is not None:
+        return bool(flag)
+    fv = tensor.fill_value
+    try:
+        return bool(np.all(np.asarray(fv) == 0))
+    except (TypeError, ValueError, AttributeError, jax.errors.TracerArrayConversionError):
+        return False
+
+
+# --- Consistency checks --------------------------------------------------
 def _check_sparse_dim_pair(d, dim_map):
     other = dim_map.get(d.other_id)
-    if (
-        not isinstance(other, SparseIndex)
-        or other.other_id != d.id
-        or d.size != other.size
-    ):
-        return False
-    return True
+    return (isinstance(other, SparseIndex) and other.other_id == d.id and d.size == other.size)
 
 
 def _check_block_axis(d, dim_map, block_axiss):
     if d.block_axis in block_axiss:
         other = dim_map.get(d.other_id)
-        if not (
-            isinstance(other, SparseIndex)
-            and other.block_axis == d.block_axis
-        ):
+        if not (isinstance(other, SparseIndex) and other.block_axis == d.block_axis):
             raise ValueError(
-                f"Topology Error: Duplicate block_axis {d.block_axis} found in SparseIndex {d.id}"
+                f"Topology Error: Duplicate block_axis {d.block_axis} in SparseIndex {d.id}"
             )
     block_axiss.add(d.block_axis)
 
 
 def _assert_sparse_tensor_consistency(st: SparseTensor):
-    from graphax.sparse.indexes import SparseIndex
-
     dim_ids = [d.id for d in st.dims]
-    assert len(set(dim_ids)) == len(dim_ids), (
-        f"Topology Error: Duplicate dimension IDs found: {dim_ids}"
+    expected_ids = list(range(len(dim_ids)))
+    assert sorted(dim_ids) == expected_ids, (
+        f"Topology Error: Index IDs must be a contiguous sequence. Got {dim_ids}"
     )
-
     dim_map = {d.id: d for d in st.dims}
     block_axiss = set()
     for d in st.dims:
@@ -64,67 +177,67 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
                 _check_block_axis(d, dim_map, block_axiss)
 
 
-def _copy(
-    st: SparseTensor,
-    val: Array | None = None,
-    scalar_mult: Array | None = None,
-    fill_value: Array | None = None,
-    out_dims: Sequence[Index] | None = None,
-    primal_dims: Sequence[Index] | None = None,
-    deep=False,
-):
+# --- Construction / mutation --------------------------------------------
+def _copy(st: SparseTensor, val: Array | None = None, scalar_mult: Array | None = None,
+          fill_value: Array | None = None, out_dims: Sequence[Index] | None = None,
+          primal_dims: Sequence[Index] | None = None, deep: bool = False):
     from graphax.sparse.tensor import SparseTensor
-
-    v = val if val is not None else st.val
     s = scalar_mult if scalar_mult is not None else st.scalar_mult
     f = fill_value if fill_value is not None else st.fill_value
     od = out_dims if out_dims is not None else st.out_dims
     pd = primal_dims if primal_dims is not None else st.primal_dims
-
+    # When the caller provides a fresh ``val``, replace the dense path and
+    # drop any compressed storage. Otherwise carry both fields through (one
+    # of them is ``None``).
+    if val is not None:
+        v, cv = val, None
+    else:
+        v, cv = st.val, getattr(st, "compressed_val", None)
     if deep:
         v = copy.deepcopy(v) if v is not None else None
-        s = copy.deepcopy(s)
-        od = copy.deepcopy(od)
-        pd = copy.deepcopy(pd)
-
+        s = copy.deepcopy(s); od = copy.deepcopy(od); pd = copy.deepcopy(pd)
+    # Preserve the source's zero-fill flag whenever ``fill_value`` is unchanged
+    # — otherwise inside jit a fresh tracer would force the constructor to
+    # conservatively report ``False`` and we'd lose the fast-path eligibility.
+    zf = getattr(st, "_zero_fill", None) if fill_value is None else None
     return SparseTensor(
-        od,
-        pd,
-        v,
-        scalar_mult=s,
-        fill_value=f,
+        od, pd, v,
+        scalar_mult=s, fill_value=f,
         pre_transforms=st.pre_transforms,
         post_transforms=st.post_transforms,
-        sort_val=False,
-        check_consistency=False,
+        sort_val=False, check_consistency=False,
+        zero_fill=zf, compressed_val=cv,
     )
 
 
+def _arr2st(arr: Array, out_ndim: int | None = None, dtype: Any = None, **kwargs: Any) -> SparseTensor:
+    from graphax.sparse.tensor import SparseTensor
+    if dtype is not None:
+        arr = arr.astype(dtype)
+    if out_ndim is None:
+        out_ndim = arr.ndim // 2
+    if arr.ndim == 0:
+        arr = jnp.expand_dims(arr, 0)
+        out_ndim = max(out_ndim or 0, 0)
+    dims = tuple(DenseIndex(i, s, i) for i, s in enumerate(arr.shape))
+    return SparseTensor(dims[:out_ndim], dims[out_ndim:], arr,
+                        sort_val=False, check_consistency=False, **kwargs)
+
+
+# --- Sort val axes into canonical (sparse-then-dense) order --------------
 def _map_sparse_axes(dims_list, sparse_axis_map, counter, perm):
     for d in dims_list:
-        if (
-            isinstance(d, SparseIndex)
-            and d.axis is not None
-            and d.axis not in sparse_axis_map
-        ):
+        if isinstance(d, SparseIndex) and d.axis is not None and d.axis not in sparse_axis_map:
             sparse_axis_map[d.axis] = next(counter)
             perm.append(d.axis)
 
 
 def _map_dense_axes(dims, dense_axis_map, counter, perm):
     for d in dims:
-        if (
-            isinstance(d, DenseIndex)
-            and d.axis is not None
-            and d.axis not in dense_axis_map
-        ):
+        if isinstance(d, DenseIndex) and d.axis is not None and d.axis not in dense_axis_map:
             dense_axis_map[d.axis] = next(counter)
             perm.append(d.axis)
-        if (
-            isinstance(d, SparseIndex)
-            and d.block_axis is not None
-            and d.block_axis not in dense_axis_map
-        ):
+        if isinstance(d, SparseIndex) and d.block_axis is not None and d.block_axis not in dense_axis_map:
             dense_axis_map[d.block_axis] = next(counter)
             perm.append(d.block_axis)
 
@@ -142,71 +255,43 @@ def _update_dim_axes(ds, s_map, d_map):
     return tuple(res)
 
 
-def _sort_val(
-    out_dims: Sequence[Index], primal_dims: Sequence[Index], val: Array | None
-) -> tuple[tuple[Index, ...], tuple[Index, ...], Array | None]:
+def _sort_val(out_dims, primal_dims, val):
+    """Permute ``val`` so its axes go (sparse axiss) → (dense axiss) → (leftover).
+
+    Skips the transpose op (and the dim-axis remap) when ``full_perm`` is the
+    identity, which is the common case for matmul / elementwise outputs whose
+    final layout already lists sparse axes first. Saves one transpose-shaped
+    HLO op per matmul/elementwise output."""
     if val is None:
         return tuple(out_dims), tuple(primal_dims), None
-
-    if not hasattr(val, "ndim"):
-        val = jnp.asarray(val)
-
     s_map, s_perm, c_s = {}, [], count()
     _map_sparse_axes(out_dims, s_map, c_s, s_perm)
     _map_sparse_axes(primal_dims, s_map, c_s, s_perm)
-
     d_map, d_perm, c_d = {}, [], count(len(s_map))
     _map_dense_axes(tuple(out_dims) + tuple(primal_dims), d_map, c_d, d_perm)
-
-    new_out, new_primal = (
-        _update_dim_axes(out_dims, s_map, d_map),
-        _update_dim_axes(primal_dims, s_map, d_map),
-    )
-
     full_perm, seen = [], set()
     for p in s_perm + d_perm:
         if p not in seen:
-            full_perm.append(p)
-            seen.add(p)
+            full_perm.append(p); seen.add(p)
     full_perm.extend(i for i in range(val.ndim) if i not in seen)
-
+    # Identity perm ⇒ no transpose, no dim remap needed.
+    if full_perm == list(range(val.ndim)):
+        return tuple(out_dims), tuple(primal_dims), val
+    new_out = _update_dim_axes(out_dims, s_map, d_map)
+    new_primal = _update_dim_axes(primal_dims, s_map, d_map)
     return new_out, new_primal, val.transpose(full_perm)
 
 
-def _arr2st(
-    arr: Array, out_ndim: int | None = None, dtype: Any = None, **kwargs: Any
-) -> SparseTensor:
-    from graphax.sparse.tensor import SparseTensor
-    from graphax.sparse.indexes import DenseIndex
-    if dtype is not None:
-        arr = arr.astype(dtype)
-    if out_ndim is None:
-        out_ndim = arr.ndim // 2
-    # Ensure rank 1 as minimum for non-empty arrays
-    if arr.ndim == 0:
-        arr = jnp.expand_dims(arr, 0)
-        out_ndim = max(out_ndim or 0, 0)
-
-    dims = tuple(DenseIndex(i, s, i) for i, s in enumerate(arr.shape))
-    return SparseTensor(
-        dims[:out_ndim],
-        dims[out_ndim:],
-        arr,
-        sort_val=False,
-        check_consistency=False,
-        **kwargs,
-    )
-
-
-def _materialize_indexes(st: SparseTensor, dims: Sequence[int]) -> Array:
-    """
-    Function that materializes the `val` property of a `SparseTensor` object
-    along a given set of axes.
-    """
+# --- graphax-specific extensions ----------------------------------------
+# These helpers are used by graphax/primitives/{transforms,reductions} and by
+# the apply_dynamic_sparsity helpers in tensor.py. They are not part of the
+# matmul project; preserved here so external graphax callers keep working.
+def _materialize_indexes(st: "SparseTensor", dims: Sequence[int]) -> Array:
+    """Materialize ``st.val`` along the given (sparse) dimensions by inserting
+    fresh broadcast axes."""
     val = st.val if st.val is not None else jnp.array(1.0, dtype=st.dtype)
     if not dims:
         return val
-
     dims = sorted(dims)
     _dims, counter = [], val.ndim
     for d in dims:
@@ -215,54 +300,40 @@ def _materialize_indexes(st: SparseTensor, dims: Sequence[int]) -> Array:
         else:
             _dims.append(counter)
             counter += 1
-
     return jnp.expand_dims(val, axis=_dims)
 
 
-def _swap_back_axes(st: SparseTensor) -> SparseTensor:
-    """
-    After operations that might have permuted dimensions, this function restores
-    the canonical order where physical axes match logical order.
-    """
+def _swap_back_axes(st: "SparseTensor") -> "SparseTensor":
+    """Restore the canonical val-axis order: dims with ``axis`` set come first
+    in dim order, then any sparse-pair ``block_axis``, then any leftover
+    physical axes. Updates the ``axis``/``block_axis`` fields to match."""
     if st.val is None:
         return st
 
-    l = len(st.out_dims)
     i = 0
     permutation = [0] * st.val.ndim
     for d in st.dims:
         if d.axis is not None:
-            if isinstance(d, DenseIndex) or d.id < getattr(
-                d, "other_id", float("inf")
-            ):
+            if isinstance(d, DenseIndex) or d.id < getattr(d, "other_id", float("inf")):
                 permutation[i] = d.axis
                 i += 1
-        if (
-            isinstance(d, SparseIndex)
-            and getattr(d, "block_axis", None) is not None
-        ):
+        if isinstance(d, SparseIndex) and getattr(d, "block_axis", None) is not None:
             permutation[i] = d.block_axis
             i += 1
 
-    # Fill remaining axes if any
     seen = set(permutation[:i])
     for j in range(st.val.ndim):
-        if j not in seen:
-            if i < len(permutation):
-                permutation[i] = j
-                i += 1
+        if j not in seen and i < len(permutation):
+            permutation[i] = j
+            i += 1
 
     new_val = st.val.transpose(permutation)
 
-    # Update dimension objects
     i = 0
-    new_dims = []
     dim_map = {d.id: d for d in st.dims}
+    processed_ids: dict[int, Index] = {}
 
-    # We need to update both out_dims and primal_dims, but they might share SparseIndexes
-    processed_ids = {}
-
-    def update_dim(d, current_i):
+    def update_dim(d, current_i: int):
         if d.id in processed_ids:
             return processed_ids[d.id], current_i
 
@@ -272,7 +343,6 @@ def _swap_back_axes(st: SparseTensor) -> SparseTensor:
                 nv = current_i
                 current_i += 1
             else:
-                # It's a SparseIndex and we are at the second one of the pair
                 other = dim_map[d.other_id]
                 nv = processed_ids[other.id].axis
 

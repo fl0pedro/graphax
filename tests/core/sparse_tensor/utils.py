@@ -419,7 +419,7 @@ def assert_matmul_result(
             if st_result.val.shape != physical_shape:
                 raise AssertionError(
                     f"Physical shape mismatch. Expected {physical_shape}, got {st_result.val.shape}. "
-                    f"The matmul operation may be losing sparsity."
+                    f"The _matmul operation may be losing sparsity."
                 )
 
 

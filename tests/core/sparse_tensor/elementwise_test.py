@@ -1,3 +1,4 @@
+import os
 import unittest
 import operator
 import jax.numpy as jnp
@@ -6,6 +7,8 @@ from utils import generate_tensors, idfn
 from graphax.sparse.indexes import SparseIndex, DenseIndex
 from graphax.sparse.tensor import SparseTensor
 from graphax.sparse.ops.elementwise import elementwise, _arr2st
+
+EXHAUSTIVE = os.getenv("EXHAUSTIVE", "0") == "1"
 
 
 def get_valid_elementwise_pairs(blocks_a, blocks_b, ndim):
@@ -45,6 +48,7 @@ class TestElementwise(unittest.TestCase):
         res_dense_ref = op(ta.dense(), tb.dense())
         self.assertTrue(jnp.allclose(res_sparse.dense(), res_dense_ref, atol=1e-5))
 
+    @unittest.skipUnless(EXHAUSTIVE, "set EXHAUSTIVE=1 to run exhaustive sweeps")
     def test_exhaustive_aligned_blocks(self):
         cases = generate_elementwise_cases(
             seed=0, n_blocks_a=4, base_shape_a=2, n_blocks_b=4, base_shape_b=2
@@ -55,6 +59,7 @@ class TestElementwise(unittest.TestCase):
             with self.subTest(ndim=ndim, op="mul", ta=idfn(ta), tb=idfn(tb)):
                 self._run_elementwise_test(ndim, ta, tb, operator.mul)
 
+    @unittest.skipUnless(EXHAUSTIVE, "set EXHAUSTIVE=1 to run exhaustive sweeps")
     def test_exhaustive_perfect_intersect_blocks(self):
         cases = generate_elementwise_cases(
             seed=1, n_blocks_a=4, base_shape_a=2, n_blocks_b=2, base_shape_b=4
@@ -65,6 +70,7 @@ class TestElementwise(unittest.TestCase):
             with self.subTest(ndim=ndim, op="mul", ta=idfn(ta), tb=idfn(tb)):
                 self._run_elementwise_test(ndim, ta, tb, operator.mul)
 
+    @unittest.skipUnless(EXHAUSTIVE, "set EXHAUSTIVE=1 to run exhaustive sweeps")
     def test_exhaustive_unaligned_diff_blocks(self):
         cases = generate_elementwise_cases(
             seed=2, n_blocks_a=4, base_shape_a=3, n_blocks_b=3, base_shape_b=4

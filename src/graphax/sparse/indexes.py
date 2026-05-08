@@ -1,8 +1,12 @@
 from __future__ import annotations
+
+from abc import ABC
 from dataclasses import dataclass
+from typing import override
+
 
 @dataclass(slots=True)
-class Index:
+class Index(ABC):
     id: int
     size: int
     axis: int | None
@@ -31,6 +35,7 @@ class SparseIndex(Index):
     block_size: int | None = None
     block_axis: int | None = None
 
+    @override
     def __post_init__(self):
         if self.size < 0:
             raise ValueError(f"Index size must be non-negative, got {self.size}")
@@ -40,6 +45,7 @@ class SparseIndex(Index):
             )
 
     @property
+    @override
     def logical_size(self) -> int:
         return self.size * (self.block_size or 1)
 
