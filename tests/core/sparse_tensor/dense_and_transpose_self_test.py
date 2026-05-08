@@ -1,15 +1,15 @@
 import unittest
+from dataclasses import replace
 
 import jax.numpy as jnp
 
 from graphax.sparse.tensor import (
     DenseIndex,
     SparseIndex,
-    _dense,
     SparseTensor,
+    dense,
 )
 from utils import matmul_reference
-from dataclasses import replace
 
 
 class TestSelfDenseAndTranspose(unittest.TestCase):
@@ -169,14 +169,14 @@ class TestSelfDenseAndTranspose(unittest.TestCase):
 
     def test_block_diagonal_transpose(self):
         stc = self.bst_3d_val_dense()
-        d1 = _dense(stc, hard=True).dense().T
-        d2 = _dense(stc.T, hard=True).dense()
+        d1 = dense(stc, hard=True).dense().T
+        d2 = dense(stc.T, hard=True).dense()
         self.assertTrue(jnp.allclose(d1, d2))
 
     def test_transpose_one_sparse(self):
         stb = self.bst_2d()
         # need some val to check shape
-        stb = _dense(stb, hard=False)
+        stb = dense(stb, hard=False)
         n, x, y = stb.val.shape
         self.assertEqual(stb.T.val.shape, (n, y, x))
         self.assertTrue(jnp.allclose(stb.dense().T, stb.T.dense()))

@@ -5,26 +5,25 @@ from itertools import product
 import jax.numpy as jnp
 import jax.random as jrand
 from jax import Array
-from utils import (
-    create_block_test_data,
-    generate_tensors,
-    get_block_configs,
-    matmul_reference,
-    validate_sparse_tensor,
-    assert_matmul_result,
-    get_keys,
-    idfn,
-    run_matmul_blocks_test,
-)
 
+from graphax.sparse.ops.matmul import matmul
 from graphax.sparse.tensor import (
     SparseIndex,
     SparseTensor,
     _arr2st,
-    _matmul,
+    matmul,
 )
-
-from graphax.sparse.ops.matmul import matmul
+from utils import (
+    assert_matmul_result,
+    create_block_test_data,
+    generate_tensors,
+    get_block_configs,
+    get_keys,
+    idfn,
+    matmul_reference,
+    run_matmul_blocks_test,
+    validate_sparse_tensor,
+)
 
 EXHAUSTIVE = os.getenv("EXHAUSTIVE", "0") == "1"
 
@@ -102,7 +101,7 @@ class TestMatmulBlocks(unittest.TestCase):
                             else r_arr
                         )
 
-                        res_matmul = _matmul(lhs, rhs)
+                        res_matmul = matmul(lhs, rhs)
                         reference = matmul_reference(lhs, rhs)
 
                         expected_out = lhs_shape[:-n_contract]
@@ -125,7 +124,7 @@ class TestMatmulBlocks(unittest.TestCase):
         st = _arr2st(arr, out_ndim=1)
 
         lhs = jnp.array([[2.0, 3.0, 4.0]])
-        res_matmul = _matmul(lhs, st)
+        res_matmul = matmul(lhs, st)
         reference = matmul_reference(lhs, st)
 
         assert_matmul_result(

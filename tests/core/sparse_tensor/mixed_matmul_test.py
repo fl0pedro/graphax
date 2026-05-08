@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import jax.random as jrand
 
 from graphax.sparse.indexes import DenseIndex, SparseIndex
-from graphax.sparse.tensor import SparseTensor, _matmul
+from graphax.sparse.tensor import SparseTensor, matmul
 from utils import assert_matmul_result
 
 
@@ -19,10 +19,8 @@ class TestMixedMatmul(unittest.TestCase):
         res = x @ jnp.diag(y)
 
         stx = SparseTensor([DenseIndex(0, 3, 0)], [DenseIndex(1, 4, 1)], x)
-        sty = SparseTensor(
-            [SparseIndex(0, 4, 0, 1)], [SparseIndex(1, 4, 0, 0)], y
-        )
-        stres = _matmul(stx, sty)
+        sty = SparseTensor([SparseIndex(0, 4, 0, 1)], [SparseIndex(1, 4, 0, 0)], y)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3,), (4,), (3, 4))
 
@@ -33,11 +31,9 @@ class TestMixedMatmul(unittest.TestCase):
         y = jrand.normal(ykey, (4, 3))
         res = jnp.diag(x) @ y
 
-        stx = SparseTensor(
-            [SparseIndex(0, 4, 0, 1)], [SparseIndex(1, 4, 0, 0)], x
-        )
+        stx = SparseTensor([SparseIndex(0, 4, 0, 1)], [SparseIndex(1, 4, 0, 0)], x)
         sty = SparseTensor([DenseIndex(0, 4, 0)], [DenseIndex(1, 3, 1)], y)
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (4,), (3,), (4, 3))
 
@@ -52,7 +48,7 @@ class TestMixedMatmul(unittest.TestCase):
         sty = SparseTensor(
             [SparseIndex(0, 3, None, 1)], [SparseIndex(1, 3, None, 0)], None
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3,), (3,), (3, 3))
 
@@ -67,7 +63,7 @@ class TestMixedMatmul(unittest.TestCase):
             [SparseIndex(0, 3, None, 1)], [SparseIndex(1, 3, None, 0)], None
         )
         sty = SparseTensor([DenseIndex(0, 3, 0)], [DenseIndex(1, 3, 1)], _y)
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3,), (3,), (3, 3))
 
@@ -96,7 +92,7 @@ class TestMixedMatmul(unittest.TestCase):
             [DenseIndex(1, 2, 1), SparseIndex(2, 5, 0, 0)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3, 5), (2, 5), (5, 3, 2))
 
@@ -117,10 +113,8 @@ class TestMixedMatmul(unittest.TestCase):
             [SparseIndex(2, 5, 1, 1)],
             x,
         )
-        sty = SparseTensor(
-            [SparseIndex(0, 5, 0, 1)], [SparseIndex(1, 5, 0, 0)], y
-        )
-        stres = _matmul(stx, sty)
+        sty = SparseTensor([SparseIndex(0, 5, 0, 1)], [SparseIndex(1, 5, 0, 0)], y)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3, 5), (5,), (5, 3))
 
@@ -137,15 +131,13 @@ class TestMixedMatmul(unittest.TestCase):
         _y = jnp.einsum("ij,jk->ijk", d, y)
         res = jnp.einsum("ij,jkl->ikl", _x, _y)
 
-        stx = SparseTensor(
-            [SparseIndex(0, 5, 0, 1)], [SparseIndex(1, 5, 0, 0)], x
-        )
+        stx = SparseTensor([SparseIndex(0, 5, 0, 1)], [SparseIndex(1, 5, 0, 0)], x)
         sty = SparseTensor(
             [SparseIndex(0, 5, 0, 1)],
             [SparseIndex(1, 5, 0, 0), DenseIndex(2, 2, 1)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (5,), (5, 2), (5, 2))
 
@@ -167,7 +159,7 @@ class TestMixedMatmul(unittest.TestCase):
             [DenseIndex(2, 2, 2)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3,), (2,), (3, 2))
 
@@ -189,7 +181,7 @@ class TestMixedMatmul(unittest.TestCase):
             [DenseIndex(2, 2, 2)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3,), (2,), (3, 2))
 
@@ -212,7 +204,7 @@ class TestMixedMatmul(unittest.TestCase):
             [SparseIndex(2, 4, 0, 0)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3,), (4,), (3, 4))
 
@@ -239,7 +231,7 @@ class TestMixedMatmul(unittest.TestCase):
             [SparseIndex(2, 5, 1, 1)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3,), (5,), (3, 5))
 
@@ -263,7 +255,7 @@ class TestMixedMatmul(unittest.TestCase):
             [SparseIndex(2, 3, 1, 1)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3,), (3,), (3,))
 
@@ -287,7 +279,7 @@ class TestMixedMatmul(unittest.TestCase):
             [SparseIndex(2, 4, 0, 0)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (4,), (4,), (4,))
 
@@ -314,7 +306,7 @@ class TestMixedMatmul(unittest.TestCase):
             [SparseIndex(2, 4, 1, 1), DenseIndex(3, 2, 2)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3, 4), (4, 2), (4, 3, 2))
 
@@ -342,7 +334,7 @@ class TestMixedMatmul(unittest.TestCase):
             [SparseIndex(2, 5, 0, 0), DenseIndex(3, 2, 2)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3, 4), (5, 2), (3, 4, 5, 2))
 
@@ -370,7 +362,7 @@ class TestMixedMatmul(unittest.TestCase):
             [DenseIndex(2, 2, 2), SparseIndex(3, 5, 0, 0)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (4, 3), (2, 5), (4, 3, 2, 5))
 
@@ -405,7 +397,7 @@ class TestMixedMatmul(unittest.TestCase):
             y,
         )
 
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (4, 3), (2, 5), (4, 3, 2, 5))
 
@@ -434,7 +426,7 @@ class TestMixedMatmul(unittest.TestCase):
             y,
         )
 
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (4, 3), (2, 5), (4, 3, 2, 5))
 
@@ -462,7 +454,7 @@ class TestMixedMatmul(unittest.TestCase):
             [DenseIndex(2, 2, 2), SparseIndex(3, 5, 0, 0)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3, 4), (2, 5), (3, 4, 2, 5))
 
@@ -490,7 +482,7 @@ class TestMixedMatmul(unittest.TestCase):
             [DenseIndex(2, 2, 2), SparseIndex(3, 5, 0, 0)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3, 4), (2, 5), (3, 4, 2, 5))
 
@@ -513,7 +505,7 @@ class TestMixedMatmul(unittest.TestCase):
             [DenseIndex(2, 2, 2), DenseIndex(3, 7, 3)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3, 4), (2, 7), (3, 4, 2, 7))
 
@@ -542,7 +534,7 @@ class TestMixedMatmul(unittest.TestCase):
             y,
         )
 
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3, 4), (2, 5), (3, 4, 2, 5))
 
@@ -568,7 +560,7 @@ class TestMixedMatmul(unittest.TestCase):
             [SparseIndex(2, 4, None, 1), SparseIndex(3, 3, None, 0)],
             None,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3, 5), (4, 3), (3, 5, 4))
 
@@ -598,7 +590,7 @@ class TestMixedMatmul(unittest.TestCase):
             [SparseIndex(2, 4, None, 1), SparseIndex(3, 3, 0, 0)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3, 5), (4, 3), (3, 5, 4))
 
@@ -627,7 +619,7 @@ class TestMixedMatmul(unittest.TestCase):
             [SparseIndex(2, 4, None, 0), DenseIndex(3, 5, 1)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3, 4), (4, 5), (4, 3, 5))
 
@@ -656,7 +648,7 @@ class TestMixedMatmul(unittest.TestCase):
             [DenseIndex(2, 5, 1), SparseIndex(3, 3, None, 1)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3, 4), (5, 3), (3, 4, 5))
 
@@ -684,7 +676,7 @@ class TestMixedMatmul(unittest.TestCase):
             [SparseIndex(2, 4, None, 0), DenseIndex(3, 2, 1)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3, 5), (4, 2), (3, 5, 4, 2))
 
@@ -710,7 +702,7 @@ class TestMixedMatmul(unittest.TestCase):
             [SparseIndex(2, 5, 0, 0), DenseIndex(3, 3, 2)],
             y,
         )
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (4,), (5, 3), (4, 5, 3))
 
@@ -738,7 +730,7 @@ class TestMixedMatmul(unittest.TestCase):
             y,
         )
 
-        stres = _matmul(stx, sty)
+        stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (2,), (2, 4), (2, 4))
 

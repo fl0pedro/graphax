@@ -1,12 +1,14 @@
 import unittest
+
 import jax.numpy as jnp
 import jax.random as jrand
+
 from graphax.sparse.tensor import (
     DenseIndex,
     SparseIndex,
     SparseTensor,
     _arr2st,
-    _dense,
+    dense,
 )
 
 
@@ -43,12 +45,8 @@ class TestDenseDiags(unittest.TestCase):
 
     def test_densify_block_2d(self):
         val = jrand.normal(self.get_keys()[0], (2, 3, 4))
-        d0 = SparseIndex(
-            id=0, size=2, axis=0, other_id=1, block_size=3, block_axis=1
-        )
-        d1 = SparseIndex(
-            id=1, size=2, axis=0, other_id=0, block_size=4, block_axis=2
-        )
+        d0 = SparseIndex(id=0, size=2, axis=0, other_id=1, block_size=3, block_axis=1)
+        d1 = SparseIndex(id=1, size=2, axis=0, other_id=0, block_size=4, block_axis=2)
         st = SparseTensor(
             (d0,),
             (d1,),
@@ -63,12 +61,8 @@ class TestDenseDiags(unittest.TestCase):
 
     def test_densify_block_3d(self):
         val = jrand.normal(self.get_keys()[0], (2, 3, 4, 5))
-        d0 = SparseIndex(
-            id=0, size=2, axis=0, other_id=1, block_size=3, block_axis=1
-        )
-        d1 = SparseIndex(
-            id=1, size=2, axis=0, other_id=0, block_size=4, block_axis=2
-        )
+        d0 = SparseIndex(id=0, size=2, axis=0, other_id=1, block_size=3, block_axis=1)
+        d1 = SparseIndex(id=1, size=2, axis=0, other_id=0, block_size=4, block_axis=2)
         d2 = DenseIndex(id=2, size=5, axis=3)
         st = SparseTensor((d0,), (d1, d2), val)
         st2 = SparseTensor((d0,), (d1, d2), val)
@@ -80,13 +74,9 @@ class TestDenseDiags(unittest.TestCase):
 
     def test_densify_block_4d_1pair(self):
         val = jrand.normal(self.get_keys()[0], (2, 3, 5, 4, 6))
-        d0 = SparseIndex(
-            id=0, size=2, axis=0, other_id=2, block_size=3, block_axis=1
-        )
+        d0 = SparseIndex(id=0, size=2, axis=0, other_id=2, block_size=3, block_axis=1)
         d1 = DenseIndex(id=1, size=5, axis=2)
-        d2 = SparseIndex(
-            id=2, size=2, axis=0, other_id=0, block_size=4, block_axis=3
-        )
+        d2 = SparseIndex(id=2, size=2, axis=0, other_id=0, block_size=4, block_axis=3)
         d3 = DenseIndex(id=3, size=6, axis=4)
         st = SparseTensor((d0, d1), (d2, d3), val)
         st2 = SparseTensor((d0, d1), (d2, d3), val)
@@ -103,18 +93,10 @@ class TestDenseDiags(unittest.TestCase):
 
     def test_densify_block_4d_2pairs(self):
         val = jrand.normal(self.get_keys()[0], (2, 3, 4, 6, 5, 7))
-        d0 = SparseIndex(
-            id=0, size=2, axis=0, other_id=2, block_size=4, block_axis=2
-        )
-        d1 = SparseIndex(
-            id=1, size=3, axis=1, other_id=3, block_size=6, block_axis=3
-        )
-        d2 = SparseIndex(
-            id=2, size=2, axis=0, other_id=0, block_size=5, block_axis=4
-        )
-        d3 = SparseIndex(
-            id=3, size=3, axis=1, other_id=1, block_size=7, block_axis=5
-        )
+        d0 = SparseIndex(id=0, size=2, axis=0, other_id=2, block_size=4, block_axis=2)
+        d1 = SparseIndex(id=1, size=3, axis=1, other_id=3, block_size=6, block_axis=3)
+        d2 = SparseIndex(id=2, size=2, axis=0, other_id=0, block_size=5, block_axis=4)
+        d3 = SparseIndex(id=3, size=3, axis=1, other_id=1, block_size=7, block_axis=5)
         st = SparseTensor((d0, d1), (d2, d3), val)
         st2 = SparseTensor((d0, d1), (d2, d3), val)
         self.assertTrue((st == st2).all())
@@ -193,9 +175,7 @@ class TestDenseDiags(unittest.TestCase):
         d0 = SparseIndex(id=0, size=2, axis=0, other_id=2)
         d1 = SparseIndex(id=1, size=3, axis=1, other_id=3)
         d2 = SparseIndex(id=2, size=2, axis=0, other_id=0)
-        d3 = SparseIndex(
-            id=3, size=3, axis=1, other_id=1, block_size=4, block_axis=2
-        )
+        d3 = SparseIndex(id=3, size=3, axis=1, other_id=1, block_size=4, block_axis=2)
         st = SparseTensor((d0, d1), (d2, d3), val)
         st2 = SparseTensor((d0, d1), (d2, d3), val)
         self.assertTrue((st == st2).all())
@@ -210,12 +190,8 @@ class TestDenseDiags(unittest.TestCase):
     def test_densify_mixed_4d_2pairs_v1(self):
         val = jrand.normal(self.get_keys()[0], (2, 3, 5, 4))
         d0 = SparseIndex(id=0, size=2, axis=0, other_id=2)
-        d1 = SparseIndex(
-            id=1, size=3, axis=1, other_id=3, block_size=5, block_axis=2
-        )
-        d2 = SparseIndex(
-            id=2, size=2, axis=0, other_id=0, block_size=4, block_axis=3
-        )
+        d1 = SparseIndex(id=1, size=3, axis=1, other_id=3, block_size=5, block_axis=2)
+        d2 = SparseIndex(id=2, size=2, axis=0, other_id=0, block_size=4, block_axis=3)
         d3 = SparseIndex(id=3, size=3, axis=1, other_id=1)
         st = SparseTensor((d0, d1), (d2, d3), val)
         st2 = SparseTensor((d0, d1), (d2, d3), val)
@@ -234,15 +210,9 @@ class TestDenseDiags(unittest.TestCase):
     def test_densify_mixed_4d_2pairs_v2(self):
         val = jrand.normal(self.get_keys()[0], (2, 3, 5, 4, 6))
         d0 = SparseIndex(id=0, size=2, axis=0, other_id=2)
-        d1 = SparseIndex(
-            id=1, size=3, axis=1, other_id=3, block_size=5, block_axis=2
-        )
-        d2 = SparseIndex(
-            id=2, size=2, axis=0, other_id=0, block_size=4, block_axis=3
-        )
-        d3 = SparseIndex(
-            id=3, size=3, axis=1, other_id=1, block_size=6, block_axis=4
-        )
+        d1 = SparseIndex(id=1, size=3, axis=1, other_id=3, block_size=5, block_axis=2)
+        d2 = SparseIndex(id=2, size=2, axis=0, other_id=0, block_size=4, block_axis=3)
+        d3 = SparseIndex(id=3, size=3, axis=1, other_id=1, block_size=6, block_axis=4)
         st = SparseTensor((d0, d1), (d2, d3), val)
         st2 = SparseTensor((d0, d1), (d2, d3), val)
         self.assertTrue((st == st2).all())
@@ -265,8 +235,8 @@ class TestDenseDiags(unittest.TestCase):
         d2 = SparseIndex(id=2, size=2, axis=0, other_id=0)
         d3 = SparseIndex(id=3, size=3, axis=1, other_id=1)
         st = SparseTensor((d0, d1), (d2, d3), val)
-        st_p = _dense(st, axes=(0,))
-        self.assertTrue((st_p == _dense(st, axes=(0, 2))).all())
+        st_p = dense(st, axes=(0,))
+        self.assertTrue((st_p == dense(st, axes=(0, 2))).all())
         self.assertTrue(
             isinstance(st_p.out_dims[0], DenseIndex)
             and isinstance(st_p.primal_dims[0], DenseIndex)
@@ -280,8 +250,8 @@ class TestDenseDiags(unittest.TestCase):
         d2 = SparseIndex(id=2, size=2, axis=0, other_id=0)
         d3 = SparseIndex(id=3, size=3, axis=1, other_id=1)
         st = SparseTensor((d0, d1), (d2, d3), val)
-        st_p = _dense(st, axes=(1,))
-        self.assertTrue((st_p == _dense(st, axes=(1, 3))).all())
+        st_p = dense(st, axes=(1,))
+        self.assertTrue((st_p == dense(st, axes=(1, 3))).all())
         self.assertTrue(
             isinstance(st_p.out_dims[1], DenseIndex)
             and isinstance(st_p.primal_dims[1], DenseIndex)
@@ -290,34 +260,26 @@ class TestDenseDiags(unittest.TestCase):
 
     def test_partial_block_4d_axis0(self):
         val = jrand.normal(self.get_keys()[0], (2, 3, 4, 5))
-        d0 = SparseIndex(
-            id=0, size=2, axis=0, other_id=2, block_size=4, block_axis=2
-        )
-        d1 = SparseIndex(
-            id=1, size=3, axis=1, other_id=3, block_size=5, block_axis=3
-        )
+        d0 = SparseIndex(id=0, size=2, axis=0, other_id=2, block_size=4, block_axis=2)
+        d1 = SparseIndex(id=1, size=3, axis=1, other_id=3, block_size=5, block_axis=3)
         d2 = SparseIndex(id=2, size=2, axis=0, other_id=0)
         d3 = SparseIndex(id=3, size=3, axis=1, other_id=1)
         st = SparseTensor((d0, d1), (d2, d3), val)
-        st_p = _dense(st, axes=(0,))
-        self.assertTrue((st_p == _dense(st, axes=(0, 2))).all())
+        st_p = dense(st, axes=(0,))
+        self.assertTrue((st_p == dense(st, axes=(0, 2))).all())
         self.assertEqual(st_p.out_dims[0].size, 8)
         self.assertEqual(st_p.primal_dims[0].size, 2)
         self.assertTrue(jnp.allclose(st_p.dense(), st.dense()))
 
     def test_partial_block_4d_axis1(self):
         val = jrand.normal(self.get_keys()[0], (2, 3, 4, 5))
-        d0 = SparseIndex(
-            id=0, size=2, axis=0, other_id=2, block_size=4, block_axis=2
-        )
-        d1 = SparseIndex(
-            id=1, size=3, axis=1, other_id=3, block_size=5, block_axis=3
-        )
+        d0 = SparseIndex(id=0, size=2, axis=0, other_id=2, block_size=4, block_axis=2)
+        d1 = SparseIndex(id=1, size=3, axis=1, other_id=3, block_size=5, block_axis=3)
         d2 = SparseIndex(id=2, size=2, axis=0, other_id=0)
         d3 = SparseIndex(id=3, size=3, axis=1, other_id=1)
         st = SparseTensor((d0, d1), (d2, d3), val)
-        st_p = _dense(st, axes=(1,))
-        self.assertTrue((st_p == _dense(st, axes=(1, 3))).all())
+        st_p = dense(st, axes=(1,))
+        self.assertTrue((st_p == dense(st, axes=(1, 3))).all())
         self.assertEqual(st_p.out_dims[1].size, 15)
         self.assertEqual(st_p.primal_dims[1].size, 3)
         self.assertTrue(jnp.allclose(st_p.dense(), st.dense()))
@@ -325,14 +287,12 @@ class TestDenseDiags(unittest.TestCase):
     def test_partial_mixed_4d_axis0(self):
         val = jrand.normal(self.get_keys()[0], (2, 3, 5))
         d0 = SparseIndex(id=0, size=2, axis=0, other_id=2)
-        d1 = SparseIndex(
-            id=1, size=3, axis=1, other_id=3, block_size=5, block_axis=2
-        )
+        d1 = SparseIndex(id=1, size=3, axis=1, other_id=3, block_size=5, block_axis=2)
         d2 = SparseIndex(id=2, size=2, axis=0, other_id=0)
         d3 = SparseIndex(id=3, size=3, axis=1, other_id=1)
         st = SparseTensor((d0, d1), (d2, d3), val)
-        st_p = _dense(st, axes=(0,))
-        self.assertTrue((st_p == _dense(st, axes=(0, 2))).all())
+        st_p = dense(st, axes=(0,))
+        self.assertTrue((st_p == dense(st, axes=(0, 2))).all())
         self.assertTrue(
             isinstance(st_p.out_dims[0], DenseIndex)
             and isinstance(st_p.primal_dims[0], DenseIndex)
@@ -342,14 +302,12 @@ class TestDenseDiags(unittest.TestCase):
     def test_partial_mixed_4d_axis1(self):
         val = jrand.normal(self.get_keys()[0], (2, 3, 5))
         d0 = SparseIndex(id=0, size=2, axis=0, other_id=2)
-        d1 = SparseIndex(
-            id=1, size=3, axis=1, other_id=3, block_size=5, block_axis=2
-        )
+        d1 = SparseIndex(id=1, size=3, axis=1, other_id=3, block_size=5, block_axis=2)
         d2 = SparseIndex(id=2, size=2, axis=0, other_id=0)
         d3 = SparseIndex(id=3, size=3, axis=1, other_id=1)
         st = SparseTensor((d0, d1), (d2, d3), val)
-        st_p = _dense(st, axes=(1,))
-        self.assertTrue((st_p == _dense(st, axes=(1, 3))).all())
+        st_p = dense(st, axes=(1,))
+        self.assertTrue((st_p == dense(st, axes=(1, 3))).all())
         self.assertTrue(
             isinstance(st_p.out_dims[1], DenseIndex)
             and isinstance(st_p.primal_dims[1], DenseIndex)
@@ -364,8 +322,8 @@ class TestDenseDiags(unittest.TestCase):
         d3 = SparseIndex(id=3, size=2, axis=0, other_id=0)
         d4 = SparseIndex(id=4, size=3, axis=1, other_id=1)
         st = SparseTensor((d0, d1, d2), (d3, d4), val)
-        st_p = _dense(st, axes=(0,))
-        self.assertTrue((st_p == _dense(st, axes=(0, 3))).all())
+        st_p = dense(st, axes=(0,))
+        self.assertTrue((st_p == dense(st, axes=(0, 3))).all())
         self.assertTrue(
             isinstance(st_p.out_dims[0], DenseIndex)
             and isinstance(st_p.primal_dims[0], DenseIndex)
@@ -380,8 +338,8 @@ class TestDenseDiags(unittest.TestCase):
         d3 = SparseIndex(id=3, size=2, axis=0, other_id=0)
         d4 = SparseIndex(id=4, size=3, axis=1, other_id=1)
         st = SparseTensor((d0, d1, d2), (d3, d4), val)
-        st_p = _dense(st, axes=(1,))
-        self.assertTrue((st_p == _dense(st, axes=(1, 4))).all())
+        st_p = dense(st, axes=(1,))
+        self.assertTrue((st_p == dense(st, axes=(1, 4))).all())
         self.assertTrue(
             isinstance(st_p.out_dims[1], DenseIndex)
             and isinstance(st_p.primal_dims[1], DenseIndex)
@@ -400,8 +358,8 @@ class TestDenseDiags(unittest.TestCase):
                 d4 = SparseIndex(id=4, size=3, axis=1, other_id=1)
                 d5 = SparseIndex(id=5, size=4, axis=2, other_id=2)
                 st = SparseTensor((d0, d1, d2), (d3, d4, d5), val)
-                st_p = _dense(st, axes=(axis,))
-                self.assertTrue((st_p == _dense(st, axes=(axis, axis + 3))).all())
+                st_p = dense(st, axes=(axis,))
+                self.assertTrue((st_p == dense(st, axes=(axis, axis + 3))).all())
                 self.assertTrue(
                     isinstance(st_p.out_dims[axis], DenseIndex)
                     and isinstance(st_p.primal_dims[axis], DenseIndex)
@@ -420,9 +378,9 @@ class TestDenseDiags(unittest.TestCase):
                 d4 = SparseIndex(id=4, size=3, axis=1, other_id=1)
                 d5 = SparseIndex(id=5, size=4, axis=2, other_id=2)
                 st = SparseTensor((d0, d1, d2), (d3, d4, d5), val)
-                st_p = _dense(st, axes=axes)
+                st_p = dense(st, axes=axes)
                 f_axes = tuple(axes) + tuple(a + 3 for a in axes)
-                self.assertTrue((st_p == _dense(st, axes=f_axes)).all())
+                self.assertTrue((st_p == dense(st, axes=f_axes)).all())
                 for a in axes:
                     self.assertTrue(
                         isinstance(st_p.out_dims[a], DenseIndex)
@@ -449,9 +407,9 @@ class TestDenseDiags(unittest.TestCase):
                     id=4, size=3, axis=1, other_id=1, block_size=9, block_axis=6
                 )
                 st = SparseTensor((d0, d1, d2), (d3, d4), val)
-                st_p = _dense(st, axes=axes)
+                st_p = dense(st, axes=axes)
                 f_axes = tuple(axes) + tuple(a + 3 for a in axes)
-                self.assertTrue((st_p == _dense(st, axes=f_axes)).all())
+                self.assertTrue((st_p == dense(st, axes=f_axes)).all())
                 for a in axes:
                     self.assertTrue(
                         isinstance(st_p.out_dims[a], DenseIndex)
@@ -484,9 +442,9 @@ class TestDenseDiags(unittest.TestCase):
     #                 id=5, size=4, axis=2, other_id=2, block_size=11, block_axis=8
     #             )
     #             st = SparseTensor((d0, d1, d2), (d3, d4, d5), val)
-    #             st_p = _dense(st, axes=axes)
+    #             st_p = dense(st, axes=axes)
     #             f_axes = tuple(axes) + tuple(a + 3 for a in axes)
-    #             self.assertTrue((st_p == _dense(st, axes=f_axes)).all())
+    #             self.assertTrue((st_p == dense(st, axes=f_axes)).all())
     #             for a in axes:
     #                 self.assertTrue(
     #                     isinstance(st_p.out_dims[a], DenseIndex)
@@ -505,7 +463,7 @@ class TestDenseDiags(unittest.TestCase):
             for j in range(3):
                 dense_ref = dense_ref.at[i, j, j, i].set(val[i, j])
         self.assertTrue(jnp.allclose(st.dense(), dense_ref))
-        st_p = _dense(st, axes=(0,))
+        st_p = dense(st, axes=(0,))
         self.assertTrue(
             isinstance(st_p.out_dims[0], DenseIndex)
             and isinstance(st_p.primal_dims[1], DenseIndex)
@@ -532,7 +490,7 @@ class TestDenseDiags(unittest.TestCase):
                 for k in range(4):
                     dense_ref = dense_ref.at[i, j, k, i, k, j].set(val[i, j, k])
         self.assertTrue(jnp.allclose(st.dense(), dense_ref))
-        st_p = _dense(st, axes=(1,))
+        st_p = dense(st, axes=(1,))
         self.assertTrue(
             isinstance(st_p.out_dims[1], DenseIndex)
             and isinstance(st_p.primal_dims[2], DenseIndex)

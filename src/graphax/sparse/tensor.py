@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import math
 from abc import ABC
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from functools import partial
 from math import prod
 from typing import Any, Callable, Literal, override
-from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
@@ -15,20 +15,19 @@ from jax import Array
 from jax.tree_util import register_pytree_node_class
 from jax.typing import DTypeLike
 
+from graphax.sparse.indexes import DenseIndex, Index, SparseIndex
+from graphax.sparse.ops.dense import dense
+from graphax.sparse.ops.elementwise import elementwise
+from graphax.sparse.ops.matmul import matmul
+from graphax.sparse.ops.transpose import transpose
 from graphax.sparse.ops.utils import (
+    _arr2st,
     _assert_sparse_tensor_consistency,
     _copy,
-    _sort_val,
-    _arr2st,
     _materialize_indexes,
+    _sort_val,
     _swap_back_axes,
 )
-from graphax.sparse.ops.dense import dense, dense as _dense
-from graphax.sparse.ops.transpose import transpose
-from graphax.sparse.ops.matmul import matmul, matmul as _matmul
-from graphax.sparse.ops.elementwise import elementwise
-
-from graphax.sparse.indexes import Index, DenseIndex, SparseIndex
 
 
 def _compute_zero_fill_flag(fill_value) -> bool:
@@ -42,8 +41,12 @@ def _compute_zero_fill_flag(fill_value) -> bool:
     in all cases; we just lose the fast-path opportunity)."""
     try:
         return bool(np.all(np.asarray(fill_value) == 0))
-    except (TypeError, ValueError, AttributeError,
-            jax.errors.TracerArrayConversionError):
+    except (
+        TypeError,
+        ValueError,
+        AttributeError,
+        jax.errors.TracerArrayConversionError,
+    ):
         # Tracer or non-array; conservatively report non-zero.
         return False
 
@@ -295,8 +298,9 @@ class SparseTensor(SparseMathMixin):
         # can pass ``zero_fill=True`` explicitly to skip the probe — this is
         # the only way to keep the flag through chained ops inside jit, where
         # the freshly-constructed ``jnp.array(0)`` is a tracer too.
-        self._zero_fill = (zero_fill if zero_fill is not None
-                           else _compute_zero_fill_flag(fill_value))
+        self._zero_fill = (
+            zero_fill if zero_fill is not None else _compute_zero_fill_flag(fill_value)
+        )
 
         self._dynamic_keys = tuple(kwargs.keys())
         for k, v in kwargs.items():
@@ -339,8 +343,12 @@ class SparseTensor(SparseMathMixin):
     def tree_unflatten(cls, aux_data, children):
         val, scalar_mult, fill_value, compressed_val = children
         (
-            out_dims, primal_dims, pre_transforms, post_transforms,
-            dynamic_kwargs, zero_fill,
+            out_dims,
+            primal_dims,
+            pre_transforms,
+            post_transforms,
+            dynamic_kwargs,
+            zero_fill,
         ) = aux_data
         kwargs = dict(dynamic_kwargs)
 
@@ -362,8 +370,9 @@ class SparseTensor(SparseMathMixin):
         return st
 
     @classmethod
-    def from_compressed(cls, compressed_val, *, fill_value=None,
-                        dim_ids: tuple[int, int] = (0, 1)) -> SparseTensor:
+    def from_compressed(
+        cls, compressed_val, *, fill_value=None, dim_ids: tuple[int, int] = (0, 1)
+    ) -> SparseTensor:
         """Wrap a structured pytree (``UnionBlocks`` / ``IntersectionBlocks`` /
         ``BlockBanded``) into a 2-D ``SparseTensor``.
 
@@ -407,20 +416,33 @@ class SparseTensor(SparseMathMixin):
             # Meta-block-diagonal storage: pair of SparseIndexes over M
             # meta-blocks of size (H_meta, W_meta), val of shape (M, H_meta, W_meta).
             M, H_meta, W_meta = meta
-            val = compressed_val.to_meta_blocks()   # (M, H_meta, W_meta, *L)
+            val = compressed_val.to_meta_blocks()  # (M, H_meta, W_meta, *L)
             leftover_dims = tuple(
-                DenseIndex(2 + i, s, axis=3 + i)
-                for i, s in enumerate(val.shape[3:])
+                DenseIndex(2 + i, s, axis=3 + i) for i, s in enumerate(val.shape[3:])
             )
             n_left = len(leftover_dims) // 2
             return cls(
-                (SparseIndex(out_id, M, axis=0,
-                                 other_id=primal_id,
-                                 block_size=H_meta, block_axis=1),)
+                (
+                    SparseIndex(
+                        out_id,
+                        M,
+                        axis=0,
+                        other_id=primal_id,
+                        block_size=H_meta,
+                        block_axis=1,
+                    ),
+                )
                 + leftover_dims[:n_left],
-                (SparseIndex(primal_id, M, axis=0,
-                                 other_id=out_id,
-                                 block_size=W_meta, block_axis=2),)
+                (
+                    SparseIndex(
+                        primal_id,
+                        M,
+                        axis=0,
+                        other_id=out_id,
+                        block_size=W_meta,
+                        block_axis=2,
+                    ),
+                )
                 + leftover_dims[n_left:],
                 val=val,
                 fill_value=fv,
@@ -430,13 +452,10 @@ class SparseTensor(SparseMathMixin):
         # Fallback (e.g. BlockBanded with w>0): keep compressed_val for late
         # densification, expose as two DenseIndexes over the full shape.
         H, W, *L = compressed_val.shape
-        leftover_dims = tuple(
-            DenseIndex(2 + i, s, axis=2 + i)
-            for i, s in enumerate(L)
-        )
+        leftover_dims = tuple(DenseIndex(2 + i, s, axis=2 + i) for i, s in enumerate(L))
         return cls(
             (DenseIndex(out_id, H, axis=0),) + leftover_dims[: len(L) // 2],
-            (DenseIndex(primal_id, W, axis=1),) + leftover_dims[len(L) // 2:],
+            (DenseIndex(primal_id, W, axis=1),) + leftover_dims[len(L) // 2 :],
             val=None,
             compressed_val=compressed_val,
             fill_value=fv,
@@ -611,11 +630,15 @@ class SparseTensor(SparseMathMixin):
 
     # Low priority TODO: axis, and other args
     def all(self) -> Array:
-        val_part = jnp.all(self.val * self.scalar_mult) if self.val is not None else True
+        val_part = (
+            jnp.all(self.val * self.scalar_mult) if self.val is not None else True
+        )
         return jnp.logical_and(val_part, self.fill_value * self.scalar_mult != 0)
 
     def any(self) -> Array:
-        val_part = jnp.any(self.val * self.scalar_mult) if self.val is not None else False
+        val_part = (
+            jnp.any(self.val * self.scalar_mult) if self.val is not None else False
+        )
         return jnp.logical_or(val_part, self.fill_value * self.scalar_mult != 0)
 
     def sum(self) -> Array:
@@ -769,9 +792,7 @@ class SparseTensor(SparseMathMixin):
         arr = self._target_arr
         if hasattr(arr, "device"):
             return arr.device
-        raise AttributeError(
-            f"'{type(arr).__name__}' object has no attribute 'device'"
-        )
+        raise AttributeError(f"'{type(arr).__name__}' object has no attribute 'device'")
 
     @property
     def platform(self):
@@ -1011,8 +1032,10 @@ def _shift_axis_after_changes(
 
 def _apply_zero_factor(
     st: SparseTensor,
-    is_out1: bool, idx1: int,
-    is_out2: bool, idx2: int,
+    is_out1: bool,
+    idx1: int,
+    is_out2: bool,
+    idx2: int,
 ) -> SparseTensor:
     """``factor == 0``: zero out the (idx1, idx2) pair by reducing each
     physical val axis to ``[..., 0]`` and converting both index entries to
@@ -1062,17 +1085,24 @@ def _apply_zero_factor(
     new_out = [_shift_other(d, d) for d in new_out]
     new_primal = [_shift_other(d, d) for d in new_primal]
     return SparseTensor(
-        new_out, new_primal, val,
+        new_out,
+        new_primal,
+        val,
         scalar_mult=st.scalar_mult,
-        sort_val=False, check_consistency=False,
+        sort_val=False,
+        check_consistency=False,
     )
 
 
 def _apply_block_diagonal(
     st: SparseTensor,
-    is_out1: bool, idx1: int,
-    is_out2: bool, idx2: int,
-    size: int, b1: int, b2: int,
+    is_out1: bool,
+    idx1: int,
+    is_out2: bool,
+    idx2: int,
+    size: int,
+    b1: int,
+    b2: int,
 ) -> SparseTensor:
     """Apply a single ``(idx1, idx2, size, b1, b2)`` block-diagonal rule.
 
@@ -1226,9 +1256,12 @@ def _apply_block_diagonal(
             new_primal[i] = _remap_other(d)
 
     return SparseTensor(
-        new_out, new_primal, val,
+        new_out,
+        new_primal,
+        val,
         scalar_mult=st.scalar_mult,
-        sort_val=False, check_consistency=False,
+        sort_val=False,
+        check_consistency=False,
     )
 
 

@@ -1,13 +1,13 @@
+import unittest
 from itertools import chain, combinations, permutations
 
 import jax.numpy as jnp
 import jax.random as jrand
-import unittest
 from chex import Array
 
 from graphax.sparse.indexes import DenseIndex, SparseIndex
-from graphax.sparse.tensor import SparseTensor
 from graphax.sparse.ops.utils import _arr2st
+from graphax.sparse.tensor import SparseTensor
 
 # --- Test fixtures and setup ---
 
@@ -149,9 +149,7 @@ def generate_dimension_specs(
         )
 
     def make_dense(id, dense_idx):
-        return DenseIndex(
-            id, get_block_size(dense_idx), axis=map_dense(dense_idx)
-        )
+        return DenseIndex(id, get_block_size(dense_idx), axis=map_dense(dense_idx))
 
     specs = []
 
@@ -419,7 +417,7 @@ def assert_matmul_result(
             if st_result.val.shape != physical_shape:
                 raise AssertionError(
                     f"Physical shape mismatch. Expected {physical_shape}, got {st_result.val.shape}. "
-                    f"The _matmul operation may be losing sparsity."
+                    f"The matmul operation may be losing sparsity."
                 )
 
 
