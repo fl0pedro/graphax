@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-from .utils import _arr2st, _is_sparse, _val_or_one, _prepare_physical_array, _materialize_compressed
+from .utils import _arr2st, _is_sparse, _val_or_one, _prepare_physical_array, _materialize_compressed, _is_zero_fill
 from .layout import generate_block_permutation
 from graphax.sparse.indexes import SparseIndex, DenseIndex
 
@@ -50,6 +50,16 @@ _ADDITIVE_IDENTITY_OPS = frozenset((
 ))
 
 
+def _scaled_fill(tensor) -> Array:
+    """Post-scaled fill_value: ``fill * scalar_mult`` (or ``& mask`` for bool).
+    Canonical form used to compose output fills consistently — every fast path
+    must produce a fill that matches the post-scaled meaning of the input
+    operands so downstream consumers see one definition."""
+    if tensor.dtype == jnp.bool_:
+        return tensor.fill_value & tensor.scalar_mult.astype(jnp.bool_)
+    return tensor.fill_value * tensor.scalar_mult
+
+
 def _normalize_inputs(lhs, rhs):
     target_dtype = (lhs.dtype if _is_sparse(lhs) and not _is_sparse(rhs)
                     else rhs.dtype if _is_sparse(rhs) and not _is_sparse(lhs)
@@ -75,6 +85,9 @@ def _normalize_inputs(lhs, rhs):
         lhs = _copy(lhs, val=_materialize_compressed(lhs))
     if getattr(rhs, "compressed_val", None) is not None:
         rhs = _copy(rhs, val=_materialize_compressed(rhs))
+    # Static shape comparison: ``SparseTensor.shape`` returns Python ints
+    # derived from the dim metadata, so this is a trace-time check (no runtime
+    # branching on traced shapes).
     if lhs.shape != rhs.shape:
         raise ValueError(f"Shape mismatch: {lhs.shape} != {rhs.shape}")
     return lhs, rhs
@@ -128,7 +141,13 @@ def _pair_metric(p):
     lb1, lb2 = ld1.block_size or 1, ld2.block_size or 1
     rb1, rb2 = rd1.block_size or 1, rd2.block_size or 1
     cb1, cb2 = math.lcm(lb1, rb1), math.lcm(lb2, rb2)
-    return {"unified_size": ld1.size // (cb1 // lb1),
+    exp_l1 = cb1 // lb1
+    if ld1.size % exp_l1:
+        raise ValueError(
+            f"Pair size {ld1.size} not divisible by promotion factor {exp_l1} "
+            f"(common block {cb1}, lhs block {lb1}); cannot tile onto LCM grid."
+        )
+    return {"unified_size": ld1.size // exp_l1,
             "common_b1": cb1, "common_b2": cb2,
             "left_b1": lb1, "left_b2": lb2,
             "right_b1": rb1, "right_b2": rb2,
@@ -175,11 +194,23 @@ def _promote_to_unified(value: Array, metrics, is_left: bool) -> Array:
     for m in metrics:
         b1, b2 = (m["left_b1"], m["left_b2"]) if is_left else (m["right_b1"], m["right_b2"])
         cb1, cb2 = m["common_b1"], m["common_b2"]
-        exp = cb1 // b1
-        in_shape.extend([m["unified_size"], exp, b1, b2])
-        exp_shape.extend([m["unified_size"], exp, 1, b1, b2])
+        exp_h, exp_w = cb1 // b1, cb2 // b2
+        # Per-pair invariant: source value has shape ``(M, b1, b2)``; promoting
+        # to the LCM grid scatters ``exp_h`` sub-blocks onto the diagonal of an
+        # ``(exp_h, exp_w)`` block-axis grid. With ``exp_h != exp_w`` the
+        # current eye-mask path can't represent which positions to fill, and
+        # downstream reshape to ``(unified, cb1, cb2)`` would also misalign.
+        # In well-formed sparse pairs the row/col extent constraint forces
+        # ``exp_h == exp_w``; reject the malformed-input case loudly.
+        if exp_h != exp_w:
+            raise ValueError(
+                f"_promote_to_unified requires square block expansion "
+                f"(exp_h={exp_h}, exp_w={exp_w}); pair metric {m} is malformed."
+            )
+        in_shape.extend([m["unified_size"], exp_h, b1, b2])
+        exp_shape.extend([m["unified_size"], exp_h, 1, b1, b2])
         out_shape.extend([m["unified_size"], cb1, cb2])
-        if exp > 1:
+        if exp_h > 1:
             needs_expansion = True
     rem = list(value.shape[3 * len(metrics):])
     in_shape += rem; exp_shape += rem; out_shape += rem
@@ -190,11 +221,11 @@ def _promote_to_unified(value: Array, metrics, is_left: bool) -> Array:
     # directly into a zero-initialized ``(M, LCM_h, LCM_w)`` buffer instead of
     # the broadcast+where dance below. The broadcast+where allocates an
     # intermediate ``(M, exp, exp, B_h, B_w)`` (size ``exp²·M·B_h·B_w``) full
-    # of zeros except on the diagonal; scatter never materializes that — peak
-    # HBM stays at ``M·LCM_h·LCM_w`` (the same as the final output buffer).
-    # That's the *divisor case*: one side already lives at LCM granularity, so
-    # only the smaller side goes through this expansion. ``test_03``'s
-    # peak-mem regression (16.69 → 4.17 MB targetted) sits on this path.
+    # of zeros except on the diagonal; the masked-where stays at peak
+    # ``M·LCM_h·LCM_w`` (the same as the final output buffer). That's the
+    # *divisor case*: one side already lives at LCM granularity, so only the
+    # smaller side goes through this expansion. ``test_03``'s peak-mem
+    # regression (16.69 → 4.17 MB targetted) sits on this path.
     #
     # Off-diagonal values are 0 (the same value the broadcast+where path
     # produces); this is correct for all zero-fill ops we support — every op
@@ -206,22 +237,39 @@ def _promote_to_unified(value: Array, metrics, is_left: bool) -> Array:
         b1, b2 = (m["left_b1"], m["left_b2"]) if is_left else (m["right_b1"], m["right_b2"])
         cb1, cb2 = m["common_b1"], m["common_b2"]
         exp = cb1 // b1
-        if exp > 1 and (cb2 // b2) == exp:   # block-diagonal shape (exp_h == exp_w)
+        if exp > 1:
             M = m["unified_size"]
-            out = jnp.zeros((M, cb1, cb2, *rem), dtype=value.dtype)
-            for i in range(exp):
-                out = out.at[:, i * b1:(i + 1) * b1, i * b2:(i + 1) * b2].set(value[:, i])
-            return out
+            # Reshape source ``(M, exp, b1, b2)`` to a per-block-axis layout
+            # ``(M, exp, 1, b1, b2)`` so a single ``where(eye_mask, value, 0)``
+            # produces the diagonal-scattered ``(M, exp, exp, b1, b2)`` form,
+            # then reshape to ``(M, cb1, cb2)``. Avoids the per-``i`` Python
+            # loop over ``out.at[...].set(...)`` (one HLO op per slice).
+            v = value.reshape(M, exp, 1, b1, b2, *rem)
+            mask_shape = [1, exp, exp, 1, 1] + [1] * len(rem)
+            eye = jnp.eye(exp, dtype=jnp.bool_).reshape(mask_shape)
+            v = jnp.where(eye, v, jnp.array(0, dtype=value.dtype))
+            return v.transpose([0, 1, 3, 2, 4] + list(range(5, 5 + len(rem)))) \
+                    .reshape(M, cb1, cb2, *rem)
 
     if value.shape != tuple(exp_shape):
         value = value.reshape(exp_shape)
     if needs_expansion:
         mask = None
         for i, m in enumerate(metrics):
-            exp = m["common_b1"] // (m["left_b1"] if is_left else m["right_b1"])
-            if exp > 1:
-                ms = [1] * len(exp_shape); ms[5 * i + 1] = exp; ms[5 * i + 2] = exp
-                em = jnp.eye(exp, dtype=jnp.bool_).reshape(ms)
+            b1 = m["left_b1"] if is_left else m["right_b1"]
+            b2 = m["left_b2"] if is_left else m["right_b2"]
+            exp_h = m["common_b1"] // b1
+            exp_w = m["common_b2"] // b2
+            if exp_h > 1:
+                # Build the diagonal selector from independent per-axis eyes
+                # (``logical_and`` of the two), so the cross-axis structure is
+                # explicit even though the well-formed invariant pins
+                # ``exp_h == exp_w``.
+                ms_h = [1] * len(exp_shape); ms_h[5 * i + 1] = exp_h; ms_h[5 * i + 2] = exp_h
+                ms_w = [1] * len(exp_shape); ms_w[5 * i + 1] = exp_w; ms_w[5 * i + 2] = exp_w
+                eye_h = jnp.eye(exp_h, dtype=jnp.bool_).reshape(ms_h)
+                eye_w = jnp.eye(exp_w, dtype=jnp.bool_).reshape(ms_w)
+                em = jnp.logical_and(eye_h, eye_w)
                 mask = em if mask is None else mask & em
         if mask is not None:
             value = jnp.where(mask, value, jnp.array(0, dtype=value.dtype))
@@ -280,7 +328,7 @@ def _reconstruct_result(value, lhs, sp, dp, output_meta, op, rhs):
         idx = tuple(0 if ax in info["squeeze"] else slice(None) for ax in range(value.ndim))
         value = value[idx]
     s_mult = jnp.array(True) if value.dtype == jnp.bool_ else jnp.array(1.0, dtype=value.dtype)
-    new_fill = op(lhs.fill_value * lhs.scalar_mult, rhs.fill_value * rhs.scalar_mult)
+    new_fill = op(_scaled_fill(lhs), _scaled_fill(rhs))
     # Propagate the static zero-fill flag when both inputs have zero fill and
     # ``op(0, 0) == 0`` — otherwise downstream matmuls drop to the densify
     # fallback. We can't probe ``op`` numerically inside jit (any jax-side
@@ -357,6 +405,14 @@ def _try_divisor_fast_path(lhs, rhs, op, is_intersection):
     if any(d.block_axis is None for d in (ao, ai, bo, bi)
            if d.block_size is not None and d.block_size > 1):
         return None
+    # Physical val-axis order must be (outer, block_h, block_w) — i.e. axes
+    # ``(0, 1, 2)`` — for the ``reshape(M, exp, b_h, b_w)`` step below to be
+    # semantically correct. A different physical order would silently scramble
+    # rows vs cols. Defer to the general path on a non-canonical layout rather
+    # than transposing here (the general path handles arbitrary axis orders).
+    canonical = lambda o, p: (o.axis, o.block_axis, p.block_axis) == (0, 1, 2)
+    if not (canonical(ao, ai) and canonical(bo, bi)):
+        return None
     a_b_h, a_b_w = ao.block_size or 1, ai.block_size or 1
     b_b_h, b_b_w = bo.block_size or 1, bi.block_size or 1
     a_n, b_n = ao.size, bo.size
@@ -376,6 +432,14 @@ def _try_divisor_fast_path(lhs, rhs, op, is_intersection):
     else:
         big, small = rhs, lhs
         s_b_h, s_b_w = a_b_h, a_b_w
+    # Off-diagonal cells of each meta-block stay at the literal ``big_v`` value
+    # because we represent the small side's missing entries as ``small_fill``
+    # and use the additive-identity property ``op(0, x) == x``. That argument
+    # only holds when ``small_fill`` is statically known to be 0; with a
+    # non-zero fill the off-diagonal cell would correctly be
+    # ``op(small_fill, big_v)`` and we'd lose the single-buffer save. Defer.
+    if not _is_zero_fill(small):
+        return None
     exp_h = lcm_h // s_b_h
     exp_w = lcm_w // s_b_w
     if exp_h != exp_w:
@@ -385,34 +449,33 @@ def _try_divisor_fast_path(lhs, rhs, op, is_intersection):
 
     # Absorb scalar_mults eagerly so the output's scalar_mult is canonical.
     bool_op = lhs.dtype == jnp.bool_
-    if bool_op:
-        big_v = big.val & big.scalar_mult.astype(jnp.bool_)
-        small_v = small.val & small.scalar_mult.astype(jnp.bool_)
-        big_fill = big.fill_value & big.scalar_mult.astype(jnp.bool_)
-        small_fill = small.fill_value & small.scalar_mult.astype(jnp.bool_)
+    big_v = big.val & big.scalar_mult.astype(jnp.bool_) if bool_op \
+        else big.val * big.scalar_mult
+    small_v = small.val & small.scalar_mult.astype(jnp.bool_) if bool_op \
+        else small.val * small.scalar_mult
+
+    # Single-buffer build via ``where(eye, op(big_diag, small), big)``:
+    #   * View ``big_v`` as a per-meta-block grid ``(M, exp_r, exp_c, b_h, b_w)``.
+    #   * View ``small_v`` as one block per meta-block-diagonal position
+    #     ``(M, exp, 1, b_h, b_w)`` (broadcasts trivially across the col-meta axis).
+    #   * Apply ``op`` between the two — XLA's broadcast yields a full
+    #     ``(M, exp, exp, b_h, b_w)`` op-applied tensor at trace time.
+    #   * Use ``eye(exp)`` to pick the op'd value on the diagonal cells and
+    #     the bare ``big`` value elsewhere — off-diagonal cells = ``big_v``
+    #     (correct because ``small_fill == 0`` and ``op(big, 0) == big``).
+    # Replaces the per-``i`` Python ``at[...].set(...)`` loop with one fused HLO.
+    big_grid = big_v.reshape(M, exp, s_b_h, exp, s_b_w).transpose(0, 1, 3, 2, 4)
+    small_diag = small_v.reshape(M, exp, 1, s_b_h, s_b_w)
+    if big is lhs:
+        op_applied = op(big_grid, small_diag)
     else:
-        big_v = big.val * big.scalar_mult
-        small_v = small.val * small.scalar_mult
-        big_fill = big.fill_value * big.scalar_mult
-        small_fill = small.fill_value * small.scalar_mult
+        op_applied = op(small_diag, big_grid)
+    eye = jnp.eye(exp, dtype=jnp.bool_).reshape(1, exp, exp, 1, 1)
+    out = jnp.where(eye, op_applied, big_grid)
+    out = out.transpose(0, 1, 3, 2, 4).reshape(M, exp * s_b_h, exp * s_b_w)
 
-    # Sequential ``at[].set`` updates into ``big_v``-sized buffer:
-    #   - off-diagonal positions of each meta-block stay equal to ``big_v``
-    #     (which equals ``op(small_fill, big_v)`` exactly because the op
-    #     zero-preserves, so off-small-support cells are op(0, big) = big);
-    #   - diagonal positions get ``op(small_v[:, i], big_v[diag-slice])``.
-    out = big_v
-    s_reshaped = small_v.reshape(M, exp, s_b_h, s_b_w)
-    for i in range(exp):
-        big_slice = big_v[:, i * s_b_h:(i + 1) * s_b_h, i * s_b_w:(i + 1) * s_b_w]
-        # Order args so caller-facing op semantics are preserved (lhs vs rhs).
-        if big is lhs:
-            combined = op(big_slice, s_reshaped[:, i])
-        else:
-            combined = op(s_reshaped[:, i], big_slice)
-        out = out.at[:, i * s_b_h:(i + 1) * s_b_h, i * s_b_w:(i + 1) * s_b_w].set(combined)
-
-    new_fill = op(big_fill, small_fill) if big is lhs else op(small_fill, big_fill)
+    new_fill = op(_scaled_fill(big), _scaled_fill(small)) if big is lhs \
+        else op(_scaled_fill(small), _scaled_fill(big))
     s_mult = jnp.array(True) if bool_op else jnp.array(1.0, dtype=lhs.val.dtype)
     zf = (getattr(lhs, "_zero_fill", False) and getattr(rhs, "_zero_fill", False)) or None
 
@@ -493,13 +556,11 @@ def _try_compressed_union(lhs, rhs, op, is_intersection):
     if bool_op:
         lhs_v = lhs.val & lhs.scalar_mult.astype(jnp.bool_)
         rhs_v = rhs.val & rhs.scalar_mult.astype(jnp.bool_)
-        fill_l = lhs.fill_value & lhs.scalar_mult.astype(jnp.bool_)
-        fill_r = rhs.fill_value & rhs.scalar_mult.astype(jnp.bool_)
     else:
         lhs_v = lhs.val * lhs.scalar_mult
         rhs_v = rhs.val * rhs.scalar_mult
-        fill_l = lhs.fill_value * lhs.scalar_mult
-        fill_r = rhs.fill_value * rhs.scalar_mult
+    fill_l = _scaled_fill(lhs)
+    fill_r = _scaled_fill(rhs)
 
     lhs_blocks = lhs_v.reshape(M, n_lhs, a_b_h, a_b_w)
     rhs_blocks = rhs_v.reshape(M, n_rhs, b_b_h, b_b_w)
@@ -511,11 +572,17 @@ def _try_compressed_union(lhs, rhs, op, is_intersection):
     s_mult = jnp.array(True) if bool_op else jnp.array(1.0, dtype=lhs.val.dtype)
     zf = (getattr(lhs, "_zero_fill", False) and getattr(rhs, "_zero_fill", False)) or None
 
+    # Preserve source IDs from lhs's sparse pair — hardcoding ``0, 1`` produces
+    # silent dim-id collisions when lhs sits inside a larger tensor whose IDs
+    # already use 0/1 (the divisor fast path correctly reuses ``big.out_dims``
+    # / ``big.primal_dims`` and so keeps the IDs; mirror that here).
+    out_id, primal_id = lhs.out_dims[0].id, lhs.primal_dims[0].id
+
     from graphax.sparse.tensor import SparseTensor
     return SparseTensor(
-        (SparseIndex(0, M, axis=0, other_id=1,
+        (SparseIndex(out_id, M, axis=0, other_id=primal_id,
                          block_size=lcm_h, block_axis=1),),
-        (SparseIndex(1, M, axis=0, other_id=0,
+        (SparseIndex(primal_id, M, axis=0, other_id=out_id,
                          block_size=lcm_w, block_axis=2),),
         val=None, compressed_val=ub,
         scalar_mult=s_mult, fill_value=new_fill,
@@ -527,14 +594,7 @@ def _try_compressed_union(lhs, rhs, op, is_intersection):
 # Re-exports from ``_path_tracking``. See that module for the full design;
 # tests opt in via the ``track_paths()`` context manager or ``TRACK_PATHS=1``
 # env var. Production runs pay nothing.
-from ._path_tracking import record_path as _record_path  # noqa: E402
-
-
-def __getattr__(name: str):
-    if name == "last_path":
-        from . import _path_tracking
-        return _path_tracking.last_path
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+from ._path_tracking import record_path as _record_path, last_path  # noqa: E402, F401
 
 
 def elementwise(
