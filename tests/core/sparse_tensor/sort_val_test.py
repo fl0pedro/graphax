@@ -61,10 +61,12 @@ class TestSortVal(unittest.TestCase):
         self.assertEqual(new_primal, tuple(primal_dims))
 
     # TODO make the ones bellow the general init tests
+    # ``_assert_sparse_tensor_consistency`` now raises ``ValueError`` (was a
+    # bare ``assert`` that ``python -O`` would strip silently).
     def test_bad_sort_val_one_sparse(self):
         d0 = SparseIndex(id=0, size=2, axis=0, other_id=1)
         d1 = SparseIndex(id=0, size=2, axis=0, other_id=1)
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             SparseTensor((d0,), (d1,), jnp.ones((2,)))
 
     def test_bad_sort_val_two_sparse(self):
@@ -72,14 +74,14 @@ class TestSortVal(unittest.TestCase):
         d1 = SparseIndex(id=1, size=2, axis=0, other_id=0)
         d2 = SparseIndex(id=0, size=2, axis=1, other_id=3)
         d3 = SparseIndex(id=3, size=2, axis=1, other_id=0)
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             SparseTensor((d0, d1), (d2, d3), jnp.ones((2, 2)))
 
     def test_bad_sort_val_mixed(self):
         d0 = DenseIndex(id=0, size=2, axis=0)
         d1 = SparseIndex(id=0, size=2, axis=1, other_id=2)
         d2 = SparseIndex(id=2, size=2, axis=1, other_id=0)
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             SparseTensor((d0,), (d1, d2), jnp.ones((2, 2)))
 
     # WIP

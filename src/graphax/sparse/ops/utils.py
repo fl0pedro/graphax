@@ -23,11 +23,32 @@ if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
 
 
+# Sentinel for ``_copy(compressed_val=...)`` — distinguishes "carry over the
+# source's compressed_val" (default) from "explicitly clear it" (None).
+_UNSET = object()
+
+
+# Lazily resolved on first ``_is_sparse`` call to dodge a circular import
+# (``graphax.sparse.tensor`` imports from this module). After resolution every
+# subsequent ``_is_sparse`` is a single ``isinstance`` instead of a string
+# compare on ``type(obj).__name__``.
+_SparseTensor = None
+
+
+def _get_sparse_tensor_cls():
+    global _SparseTensor
+    if _SparseTensor is None:
+        from graphax.sparse.tensor import SparseTensor
+        _SparseTensor = SparseTensor
+    return _SparseTensor
+
+
 def _is_sparse(obj) -> bool:
-    if getattr(type(obj), "__name__", "") == "SparseTensor":
+    cls = _get_sparse_tensor_cls()
+    if isinstance(obj, cls):
         return True
     if isinstance(obj, tuple) and len(obj) > 0:
-        return getattr(type(obj[0]), "__name__", "") == "SparseTensor"
+        return isinstance(obj[0], cls)
     return False
 
 
@@ -73,6 +94,8 @@ def _materialize_compressed(tensor):
 def _has_meta_block_diag_dims(tensor, meta_block_shape) -> bool:
     """``True`` iff the host SparseTensor's first out_dim/primal_dim form a
     meta-block-diagonal sparse pair sized to host ``compressed_val.to_meta_blocks()``."""
+    # Assumes meta-block-diagonal storage lives on out_dims[0] / primal_dims[0];
+    # callers must enforce.
     M, H_meta, W_meta = meta_block_shape
     if not tensor.out_dims or not tensor.primal_dims:
         return False
@@ -135,12 +158,17 @@ def _is_zero_fill(tensor: SparseTensor) -> bool:
     Falls back to inspecting ``fill_value`` directly when the flag is missing
     (e.g. a tensor produced before the static-flag mechanism was added)."""
     flag = getattr(tensor, "_zero_fill", None)
+    # Honour any explicit boolean — the cache exists precisely to avoid
+    # re-probing the (possibly traced) ``fill_value``. Only fall through
+    # when the flag is genuinely unset (``None``).
     if flag is not None:
         return bool(flag)
     fv = tensor.fill_value
     try:
         return bool(np.all(np.asarray(fv) == 0))
-    except (TypeError, ValueError, AttributeError, jax.errors.TracerArrayConversionError):
+    except (TypeError, ValueError, AttributeError,
+            jax.errors.TracerArrayConversionError,
+            jax.errors.ConcretizationTypeError):
         return False
 
 
@@ -161,18 +189,23 @@ def _check_block_axis(d, dim_map, block_axiss):
 
 
 def _assert_sparse_tensor_consistency(st: SparseTensor):
+    # Raise (not ``assert``) so the invariant survives ``python -O`` /
+    # ``PYTHONOPTIMIZE`` — every downstream op assumes contiguous IDs and
+    # paired SparseIndex links, and silently dropping the check has caused
+    # wrong-shape Jacobians in the past.
     dim_ids = [d.id for d in st.dims]
-    expected_ids = list(range(len(dim_ids)))
-    assert sorted(dim_ids) == expected_ids, (
-        f"Topology Error: Index IDs must be a contiguous sequence. Got {dim_ids}"
-    )
+    if set(dim_ids) != set(range(len(dim_ids))):
+        raise ValueError(
+            f"Topology Error: Index IDs must be a contiguous sequence. Got {dim_ids}"
+        )
     dim_map = {d.id: d for d in st.dims}
     block_axiss = set()
     for d in st.dims:
         if isinstance(d, SparseIndex):
-            assert _check_sparse_dim_pair(d, dim_map), (
-                f"Topology Error: Invalid sparse dimension pair configuration for dimension {d.id}"
-            )
+            if not _check_sparse_dim_pair(d, dim_map):
+                raise ValueError(
+                    f"Topology Error: Invalid sparse dimension pair configuration for dimension {d.id}"
+                )
             if getattr(d, "block_axis", None) is not None:
                 _check_block_axis(d, dim_map, block_axiss)
 
@@ -180,19 +213,26 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
 # --- Construction / mutation --------------------------------------------
 def _copy(st: SparseTensor, val: Array | None = None, scalar_mult: Array | None = None,
           fill_value: Array | None = None, out_dims: Sequence[Index] | None = None,
-          primal_dims: Sequence[Index] | None = None, deep: bool = False):
+          primal_dims: Sequence[Index] | None = None, deep: bool = False,
+          compressed_val: Any = _UNSET):
     from graphax.sparse.tensor import SparseTensor
     s = scalar_mult if scalar_mult is not None else st.scalar_mult
     f = fill_value if fill_value is not None else st.fill_value
     od = out_dims if out_dims is not None else st.out_dims
     pd = primal_dims if primal_dims is not None else st.primal_dims
-    # When the caller provides a fresh ``val``, replace the dense path and
-    # drop any compressed storage. Otherwise carry both fields through (one
-    # of them is ``None``).
+    # ``compressed_val=_UNSET`` (default): carry over the source's
+    # compressed_val. An explicit value (incl. ``None``) replaces it — used
+    # by callers swapping compressed storage (e.g. UnionBlocks →
+    # IntersectionBlocks) without manually constructing ``SparseTensor(...)``.
+    # When a fresh dense ``val`` is supplied we default to clearing
+    # compressed_val (the constructor rejects both at once).
     if val is not None:
-        v, cv = val, None
+        v = val
+        cv = None if compressed_val is _UNSET else compressed_val
     else:
-        v, cv = st.val, getattr(st, "compressed_val", None)
+        v = st.val
+        cv = (getattr(st, "compressed_val", None) if compressed_val is _UNSET
+              else compressed_val)
     if deep:
         v = copy.deepcopy(v) if v is not None else None
         s = copy.deepcopy(s); od = copy.deepcopy(od); pd = copy.deepcopy(pd)
@@ -211,6 +251,12 @@ def _copy(st: SparseTensor, val: Array | None = None, scalar_mult: Array | None 
 
 
 def _arr2st(arr: Array, out_ndim: int | None = None, dtype: Any = None, **kwargs: Any) -> SparseTensor:
+    # Surface the bug instead of silently flipping to 0. Callers like
+    # ``matmul._normalize_inputs`` compute ``out_ndim`` as
+    # ``lhs.ndim - len(rhs.out_dims)`` which can go negative when the
+    # operand shapes don't line up for a matmul.
+    if out_ndim is not None and out_ndim < 0:
+        raise ValueError(f"_arr2st out_ndim must be non-negative, got {out_ndim}")
     from graphax.sparse.tensor import SparseTensor
     if dtype is not None:
         arr = arr.astype(dtype)
@@ -218,7 +264,6 @@ def _arr2st(arr: Array, out_ndim: int | None = None, dtype: Any = None, **kwargs
         out_ndim = arr.ndim // 2
     if arr.ndim == 0:
         arr = jnp.expand_dims(arr, 0)
-        out_ndim = max(out_ndim or 0, 0)
     dims = tuple(DenseIndex(i, s, i) for i, s in enumerate(arr.shape))
     return SparseTensor(dims[:out_ndim], dims[out_ndim:], arr,
                         sort_val=False, check_consistency=False, **kwargs)
@@ -323,9 +368,18 @@ def _swap_back_axes(st: "SparseTensor") -> "SparseTensor":
 
     seen = set(permutation[:i])
     for j in range(st.val.ndim):
-        if j not in seen and i < len(permutation):
+        if j not in seen:
             permutation[i] = j
             i += 1
+
+    # Sanity guard — the loops above must produce a valid permutation of
+    # ``range(val.ndim)``. The previous ``i < len(permutation)`` clamp would
+    # silently leave initial 0s in trailing slots when val carried physical
+    # axes not described by any Index, producing a transpose that duplicated
+    # axis 0.
+    assert sorted(permutation) == list(range(st.val.ndim)), (
+        f"_swap_back_axes produced invalid permutation {permutation}"
+    )
 
     new_val = st.val.transpose(permutation)
 
