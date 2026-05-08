@@ -13,12 +13,16 @@ The fix routes the densified ``.val`` through ``_resolve_val`` (which expands
 compressed pytrees and returns ``None`` unchanged) and broadcasts the
 ``fill_value`` when the resolved ``val`` is genuinely ``None``.
 """
+import importlib
+
 import jax.numpy as jnp
 import numpy as np
 
 from graphax.sparse.indexes import DenseIndex, SparseIndex
 from graphax.sparse.ops.dense import dense_for_matmul
 from graphax.sparse.tensor import SparseTensor
+
+dense_mod = importlib.import_module("graphax.sparse.ops.dense")
 
 
 def test_fallback_does_not_crash_with_none_densified_val(monkeypatch):
@@ -31,8 +35,6 @@ def test_fallback_does_not_crash_with_none_densified_val(monkeypatch):
     line would raise ``TypeError`` on this; the fixed path returns the
     fill * scalar broadcast instead.
     """
-    import graphax.sparse.ops.dense as dense_mod
-
     # Build a 3-dim tensor that defeats the fully-dense and single-pair
     # fast paths so the fallback runs.
     out_a = SparseIndex(id=0, size=3, axis=0, other_id=2)
@@ -83,8 +85,6 @@ def test_fallback_works_with_compressed_pytree_val(monkeypatch):
     try ``pytree * scalar_mult`` which is ill-typed. The fix routes through
     ``_resolve_val`` which materializes the pytree first.
     """
-    import graphax.sparse.ops.dense as dense_mod
-
     out_a = SparseIndex(id=0, size=3, axis=0, other_id=2)
     out_b = SparseIndex(id=1, size=2, axis=1, other_id=3)
     primal_a = SparseIndex(id=2, size=3, axis=0, other_id=0)
