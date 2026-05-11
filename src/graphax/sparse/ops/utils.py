@@ -328,9 +328,9 @@ def _sort_val(out_dims, primal_dims, val):
 
 
 # --- graphax-specific extensions ----------------------------------------
-# These helpers are used by graphax/primitives/{transforms,reductions} and by
-# the apply_dynamic_sparsity helpers in tensor.py. They are not part of the
-# matmul project; preserved here so external graphax callers keep working.
+# These helpers are used by graphax/primitives/{transforms,reductions}. They
+# are not part of the matmul project; preserved here so external graphax
+# callers keep working.
 def _materialize_indexes(st: "SparseTensor", dims: Sequence[int]) -> Array:
     """Materialize ``st.val`` along the given (sparse) dimensions by inserting
     fresh broadcast axes."""

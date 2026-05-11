@@ -3,10 +3,9 @@
 Two operations the RL policy can emit per sub-step:
 
 * :class:`Diag` — block-diagonalise a pair of *logical* indices ``(i, j)`` with
-  an explicit positive integer factor. Replaces the legacy
-  ``apply_dynamic_sparsity`` factor-table sentinels (``-1`` for gcd, ``0`` for
-  drop). gcd-collapse is *not* a sentinel here — the policy passes the actual
-  integer it picked, even if that integer happens to equal ``gcd(N_i, N_j)``.
+  an explicit positive integer factor. gcd-collapse is *not* a sentinel here —
+  the caller passes the actual integer it picked, even if that integer happens
+  to equal ``gcd(N_i, N_j)``.
 * :class:`Compress` — mean-compress one or more *physical* axes of the val
   array and mark every Index that pointed at those axes as ``axis=None``. The
   per-step semantics: ``val ← jnp.mean(val, axis=axes)``, then physical-axis
@@ -25,9 +24,9 @@ The atomic helpers raise :class:`ValueError` on structural illegality —
 ``SparseIndex`` pairings, etc. Policy code is expected to either mask these
 choices out before sampling or catch the ValueError at rollout time.
 
-The legacy :func:`apply_dynamic_sparsity` (in ``tensor.py``) silently filters
-invalid pairs — this module's contract is stricter so policy bugs surface
-rather than being masked by upstream filtering.
+This module's atomic helpers raise on structural illegality rather than
+silently filtering (as the now-removed ``apply_dynamic_sparsity`` did) so
+policy bugs surface immediately.
 """
 
 from __future__ import annotations
@@ -68,8 +67,8 @@ class Diag:
             raise ValueError(
                 f"Diag.factor must be a positive integer, got {self.factor!r}. "
                 "Use math.gcd(...) for gcd-collapse and pass it explicitly; "
-                "the -1 / 0 sentinels from apply_dynamic_sparsity are no "
-                "longer accepted."
+                "Pass an explicit positive divisor (the -1 / 0 sentinels "
+                "from the legacy sparsity_map API are not accepted)."
             )
         if self.i == self.j:
             raise ValueError(f"Diag pair must be distinct, got i = j = {self.i}.")
