@@ -23,7 +23,8 @@ from .primitives import (
 )
 from .sparse.ops import add_w_counts
 from .sparse.ops.matmul import matmul as sparse_matmul
-from .sparse.tensor import _assert_sparse_tensor_consistency, apply_dynamic_sparsity
+from .sparse.tensor import _assert_sparse_tensor_consistency
+from .sparse.micro_actions import Compress, Diag, apply_compress, apply_diag
 from .sparse.utils import zeros_like
 
 EliminationOrder = Union[Sequence[int], str]
@@ -137,7 +138,12 @@ def jacve(
     has_aux: bool = False,
     count_ops: bool = False,
     sparse_representation: bool = False,
-    sparsity_map: Sequence[Tuple[int, Tuple[Tuple[int, ...], ...]]] = None,
+    transforms: Sequence[
+        Tuple[
+            int,
+            Sequence[Union[Diag, Compress, Callable[["SparseTensor"], "SparseTensor"]]],
+        ]
+    ] = None,
 ) -> Callable:
     """
     Jacobian `fun` with respect to the `argnums` using the vertex elimination method.
@@ -187,7 +193,7 @@ def jacve(
             argnums=argnums,
             count_ops=count_ops,
             sparse_representation=sparse_representation,
-            sparsity_map=sparsity_map,
+            transforms=transforms,
         )
 
         # When count_ops is True, vertex_elimination_jaxpr returns (out, aux).
@@ -260,7 +266,9 @@ def _eliminate_vertex(
     transpose_graph: ComputationalGraph,
     vo_vertices: Set[core.Var],
     count_ops: bool = False,
-    sp_rules: tuple = (),
+    transforms: Sequence[
+        Union[Diag, Compress, Callable[["SparseTensor"], "SparseTensor"]]
+    ] = (),
 ) -> Tuple[int, int, int, int]:
     """
     Function that eliminates a vertex from the computational graph.
@@ -279,6 +287,18 @@ def _eliminate_vertex(
         vo_vertices (Set[core.Var]): A `set` containing all the output vertices.
         count_ops (bool): If True, track adds/muls/fmas/peak-mem during the
                           elimination and return them; otherwise return zeros.
+        transforms (Sequence[Union[Diag, Compress, Callable]]): Per-vertex
+            Jacobian transforms applied IN ORDER to each ``edge_outval``
+            before it's wired back into the graph. Each transform is one
+            of:
+              * :class:`Diag` — block-diagonalise a logical-index pair
+                (``Diag(i, j, factor)``) via :func:`apply_diag`.
+              * :class:`Compress` — mean-compress one or more physical
+                axes (``Compress(axes)``) via :func:`apply_compress`.
+              * a callable ``(SparseTensor) -> SparseTensor`` — escape
+                hatch for arbitrary user-defined transforms.
+            ``DIAG ∘ COMPRESS ≠ COMPRESS ∘ DIAG``, so the sequence order
+            is preserved exactly. Defaults to ``()`` (no transforms).
 
     Returns:
         Tuple[int, int, int, int]: ``(adds, muls, fmas, mem)`` accumulated
@@ -413,8 +433,25 @@ def _eliminate_vertex(
                     else:
                         edge_outval += _edge
 
-                if sp_rules:
-                    edge_outval = apply_dynamic_sparsity(edge_outval, sp_rules)
+                # Apply per-vertex transforms in order. Diag / Compress are
+                # dispatched to the atomic helpers in micro_actions; any
+                # other callable is given the edge_outval directly. The
+                # dispatch happens at Python time; each helper produces
+                # traced JAX ops so the resulting jaxpr is statically
+                # determined.
+                for _t in transforms:
+                    if isinstance(_t, Diag):
+                        edge_outval = apply_diag(edge_outval, _t)
+                    elif isinstance(_t, Compress):
+                        edge_outval = apply_compress(edge_outval, _t)
+                    elif callable(_t):
+                        edge_outval = _t(edge_outval)
+                    else:
+                        raise TypeError(
+                            f"Unknown transform of type {type(_t).__name__} "
+                            f"at vertex {vertex}; expected Diag, Compress, "
+                            "or a callable (SparseTensor) -> SparseTensor."
+                        )
                     _assert_sparse_tensor_consistency(edge_outval)
 
                 # print("Edge_outval:", edge_outval)
@@ -872,12 +909,15 @@ class GraphState:
 
 
 class VertexEliminator:
-    """Caches intermediate elimination states keyed by (vertex, sp_rules).
+    """Caches intermediate elimination states keyed by (vertex, transforms).
 
     When two elimination plans share a prefix, the cached `GraphState` for the
     longest matching prefix is reused — only the suffix is re-executed. This
     is the main reason the graph uses ``immutables.Map``: snapshots cost
     O(log N) instead of O(N) deep copies.
+
+    The cache key includes the per-vertex transforms tuple — different
+    transforms for the same vertex produce different sub-trees.
     """
 
     def __init__(self, initial_graph, initial_transpose_graph) -> None:
@@ -889,20 +929,33 @@ class VertexEliminator:
         self,
         order: Sequence[int],
         jaxpr: core.Jaxpr,
-        sparsity_map: Sequence[Tuple[int, Tuple[Tuple[int, ...], ...]]],
+        transforms: Sequence[
+            Tuple[int, Sequence[Union[Diag, Compress, Callable]]]
+        ],
         vo_vertices: Set[core.Var],
         count_ops: bool,
     ):
-        """Run elimination, reusing any cached prefix in the GraphState tree."""
+        """Run elimination, reusing any cached prefix in the GraphState tree.
+
+        ``transforms`` is the new typed-transform API — a sequence of
+        ``(vertex, (transform1, transform2, ...))`` pairs where each
+        transform is :class:`Diag`, :class:`Compress`, or a callable.
+        See :func:`_eliminate_vertex` for the per-vertex dispatch.
+        """
         node = self.root
         prefix_length = 0
 
-        sp_dict = dict(sparsity_map) if sparsity_map is not None else {}
+        # Build a per-vertex transforms dict for fast lookup during the
+        # elimination scan. Vertices missing from `transforms` get an
+        # empty tuple (no transforms applied).
+        t_dict: Dict[int, Tuple] = {
+            int(v): tuple(ts) for v, ts in (transforms or ())
+        }
 
         if ENABLE_CACHE:
             for vertex in order:
-                sp_rules = sp_dict.get(vertex, ())
-                key = (vertex, sp_rules)
+                v_transforms = t_dict.get(vertex, ())
+                key = (vertex, v_transforms)
                 with node.lock:
                     if key in node.children:
                         node = node.children[key]
@@ -919,7 +972,7 @@ class VertexEliminator:
         m_transpose_graph = node.transpose_graph.mutate()
 
         for vertex in order[prefix_length:]:
-            sp_rules = sp_dict.get(vertex, ())
+            v_transforms = t_dict.get(vertex, ())
             _adds, _muls, _fmas, _mem = _eliminate_vertex(
                 vertex,
                 jaxpr,
@@ -927,7 +980,7 @@ class VertexEliminator:
                 m_transpose_graph,
                 vo_vertices,
                 count_ops=count_ops,
-                sp_rules=sp_rules,
+                transforms=v_transforms,
             )
             adds += _adds
             muls += _muls
@@ -937,7 +990,7 @@ class VertexEliminator:
                 counts.append((adds, muls, fmas, mem))
 
             if ENABLE_CACHE:
-                key = (vertex, sp_rules)
+                key = (vertex, v_transforms)
                 with node.lock:
                     if key not in node.children:
                         cur_graph = m_graph.finish()
@@ -987,7 +1040,12 @@ def vertex_elimination_jaxpr(
     argnums: Sequence[int] = (0,),
     count_ops: bool = False,
     sparse_representation: bool = False,
-    sparsity_map: Sequence[Tuple[int, Tuple[Tuple[int, ...], ...]]] = None,
+    transforms: Sequence[
+        Tuple[
+            int,
+            Sequence[Union[Diag, Compress, Callable[["SparseTensor"], "SparseTensor"]]],
+        ]
+    ] = None,
 ) -> Sequence[Sequence[jnp.ndarray]]:
     """
     Function that generates a new vertex elimination jaxpression based on the
@@ -1036,7 +1094,7 @@ def vertex_elimination_jaxpr(
     eliminator = _get_eliminator(jaxpr, args, consts, tuple(argnums))
     order = _checkify_order(order, jaxpr, vo_vertices)
     graph, _, adds, muls, fmas, mem, counts = eliminator.eliminate(
-        order, jaxpr, sparsity_map, vo_vertices, count_ops
+        order, jaxpr, transforms, vo_vertices, count_ops
     )
 
     # Offloading all remaining Jacobian transforms to the output variables
@@ -1132,14 +1190,26 @@ def extract_jaxpr(
     sparse_representation: bool,
     args: Sequence,
     consts: Sequence,
-    sparsity_map: Sequence[Tuple[int, Tuple[Tuple[int, ...], ...]]] = None,
+    transforms: Sequence[
+        Tuple[
+            int,
+            Sequence[Union[Diag, Compress, Callable[["SparseTensor"], "SparseTensor"]]],
+        ]
+    ] = None,
 ) -> VEJaxpr:
     """Build a `VEJaxpr` capturing the full vertex-elimination computation.
 
     The returned `VEJaxpr` is the closed jaxpr of `vertex_elimination_jaxpr`
-    applied with the given `order`. Cached by (jaxpr, argnums, order,
-    sparsity_map, sparse_representation) so subsequent calls with the same
-    plan return the cached object without re-tracing.
+    applied with the given `order` and per-vertex `transforms`. Cached by
+    ``(jaxpr, argnums, order, transforms, sparse_representation)`` so
+    subsequent calls with the same plan return the cached object without
+    re-tracing.
+
+    ``transforms`` is the typed-transform API: a sequence of
+    ``(vertex, (transform1, transform2, ...))`` pairs where each transform
+    is a :class:`Diag`, a :class:`Compress`, or a callable
+    ``(SparseTensor) -> SparseTensor``. See :func:`_eliminate_vertex` for
+    the per-vertex dispatch.
     """
     if isinstance(order, str):
         env, graph, transpose_graph, vo_vertices = _build_graph(jaxpr, args, consts)
@@ -1149,16 +1219,19 @@ def extract_jaxpr(
     else:
         _order = tuple(map(int, order))
 
-    _sparsity_map = (
+    # Cache-key normalisation: each transform is either a frozen dataclass
+    # (Diag / Compress — hashable by value) or a plain callable (hashable
+    # by identity). Outer structure is a tuple of (vertex, tuple-of-transforms).
+    _transforms = (
         tuple(
-            (int(v), tuple(tuple(int(i) for i in pair) for pair in rules))
-            for v, rules in sparsity_map
+            (int(v), tuple(ts))
+            for v, ts in transforms
         )
-        if sparsity_map is not None
+        if transforms is not None
         else ()
     )
 
-    cache_key = (jaxpr, tuple(argnums), _order, _sparsity_map, sparse_representation)
+    cache_key = (jaxpr, tuple(argnums), _order, _transforms, sparse_representation)
 
     must_compute = False
     event = None
@@ -1191,7 +1264,7 @@ def extract_jaxpr(
                 *full_args,
                 argnums=argnums,
                 sparse_representation=sparse_representation,
-                sparsity_map=_sparsity_map,
+                transforms=_transforms,
             )
             # vertex_elimination_jaxpr returns just jac_vals when has_aux=False.
             # Flatten so the resulting jaxpr has all jacobians as outputs.
