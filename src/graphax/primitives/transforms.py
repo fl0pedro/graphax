@@ -1,4 +1,5 @@
 import copy
+from dataclasses import replace
 from functools import partial
 from typing import Callable
 
@@ -59,16 +60,18 @@ def _transpose_elementals(primals, val_out, **params):
 
     def transpose_transform(pre):
         new_out_dims = []
-        new_primal_dims = pre.primal_dims
+        new_primal_dims = list(pre.primal_dims)
         counter = 0
         l = len(pre.out_dims)
 
         for p in permutation:
             new_out_dims.append(pre.out_dims[p])
-            new_out_dims[-1].id = counter
+            new_out_dims[-1] = replace(new_out_dims[-1], id=counter)
             if isinstance(new_out_dims[-1], SparseIndex):
                 other_id = new_out_dims[-1].other_id
-                new_primal_dims[other_id - l].other_id = counter
+                new_primal_dims[other_id - l] = replace(
+                    new_primal_dims[other_id - l], other_id=counter
+                )
             counter += 1
 
         return _swap_back_axes(
@@ -82,7 +85,7 @@ def _transpose_elementals(primals, val_out, **params):
         )
 
     def inverse_transpose_transform(post):
-        new_out_dims = post.out_dims
+        new_out_dims = list(post.out_dims)
         new_primal_dims = []
         counter = len(post.out_dims)
 
@@ -90,10 +93,12 @@ def _transpose_elementals(primals, val_out, **params):
         inv_permutation = _inverse_permutation(permutation)
         for p in inv_permutation:
             new_primal_dims.append(post.primal_dims[p])
-            new_primal_dims[-1].id = counter
+            new_primal_dims[-1] = replace(new_primal_dims[-1], id=counter)
             if isinstance(new_primal_dims[-1], SparseIndex):
                 other_id = new_primal_dims[-1].other_id
-                new_out_dims[other_id].other_id = counter
+                new_out_dims[other_id] = replace(
+                    new_out_dims[other_id], other_id=counter
+                )
             counter += 1
 
         return _swap_back_axes(
@@ -288,16 +293,28 @@ def _broadcast_elementals(primals, val_out, **params):
     n = len(primal_shape)
     # dims[j] is the output axis where primal axis j is placed; any remaining
     # output axes are new broadcast axes.
+    # Pair an output axis with its primal axis only when their sizes match
+    # (a Kronecker-delta on that axis). For stretch broadcasts (primal size 1
+    # → output size N) the contribution is a constant 1 across the entire
+    # axis pair, not a diagonal — represent both ends as DenseIndex so the
+    # sparse-pair topology check (size match) holds.
     new_out_dims = []
     for i in range(l):
         if i in dims:
             primal_idx = dims.index(i)
-            new_out_dims.append(SparseIndex(i, shape[i], None, l + primal_idx))
+            if primal_shape[primal_idx] == shape[i]:
+                new_out_dims.append(SparseIndex(i, shape[i], None, l + primal_idx))
+            else:
+                new_out_dims.append(DenseIndex(i, shape[i], None))
         else:
             new_out_dims.append(DenseIndex(i, shape[i], None))
-    new_primal_dims = [
-        SparseIndex(l + j, primal_shape[j], None, dims[j]) for j in range(n)
-    ]
+    new_primal_dims = []
+    for j in range(n):
+        out_pos = dims[j]
+        if primal_shape[j] == shape[out_pos]:
+            new_primal_dims.append(SparseIndex(l + j, primal_shape[j], None, out_pos))
+        else:
+            new_primal_dims.append(DenseIndex(l + j, primal_shape[j], None))
     return [SparseTensor(new_out_dims, new_primal_dims, 1.0)]
 
 
@@ -361,19 +378,21 @@ def _squeeze_elementals(primals, val_out, **params):
             if isinstance(d, DenseIndex) and d.axis is not None
         ]
 
-        for d in new_out_dims:
-            d.id = out_ids.index(d.id)
+        for i, d in enumerate(new_out_dims):
+            updates = {"id": out_ids.index(d.id)}
             if d.axis is not None:
-                d.axis = new_val_axes.index(d.axis)
+                updates["axis"] = new_val_axes.index(d.axis)
             if isinstance(d, SparseIndex):
-                d.other_id = len(new_out_dims) + primal_ids.index(d.other_id)
+                updates["other_id"] = len(new_out_dims) + primal_ids.index(d.other_id)
+            new_out_dims[i] = replace(d, **updates)
 
-        for d in new_primal_dims:
-            d.id = len(new_out_dims) + primal_ids.index(d.id)
+        for i, d in enumerate(new_primal_dims):
+            updates = {"id": len(new_out_dims) + primal_ids.index(d.id)}
             if d.axis is not None:
-                d.axis = new_val_axes.index(d.axis)
+                updates["axis"] = new_val_axes.index(d.axis)
             if isinstance(d, SparseIndex):
-                d.other_id = out_ids.index(d.other_id)
+                updates["other_id"] = out_ids.index(d.other_id)
+            new_primal_dims[i] = replace(d, **updates)
 
         squeeze_dims = [d for d in squeeze_dims if d is not None]
         if len(squeeze_dims) > 0:
@@ -400,15 +419,19 @@ def _squeeze_elementals(primals, val_out, **params):
                 if d.axis is not None and isinstance(d, DenseIndex)
             )
             new_primal_dims.insert(dim, DenseIndex(dim, 1, axis))
-            for d in new_primal_dims[dim:]:
-                d.id += 1
+            for j in range(dim, len(new_primal_dims)):
+                d = new_primal_dims[j]
+                updates = {"id": d.id + 1}
                 if d.axis is not None:
-                    d.axis += 1
+                    updates["axis"] = d.axis + 1
+                new_primal_dims[j] = replace(d, **updates)
                 if isinstance(d, SparseIndex):
-                    _d = new_out_dims[d.other_id]
-                    _d.other_id += 1
+                    other_id = d.other_id
+                    _d = new_out_dims[other_id]
+                    _updates = {"other_id": _d.other_id + 1}
                     if _d.axis is not None:
-                        _d.axis += 1
+                        _updates["axis"] = _d.axis + 1
+                    new_out_dims[other_id] = replace(_d, **_updates)
 
         new_val = jnp.expand_dims(post.val, axis=new_dims)
         return SparseTensor(
@@ -475,7 +498,9 @@ def _concatenate_elementals(primals, val_out, **params):
                     [lcat_zeros, pre.val, rcat_zeros], axis=d.axis
                 )
 
-                new_out_dims[dim].size = new_val.shape[d.axis]
+                new_out_dims[dim] = replace(
+                    new_out_dims[dim], size=new_val.shape[d.axis]
+                )
             else:
                 # axis=None: this output dimension is a Kronecker factor not stored in val.
                 # Materialize it: broadcast pre.val to the primal's slice size (zero-copy),
@@ -496,15 +521,17 @@ def _concatenate_elementals(primals, val_out, **params):
                 )
 
                 # Inserting a new axis shifts all subsequent val_axes up by 1
-                for _dim in new_out_dims[dim + 1 :]:
+                for j in range(dim + 1, len(new_out_dims)):
+                    _dim = new_out_dims[j]
                     if _dim.axis is not None:
-                        _dim.axis += 1
-                for _dim in new_primal_dims:
+                        new_out_dims[j] = replace(_dim, axis=_dim.axis + 1)
+                for j, _dim in enumerate(new_primal_dims):
                     if isinstance(_dim, DenseIndex) and _dim.axis is not None:
-                        _dim.axis += 1
+                        new_primal_dims[j] = replace(_dim, axis=_dim.axis + 1)
 
-                new_out_dims[dim].axis = new_axis
-                new_out_dims[dim].size = val_out.shape[dim]
+                new_out_dims[dim] = replace(
+                    new_out_dims[dim], axis=new_axis, size=val_out.shape[dim]
+                )
         else:
             other_id = d.other_id
             if d.axis is not None:
@@ -519,9 +546,10 @@ def _concatenate_elementals(primals, val_out, **params):
                 )
 
                 # Update the axis of all following dimensions
-                for _dim in new_primal_dims[dim + 1 :]:
+                for j in range(dim + 1, len(new_primal_dims)):
+                    _dim = new_primal_dims[j]
                     if isinstance(_dim, DenseIndex) and _dim.axis is not None:
-                        _dim.axis += 1
+                        new_primal_dims[j] = replace(_dim, axis=_dim.axis + 1)
 
                 # Materialize the sparse dimensions related to the concatenation dimension
                 new_val = _materialize_indexes(pre, [d.id])
@@ -581,9 +609,10 @@ def _concatenate_elementals(primals, val_out, **params):
                 primal_axis = max(1, primal_axis)
 
                 # Update the axis of all following dimensions
-                for _dim in new_primal_dims[dim + 1 :]:
+                for j in range(dim + 1, len(new_primal_dims)):
+                    _dim = new_primal_dims[j]
                     if isinstance(_dim, DenseIndex) and _dim.axis is not None:
-                        _dim.axis += 1
+                        new_primal_dims[j] = replace(_dim, axis=_dim.axis + 1)
 
                 # Materialize the sparse dimensions related to the concatenation dimension
                 if pre.val.shape != ():
@@ -643,11 +672,13 @@ def _concatenate_elementals(primals, val_out, **params):
         elif isinstance(d, DenseIndex):
             if d.axis is not None:
                 new_val = lax.slice_in_dim(post.val, *slices[primal_idx], axis=d.axis)
-                d.size = new_val.shape[d.axis]
+                new_primal_dims[dim] = replace(d, size=new_val.shape[d.axis])
             else:
                 # axis=None: the primal dimension is a Kronecker factor not stored in val.
                 # There is no axis to slice — just narrow the size to this primal's contribution.
-                d.size = slices[primal_idx][1] - slices[primal_idx][0]
+                new_primal_dims[dim] = replace(
+                    d, size=slices[primal_idx][1] - slices[primal_idx][0]
+                )
                 new_val = post.val
         else:
             _d = new_out_dims[d.other_id]
@@ -665,9 +696,10 @@ def _concatenate_elementals(primals, val_out, **params):
                 new_primal_dims[dim] = DenseIndex(_d.other_id, size, axis)
 
                 # Update the axis of all following dimensions
-                for _dim in new_primal_dims[dim + 1 :]:
+                for j in range(dim + 1, len(new_primal_dims)):
+                    _dim = new_primal_dims[j]
                     if type(_dim) is DenseIndex and _dim.axis is not None:
-                        _dim.axis += 1
+                        new_primal_dims[j] = replace(_dim, axis=_dim.axis + 1)
 
                 # Materialize the sparse dimensions related to the concatenation dimension
                 new_val = _materialize_indexes(post, [d.id])
@@ -682,8 +714,8 @@ def _concatenate_elementals(primals, val_out, **params):
                 new_val = new_val * sub_iota
 
                 new_val = lax.slice_in_dim(new_val, *slices[primal_idx], axis=axis)
-                d.size = new_val.shape[d.axis]
-                _d.size = new_val.shape[d.axis]
+                # d and _d were already replaced in the lists above; the prior
+                # d.size/_d.size mutations targeted orphaned objects (no-op).
             else:
                 # d is SparseIndex with axis=None:
                 # Both d and its partner _d are implicit Kronecker factors not stored
@@ -712,19 +744,23 @@ def _concatenate_elementals(primals, val_out, **params):
 
                 # Shift val_axes of all existing val-axis-bearing dims for the two
                 # axis insertions (out then primal).
-                def _shift(idx_dim):
-                    if idx_dim.axis is None:
-                        return
-                    if idx_dim.axis >= out_axis:
-                        idx_dim.axis += 1
-                    if idx_dim.axis >= primal_axis:
-                        idx_dim.axis += 1
+                def _shifted_axis(axis):
+                    if axis is None:
+                        return None
+                    if axis >= out_axis:
+                        axis += 1
+                    if axis >= primal_axis:
+                        axis += 1
+                    return axis
 
-                for _dim in new_out_dims:
-                    _shift(_dim)
-                for _dim in new_primal_dims:
-                    if isinstance(_dim, DenseIndex):
-                        _shift(_dim)
+                for j, _dim in enumerate(new_out_dims):
+                    if _dim.axis is not None:
+                        new_out_dims[j] = replace(_dim, axis=_shifted_axis(_dim.axis))
+                for j, _dim in enumerate(new_primal_dims):
+                    if isinstance(_dim, DenseIndex) and _dim.axis is not None:
+                        new_primal_dims[j] = replace(
+                            _dim, axis=_shifted_axis(_dim.axis)
+                        )
 
                 # Build the column slice of identity: shape (_d.size, size).
                 sub_iota = jnp.eye(_d.size, dtype=jnp.float32)

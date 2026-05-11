@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+
 # `typing.override` requires Python 3.12+ (matches pyproject.toml `requires-python = "==3.12.*"`).
 from typing import override
 

@@ -23,7 +23,7 @@ defelemental2(lax.logistic_p, lambda out, primal, accuracy: out * (1.0 - out))
 defelemental(lax.log1p_p, lambda x, accuracy: 1.0 / (1.0 + x))
 
 defelemental(lax.sin_p, lambda x, accuracy: lax.cos(x, accuracy=accuracy))
-defelemental(lax.asin_p, lambda x: 1.0 / lax.sqrt(1.0 - x**2)) 
+defelemental(lax.asin_p, lambda x: 1.0 / lax.sqrt(1.0 - x**2))
 defelemental(lax.cos_p, lambda x, accuracy: -lax.sin(x, accuracy=accuracy))
 defelemental(lax.acos_p, lambda x: -1.0 / lax.sqrt(1.0 - x**2))
 defelemental2(lax.tan_p, lambda out, primal, accuracy: 1.0 + out**2)
@@ -41,6 +41,7 @@ defelemental(lax.erf_p, lambda x: 2.0 * lax.exp(-(x**2)) / lax.sqrt(jnp.pi))
 
 def with_type_promotion(fn: Callable) -> Callable:
     def promoted_fn(*operands, **params) -> tuple[Array, ...]:
+        operands = tuple(jnp.asarray(o) for o in operands)
         res = fn(*operands, **params)
         type = jnp.result_type(*(op.dtype for op in operands))
         return tuple(lax.convert_element_type(el, type) for el in res)

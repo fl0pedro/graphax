@@ -220,27 +220,21 @@ class SparseTensor(SparseMathMixin):
         out_dims: Sequence[Index],
         primal_dims: Sequence[Index],
         val: Array | None,
-        *,
         scalar_mult: Array | None = None,
         fill_value: Array | None = None,
         dtype: DTypeLike | None = None,
         pre_transforms: Sequence[Callable] | None = None,
         post_transforms: Sequence[Callable] | None = None,
+        *,
         sort_val=True,
         check_consistency=True,
-        zero_fill: bool | None = None,
-        compressed_val=None,
+        zero_fill: bool | None = None,  # this depends on fill_value... should just be
+        compressed_val=None,  # TODO migrate this into val, and we check it automatically via type
         **kwargs,
     ):
-        # Coerce Python scalars / numpy values to a JAX array so the rest of
-        # __init__ can rely on ``.dtype`` / ``.ndim`` / ``.shape`` access.
         if val is not None and not hasattr(val, "dtype"):
             val = jnp.asarray(val)
 
-        # Default ``dtype`` to *the value's* dtype when one is provided (so a
-        # bool/int val isn't silently widened to float32). The float32 default
-        # only applies when neither ``val`` nor ``compressed_val`` is given —
-        # i.e. a structure-only tensor whose fill_value defines the dtype.
         if dtype is None:
             if val is not None:
                 dtype = val.dtype
@@ -264,12 +258,7 @@ class SparseTensor(SparseMathMixin):
         if post_transforms is None:
             post_transforms = ()
 
-        # Compressed-storage path: ``compressed_val`` is one of the structured
-        # pytrees from ``ops.block_storage`` (UnionBlocks / IntersectionBlocks /
-        # BlockBanded). Stored alongside ``val=None``; consumers materialize it
-        # via ``compressed_val.to_dense()`` at trace time, which is a fused
-        # broadcast+select+sum chain XLA folds into the consumer kernel.
-        if compressed_val is not None and val is not None:
+        if compressed_val is not None and val is not None:  # yeah this is dumb :p
             raise ValueError("set exactly one of ``val`` and ``compressed_val``")
 
         if sort_val and compressed_val is None:
@@ -289,23 +278,12 @@ class SparseTensor(SparseMathMixin):
         self.fill_value = fill_value
         self.pre_transforms = tuple(pre_transforms)
         self.post_transforms = tuple(post_transforms)
-        # Compute the zero-fill flag once at construction (when fill_value is
-        # still concrete) and propagate it as static pytree aux_data so it
-        # survives jit tracing — otherwise jit'd code can't statically branch
-        # on whether the fill is zero, since traced fill_values lose their
-        # concrete value at the jaxpr boundary. Callers that *know* the new
-        # fill is zero (e.g. matmul output where both inputs had zero fill)
-        # can pass ``zero_fill=True`` explicitly to skip the probe — this is
-        # the only way to keep the flag through chained ops inside jit, where
-        # the freshly-constructed ``jnp.array(0)`` is a tracer too.
         self._zero_fill = (
             zero_fill if zero_fill is not None else _compute_zero_fill_flag(fill_value)
         )
 
         self._dynamic_keys = tuple(kwargs.keys())
         for k, v in kwargs.items():
-            # JAX requires aux_data values to be hashable for jit cache keying;
-            # ``**kwargs`` ride along in aux_data via ``tree_flatten``.
             try:
                 hash(v)
             except TypeError as e:
@@ -319,12 +297,6 @@ class SparseTensor(SparseMathMixin):
             _assert_sparse_tensor_consistency(self)
 
     def tree_flatten(self):
-        # ``compressed_val`` is a NamedTuple (auto-pytree) when set, ``None``
-        # otherwise. Including it in children lets jax flatten its inner
-        # buffers too. The presence/absence of ``compressed_val`` becomes part
-        # of the pytree structure and so part of the jit cache key — a tensor
-        # with compressed storage compiles separately from a dense one (which
-        # is correct: the densify expression is different).
         children = (self.val, self.scalar_mult, self.fill_value, self.compressed_val)
         dynamic_kwargs = tuple(
             (k, getattr(self, k)) for k in getattr(self, "_dynamic_keys", ())
@@ -391,7 +363,6 @@ class SparseTensor(SparseMathMixin):
         ``compressed_val=...`` storage that materializes via ``to_dense`` —
         same dense form, just no sparse compression.
         """
-        # Pull dtype from the first array-like buffer of the structured type.
         for attr in ("data", "lhs", "main"):
             buf = getattr(compressed_val, attr, None)
             if buf is not None:
@@ -403,9 +374,6 @@ class SparseTensor(SparseMathMixin):
 
         meta = getattr(compressed_val, "meta_block_shape", None)
         out_id, primal_id = dim_ids
-        # ``_assert_sparse_tensor_consistency`` requires the produced IDs to be
-        # a contiguous 0..N-1 sequence; with non-default ``dim_ids`` (e.g.
-        # ``(5, 7)``) the trailing leftover IDs would land non-contiguous.
         if sorted(dim_ids) != [0, 1]:
             raise ValueError(
                 f"from_compressed: dim_ids must be a permutation of (0, 1) to "
@@ -413,8 +381,6 @@ class SparseTensor(SparseMathMixin):
             )
 
         if meta is not None:
-            # Meta-block-diagonal storage: pair of SparseIndexes over M
-            # meta-blocks of size (H_meta, W_meta), val of shape (M, H_meta, W_meta).
             M, H_meta, W_meta = meta
             val = compressed_val.to_meta_blocks()  # (M, H_meta, W_meta, *L)
             leftover_dims = tuple(
@@ -449,8 +415,6 @@ class SparseTensor(SparseMathMixin):
                 check_consistency=False,
             )
 
-        # Fallback (e.g. BlockBanded with w>0): keep compressed_val for late
-        # densification, expose as two DenseIndexes over the full shape.
         H, W, *L = compressed_val.shape
         leftover_dims = tuple(DenseIndex(2 + i, s, axis=2 + i) for i, s in enumerate(L))
         return cls(
@@ -593,12 +557,7 @@ class SparseTensor(SparseMathMixin):
             return self.compressed_val.to_dense()
         return self.scalar_mult
 
-    def eff_val(self) -> Array | None:
-        """Effective dense ``val``: materialize ``compressed_val`` if present.
-
-        For ``compressed_val`` set, returns ``compressed_val.to_dense()`` as a
-        traced JAX expression — XLA folds the densify into the consuming
-        kernel (no HBM round-trip). For plain ``val``, returns it directly."""
+    def eff_val(self) -> Array | None:  # put this somewhere else?
         if self.compressed_val is not None:
             return self.compressed_val.to_dense()
         return self.val
@@ -612,13 +571,11 @@ class SparseTensor(SparseMathMixin):
         if self.val is not None:
             return self.val.dtype
         if self.compressed_val is not None:
-            # All structured types store the dtype on their primary inner buffer.
             for attr in ("data", "lhs", "main"):
                 buf = getattr(self.compressed_val, attr, None)
                 if buf is not None:
                     return buf.dtype
-        # Infer from scalar_mult or fill_value if val is None
-        return self.fill_value.dtype
+        return self.scalar_mult.dtype
 
     def copy(
         self,
@@ -722,16 +679,9 @@ class SparseTensor(SparseMathMixin):
         return self.copy()
 
     def astype(self, dtype: DTypeLike, **kwargs) -> SparseTensor:
-        # Skip ``astype(...)`` on a boolean ``scalar_mult`` to avoid widening
-        # the structural ``True``/``False`` flag back to a numeric type.
-        new_scalar_mult = (
-            self.scalar_mult
-            if self.scalar_mult.dtype == jnp.bool_
-            else self.scalar_mult.astype(dtype, **kwargs)
-        )
         return self.copy(
             val=self.val.astype(dtype, **kwargs) if self.val is not None else None,
-            scalar_mult=new_scalar_mult,
+            scalar_mult=self.scalar_mult.astype(dtype, **kwargs),
             fill_value=self.fill_value.astype(dtype, **kwargs),
         )
 
@@ -879,14 +829,9 @@ class SparseTensor(SparseMathMixin):
         return getattr(self._target_arr, "traceback", None)
 
     def delete(self):
-        # NOTE: ``_target_arr`` re-materializes ``compressed_val`` on every
-        # access, so for compressed storage this only deletes a fresh temporary
-        # — the underlying ``compressed_val`` buffers are NOT freed.
+        # TODO this does not free buffers...
         if self.compressed_val is not None:
-            raise NotImplementedError(
-                "delete() does not free compressed_val buffers; "
-                "drop the SparseTensor reference to release storage"
-            )
+            raise NotImplementedError()
         arr = self._target_arr
         if hasattr(arr, "delete"):
             arr.delete()
@@ -926,14 +871,6 @@ class SparseTensor(SparseMathMixin):
         return self._target_arr.on_device_size_in_bytes()
 
 
-# === graphax-specific extensions ========================================
-# Below are graphax-specific helpers (dynamic-sparsity rule application,
-# valid-pair lookup) that aren't part of the matmul project. They build on
-# top of the matmul-derived SparseTensor and live alongside it so external
-# graphax callers can keep importing ``apply_dynamic_sparsity`` etc. from
-# this module.
-
-
 def get_valid_pairings(
     st: SparseTensor,
     dim_id: int,
@@ -950,7 +887,6 @@ def get_valid_pairings(
 
     out_len = len(st.out_dims)
 
-    # 1. Locate the dimension and its positional index.
     for i, d in enumerate(st.out_dims):
         if d.id == dim_id:
             target_dim = d
@@ -1367,5 +1303,4 @@ def apply_dynamic_sparsity(
 
 
 def sparse_tensor_zeros_like(st: SparseTensor) -> SparseTensor:
-    """Return a copy of ``st`` whose ``val`` is zero everywhere."""
-    return _copy(st, val=jnp.zeros_like(st.val))
+    return _copy(st, jnp.zeros_like(st.val), jnp.array(1.0), jnp.array(0.0))

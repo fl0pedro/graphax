@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import jax.lax as lax
 
 from .base import elemental_rules, elemental_only_rules, get_shape
@@ -56,11 +58,15 @@ def _dot_general_elementals(primals, out_shape, **params):
                     SparseIndex(other_lid, ld, dim, batch_dim_counter)
                 )
                 batch_dim_counter += 1
-                for d in lhs_out_dims[batch_dim_counter:]:
-                    d.id += 1
+                for k in range(batch_dim_counter, len(lhs_out_dims)):
+                    d = lhs_out_dims[k]
+                    lhs_out_dims[k] = replace(d, id=d.id + 1)
                     if isinstance(d, SparseIndex):
-                        _d = lhs_primal_dims[d.other_id - num_out_dims]
-                        _d.other_id += 1
+                        partner = d.other_id - num_out_dims
+                        _d = lhs_primal_dims[partner]
+                        lhs_primal_dims[partner] = replace(
+                            _d, other_id=_d.other_id + 1
+                        )
             else:
                 # Otherwise, we can just set `axis` to None
                 _lid = len(lhs_out_dims)
@@ -91,11 +97,15 @@ def _dot_general_elementals(primals, out_shape, **params):
                     SparseIndex(other_rid, rd, dim, batch_dim_counter)
                 )
                 batch_dim_counter += 1
-                for d in rhs_out_dims[batch_dim_counter:]:
-                    d.id += 1
+                for k in range(batch_dim_counter, len(rhs_out_dims)):
+                    d = rhs_out_dims[k]
+                    rhs_out_dims[k] = replace(d, id=d.id + 1)
                     if isinstance(d, SparseIndex):
-                        _d = rhs_primal_dims[d.other_id - num_out_dims]
-                        _d.other_id += 1
+                        partner = d.other_id - num_out_dims
+                        _d = rhs_primal_dims[partner]
+                        rhs_primal_dims[partner] = replace(
+                            _d, other_id=_d.other_id + 1
+                        )
             else:
                 # Otherwise, we can just set `axis` to None
                 _rid = len(rhs_out_dims)
