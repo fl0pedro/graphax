@@ -6,10 +6,14 @@ Two operations the RL policy can emit per sub-step:
   an explicit positive integer factor. gcd-collapse is *not* a sentinel here —
   the caller passes the actual integer it picked, even if that integer happens
   to equal ``gcd(N_i, N_j)``.
-* :class:`Compress` — mean-compress one or more *physical* axes of the val
-  array and mark every Index that pointed at those axes as ``axis=None``. The
-  per-step semantics: ``val ← jnp.mean(val, axis=axes)``, then physical-axis
-  bookkeeping shifts the surviving indices down.
+* :class:`Compress` — reduce one or more *physical* axes of the val array via
+  one of six elementwise reductions (``mean`` / ``min`` / ``max`` / ``median``
+  / ``abs_min`` / ``abs_max``), and mark every Index that pointed at those
+  axes as ``axis=None``. The per-step semantics: ``val ← reduce(val,
+  axis=axes)``, then physical-axis bookkeeping shifts the surviving indices
+  down. ``abs_min`` / ``abs_max`` pick the entry whose absolute value is
+  smallest / largest (closest to zero / furthest from zero), preserving the
+  original sign.
 
 The two operations are atomic and order-dependent:
 ``DIAG ∘ COMPRESS ≠ COMPRESS ∘ DIAG`` in general. :func:`apply_micro_actions`
@@ -33,7 +37,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from typing import Sequence, Union
+from typing import Callable, Sequence, Union
 
 import jax.numpy as jnp
 
@@ -74,9 +78,16 @@ class Diag:
             raise ValueError(f"Diag pair must be distinct, got i = j = {self.i}.")
 
 
+COMPRESS_KINDS: tuple[str, ...] = (
+    "mean", "min", "max", "median", "abs_min", "abs_max",
+)
+NUM_COMPRESS_KINDS = len(COMPRESS_KINDS)
+COMPRESS_KIND_INDEX: dict[str, int] = {k: i for i, k in enumerate(COMPRESS_KINDS)}
+
+
 @dataclass(frozen=True)
 class Compress:
-    """Mean-compress one or more *physical* axes of the underlying val array.
+    """Reduce one or more *physical* axes of the underlying val array.
 
     ``axes`` is a tuple of physical-axis positions (``0 <= a < val.ndim``).
     Each axis must appear at most once. The physical axes are interpreted in
@@ -84,12 +95,23 @@ class Compress:
     were renumbered by an earlier micro-action in the same sub-episode, use
     the *current* numbering, not the numbering at sub-episode start.
 
+    ``kind`` picks the reduction:
+
+    * ``"mean"`` — arithmetic mean (default; the legacy behaviour).
+    * ``"min"`` / ``"max"`` — elementwise min / max.
+    * ``"median"`` — elementwise median.
+    * ``"abs_min"`` — the entry whose absolute value is smallest along the
+      axis (closest to zero); the original sign is preserved.
+    * ``"abs_max"`` — the entry whose absolute value is largest (furthest
+      from zero); the original sign is preserved.
+
     All :class:`Index` instances whose ``axis`` or ``block_axis`` referenced a
     compressed physical axis have that pointer set to ``None``; remaining
     pointers are shifted down to account for the dropped axes.
     """
 
     axes: tuple[int, ...]
+    kind: str = "mean"
 
     def __post_init__(self):
         if len(self.axes) != len(set(self.axes)):
@@ -101,6 +123,11 @@ class Compress:
                 raise ValueError(
                     f"Compress.axes entries must be non-negative, got {a!r}."
                 )
+        if self.kind not in COMPRESS_KIND_INDEX:
+            raise ValueError(
+                f"Compress.kind must be one of {COMPRESS_KINDS!r}, "
+                f"got {self.kind!r}."
+            )
 
 
 MicroAction = Union[Diag, Compress]
@@ -175,12 +202,50 @@ def apply_diag(st: SparseTensor, action: Diag) -> SparseTensor:
 # ---------------------------------------------------------------------------
 
 
-def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
-    """Mean-compress the listed physical axes.
+def _reduce_along_axes(val: jnp.ndarray, axes: tuple[int, ...], kind: str):
+    """Reduce ``val`` along ``axes`` using the named elementwise rule.
 
-    The reductions happen as one ``jnp.mean(val, axis=sorted_axes)`` call —
-    multi-axis Compress is the efficient form because all axes are dropped in
-    a single XLA op rather than a sequence of one-axis means.
+    ``abs_min`` / ``abs_max`` pick the entry whose absolute value is smallest
+    / largest along the reduction axes, preserving the original sign. Both
+    are implemented as a take_along_axis over the argmin / argmax of ``|val|``
+    after merging the reduction axes into a single trailing one — this keeps
+    the reduction to a single XLA op even for multi-axis Compress and avoids
+    a Python-level fold over the axes.
+    """
+    axes = tuple(sorted(set(axes)))
+    if kind == "mean":
+        return jnp.mean(val, axis=axes)
+    if kind == "min":
+        return jnp.min(val, axis=axes)
+    if kind == "max":
+        return jnp.max(val, axis=axes)
+    if kind == "median":
+        return jnp.median(val, axis=axes)
+    if kind in ("abs_min", "abs_max"):
+        # Move every reduction axis to the trailing positions, flatten them
+        # into a single axis, then argmin / argmax over |·|. take_along_axis
+        # against the original (flattened) values keeps the sign.
+        keep = [a for a in range(val.ndim) if a not in axes]
+        perm = keep + list(axes)
+        moved = jnp.transpose(val, perm)
+        flat_shape = moved.shape[: len(keep)] + (-1,)
+        flat = moved.reshape(flat_shape)
+        abs_flat = jnp.abs(flat)
+        if kind == "abs_min":
+            idx = jnp.argmin(abs_flat, axis=-1, keepdims=True)
+        else:
+            idx = jnp.argmax(abs_flat, axis=-1, keepdims=True)
+        picked = jnp.take_along_axis(flat, idx, axis=-1)
+        return jnp.squeeze(picked, axis=-1)
+    raise ValueError(f"Unknown Compress.kind {kind!r}")
+
+
+def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
+    """Reduce the listed physical axes via ``action.kind`` (default ``mean``).
+
+    The reduction happens as a single ``jnp.<reduce>(val, axis=sorted_axes)``
+    call — multi-axis Compress is the efficient form because all axes are
+    dropped in one XLA op rather than a sequence of single-axis reductions.
     """
     if st.val is None:
         if action.axes:
@@ -200,7 +265,7 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
             )
 
     drops = sorted(set(action.axes))
-    new_val = jnp.mean(st.val, axis=tuple(drops))
+    new_val = _reduce_along_axes(st.val, tuple(drops), action.kind)
 
     drop_set = set(drops)
 
@@ -236,6 +301,49 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
 # ---------------------------------------------------------------------------
 # Chain
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Copy-pastable factory helpers
+# ---------------------------------------------------------------------------
+#
+# These return a callable ``(SparseTensor) -> SparseTensor`` so the policy
+# logs can render a sub-episode as a list of evaluable Python expressions
+# (e.g. ``[diag(0, 1, 2), compress("abs_min", 3)]``) that round-trip through
+# the typed-transform API in :mod:`graphax.core`.
+
+
+def diag(i: int, j: int, factor: int) -> Callable[[SparseTensor], SparseTensor]:
+    """Return a function that applies :class:`Diag` with the given args.
+
+    Equivalent to ``lambda st: apply_diag(st, Diag(i, j, factor))``; the
+    closure is hashable in graphax's `transforms` cache because the inner
+    ``Diag`` is a frozen dataclass.
+    """
+    action = Diag(i=int(i), j=int(j), factor=int(factor))
+
+    def _apply(st: SparseTensor) -> SparseTensor:
+        return apply_diag(st, action)
+
+    _apply.__name__ = f"diag({i}, {j}, {factor})"
+    return _apply
+
+
+def compress(
+    kind: str, *axes: int,
+) -> Callable[[SparseTensor], SparseTensor]:
+    """Return a function that applies :class:`Compress` with the given kind/axes.
+
+    ``compress("mean", 3)`` is the single-axis form; multi-axis is
+    ``compress("abs_max", 0, 2)``. Mirrors the API of :func:`diag`.
+    """
+    action = Compress(axes=tuple(int(a) for a in axes), kind=kind)
+
+    def _apply(st: SparseTensor) -> SparseTensor:
+        return apply_compress(st, action)
+
+    _apply.__name__ = f"compress({kind!r}, {', '.join(str(a) for a in axes)})"
+    return _apply
 
 
 def apply_micro_actions(
