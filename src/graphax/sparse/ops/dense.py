@@ -128,6 +128,17 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
         # a larger structural shape (e.g. concat-transformed Jacobians where
         # the val landed as a scalar but the structure says ``(N,)``).
         if v.ndim != len(tensor.shape):
+            # If v has one axis per non-None-axis dim, insert singleton axes at
+            # None-axis positions so broadcast_to lines them up correctly.
+            # (broadcast_to right-aligns smaller-rank arrays, which fails when
+            # the singleton dim is interior or trailing — e.g. (4,) → (4, 1).)
+            n_non_none = sum(1 for d in tensor.dims if d.axis is not None)
+            if v.ndim == n_non_none and n_non_none < len(tensor.shape):
+                expanded_shape = []
+                v_iter = iter(v.shape)
+                for d in tensor.dims:
+                    expanded_shape.append(1 if d.axis is None else next(v_iter))
+                v = v.reshape(expanded_shape)
             v = jnp.broadcast_to(v, tensor.shape)
         return v
 

@@ -23,7 +23,9 @@ def test_order(order: str | Sequence[int], fn: Callable, argnums: Sequence[int],
 
     return tree_allclose(veres, revres)
 
+test_order.__test__ = False
 test_rev = partial(test_order, "rev")
+test_rev.__test__ = False
 
 def test_fwd(fn: Callable, argnums: Sequence[int], *args) -> bool:
     print(jax.make_jaxpr(fn)(*args))
@@ -37,6 +39,8 @@ def test_fwd(fn: Callable, argnums: Sequence[int], *args) -> bool:
     print(veres)
 
     return tree_allclose(veres, fwdres)
+
+test_fwd.__test__ = False
 
 
 class ExampleTests(unittest.TestCase): 

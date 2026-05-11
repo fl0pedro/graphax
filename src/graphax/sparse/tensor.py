@@ -220,12 +220,12 @@ class SparseTensor(SparseMathMixin):
         out_dims: Sequence[Index],
         primal_dims: Sequence[Index],
         val: Array | None,
+        *,
         scalar_mult: Array | None = None,
         fill_value: Array | None = None,
         dtype: DTypeLike | None = None,
         pre_transforms: Sequence[Callable] | None = None,
         post_transforms: Sequence[Callable] | None = None,
-        *,
         sort_val=True,
         check_consistency=True,
         zero_fill: bool | None = None,  # this depends on fill_value... should just be

@@ -170,28 +170,28 @@ class TestSelfDenseNones(unittest.TestCase):
         for fixture_fn in self.get_all_fixtures():
             with self.subTest(fixture=fixture_fn.__name__):
                 st = fixture_fn()
-                dense = dense(st)
-                self.assertEqual(st.shape, dense.shape)
-                self.assertEqual(len(st.dims), len(dense.dims))
+                result = dense(st)
+                self.assertEqual(st.shape, result.shape)
+                self.assertEqual(len(st.dims), len(result.dims))
 
     def test_dense_once_hard(self):
         for fixture_fn in self.get_all_fixtures():
             with self.subTest(fixture=fixture_fn.__name__):
                 st = fixture_fn()
-                dense = dense(st, hard=True)
-                self.assertEqual(st.shape, dense.shape)
-                self.assertEqual(len(st.dims), len(dense.dims))
-                if dense.val is not None:
-                    self.assertEqual(st.shape, dense.val.shape)
-                self.assertTrue(all(isinstance(d, DenseIndex) for d in dense.dims))
+                result = dense(st, hard=True)
+                self.assertEqual(st.shape, result.shape)
+                self.assertEqual(len(st.dims), len(result.dims))
+                if result.val is not None:
+                    self.assertEqual(st.shape, result.val.shape)
+                self.assertTrue(all(isinstance(d, DenseIndex) for d in result.dims))
 
     def test_dense_twice(self):
         for fixture_fn in self.get_all_fixtures():
             with self.subTest(fixture=fixture_fn.__name__):
                 st = fixture_fn()
-                dense = dense(st, hard=True)
+                result = dense(st, hard=True)
                 ddense = dense(dense(st))
-                self.assertTrue(jnp.allclose(dense.dense(), ddense.dense()))
+                self.assertTrue(jnp.allclose(result.dense(), ddense.dense()))
 
     def test_dense_axis(self):
         for fixture_fn in self.get_all_fixtures():
@@ -201,9 +201,9 @@ class TestSelfDenseNones(unittest.TestCase):
 
                 for r in range(len(axes)):
                     for axis in combinations(axes, r):
-                        dense = dense(st, axes=axis)
-                        self.assertEqual(st.shape, dense.shape)
-                        self.assertEqual(len(st.dims), len(dense.dims))
+                        result = dense(st, axes=axis)
+                        self.assertEqual(st.shape, result.shape)
+                        self.assertEqual(len(st.dims), len(result.dims))
 
                 self.assertTrue(
                     jnp.allclose(dense(st, axes=tuple(axes)).dense(), dense(st).dense())
@@ -216,9 +216,9 @@ class TestSelfDenseNones(unittest.TestCase):
                 axes = [d.id for d in st.dims if d.axis is None]
                 for r in range(len(axes)):
                     for axis in combinations(axes, r):
-                        dense = dense(st, axes=axis, hard=True)
-                        self.assertEqual(st.shape, dense.shape)
-                        self.assertEqual(len(st.dims), len(dense.dims))
+                        result = dense(st, axes=axis, hard=True)
+                        self.assertEqual(st.shape, result.shape)
+                        self.assertEqual(len(st.dims), len(result.dims))
 
                 self.assertTrue(
                     jnp.allclose(

@@ -30,13 +30,15 @@ def test_order(order: str | Sequence[int], fn: Callable, argnums: Sequence[int],
                *args) -> bool:
     jacve_f = jax.jit(jacve(fn, order=order, argnums=argnums, count_ops=True))
     veres, aux = jacve_f(*args)
-            
+
     jacrev_f = jax.jit(jax.jacrev(fn, argnums=argnums))
     revres = jacrev_f(*args)
 
     return tree_allclose(veres, revres)
 
+test_order.__test__ = False
 test_rev = partial(test_order, "rev")
+test_rev.__test__ = False
 
 def test_fwd(fn: Callable, argnums: Sequence[int], *args) -> bool:
     jacve_f = jax.jit(jacve(fn, order="fwd", argnums=argnums, count_ops=True))
@@ -50,6 +52,8 @@ def test_fwd(fn: Callable, argnums: Sequence[int], *args) -> bool:
     print(veres)
 
     return tree_allclose(veres, fwdres)
+
+test_fwd.__test__ = False
 
 
 class BroadcastBugTests(unittest.TestCase):
