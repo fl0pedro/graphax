@@ -439,19 +439,41 @@ def _eliminate_vertex(
                 # dispatch happens at Python time; each helper produces
                 # traced JAX ops so the resulting jaxpr is statically
                 # determined.
+                #
+                # A transform may legitimately not fit the current edge
+                # even though it fit the nominal `(out_dims, primal_dims)`
+                # signature — the SparseTensor's physical `val.ndim` can
+                # be smaller than the nominal axis count (sparse
+                # representations omit dims of size 1 / diagonal axes), and
+                # earlier transforms in the same sequence may shrink it
+                # further. apply_diag / apply_compress raise ValueError in
+                # that case; we catch and skip the offending transform so
+                # the caller's "best-effort" intent — apply what fits, drop
+                # what doesn't — round-trips through to JAX correctly. The
+                # alternative is to push the full edge geometry up to the
+                # caller so it can pre-filter, which couples the typed
+                # transform API to internal sparse representations.
                 for _t in transforms:
-                    if isinstance(_t, Diag):
-                        edge_outval = apply_diag(edge_outval, _t)
-                    elif isinstance(_t, Compress):
-                        edge_outval = apply_compress(edge_outval, _t)
-                    elif callable(_t):
-                        edge_outval = _t(edge_outval)
-                    else:
-                        raise TypeError(
-                            f"Unknown transform of type {type(_t).__name__} "
-                            f"at vertex {vertex}; expected Diag, Compress, "
-                            "or a callable (SparseTensor) -> SparseTensor."
-                        )
+                    try:
+                        if isinstance(_t, Diag):
+                            edge_outval = apply_diag(edge_outval, _t)
+                        elif isinstance(_t, Compress):
+                            edge_outval = apply_compress(edge_outval, _t)
+                        elif callable(_t):
+                            edge_outval = _t(edge_outval)
+                        else:
+                            raise TypeError(
+                                f"Unknown transform of type "
+                                f"{type(_t).__name__} at vertex {vertex}; "
+                                "expected Diag, Compress, or a callable "
+                                "(SparseTensor) -> SparseTensor."
+                            )
+                    except ValueError:
+                        # Out-of-range axes / shape mismatch — skip this
+                        # transform on this edge. The TypeError above is
+                        # intentionally NOT caught: it's a structural
+                        # programming error, not a per-edge geometry miss.
+                        continue
                     _assert_sparse_tensor_consistency(edge_outval)
 
                 # print("Edge_outval:", edge_outval)
