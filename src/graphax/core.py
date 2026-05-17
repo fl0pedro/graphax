@@ -24,7 +24,9 @@ from .primitives import (
 from .sparse.ops import add_w_counts
 from .sparse.ops.matmul import matmul as sparse_matmul
 from .sparse.tensor import _assert_sparse_tensor_consistency
-from .sparse.micro_actions import Compress, Diag, apply_compress, apply_diag
+from .sparse.micro_actions import (
+    Compress, Diag, Quant, apply_compress, apply_diag, apply_quant,
+)
 from .sparse.utils import zeros_like
 
 EliminationOrder = Union[Sequence[int], str]
@@ -459,14 +461,16 @@ def _eliminate_vertex(
                             edge_outval = apply_diag(edge_outval, _t)
                         elif isinstance(_t, Compress):
                             edge_outval = apply_compress(edge_outval, _t)
+                        elif isinstance(_t, Quant):
+                            edge_outval = apply_quant(edge_outval, _t)
                         elif callable(_t):
                             edge_outval = _t(edge_outval)
                         else:
                             raise TypeError(
                                 f"Unknown transform of type "
                                 f"{type(_t).__name__} at vertex {vertex}; "
-                                "expected Diag, Compress, or a callable "
-                                "(SparseTensor) -> SparseTensor."
+                                "expected Diag, Compress, Quant, or a "
+                                "callable (SparseTensor) -> SparseTensor."
                             )
                     except ValueError:
                         # Out-of-range axes / shape mismatch — skip this

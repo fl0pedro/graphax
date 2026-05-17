@@ -1,6 +1,6 @@
-"""Atomic SparseTensor micro-actions: DIAG and COMPRESS.
+"""Atomic SparseTensor micro-actions: DIAG, COMPRESS, and QUANT.
 
-Two operations the RL policy can emit per sub-step:
+Three operations the RL policy can emit per sub-step:
 
 * :class:`Diag` — block-diagonalise a pair of *logical* indices ``(i, j)`` with
   an explicit positive integer factor. gcd-collapse is *not* a sentinel here —
@@ -14,12 +14,18 @@ Two operations the RL policy can emit per sub-step:
   down. ``abs_min`` / ``abs_max`` pick the entry whose absolute value is
   smallest / largest (closest to zero / furthest from zero), preserving the
   original sign.
+* :class:`Quant` — cast the ``val`` array to a chosen JAX dtype (e.g.
+  ``"float16"``, ``"float8_e4m3fn"``, ``"bfloat16"``). Multiple Quant actions
+  in a sub-episode are applied sequentially — last one wins, no special
+  rounding (plain ``val.astype(dtype)``). Only ``val`` is cast;
+  ``scalar_mult`` and ``fill_value`` keep their native dtype.
 
-The two operations are atomic and order-dependent:
-``DIAG ∘ COMPRESS ≠ COMPRESS ∘ DIAG`` in general. :func:`apply_micro_actions`
-applies an ordered sequence; multi-axis :class:`Compress` is the natural way
-to batch several physical-axis reductions into one ``jnp.mean`` call when the
-policy emits them in the same coordinate frame.
+The operations are atomic and order-dependent: ``DIAG ∘ COMPRESS ≠
+COMPRESS ∘ DIAG`` and ``DIAG ∘ QUANT ≠ QUANT ∘ DIAG`` in general.
+:func:`apply_micro_actions` applies an ordered sequence; multi-axis
+:class:`Compress` is the natural way to batch several physical-axis
+reductions into one ``jnp.mean`` call when the policy emits them in
+the same coordinate frame.
 
 Legality
 --------
@@ -85,6 +91,27 @@ NUM_COMPRESS_KINDS = len(COMPRESS_KINDS)
 COMPRESS_KIND_INDEX: dict[str, int] = {k: i for i, k in enumerate(COMPRESS_KINDS)}
 
 
+# Canonical JAX dtype names accepted by :class:`Quant`. The list mirrors
+# the numerical dtypes exposed by ``jax.numpy`` in the repo's pinned JAX —
+# strings (not ``jnp.dtype`` objects) keep :class:`Quant` hashable and match
+# the existing ``Compress.kind: str`` pattern. Indices into
+# :data:`QUANT_DTYPE_INDEX` are the contract between a policy head (which
+# samples an int) and the env-side translator (which looks the int up here
+# to construct a ``Quant``); same wire-format as :data:`COMPRESS_KINDS`.
+QUANT_DTYPES: tuple[str, ...] = (
+    "bool",
+    "int2", "int4", "int8", "int16", "int32", "int64",
+    "uint2", "uint4", "uint8", "uint16", "uint32", "uint64",
+    "float4_e2m1fn",
+    "float8_e3m4", "float8_e4m3", "float8_e4m3b11fnuz", "float8_e4m3fn",
+    "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz", "float8_e8m0fnu",
+    "bfloat16", "float16", "float32", "float64",
+    "complex64", "complex128",
+)
+NUM_QUANT_DTYPES = len(QUANT_DTYPES)
+QUANT_DTYPE_INDEX: dict[str, int] = {d: i for i, d in enumerate(QUANT_DTYPES)}
+
+
 @dataclass(frozen=True)
 class Compress:
     """Reduce one or more *physical* axes of the underlying val array.
@@ -130,7 +157,36 @@ class Compress:
             )
 
 
-MicroAction = Union[Diag, Compress]
+@dataclass(frozen=True)
+class Quant:
+    """Cast :attr:`SparseTensor.val` to a chosen JAX dtype.
+
+    Multiple Quant actions in a sub-episode are applied sequentially in
+    order — last one wins, no special rounding. Equivalent to chained
+    ``val.astype(d_1).astype(d_2)...``; the chain matters when
+    intermediate dtypes are lossy (e.g. ``int8`` then ``float32``). Only
+    ``val`` is cast; ``scalar_mult`` and ``fill_value`` keep their native
+    dtype — this intentionally differs from :meth:`SparseTensor.astype`,
+    which casts all three.
+
+    A ``val=None`` SparseTensor (uniform grid) is returned unchanged.
+
+    ``dtype`` is the canonical name (e.g. ``"float16"``,
+    ``"float8_e4m3fn"``, ``"bfloat16"``) and must be a member of
+    :data:`QUANT_DTYPES`.
+    """
+
+    dtype: str
+
+    def __post_init__(self):
+        if self.dtype not in QUANT_DTYPE_INDEX:
+            raise ValueError(
+                f"Quant.dtype must be one of {QUANT_DTYPES!r}, "
+                f"got {self.dtype!r}."
+            )
+
+
+MicroAction = Union[Diag, Compress, Quant]
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +355,34 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
 
 
 # ---------------------------------------------------------------------------
+# Atomic QUANT
+# ---------------------------------------------------------------------------
+
+
+def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
+    """Cast ``st.val`` to ``action.dtype``.
+
+    Returns ``st`` unchanged if ``val is None`` or if the target dtype
+    already matches the current one. Only ``val`` is cast — ``scalar_mult``
+    and ``fill_value`` are passed through with their original dtypes.
+    """
+    if st.val is None:
+        return st
+    target = jnp.dtype(action.dtype)
+    if st.val.dtype == target:
+        return st
+    return SparseTensor(
+        st.out_dims,
+        st.primal_dims,
+        st.val.astype(target),
+        scalar_mult=st.scalar_mult,
+        fill_value=st.fill_value,
+        sort_val=False,
+        check_consistency=False,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Chain
 # ---------------------------------------------------------------------------
 
@@ -346,6 +430,23 @@ def compress(
     return _apply
 
 
+def quant(dtype: str) -> Callable[[SparseTensor], SparseTensor]:
+    """Return a function that applies :class:`Quant` with the given dtype.
+
+    Equivalent to ``lambda st: apply_quant(st, Quant(dtype))``; the closure
+    is hashable in graphax's ``transforms`` cache because the inner
+    ``Quant`` is a frozen dataclass. Mirrors the API of :func:`diag` /
+    :func:`compress`.
+    """
+    action = Quant(dtype=str(dtype))
+
+    def _apply(st: SparseTensor) -> SparseTensor:
+        return apply_quant(st, action)
+
+    _apply.__name__ = f"quant({dtype!r})"
+    return _apply
+
+
 def apply_micro_actions(
     st: SparseTensor,
     actions: Sequence[MicroAction],
@@ -367,9 +468,11 @@ def apply_micro_actions(
             st = apply_diag(st, action)
         elif isinstance(action, Compress):
             st = apply_compress(st, action)
+        elif isinstance(action, Quant):
+            st = apply_quant(st, action)
         else:
             raise TypeError(
-                f"apply_micro_actions expected Diag or Compress, "
+                f"apply_micro_actions expected Diag, Compress, or Quant, "
                 f"got {type(action).__name__}."
             )
     return st
