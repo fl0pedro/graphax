@@ -25,7 +25,6 @@ from graphax.sparse.ops.utils import (
     _assert_sparse_tensor_consistency,
     _copy,
     _materialize_indexes,
-    _sort_val,
     _swap_back_axes,
 )
 
@@ -226,7 +225,6 @@ class SparseTensor(SparseMathMixin):
         dtype: DTypeLike | None = None,
         pre_transforms: Sequence[Callable] | None = None,
         post_transforms: Sequence[Callable] | None = None,
-        sort_val=True,
         check_consistency=True,
         zero_fill: bool | None = None,  # this depends on fill_value... should just be
         compressed_val=None,  # TODO migrate this into val, and we check it automatically via type
@@ -260,9 +258,6 @@ class SparseTensor(SparseMathMixin):
 
         if compressed_val is not None and val is not None:  # yeah this is dumb :p
             raise ValueError("set exactly one of ``val`` and ``compressed_val``")
-
-        if sort_val and compressed_val is None:
-            out_dims, primal_dims, val = _sort_val(out_dims, primal_dims, val)
 
         if val is not None and val.dtype != dtype:
             val = val.astype(dtype)
@@ -461,7 +456,7 @@ class SparseTensor(SparseMathMixin):
     def sparse_pairs(self, key: Literal["out", "primal"] = "out") -> dict[int, int]:
         res = {}
         for d in self.out_dims:
-            if isinstance(d, SparseIndex):
+            if d.is_sparse:
                 if key == "out":
                     res[d.id] = d.other_id
                 elif key == "primal":
@@ -473,7 +468,7 @@ class SparseTensor(SparseMathMixin):
         sparse_dims = []
         seen_axes = set()
         for d in self.dims:
-            if isinstance(d, SparseIndex) and d.axis is not None:
+            if d.is_sparse and d.axis is not None:
                 if d.axis not in seen_axes:
                     sparse_dims.append(d)
                     seen_axes.add(d.axis)
@@ -492,9 +487,9 @@ class SparseTensor(SparseMathMixin):
     def dense_shape(self) -> tuple[int, ...]:
         dense_dims_meta = []
         for d in self.dims:
-            if isinstance(d, DenseIndex) and d.axis is not None:
+            if not d.is_sparse and d.axis is not None:
                 dense_dims_meta.append((d.axis, d.size))
-            if isinstance(d, SparseIndex) and d.block_axis is not None:
+            if d.is_sparse and d.block_axis is not None:
                 dense_dims_meta.append((d.block_axis, d.block_size))
         dense_dims_meta.sort(key=lambda x: x[0])
         return tuple(x[1] for x in dense_dims_meta)
@@ -534,7 +529,7 @@ class SparseTensor(SparseMathMixin):
     @property
     def batch_size(self) -> int:
         for d in self.dims:
-            if isinstance(d, SparseIndex) and d.axis is not None:
+            if d.is_sparse and d.axis is not None:
                 return d.size
         return 1
 
@@ -918,13 +913,13 @@ def get_valid_pairings(
         return -1
 
     valid_ids: list[int] = []
-    if isinstance(target_dim, SparseIndex):
+    if target_dim.is_sparse:
         valid_ids = [target_dim.other_id]
     else:
         opposite_dims = st.primal_dims if is_out_dim else st.out_dims
         for d in opposite_dims:
             if (
-                isinstance(d, DenseIndex)
+                not d.is_sparse
                 and math.gcd(target_dim.logical_size, d.logical_size) > 1
             ):
                 valid_ids.append(d.id)
@@ -971,9 +966,9 @@ def _apply_block_diagonal(
     d1 = st.out_dims[idx1] if is_out1 else st.primal_dims[idx1]
     d2 = st.out_dims[idx2] if is_out2 else st.primal_dims[idx2]
 
-    if isinstance(d1, SparseIndex) and getattr(d1, "other_id", None) != d2.id:
+    if d1.is_sparse and getattr(d1, "other_id", None) != d2.id:
         return st
-    if isinstance(d2, SparseIndex) and getattr(d2, "other_id", None) != d1.id:
+    if d2.is_sparse and getattr(d2, "other_id", None) != d1.id:
         return st
 
     v1 = getattr(d1, "axis", None)
@@ -1080,7 +1075,7 @@ def _apply_block_diagonal(
         old_b = getattr(d, "block_axis", None)
         nv = _shift_other(old_v)
         nb = _shift_other(old_b)
-        if isinstance(d, SparseIndex):
+        if d.is_sparse:
             return replace(d, axis=nv, block_axis=nb)
         return replace(d, axis=nv)
 
@@ -1106,7 +1101,6 @@ def _apply_block_diagonal(
         new_primal,
         val,
         scalar_mult=st.scalar_mult,
-        sort_val=False,
         check_consistency=False,
     )
 

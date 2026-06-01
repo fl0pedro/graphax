@@ -236,7 +236,7 @@ class TestSelfDenseAndTranspose(unittest.TestCase):
         seen_sparse = {}
 
         for d in stb_none.out_dims + stb_none.primal_dims:
-            if isinstance(d, SparseIndex):
+            if d.is_sparse:
                 pair_key = tuple(sorted((d.id, d.other_id)))
                 if pair_key not in seen_sparse:
                     seen_sparse[pair_key] = v_idx

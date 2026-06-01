@@ -61,7 +61,7 @@ def _dot_general_elementals(primals, out_shape, **params):
                 for k in range(batch_dim_counter, len(lhs_out_dims)):
                     d = lhs_out_dims[k]
                     lhs_out_dims[k] = replace(d, id=d.id + 1)
-                    if isinstance(d, SparseIndex):
+                    if d.is_sparse:
                         partner = d.other_id - num_out_dims
                         _d = lhs_primal_dims[partner]
                         lhs_primal_dims[partner] = replace(
@@ -100,7 +100,7 @@ def _dot_general_elementals(primals, out_shape, **params):
                 for k in range(batch_dim_counter, len(rhs_out_dims)):
                     d = rhs_out_dims[k]
                     rhs_out_dims[k] = replace(d, id=d.id + 1)
-                    if isinstance(d, SparseIndex):
+                    if d.is_sparse:
                         partner = d.other_id - num_out_dims
                         _d = rhs_primal_dims[partner]
                         rhs_primal_dims[partner] = replace(

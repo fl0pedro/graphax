@@ -259,6 +259,10 @@ def append_pre_transforms(pre, out):
     return out
 
 
+def _is_scalar_st(t) -> bool:
+    return not t.out_dims and not t.primal_dims
+
+
 def _eliminate_vertex(
     vertex: int,
     jaxpr: core.Jaxpr,
@@ -363,7 +367,10 @@ def _eliminate_vertex(
                             out_size * edge_outval.dtype.itemsize,
                         )
                     else:
-                        edge_outval = _post_val @ _pre_val
+                        if _is_scalar_st(_post_val) and _is_scalar_st(_pre_val):
+                            edge_outval = _post_val * _pre_val
+                        else:
+                            edge_outval = _post_val @ _pre_val
 
                 elif pre_val.val is not None:
                     edge_outval = _pre_val
@@ -1415,7 +1422,10 @@ def _accumulate_edge_triplet(
         _pre_val = unload_pre_transforms(post_val, pre_val)
 
     if pre_val.val is not None and post_val.val is not None:
-        edge_outval = _post_val @ _pre_val
+        if _is_scalar_st(_post_val) and _is_scalar_st(_pre_val):
+            edge_outval = _post_val * _pre_val
+        else:
+            edge_outval = _post_val @ _pre_val
     elif pre_val.val is not None:
         edge_outval = _pre_val
     else:

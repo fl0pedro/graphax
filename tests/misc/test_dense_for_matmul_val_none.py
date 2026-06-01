@@ -63,7 +63,7 @@ def test_fallback_does_not_crash_with_none_densified_val(monkeypatch):
             densified.out_dims, densified.primal_dims, None,
             scalar_mult=densified.scalar_mult,
             fill_value=densified.fill_value,
-            sort_val=False, check_consistency=False,
+            check_consistency=False,
         )
 
     monkeypatch.setattr(dense_mod, "dense", fake_dense)
@@ -118,7 +118,7 @@ def test_fallback_works_with_compressed_pytree_val(monkeypatch):
             densified.out_dims, densified.primal_dims, None,
             scalar_mult=densified.scalar_mult,
             fill_value=densified.fill_value,
-            sort_val=False, check_consistency=False,
+            check_consistency=False,
         )
         object.__setattr__(st_out, "val", FakeCompressed())
         return st_out

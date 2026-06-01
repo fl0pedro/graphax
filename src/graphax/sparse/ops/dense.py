@@ -31,6 +31,50 @@ if TYPE_CHECKING:
 def dense(
     tensor: SparseTensor, axes: Sequence[int] | None = None, hard: bool = False
 ) -> SparseTensor:
+    """Materialize sparse pairs into dense axes on a ``SparseTensor``.
+
+    Pipeline (each step is one helper below):
+
+      1. ``compressed_val`` short-circuit — if the tensor carries a
+         ``UnionBlocks`` / ``BlockBanded`` storage and ``axes`` only target
+         positions outside the compressed pair, return early; otherwise
+         expand the compressed buffer via ``_materialize_compressed`` and
+         fall through to the regular path.
+      2. ``_get_implicit_indices`` — find dims whose ``axis`` (or ``block_axis``
+         for sparse) is ``None``, i.e. the val doesn't yet carry that axis.
+         Under ``hard=False`` these are excluded from the materialization set;
+         under ``hard=True`` they're forced in.
+      3. ``_broadcast_and_append_dimensions`` — grow ``val`` so every requested
+         (and implicit, when ``hard``) axis has a physical slot. Reuses any
+         orphan val axes via ``_collect_free_val_axes`` before appending new ones.
+      4. ``_collect_scatter_indices`` — for each requested dim, also pull in
+         its sparse-pair sibling (the diagonal needs both ends).
+      5. ``_apply_dense_scattering`` → ``_prepare_values_for_scattering`` →
+         ``_densify_diagonal_scatter`` — for each sparse pair to materialize,
+         emit one ``(N, N, …) where eye_mask`` broadcast/select; loop the pairs
+         independently (linearizing them would corrupt block-axis layouts and
+         waste memory in the trailing axes).
+      6. Wrap the resulting array + relabeled dims into a fresh ``SparseTensor``.
+
+    Worked example — a single sparse pair with ``N=2`` blocks of size ``B=3``::
+
+        a = SparseTensor(
+            (SparseIndex(0, 2, axis=0, other_id=1, block_size=3, block_axis=1),),
+            (SparseIndex(1, 2, axis=0, other_id=0, block_size=3, block_axis=2),),
+            val,  # shape (2, 3, 3) — two 3×3 blocks
+        )
+        a.dense()  # SparseTensor with val shape (6, 6) — blocks on the diagonal,
+                   # fill_value elsewhere; dims become two ``DenseIndex``-of-size-6.
+
+    Internally: implicit=∅ (every dim already has an axis), so step 3 is a
+    no-op. Step 4 expands the requested ``{0, 1}`` to itself (siblings already
+    in). Step 5 calls ``_densify_diagonal_scatter`` once on the leading axis,
+    producing shape ``(2, 2, 3, 3)``; ``_apply_dense_scattering`` then
+    transposes to ``(2, 3, 2, 3)`` and reshapes to ``(6, 6)``.
+
+    ``axes`` selects which logical dim positions to densify (``None`` = all).
+    ``hard=True`` also materializes dims whose val axis is implicit (``None``).
+    """
     # Compressed-storage path: materialize only as much as the requested ``axes``
     # demand.
     #   * No axes asked / axes covering every meta-block-diagonal pair → expand
@@ -79,7 +123,7 @@ def dense(
         {
             updated_dims[i].axis
             for i in actual_scatter
-            if isinstance(updated_dims[i], SparseIndex)
+            if updated_dims[i].is_sparse
             and updated_dims[i].axis is not None
         }
     )
@@ -95,7 +139,6 @@ def dense(
         values,
         scalar_mult=tensor.scalar_mult,
         fill_value=tensor.fill_value,
-        sort_val=False,
         check_consistency=False,
         zero_fill=getattr(tensor, "_zero_fill", None),
     )
@@ -108,7 +151,7 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
     simple builder doesn't cover.
     """
     # Fast path: fully-dense tensor — val IS the dense form (modulo permutation).
-    if all(isinstance(d, DenseIndex) for d in tensor.dims):
+    if all(not d.is_sparse for d in tensor.dims):
         if tensor.val is None:
             return jnp.broadcast_to(
                 tensor.fill_value * tensor.scalar_mult, tensor.shape
@@ -143,7 +186,7 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
         return v
 
     # Single-sparse-pair fast path: emit a where over a 1-fusion dense form.
-    sparse_dims = [d for d in tensor.dims if isinstance(d, SparseIndex)]
+    sparse_dims = [d for d in tensor.dims if d.is_sparse]
     if (
         tensor.val is not None
         and len(sparse_dims) == 2
@@ -202,11 +245,11 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
 def _is_dimension_implicit(dim, id_to_idx):
     needs_val = dim.axis is None
     needs_block = (
-        isinstance(dim, SparseIndex) and dim.block_size and dim.block_axis is None
+        dim.is_sparse and dim.block_size and dim.block_axis is None
     )
     if needs_val or needs_block:
         to_add = {id_to_idx[dim.id]}
-        if isinstance(dim, SparseIndex):
+        if dim.is_sparse:
             to_add.add(id_to_idx[dim.other_id])
         return True, to_add
     return False, set()
@@ -227,7 +270,7 @@ def _calculate_target_shape(val_shape, dims):
     for dim in dims:
         if dim.axis is not None:
             target[dim.axis] = max(target[dim.axis], dim.size)
-        if isinstance(dim, SparseIndex) and dim.block_axis is not None:
+        if dim.is_sparse and dim.block_axis is not None:
             target[dim.block_axis] = max(target[dim.block_axis], dim.block_size or 1)
     return tuple(target)
 
@@ -236,7 +279,7 @@ def _append_primary_dimension(
     i, dim, implicit, current_ndim, dims_to_append, sparse_pair_map, free_axes
 ):
     if i in implicit and dim.axis is None:
-        if isinstance(dim, SparseIndex):
+        if dim.is_sparse:
             pair_key = tuple(sorted((dim.id, dim.other_id)))
             if pair_key in sparse_pair_map:
                 new_idx = sparse_pair_map[pair_key]
@@ -265,7 +308,7 @@ def _claim_free_axis(free_axes, size):  # TODO this is a workaround*
 def _append_block_dimension(i, dim, implicit, current_ndim, dims_to_append):
     if (
         i in implicit
-        and isinstance(dim, SparseIndex)
+        and dim.is_sparse
         and dim.block_axis is None
         and dim.block_size is not None
     ):
@@ -280,7 +323,7 @@ def _collect_free_val_axes(tensor, val_shape):  # TODO this is a workaround*
     for d in tensor.dims:
         if d.axis is not None:
             claimed.add(d.axis)
-        if isinstance(d, SparseIndex) and d.block_axis is not None:
+        if d.is_sparse and d.block_axis is not None:
             claimed.add(d.block_axis)
     free = {}
     for ax in range(len(val_shape)):
@@ -317,7 +360,7 @@ def _collect_scatter_indices(logical_indices, updated_dims, id_to_idx):
     scatter_logical = set()
     for i in logical_indices:
         scatter_logical.add(i)
-        if isinstance(updated_dims[i], SparseIndex):
+        if updated_dims[i].is_sparse:
             scatter_logical.add(id_to_idx[updated_dims[i].other_id])
     return scatter_logical
 
@@ -394,10 +437,10 @@ def _apply_dense_scattering(
     for i, dim in enumerate(logical_dims):
         pair_key = (
             tuple(sorted((dim.id, dim.other_id)))
-            if isinstance(dim, SparseIndex)
+            if dim.is_sparse
             else (dim.id,)
         )
-        if i in scatter_logical_indices and isinstance(dim, SparseIndex):
+        if i in scatter_logical_indices and dim.is_sparse:
             idx = 1 if pair_key in visited_pairs else 0
             visited_pairs.add(pair_key)
             p_idx = phys_map[dim.axis][idx]
@@ -412,7 +455,7 @@ def _apply_dense_scattering(
             final_shape.append(l_size)
             log_to_phys[i] = (curr_f_idx, None, l_size)
             curr_f_idx += 1
-        elif isinstance(dim, SparseIndex):
+        elif dim.is_sparse:
             new_v, new_b = None, None
             if pair_key not in visited_pairs:
                 if dim.axis is not None:
@@ -457,7 +500,7 @@ def _reconstruct_logical_dimensions(logical_dims, logical_to_physical):
         v_ax, b_ax, d_size = logical_to_physical[i]
         if d_size is not None:
             res.append(DenseIndex(dim.id, d_size, v_ax))
-        elif isinstance(dim, SparseIndex):
+        elif dim.is_sparse:
             res.append(replace(dim, axis=v_ax, block_axis=b_ax))
         else:
             res.append(replace(dim, axis=v_ax))

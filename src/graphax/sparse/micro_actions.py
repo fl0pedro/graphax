@@ -169,12 +169,12 @@ def apply_diag(st: SparseTensor, action: Diag) -> SparseTensor:
     d1 = st.out_dims[rel_i] if is_out1 else st.primal_dims[rel_i]
     d2 = st.out_dims[rel_j] if is_out2 else st.primal_dims[rel_j]
 
-    if isinstance(d1, SparseIndex) and d1.other_id != d2.id:
+    if d1.is_sparse and d1.other_id != d2.id:
         raise ValueError(
             f"Diag pair conflict: logical index {action.i} is already paired "
             f"with another index (other_id={d1.other_id}, but d2.id={d2.id})."
         )
-    if isinstance(d2, SparseIndex) and d2.other_id != d1.id:
+    if d2.is_sparse and d2.other_id != d1.id:
         raise ValueError(
             f"Diag pair conflict: logical index {action.j} is already paired "
             f"with another index (other_id={d2.other_id}, but d1.id={d1.id})."
@@ -278,10 +278,10 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
 
     def _remap(d: Index) -> Index:
         new_axis = _shift_after_drops(getattr(d, "axis", None))
-        if isinstance(d, SparseIndex):
+        if d.is_sparse:
             new_block_axis = _shift_after_drops(d.block_axis)
             return replace(d, axis=new_axis, block_axis=new_block_axis)
-        if isinstance(d, DenseIndex):
+        if not d.is_sparse:
             return replace(d, axis=new_axis)
         return replace(d, axis=new_axis)
 
@@ -293,7 +293,6 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
         new_primal,
         new_val,
         scalar_mult=st.scalar_mult,
-        sort_val=False,
         check_consistency=False,
     )
 

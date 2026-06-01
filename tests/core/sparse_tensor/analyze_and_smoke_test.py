@@ -250,11 +250,11 @@ def wrap_dense(fn):
 
 
 def manual_01(a, b):
-    return SparseTensor(a.out_dims, a.primal_dims, a.val + b.val, sort_val=False)
+    return SparseTensor(a.out_dims, a.primal_dims, a.val + b.val)
 
 
 def manual_02(a, b):
-    return SparseTensor(a.out_dims, a.primal_dims, a.val - b.val, sort_val=False)
+    return SparseTensor(a.out_dims, a.primal_dims, a.val - b.val)
 
 
 def manual_03(a, b):
@@ -265,18 +265,18 @@ def manual_03(a, b):
     a_blocks = a_blocks.at[:, 0:s2, 0:s3].set(a_val[:, 0])
     a_blocks = a_blocks.at[:, s2 : s2 * 2, s3 : s3 * 2].set(a_val[:, 1])
     return SparseTensor(
-        b.out_dims, b.primal_dims, a_blocks | b.val, dtype=jnp.bool_, sort_val=False
+        b.out_dims, b.primal_dims, a_blocks | b.val, dtype=jnp.bool_
     )
 
 
 def manual_04(a, b):
     return SparseTensor(
-        a.out_dims, a.primal_dims, jnp.maximum(a.val, b.val), sort_val=False
+        a.out_dims, a.primal_dims, jnp.maximum(a.val, b.val)
     )
 
 
 def manual_05(a, b):
-    return SparseTensor(a.out_dims, a.primal_dims, a.val * b.val, sort_val=False)
+    return SparseTensor(a.out_dims, a.primal_dims, a.val * b.val)
 
 
 def manual_06(a, b):
@@ -338,24 +338,25 @@ def manual_06(a, b):
         ),
         out_macro,
         fill_value=1,
-        sort_val=False,
     )
 
 
 def manual_07(a, b):
-    return SparseTensor(a.out_dims, b.primal_dims, a.val * b.val, sort_val=False)
+    return SparseTensor(a.out_dims, b.primal_dims, a.val * b.val)
 
 
 def manual_08(a, b):
     s1 = a.dims[0].size
     s2 = a.dims[1].size
     s3 = b.primal_dims[1].size
-    R_val = jnp.expand_dims(a.val, 2) * jnp.expand_dims(b.val, 1)  # (s1, s2, s3)
+    # a.val[i, j] sits at dense position [i, j, j]; b.val[j, m] at [j, j, m].
+    # Matmul contracts the inner sparse pair (j == j), so R_val[i, j, m] =
+    # a.val[i, j] * b.val[j, m] (the surviving s2 pair stays diagonal in val).
+    R_val = jnp.einsum("ij,jm->ijm", a.val, b.val)
     return SparseTensor(
         (DenseIndex(0, s1, 0), SparseIndex(1, s2, axis=1, other_id=2)),
         (SparseIndex(2, s2, axis=1, other_id=1), DenseIndex(3, s3, 2)),
         R_val,
-        sort_val=False,
     )
 
 
@@ -372,7 +373,6 @@ def manual_09(a, b):
             DenseIndex(3, s3, 2),
         ),
         R_val,
-        sort_val=False,
     )
 
 
@@ -385,7 +385,6 @@ def manual_10(a, b):
         (SparseIndex(0, s1, axis=0, other_id=2), DenseIndex(1, s2, 1)),
         (SparseIndex(2, s1, axis=0, other_id=0), DenseIndex(3, s3, 2)),
         R_val,
-        sort_val=False,
     )
 
 
@@ -397,7 +396,6 @@ def manual_11(a, b):
         (SparseIndex(0, s1, axis=0, other_id=1, block_size=s2, block_axis=1),),
         (SparseIndex(1, s1, axis=0, other_id=0, block_size=s2, block_axis=2),),
         R_val,
-        sort_val=False,
     )
 
 
@@ -414,7 +412,6 @@ def manual_12(a, b):
         ),
         (SparseIndex(3, s1, axis=0, other_id=0),),
         R_val,
-        sort_val=False,
     )
 
 
@@ -431,7 +428,6 @@ def manual_13(a, b):
         ),
         (SparseIndex(3, s3, axis=2, other_id=2),),
         R_val,
-        sort_val=False,
     )
 
 
@@ -443,7 +439,6 @@ def manual_14(a, b):
         (SparseIndex(0, s1, axis=0, other_id=2), DenseIndex(1, s2, None)),
         (SparseIndex(2, s1, axis=0, other_id=0), DenseIndex(3, s3, 1)),
         b.val,
-        sort_val=False,
     )
 
 
@@ -454,7 +449,6 @@ def manual_15(a, b):
         (SparseIndex(0, s1, axis=0, other_id=1),),
         (SparseIndex(1, s1, axis=0, other_id=0),),
         R_val,
-        sort_val=False,
     )
 
 
@@ -471,7 +465,6 @@ def manual_16(a, b):
         ),
         (SparseIndex(3, s3, axis=2, other_id=2),),
         R_val,
-        sort_val=False,
     )
 
 
@@ -485,7 +478,6 @@ def manual_17(a, b):
         (SparseIndex(0, s1, axis=0, other_id=1, block_size=s2, block_axis=1),),
         (SparseIndex(1, s1, axis=0, other_id=0, block_size=s4, block_axis=2),),
         R_val,
-        sort_val=False,
     )
 
 
@@ -493,12 +485,12 @@ def manual_18(a, b):
     s1 = a.dims[0].size
     s2 = a.dims[1].size
     s3 = b.primal_dims[1].size
-    R_val = jnp.expand_dims(a.val, 2) * jnp.expand_dims(b.val, 1)  # (s1, s2, s3)
+    # See manual_08 — same diagonal-collapse shortcut, just different sizes.
+    R_val = jnp.einsum("ij,jm->ijm", a.val, b.val)
     return SparseTensor(
         (DenseIndex(0, s1, 0), SparseIndex(1, s2, axis=1, other_id=2)),
         (SparseIndex(2, s2, axis=1, other_id=1), DenseIndex(3, s3, 2)),
         R_val,
-        sort_val=False,
     )
 
 
@@ -518,7 +510,6 @@ def manual_19(a, b):
         ),
         (SparseIndex(4, s3, axis=2, other_id=2), DenseIndex(5, s6, 4)),
         R_val,
-        sort_val=False,
     )
 
 
@@ -547,7 +538,6 @@ def manual_21(a, b):
         (DenseIndex(0, NB_o, 0),),
         (DenseIndex(1, s4, 1),),
         R_val,
-        sort_val=False,
     )
 
 
@@ -559,7 +549,6 @@ def manual_22(a, b):
         (DenseIndex(0, s1, 0),),
         (DenseIndex(1, s2, 1),),
         R_val,
-        sort_val=False,
     )
 
 
@@ -582,7 +571,6 @@ def manual_23(a, b):
             DenseIndex(6, s5, 3),
         ),
         R_val,
-        sort_val=False,
     )
 
 
@@ -600,12 +588,11 @@ def manual_24(a, b):
         (DenseIndex(0, s1 * s2, 0),),
         (DenseIndex(1, s3, 1),),
         R_val,
-        sort_val=False,
     )
 
 
 def manual_25(a, _b):
-    return SparseTensor(a.out_dims, a.primal_dims, a.val * a.val, sort_val=False)
+    return SparseTensor(a.out_dims, a.primal_dims, a.val * a.val)
 
 
 def manual_26(a, _b):
@@ -616,7 +603,6 @@ def manual_26(a, _b):
         (SparseIndex(0, s1, axis=0, other_id=1, block_size=s2, block_axis=1),),
         (SparseIndex(1, s1, axis=0, other_id=0, block_size=s2, block_axis=2),),
         R_val,
-        sort_val=False,
     )
 
 
@@ -643,7 +629,6 @@ def manual_27(a, b, c):
         (DenseIndex(0, NB, 0),),
         (DenseIndex(1, s5, 1),),
         R_val,
-        sort_val=False,
     )
 
 
@@ -666,7 +651,6 @@ def manual_28(a, b):
         (DenseIndex(0, NB, 0),),
         (DenseIndex(1, s3, 1),),
         R_val,
-        sort_val=False,
     )
 
 
@@ -679,12 +663,11 @@ def manual_matmul_aligned(a, b):
         (SparseIndex(0, s1, axis=0, other_id=2), DenseIndex(1, s2, 1)),
         (SparseIndex(2, s1, axis=0, other_id=0), DenseIndex(3, s4, 2)),
         res_val,
-        sort_val=False,
     )
 
 
 def manual_plus_aligned(a, b):
-    return SparseTensor(a.out_dims, a.primal_dims, a.val + b.val, sort_val=False)
+    return SparseTensor(a.out_dims, a.primal_dims, a.val + b.val)
 
 
 def manual_matmul_plus_aligned(a, b, c):
@@ -696,7 +679,6 @@ def manual_matmul_plus_aligned(a, b, c):
         (SparseIndex(0, s1, axis=0, other_id=2), DenseIndex(1, s2, 1)),
         (SparseIndex(2, s1, axis=0, other_id=0), DenseIndex(3, s4, 2)),
         res_val + c.val,
-        sort_val=False,
     )
 
 
@@ -714,7 +696,6 @@ def manual_matmul_unaligned(a, b):
         (DenseIndex(0, s3, 0), DenseIndex(1, s2, 1)),
         (DenseIndex(2, s1, 2), DenseIndex(3, s4, 3)),
         res_val,
-        sort_val=False,
     )
 
 
@@ -727,7 +708,7 @@ def manual_plus_unaligned(a, b):
     idx = jnp.arange(s5)
     res_val = val_reshaped.at[idx, :, :, idx, :, :].add(b.val[:, None, :, :, :])
     return SparseTensor(
-        a.out_dims, a.primal_dims, res_val.reshape(a.val.shape), sort_val=False
+        a.out_dims, a.primal_dims, res_val.reshape(a.val.shape)
     )
 
 
@@ -750,7 +731,6 @@ def manual_matmul_plus_unaligned(a, b, c):
         (DenseIndex(0, s3, 0), DenseIndex(1, s2, 1)),
         (DenseIndex(2, s1, 2), DenseIndex(3, s4, 3)),
         summed.reshape(s3, s2, s1, s4),
-        sort_val=False,
     )
 
 
@@ -765,18 +745,17 @@ class TestSmokeScreen(unittest.TestCase):
         return jr.normal(key, shape).astype(dtype)
 
     def _assert_equivalence(self, res, res_dense, res_manual):
+        # Phase 2 dropped sort_val, so ``res.val.shape`` and ``manual.val.shape``
+        # may carry equivalent data in different physical layouts (each dim's
+        # ``axis`` / ``block_axis`` still points to its own physical slot). The
+        # invariant that matters is ``res.dense() == manual.dense()`` — verify
+        # that, not the storage layout.
         tol = {"atol": 1e-3} if ANALYZE else {}
         if res_dense is not None:
             self.assertTrue(jnp.allclose(res.dense(), res_dense.dense(), **tol))
         self.assertEqual(res.shape, res_manual.shape)
-        if res.val is not None and res_manual.val is not None:
-            self.assertEqual(res.val.shape, res_manual.val.shape)
-            self.assertTrue(jnp.allclose(res.val, res_manual.val, **tol))
-
-        # JAX equality across structural SparseTensors
-        if res.val is not None and res_manual.val is not None:
-            self.assertTrue(res.val.shape == res_manual.val.shape)
-        else:
+        self.assertTrue(jnp.allclose(res.dense(), res_manual.dense(), **tol))
+        if res.val is None or res_manual.val is None:
             self.assertTrue(res.val is None and res_manual.val is None)
 
     def _analyze(self, func, *args, **kwargs):
@@ -1150,7 +1129,7 @@ class TestSmokeScreen(unittest.TestCase):
             manual_07,
             a,
             b,
-            expected_path="dot_general_fast",
+            expected_path="tiled",
             mem_ratio_max=1.5,
         )
         res = core_matmul(a, b)
@@ -1183,7 +1162,7 @@ class TestSmokeScreen(unittest.TestCase):
             manual_08,
             a,
             b,
-            expected_path="dot_general_fast",
+            expected_path="tiled",
             mem_ratio_max=1.5,
         )
         res = core_matmul(a, b)
@@ -1255,7 +1234,7 @@ class TestSmokeScreen(unittest.TestCase):
             manual_10,
             a,
             b,
-            expected_path="dot_general_fast",
+            expected_path="tiled",
             mem_ratio_max=1.5,
         )
         res = core_matmul(a, b)
@@ -1288,7 +1267,7 @@ class TestSmokeScreen(unittest.TestCase):
             manual_11,
             a,
             b,
-            expected_path="aligned_pair",
+            expected_path="tiled",
             mem_ratio_max=1.5,
         )
         res = core_matmul(a, b)
@@ -1365,7 +1344,7 @@ class TestSmokeScreen(unittest.TestCase):
             manual_13,
             a,
             b,
-            expected_path="dot_general_fast",
+            expected_path="tiled",
             mem_ratio_max=1.5,
         )
         res = core_matmul(a, b)
@@ -1424,7 +1403,7 @@ class TestSmokeScreen(unittest.TestCase):
             manual_15,
             a,
             b,
-            expected_path="dot_general_fast",
+            expected_path="tiled",
             mem_ratio_max=1.5,
         )
         res = core_matmul(a, b)
@@ -1468,7 +1447,7 @@ class TestSmokeScreen(unittest.TestCase):
             manual_16,
             a,
             b,
-            expected_path="dot_general_fast",
+            expected_path="tiled",
             mem_ratio_max=1.5,
         )
         res = core_matmul(a, b)
@@ -1503,7 +1482,7 @@ class TestSmokeScreen(unittest.TestCase):
             manual_17,
             a,
             b,
-            expected_path="aligned_pair",
+            expected_path="tiled",
             mem_ratio_max=1.5,
         )
         res = core_matmul(a, b)
@@ -1536,7 +1515,7 @@ class TestSmokeScreen(unittest.TestCase):
             manual_18,
             a,
             b,
-            expected_path="dot_general_fast",
+            expected_path="tiled",
             mem_ratio_max=1.5,
         )
         res = core_matmul(a, b)
@@ -1585,7 +1564,7 @@ class TestSmokeScreen(unittest.TestCase):
             manual_19,
             a,
             b,
-            expected_path="dot_general_fast",
+            expected_path="tiled",
             mem_ratio_max=1.5,
         )
         res = core_matmul(a, b)
@@ -1864,7 +1843,7 @@ class TestSmokeScreen(unittest.TestCase):
             manual_23,
             a,
             b,
-            expected_path="dot_general_fast",
+            expected_path="tiled",
             mem_ratio_max=1.5,
         )
         res = core_matmul(a, b)
@@ -1959,7 +1938,7 @@ class TestSmokeScreen(unittest.TestCase):
             manual_26,
             a,
             a,
-            expected_path="aligned_pair",
+            expected_path="tiled",
             mem_ratio_max=1.5,
         )
         res = core_matmul(a, a)
@@ -2042,6 +2021,319 @@ class TestSmokeScreen(unittest.TestCase):
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1 * s2, s3))
         self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_28(a, b))
+
+    # --- Phase 1a additions: refinement spectrum + band scenarios ---
+    # These exercise the cases the unified-kernel work in Phase 5/6 needs to
+    # collapse into one algorithm. Correctness only here — dense ground truth
+    # via ``a.dense() + b.dense()`` / ``a.dense() @ b.dense()``. Phase 1b will
+    # wrap these in ``_expect_path(...)`` once the path taxonomy is locked in.
+
+    def _mul_intersection(self, a, b):
+        return elementwise(a, b, jax.lax.mul, is_intersection=True)
+
+    # --- Elementwise refinement spectrum (union: add) -------------------
+
+    def test_29_add_1refine_aligned(self):
+        """Union add on two sparse pairs with identical block_size on the
+        contracting axis (gcd == block_size — degenerate refinement)."""
+        n = 4
+        b = 4  # logical 16
+        if ANALYZE:
+            n *= 8 * SCALE
+            b *= 8 * SCALE
+
+        a = SparseTensor(
+            (SparseIndex(0, n, axis=0, other_id=1, block_size=b, block_axis=1),),
+            (SparseIndex(1, n, axis=0, other_id=0, block_size=b, block_axis=2),),
+            self._n((n, b, b), 29),
+        )
+        rhs = SparseTensor(
+            (SparseIndex(0, n, axis=0, other_id=1, block_size=b, block_axis=1),),
+            (SparseIndex(1, n, axis=0, other_id=0, block_size=b, block_axis=2),),
+            self._n((n, b, b), 129),
+        )
+        _expect_path(core_plus, a, rhs, expected_path="general")
+        expected = a.dense() + rhs.dense()
+        res = core_plus(a, rhs)
+        self.assertEqual(res.shape, expected.shape)
+        self.assertTrue(jnp.allclose(res.dense(), expected, atol=1e-5))
+
+    def test_30_add_multi_refine(self):
+        """Union add with non-trivial GCD on the contracting axis.
+        lhs block 4 over 6 outer (logical 24), rhs block 6 over 4 outer
+        (logical 24). gcd == 2, LCM == 12."""
+        n_lhs, b_lhs = 6, 4
+        n_rhs, b_rhs = 4, 6
+        if ANALYZE:
+            n_lhs *= 4 * SCALE
+            b_lhs *= 4 * SCALE
+            n_rhs *= 4 * SCALE
+            b_rhs *= 4 * SCALE
+
+        a = SparseTensor(
+            (SparseIndex(0, n_lhs, axis=0, other_id=1, block_size=b_lhs, block_axis=1),),
+            (SparseIndex(1, n_lhs, axis=0, other_id=0, block_size=b_lhs, block_axis=2),),
+            self._n((n_lhs, b_lhs, b_lhs), 30),
+        )
+        rhs = SparseTensor(
+            (SparseIndex(0, n_rhs, axis=0, other_id=1, block_size=b_rhs, block_axis=1),),
+            (SparseIndex(1, n_rhs, axis=0, other_id=0, block_size=b_rhs, block_axis=2),),
+            self._n((n_rhs, b_rhs, b_rhs), 130),
+        )
+        _expect_path(core_plus, a, rhs, expected_path="compressed_union")
+        expected = a.dense() + rhs.dense()
+        res = core_plus(a, rhs)
+        self.assertEqual(res.shape, expected.shape)
+        self.assertTrue(jnp.allclose(res.dense(), expected, atol=1e-5))
+
+    def test_31_add_very_unaligned(self):
+        """Union add with coprime block sizes (gcd == 1) — LCM == full
+        logical size, so the LCM-grid degenerates to a single big block.
+        lhs block 5 over 7 outer (logical 35), rhs block 7 over 5 outer."""
+        n_lhs, b_lhs = 7, 5
+        n_rhs, b_rhs = 5, 7
+        if ANALYZE:
+            n_lhs *= 3 * SCALE
+            b_lhs *= 3 * SCALE
+            n_rhs *= 3 * SCALE
+            b_rhs *= 3 * SCALE
+
+        a = SparseTensor(
+            (SparseIndex(0, n_lhs, axis=0, other_id=1, block_size=b_lhs, block_axis=1),),
+            (SparseIndex(1, n_lhs, axis=0, other_id=0, block_size=b_lhs, block_axis=2),),
+            self._n((n_lhs, b_lhs, b_lhs), 31),
+        )
+        rhs = SparseTensor(
+            (SparseIndex(0, n_rhs, axis=0, other_id=1, block_size=b_rhs, block_axis=1),),
+            (SparseIndex(1, n_rhs, axis=0, other_id=0, block_size=b_rhs, block_axis=2),),
+            self._n((n_rhs, b_rhs, b_rhs), 131),
+        )
+        _expect_path(core_plus, a, rhs, expected_path="compressed_union")
+        expected = a.dense() + rhs.dense()
+        res = core_plus(a, rhs)
+        self.assertEqual(res.shape, expected.shape)
+        self.assertTrue(jnp.allclose(res.dense(), expected, atol=1e-5))
+
+    # --- Elementwise refinement spectrum (intersection: mul) ------------
+
+    def test_32_mul_1refine_aligned(self):
+        """Intersection mul on two sparse pairs with identical block_size."""
+        n = 4
+        b = 4
+        if ANALYZE:
+            n *= 8 * SCALE
+            b *= 8 * SCALE
+
+        a = SparseTensor(
+            (SparseIndex(0, n, axis=0, other_id=1, block_size=b, block_axis=1),),
+            (SparseIndex(1, n, axis=0, other_id=0, block_size=b, block_axis=2),),
+            self._n((n, b, b), 32),
+        )
+        rhs = SparseTensor(
+            (SparseIndex(0, n, axis=0, other_id=1, block_size=b, block_axis=1),),
+            (SparseIndex(1, n, axis=0, other_id=0, block_size=b, block_axis=2),),
+            self._n((n, b, b), 132),
+        )
+        _expect_path(self._mul_intersection, a, rhs, expected_path="general")
+        expected = a.dense() * rhs.dense()
+        res = self._mul_intersection(a, rhs)
+        self.assertEqual(res.shape, expected.shape)
+        self.assertTrue(jnp.allclose(res.dense(), expected, atol=1e-5))
+
+    def test_33_mul_multi_refine(self):
+        """Intersection mul with non-trivial GCD (gcd == 2, LCM == 12)."""
+        n_lhs, b_lhs = 6, 4
+        n_rhs, b_rhs = 4, 6
+        if ANALYZE:
+            n_lhs *= 4 * SCALE
+            b_lhs *= 4 * SCALE
+            n_rhs *= 4 * SCALE
+            b_rhs *= 4 * SCALE
+
+        a = SparseTensor(
+            (SparseIndex(0, n_lhs, axis=0, other_id=1, block_size=b_lhs, block_axis=1),),
+            (SparseIndex(1, n_lhs, axis=0, other_id=0, block_size=b_lhs, block_axis=2),),
+            self._n((n_lhs, b_lhs, b_lhs), 33),
+        )
+        rhs = SparseTensor(
+            (SparseIndex(0, n_rhs, axis=0, other_id=1, block_size=b_rhs, block_axis=1),),
+            (SparseIndex(1, n_rhs, axis=0, other_id=0, block_size=b_rhs, block_axis=2),),
+            self._n((n_rhs, b_rhs, b_rhs), 133),
+        )
+        _expect_path(self._mul_intersection, a, rhs, expected_path="general")
+        expected = a.dense() * rhs.dense()
+        res = self._mul_intersection(a, rhs)
+        self.assertEqual(res.shape, expected.shape)
+        self.assertTrue(jnp.allclose(res.dense(), expected, atol=1e-5))
+
+    def test_34_mul_very_unaligned(self):
+        """Intersection mul with coprime block sizes (gcd == 1, LCM == 35)."""
+        n_lhs, b_lhs = 7, 5
+        n_rhs, b_rhs = 5, 7
+        if ANALYZE:
+            n_lhs *= 3 * SCALE
+            b_lhs *= 3 * SCALE
+            n_rhs *= 3 * SCALE
+            b_rhs *= 3 * SCALE
+
+        a = SparseTensor(
+            (SparseIndex(0, n_lhs, axis=0, other_id=1, block_size=b_lhs, block_axis=1),),
+            (SparseIndex(1, n_lhs, axis=0, other_id=0, block_size=b_lhs, block_axis=2),),
+            self._n((n_lhs, b_lhs, b_lhs), 34),
+        )
+        rhs = SparseTensor(
+            (SparseIndex(0, n_rhs, axis=0, other_id=1, block_size=b_rhs, block_axis=1),),
+            (SparseIndex(1, n_rhs, axis=0, other_id=0, block_size=b_rhs, block_axis=2),),
+            self._n((n_rhs, b_rhs, b_rhs), 134),
+        )
+        _expect_path(self._mul_intersection, a, rhs, expected_path="general")
+        expected = a.dense() * rhs.dense()
+        res = self._mul_intersection(a, rhs)
+        self.assertEqual(res.shape, expected.shape)
+        self.assertTrue(jnp.allclose(res.dense(), expected, atol=1e-5))
+
+    # --- Matmul refinement spectrum ------------------------------------
+
+    def test_35_matmul_1refine_aligned(self):
+        """Matmul on two sparse pairs with identical contracting block size
+        (gcd == block_size). The aligned fast path is expected to fire."""
+        n = 4
+        b = 4
+        if ANALYZE:
+            n *= 8 * SCALE
+            b *= 8 * SCALE
+
+        a = SparseTensor(
+            (SparseIndex(0, n, axis=0, other_id=1, block_size=b, block_axis=1),),
+            (SparseIndex(1, n, axis=0, other_id=0, block_size=b, block_axis=2),),
+            self._n((n, b, b), 35),
+        )
+        rhs = SparseTensor(
+            (SparseIndex(0, n, axis=0, other_id=1, block_size=b, block_axis=1),),
+            (SparseIndex(1, n, axis=0, other_id=0, block_size=b, block_axis=2),),
+            self._n((n, b, b), 135),
+        )
+        _expect_path(core_matmul, a, rhs, expected_path="tiled")
+        expected = a.dense() @ rhs.dense()
+        res = core_matmul(a, rhs)
+        self.assertEqual(res.shape, expected.shape)
+        self.assertTrue(jnp.allclose(res.dense(), expected, atol=1e-4))
+
+    def test_36_matmul_multi_refine(self):
+        """Matmul with non-trivial GCD on the contracting axis.
+        lhs block 4 over 6 outer (logical 24), rhs block 6 over 4 outer
+        (logical 24). gcd == 2 — the tiled path's LCM-grid is expected."""
+        n_lhs, b_lhs = 6, 4
+        n_rhs, b_rhs = 4, 6
+        if ANALYZE:
+            n_lhs *= 4 * SCALE
+            b_lhs *= 4 * SCALE
+            n_rhs *= 4 * SCALE
+            b_rhs *= 4 * SCALE
+
+        a = SparseTensor(
+            (SparseIndex(0, n_lhs, axis=0, other_id=1, block_size=b_lhs, block_axis=1),),
+            (SparseIndex(1, n_lhs, axis=0, other_id=0, block_size=b_lhs, block_axis=2),),
+            self._n((n_lhs, b_lhs, b_lhs), 36),
+        )
+        rhs = SparseTensor(
+            (SparseIndex(0, n_rhs, axis=0, other_id=1, block_size=b_rhs, block_axis=1),),
+            (SparseIndex(1, n_rhs, axis=0, other_id=0, block_size=b_rhs, block_axis=2),),
+            self._n((n_rhs, b_rhs, b_rhs), 136),
+        )
+        _expect_path(core_matmul, a, rhs, expected_path="tiled")
+        expected = a.dense() @ rhs.dense()
+        res = core_matmul(a, rhs)
+        self.assertEqual(res.shape, expected.shape)
+        self.assertTrue(jnp.allclose(res.dense(), expected, atol=1e-4))
+
+    def test_37_matmul_very_unaligned(self):
+        """Matmul with coprime contracting block sizes (gcd == 1, LCM == 35).
+        Every output element pulls data from every input block on the
+        contracting axis — stress test for the tiled path."""
+        n_lhs, b_lhs = 7, 5
+        n_rhs, b_rhs = 5, 7
+        if ANALYZE:
+            n_lhs *= 3 * SCALE
+            b_lhs *= 3 * SCALE
+            n_rhs *= 3 * SCALE
+            b_rhs *= 3 * SCALE
+
+        a = SparseTensor(
+            (SparseIndex(0, n_lhs, axis=0, other_id=1, block_size=b_lhs, block_axis=1),),
+            (SparseIndex(1, n_lhs, axis=0, other_id=0, block_size=b_lhs, block_axis=2),),
+            self._n((n_lhs, b_lhs, b_lhs), 37),
+        )
+        rhs = SparseTensor(
+            (SparseIndex(0, n_rhs, axis=0, other_id=1, block_size=b_rhs, block_axis=1),),
+            (SparseIndex(1, n_rhs, axis=0, other_id=0, block_size=b_rhs, block_axis=2),),
+            self._n((n_rhs, b_rhs, b_rhs), 137),
+        )
+        _expect_path(core_matmul, a, rhs, expected_path="tiled")
+        expected = a.dense() @ rhs.dense()
+        res = core_matmul(a, rhs)
+        self.assertEqual(res.shape, expected.shape)
+        self.assertTrue(jnp.allclose(res.dense(), expected, atol=1e-4))
+
+    # --- Band scenarios (uniform blocks per Phase 5d deferral) ---------
+
+    def test_38_dense_x_block_diag(self):
+        """Dense × block-diagonal (uniform blocks). Output's column axis
+        is the block-diag's logical size. Complement to test_24 (which is
+        block-diag × dense). 'Horizontal band' in the user's framing —
+        the block-diag is on the right and has many small blocks."""
+        m = 6   # rows of dense lhs
+        n = 8   # block count on rhs (more, smaller blocks)
+        b = 4   # block size on rhs
+        if ANALYZE:
+            m *= 10 * SCALE
+            n *= 10 * SCALE
+            b *= 10 * SCALE
+
+        a = SparseTensor(
+            (DenseIndex(0, m, 0),),
+            (DenseIndex(1, n * b, 1),),
+            self._n((m, n * b), 38),
+        )
+        rhs = SparseTensor(
+            (SparseIndex(0, n, axis=0, other_id=1, block_size=b, block_axis=1),),
+            (SparseIndex(1, n, axis=0, other_id=0, block_size=b, block_axis=2),),
+            self._n((n, b, b), 138),
+        )
+        _expect_path(core_matmul, a, rhs, expected_path="tiled")
+        expected = a.dense() @ rhs.dense()
+        res = core_matmul(a, rhs)
+        self.assertEqual(res.shape, expected.shape)
+        self.assertTrue(jnp.allclose(res.dense(), expected, atol=1e-4))
+
+    def test_39_block_diag_x_dense_fewer_larger(self):
+        """Block-diagonal × dense, with fewer, larger blocks on the lhs.
+        Companion to test_24 (which uses many small blocks). 'Vertical
+        band' in the user's framing — output's row axis is the block-diag
+        side, large per-block rows."""
+        n = 2   # block count on lhs (fewer, larger blocks)
+        b = 16  # block size on lhs
+        k = 5   # cols of dense rhs
+        if ANALYZE:
+            n *= 8 * SCALE
+            b *= 8 * SCALE
+            k *= 8 * SCALE
+
+        a = SparseTensor(
+            (SparseIndex(0, n, axis=0, other_id=1, block_size=b, block_axis=1),),
+            (SparseIndex(1, n, axis=0, other_id=0, block_size=b, block_axis=2),),
+            self._n((n, b, b), 39),
+        )
+        rhs = SparseTensor(
+            (DenseIndex(0, n * b, 0),),
+            (DenseIndex(1, k, 1),),
+            self._n((n * b, k), 139),
+        )
+        _expect_path(core_matmul, a, rhs, expected_path="tiled")
+        expected = a.dense() @ rhs.dense()
+        res = core_matmul(a, rhs)
+        self.assertEqual(res.shape, expected.shape)
+        self.assertTrue(jnp.allclose(res.dense(), expected, atol=1e-4))
 
 
 if __name__ == "__main__":

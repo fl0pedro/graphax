@@ -102,25 +102,25 @@ def _promote_dense(d, partner_id):
 def _resolve_dim_pairing(i, ldims, rdims, processed):
     """Pair dim i across (lhs, rhs); promote Dense↔Sparse to a synthetic 1-block sparse pair."""
     ld, rd = ldims[i], rdims[i]
-    l_sp, r_sp = isinstance(ld, SparseIndex), isinstance(rd, SparseIndex)
+    l_sp, r_sp = ld.is_sparse, rd.is_sparse
     if not l_sp and not r_sp:
         processed.add(i); return "dense", (ld, rd)
     if l_sp and r_sp:
         j = next(k for k, d in enumerate(ldims) if d.id == ld.other_id)
         lp, rp = ldims[j], rdims[j]
-        if not isinstance(rp, SparseIndex) or rd.other_id != rp.id:
+        if not rp.is_sparse or rd.other_id != rp.id:
             raise ValueError("Topology mismatch: sparse pairs do not align.")
         processed.update([i, j]); return "sparse", (ld, lp, rd, rp)
     if l_sp:
         j = next(k for k, d in enumerate(ldims) if d.id == ld.other_id)
         lp, rp = ldims[j], rdims[j]
-        if not isinstance(rp, DenseIndex):
+        if not not rp.is_sparse:
             raise ValueError("Topology mismatch: expected DenseIndex partner.")
         processed.update([i, j])
         return "sparse", (ld, lp, _promote_dense(rd, rp.id), _promote_dense(rp, rd.id))
     j = next(k for k, d in enumerate(rdims) if d.id == rd.other_id)
     rp, lp = rdims[j], ldims[j]
-    if not isinstance(lp, DenseIndex):
+    if not not lp.is_sparse:
         raise ValueError("Topology mismatch: expected DenseIndex partner.")
     processed.update([i, j])
     return "sparse", (_promote_dense(ld, lp.id), _promote_dense(lp, ld.id), rd, rp)
@@ -394,7 +394,7 @@ def _try_divisor_fast_path(lhs, rhs, op, is_intersection):
         return None
     ao, ai = lhs.out_dims[0], lhs.primal_dims[0]
     bo, bi = rhs.out_dims[0], rhs.primal_dims[0]
-    if not all(isinstance(d, SparseIndex) for d in (ao, ai, bo, bi)):
+    if not all(d.is_sparse for d in (ao, ai, bo, bi)):
         return None
     if ao.other_id != ai.id or bo.other_id != bi.id:
         return None
@@ -483,7 +483,7 @@ def _try_divisor_fast_path(lhs, rhs, op, is_intersection):
     return SparseTensor(
         big.out_dims, big.primal_dims, out,
         scalar_mult=s_mult, fill_value=new_fill,
-        check_consistency=False, sort_val=False, zero_fill=zf,
+        check_consistency=False, zero_fill=zf,
     )
 
 
@@ -516,7 +516,7 @@ def _try_compressed_union(lhs, rhs, op, is_intersection):
         return None
     ao, ai = lhs.out_dims[0], lhs.primal_dims[0]
     bo, bi = rhs.out_dims[0], rhs.primal_dims[0]
-    if not all(isinstance(d, SparseIndex) for d in (ao, ai, bo, bi)):
+    if not all(d.is_sparse for d in (ao, ai, bo, bi)):
         return None
     # Sparse pair siblings must match on each side.
     if ao.other_id != ai.id or ai.other_id != ao.id: return None

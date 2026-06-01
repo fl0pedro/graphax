@@ -103,7 +103,7 @@ class TestMatmulBatchedSparsePair(unittest.TestCase):
         )
         # Sanity-check that the result actually carries a SparseIndex pair (the proof
         # that the `batch_sparse` arm built the output and not, say, a `spatial_*` arm).
-        sparse_dims_out = [d for d in got.dims if isinstance(d, SparseIndex)]
+        sparse_dims_out = [d for d in got.dims if d.is_sparse]
         self.assertEqual(len(sparse_dims_out), 2, "expected one sparse pair in output")
 
 

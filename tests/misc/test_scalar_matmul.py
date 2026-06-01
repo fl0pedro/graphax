@@ -1,42 +1,43 @@
-"""Bug: scalar @ scalar in `SparseTensor.__matmul__` dropped `val` -> None.
+"""Scalar `SparseTensor` composition under ``*`` (elementwise).
 
-`matmul(lhs, rhs)` where both lhs and rhs have no out_dims/primal_dims (pure
-scalar SparseTensors) was hitting `_build_matmul_topology` with no pairs,
-producing a result with `val=None`. Vertex elimination uses `_post_val @
-_pre_val` to compose two scalar edges (e.g. tan'(x) and (-1)·sin'(x)), so the
-returned tensor silently lost its value and downstream Jacobians collapsed to
-the structural identity.
+`@` (matmul) of two 0-rank SparseTensors is rejected — callers must use
+``*``. Vertex elimination in ``core.py`` routes scalar Jacobian edges
+through ``*`` (e.g. tan'(x) ∘ (-1)·sin'(x)), so the elementwise path must
+preserve ``val`` and compose ``scalar_mult`` correctly.
 
-Caught by the test_Simple example which silently produced
-((8., 6.), (-2.34, -2.34)) instead of the correct
-((0.674, 0.482), (14.77, 10.55)).
+These tests pin the elementwise-scalar invariants so vertex elimination's
+chain rule stays correct across refactors.
 """
 
 import jax.numpy as jnp
+import pytest
 
 from graphax.sparse.tensor import SparseTensor
 
 
-def test_scalar_at_scalar_preserves_val():
-    """`SparseTensor((), (), x) @ SparseTensor((), (), y)` must equal x*y."""
+def test_scalar_times_scalar_preserves_val():
+    """`SparseTensor((), (), x) * SparseTensor((), (), y)` must equal x*y."""
     a = SparseTensor((), (), jnp.array(2.0))
     b = SparseTensor((), (), jnp.array(3.0))
-    res = a @ b
-    assert res.val is not None, "scalar @ scalar dropped val"
+    res = a * b
+    assert res.val is not None, "scalar * scalar dropped val"
     assert float(res.val) == 6.0
 
 
-def test_scalar_at_scalar_with_none_val_uses_one():
+def test_scalar_times_scalar_with_none_val_uses_one():
     """Identity-shaped scalar (val=None) should multiply as 1."""
     a = SparseTensor((), (), None)
     b = SparseTensor((), (), jnp.array(7.0))
-    res = a @ b
+    res = a * b
     assert res.val is not None
     assert float(res.val) == 7.0
 
 
-def test_scalar_at_scalar_via_jacve():
-    """End-to-end: a function that triggers scalar @ scalar during elimination."""
+def test_scalar_times_scalar_via_jacve():
+    """End-to-end: a function that triggers scalar composition during
+    vertex elimination. Tests the ``core.py`` scalar guard in
+    ``_eliminate_vertex`` that routes scalar Jacobian edges through
+    ``*`` instead of ``@``."""
     import jax
     from graphax import jacve, tree_allclose
 
@@ -52,17 +53,28 @@ def test_scalar_at_scalar_via_jacve():
     assert bool(tree_allclose(veres, refres))
 
 
-def test_scalar_at_scalar_both_val_none_composes_scalar_mult():
+def test_scalar_times_scalar_both_val_none_composes_correctly():
     """Both operands have ``val=None`` and non-1 ``scalar_mult`` — the
-    composed multiplier must be ``lhs.scalar_mult * rhs.scalar_mult``,
-    not silently reset to 1. Vertex elimination chains structural-identity
-    Jacobians (e.g. ``-1 * sin'(x)`` ∘ another scalar Jacobian) this way,
-    and dropping the multipliers makes the chained Jacobian wrong by a
-    factor of the missing scalars."""
+    composed effective value must be ``lhs.scalar_mult * rhs.scalar_mult``.
+
+    Elementwise ``*`` materializes the result (``val`` becomes a concrete
+    array, ``scalar_mult`` resets to 1), unlike the old ``_scalar_matmul``
+    which kept ``val=None`` and rode the multiplier on ``scalar_mult``.
+    The effective value (``val * scalar_mult``, treating ``val=None`` as 1)
+    is what matters here; the val=None Kronecker-identity preservation is
+    OPTIMIZATION_PLAN issue 2 (a separate perf optimization)."""
     a = SparseTensor((), (), None, scalar_mult=jnp.array(2.0))
     b = SparseTensor((), (), None, scalar_mult=jnp.array(3.0))
-    res = a @ b
-    # Composed effective scalar = 2.0 * 3.0 = 6.0; with val=None the value
-    # rides entirely on ``scalar_mult``.
-    assert res.val is None
-    assert float(res.scalar_mult) == 6.0
+    res = a * b
+    effective = (1.0 if res.val is None else float(res.val)) * float(res.scalar_mult)
+    assert effective == 6.0
+
+
+def test_scalar_at_scalar_rejected():
+    """Scalar @ scalar is no longer supported on ``matmul``; callers must
+    use ``*``. Locks in the new contract so a future regression that
+    silently re-enables a scalar matmul path fails loudly."""
+    a = SparseTensor((), (), jnp.array(2.0))
+    b = SparseTensor((), (), jnp.array(3.0))
+    with pytest.raises(ValueError, match="0-rank SparseTensors"):
+        a @ b

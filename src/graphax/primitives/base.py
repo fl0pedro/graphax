@@ -89,7 +89,7 @@ def make_parallel_jacobian(i, primals, val_out, elemental):
                     SparseIndex(n_out + n_primal + 1, os, axis, j)
                 )
             for k, d in enumerate(primal_dims[:-1]):
-                if isinstance(d, SparseIndex):
+                if d.is_sparse:
                     out_dims[d.other_id] = replace(
                         out_dims[d.other_id], other_id=out_dims[d.other_id].other_id + 1
                     )

@@ -72,7 +72,7 @@ def verify_dimensions(out_dims, primal_dims, val=None):
     ids = [d.id for d in dims]
     assert len(ids) == len(set(ids))
 
-    sparse_dims = {d.id: d for d in dims if isinstance(d, SparseIndex)}
+    sparse_dims = {d.id: d for d in dims if d.is_sparse}
     for d in sparse_dims.values():
         assert d.other_id in sparse_dims
         other = sparse_dims[d.other_id]
@@ -105,7 +105,7 @@ def validate_sparse_tensor(st):
     assert st.shape == st.out_shape + st.primal_shape
 
     for d in st.dims:
-        if isinstance(d, SparseIndex):
+        if d.is_sparse:
             assert d.logical_size == d.size * (d.block_size or 1)
         else:
             assert d.logical_size == d.size
@@ -282,7 +282,7 @@ def drop_physical_axes(st, axes_to_drop):
 
     new_dims = []
     for d in st.dims:
-        if isinstance(d, SparseIndex):
+        if d.is_sparse:
             new_d = SparseIndex(
                 d.id,
                 d.size,
@@ -392,6 +392,12 @@ def assert_matmul_result(
     primal_logical_shape: tuple[int, ...],
     physical_shape: tuple[int, ...] | None = None,
 ):
+    # ``physical_shape`` pins ``val.shape`` to catch unintended densification —
+    # not a semantic invariant. The SparseTensor algebra allows any axis order
+    # in val as long as ``dim.axis`` agrees; equivalent layouts (same multiset
+    # of sizes, different permutation) all denote the same logical tensor.
+    # When refactors change which path emits a matmul (e.g. the fast paths
+    # were removed in Phase 5c), the expected ``physical_shape`` may permute.
     if not jnp.allclose(st_result.dense(), dense_ref, atol=1e-5):
         raise AssertionError("Dense evaluations do not match.")
 

@@ -238,8 +238,8 @@ class TestDenseDiags(unittest.TestCase):
         st_p = dense(st, axes=(0,))
         self.assertTrue((st_p == dense(st, axes=(0, 2))).all())
         self.assertTrue(
-            isinstance(st_p.out_dims[0], DenseIndex)
-            and isinstance(st_p.primal_dims[0], DenseIndex)
+            not st_p.out_dims[0].is_sparse
+            and not st_p.primal_dims[0].is_sparse
         )
         self.assertTrue(jnp.allclose(st_p.dense(), st.dense()))
 
@@ -253,8 +253,8 @@ class TestDenseDiags(unittest.TestCase):
         st_p = dense(st, axes=(1,))
         self.assertTrue((st_p == dense(st, axes=(1, 3))).all())
         self.assertTrue(
-            isinstance(st_p.out_dims[1], DenseIndex)
-            and isinstance(st_p.primal_dims[1], DenseIndex)
+            not st_p.out_dims[1].is_sparse
+            and not st_p.primal_dims[1].is_sparse
         )
         self.assertTrue(jnp.allclose(st_p.dense(), st.dense()))
 
@@ -294,8 +294,8 @@ class TestDenseDiags(unittest.TestCase):
         st_p = dense(st, axes=(0,))
         self.assertTrue((st_p == dense(st, axes=(0, 2))).all())
         self.assertTrue(
-            isinstance(st_p.out_dims[0], DenseIndex)
-            and isinstance(st_p.primal_dims[0], DenseIndex)
+            not st_p.out_dims[0].is_sparse
+            and not st_p.primal_dims[0].is_sparse
         )
         self.assertTrue(jnp.allclose(st_p.dense(), st.dense()))
 
@@ -309,8 +309,8 @@ class TestDenseDiags(unittest.TestCase):
         st_p = dense(st, axes=(1,))
         self.assertTrue((st_p == dense(st, axes=(1, 3))).all())
         self.assertTrue(
-            isinstance(st_p.out_dims[1], DenseIndex)
-            and isinstance(st_p.primal_dims[1], DenseIndex)
+            not st_p.out_dims[1].is_sparse
+            and not st_p.primal_dims[1].is_sparse
         )
         self.assertTrue(jnp.allclose(st_p.dense(), st.dense()))
 
@@ -325,8 +325,8 @@ class TestDenseDiags(unittest.TestCase):
         st_p = dense(st, axes=(0,))
         self.assertTrue((st_p == dense(st, axes=(0, 3))).all())
         self.assertTrue(
-            isinstance(st_p.out_dims[0], DenseIndex)
-            and isinstance(st_p.primal_dims[0], DenseIndex)
+            not st_p.out_dims[0].is_sparse
+            and not st_p.primal_dims[0].is_sparse
         )
         self.assertTrue(jnp.allclose(st_p.dense(), st.dense()))
 
@@ -341,8 +341,8 @@ class TestDenseDiags(unittest.TestCase):
         st_p = dense(st, axes=(1,))
         self.assertTrue((st_p == dense(st, axes=(1, 4))).all())
         self.assertTrue(
-            isinstance(st_p.out_dims[1], DenseIndex)
-            and isinstance(st_p.primal_dims[1], DenseIndex)
+            not st_p.out_dims[1].is_sparse
+            and not st_p.primal_dims[1].is_sparse
         )
         self.assertTrue(jnp.allclose(st_p.dense(), st.dense()))
 
@@ -361,8 +361,8 @@ class TestDenseDiags(unittest.TestCase):
                 st_p = dense(st, axes=(axis,))
                 self.assertTrue((st_p == dense(st, axes=(axis, axis + 3))).all())
                 self.assertTrue(
-                    isinstance(st_p.out_dims[axis], DenseIndex)
-                    and isinstance(st_p.primal_dims[axis], DenseIndex)
+                    not st_p.out_dims[axis].is_sparse
+                    and not st_p.primal_dims[axis].is_sparse
                 )
                 self.assertTrue(jnp.allclose(st_p.dense(), st.dense()))
 
@@ -383,8 +383,8 @@ class TestDenseDiags(unittest.TestCase):
                 self.assertTrue((st_p == dense(st, axes=f_axes)).all())
                 for a in axes:
                     self.assertTrue(
-                        isinstance(st_p.out_dims[a], DenseIndex)
-                        and isinstance(st_p.primal_dims[a], DenseIndex)
+                        not st_p.out_dims[a].is_sparse
+                        and not st_p.primal_dims[a].is_sparse
                     )
                 self.assertTrue(jnp.allclose(st_p.dense(), st.dense()))
 
@@ -412,8 +412,8 @@ class TestDenseDiags(unittest.TestCase):
                 self.assertTrue((st_p == dense(st, axes=f_axes)).all())
                 for a in axes:
                     self.assertTrue(
-                        isinstance(st_p.out_dims[a], DenseIndex)
-                        and isinstance(st_p.primal_dims[a], DenseIndex)
+                        not st_p.out_dims[a].is_sparse
+                        and not st_p.primal_dims[a].is_sparse
                     )
                 self.assertTrue(jnp.allclose(st_p.dense(), st.dense()))
 
@@ -447,8 +447,8 @@ class TestDenseDiags(unittest.TestCase):
     #             self.assertTrue((st_p == dense(st, axes=f_axes)).all())
     #             for a in axes:
     #                 self.assertTrue(
-    #                     isinstance(st_p.out_dims[a], DenseIndex)
-    #                     and isinstance(st_p.primal_dims[a], DenseIndex)
+    #                     not st_p.out_dims[a].is_sparse
+    #                     and not st_p.primal_dims[a].is_sparse
     #                 )
     #             self.assertTrue(jnp.allclose(st_p.dense(), st.dense()))
 
@@ -465,8 +465,8 @@ class TestDenseDiags(unittest.TestCase):
         self.assertTrue(jnp.allclose(st.dense(), dense_ref))
         st_p = dense(st, axes=(0,))
         self.assertTrue(
-            isinstance(st_p.out_dims[0], DenseIndex)
-            and isinstance(st_p.primal_dims[1], DenseIndex)
+            not st_p.out_dims[0].is_sparse
+            and not st_p.primal_dims[1].is_sparse
         )
         self.assertTrue(jnp.allclose(st_p.dense(), dense_ref))
 
@@ -492,8 +492,8 @@ class TestDenseDiags(unittest.TestCase):
         self.assertTrue(jnp.allclose(st.dense(), dense_ref))
         st_p = dense(st, axes=(1,))
         self.assertTrue(
-            isinstance(st_p.out_dims[1], DenseIndex)
-            and isinstance(st_p.primal_dims[2], DenseIndex)
+            not st_p.out_dims[1].is_sparse
+            and not st_p.primal_dims[2].is_sparse
         )
         self.assertTrue(jnp.allclose(st_p.dense(), dense_ref))
 

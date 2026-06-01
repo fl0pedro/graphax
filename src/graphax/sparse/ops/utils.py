@@ -3,13 +3,12 @@
 * Type / consistency: ``_is_sparse``, ``_assert_sparse_tensor_consistency``.
 * Shared primitives (used by both elementwise and matmul):
     ``_val_or_one``, ``_prepare_physical_array``, ``_is_zero_fill``.
-* Construction / mutation: ``_arr2st``, ``_copy``, ``_sort_val``.
+* Construction / mutation: ``_arr2st``, ``_copy``.
 """
 from __future__ import annotations
 
 import copy
 from dataclasses import replace
-from itertools import count
 from typing import TYPE_CHECKING, Any, Sequence
 
 import jax
@@ -101,7 +100,7 @@ def _has_meta_block_diag_dims(tensor, meta_block_shape) -> bool:
         return False
     o, p = tensor.out_dims[0], tensor.primal_dims[0]
     return (
-        isinstance(o, SparseIndex) and isinstance(p, SparseIndex)
+        o.is_sparse and p.is_sparse
         and o.size == M and p.size == M
         and o.block_size == H_meta and p.block_size == W_meta
         and o.other_id == p.id and p.other_id == o.id
@@ -175,13 +174,13 @@ def _is_zero_fill(tensor: SparseTensor) -> bool:
 # --- Consistency checks --------------------------------------------------
 def _check_sparse_dim_pair(d, dim_map):
     other = dim_map.get(d.other_id)
-    return (isinstance(other, SparseIndex) and other.other_id == d.id and d.size == other.size)
+    return (other.is_sparse and other.other_id == d.id and d.size == other.size)
 
 
 def _check_block_axis(d, dim_map, block_axiss):
     if d.block_axis in block_axiss:
         other = dim_map.get(d.other_id)
-        if not (isinstance(other, SparseIndex) and other.block_axis == d.block_axis):
+        if not (other.is_sparse and other.block_axis == d.block_axis):
             raise ValueError(
                 f"Topology Error: Duplicate block_axis {d.block_axis} in SparseIndex {d.id}"
             )
@@ -201,7 +200,7 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
     dim_map = {d.id: d for d in st.dims}
     block_axiss = set()
     for d in st.dims:
-        if isinstance(d, SparseIndex):
+        if d.is_sparse:
             if not _check_sparse_dim_pair(d, dim_map):
                 raise ValueError(
                     f"Topology Error: Invalid sparse dimension pair configuration for dimension {d.id}"
@@ -245,7 +244,7 @@ def _copy(st: SparseTensor, val: Array | None = None, scalar_mult: Array | None 
         scalar_mult=s, fill_value=f,
         pre_transforms=st.pre_transforms,
         post_transforms=st.post_transforms,
-        sort_val=False, check_consistency=False,
+        check_consistency=False,
         zero_fill=zf, compressed_val=cv,
     )
 
@@ -266,65 +265,7 @@ def _arr2st(arr: Array, out_ndim: int | None = None, dtype: Any = None, **kwargs
         arr = jnp.expand_dims(arr, 0)
     dims = tuple(DenseIndex(i, s, i) for i, s in enumerate(arr.shape))
     return SparseTensor(dims[:out_ndim], dims[out_ndim:], arr,
-                        sort_val=False, check_consistency=False, **kwargs)
-
-
-# --- Sort val axes into canonical (sparse-then-dense) order --------------
-def _map_sparse_axes(dims_list, sparse_axis_map, counter, perm):
-    for d in dims_list:
-        if isinstance(d, SparseIndex) and d.axis is not None and d.axis not in sparse_axis_map:
-            sparse_axis_map[d.axis] = next(counter)
-            perm.append(d.axis)
-
-
-def _map_dense_axes(dims, dense_axis_map, counter, perm):
-    for d in dims:
-        if isinstance(d, DenseIndex) and d.axis is not None and d.axis not in dense_axis_map:
-            dense_axis_map[d.axis] = next(counter)
-            perm.append(d.axis)
-        if isinstance(d, SparseIndex) and d.block_axis is not None and d.block_axis not in dense_axis_map:
-            dense_axis_map[d.block_axis] = next(counter)
-            perm.append(d.block_axis)
-
-
-def _update_dim_axes(ds, s_map, d_map):
-    res = []
-    for d in ds:
-        if isinstance(d, SparseIndex):
-            nv = s_map.get(d.axis) if d.axis is not None else None
-            nb = d_map.get(d.block_axis) if d.block_axis is not None else None
-            res.append(replace(d, axis=nv, block_axis=nb))
-        else:
-            nv = d_map.get(d.axis) if d.axis is not None else None
-            res.append(replace(d, axis=nv))
-    return tuple(res)
-
-
-def _sort_val(out_dims, primal_dims, val):
-    """Permute ``val`` so its axes go (sparse axiss) → (dense axiss) → (leftover).
-
-    Skips the transpose op (and the dim-axis remap) when ``full_perm`` is the
-    identity, which is the common case for matmul / elementwise outputs whose
-    final layout already lists sparse axes first. Saves one transpose-shaped
-    HLO op per matmul/elementwise output."""
-    if val is None:
-        return tuple(out_dims), tuple(primal_dims), None
-    s_map, s_perm, c_s = {}, [], count()
-    _map_sparse_axes(out_dims, s_map, c_s, s_perm)
-    _map_sparse_axes(primal_dims, s_map, c_s, s_perm)
-    d_map, d_perm, c_d = {}, [], count(len(s_map))
-    _map_dense_axes(tuple(out_dims) + tuple(primal_dims), d_map, c_d, d_perm)
-    full_perm, seen = [], set()
-    for p in s_perm + d_perm:
-        if p not in seen:
-            full_perm.append(p); seen.add(p)
-    full_perm.extend(i for i in range(val.ndim) if i not in seen)
-    # Identity perm ⇒ no transpose, no dim remap needed.
-    if full_perm == list(range(val.ndim)):
-        return tuple(out_dims), tuple(primal_dims), val
-    new_out = _update_dim_axes(out_dims, s_map, d_map)
-    new_primal = _update_dim_axes(primal_dims, s_map, d_map)
-    return new_out, new_primal, val.transpose(full_perm)
+                        check_consistency=False, **kwargs)
 
 
 # --- graphax-specific extensions ----------------------------------------
@@ -359,10 +300,10 @@ def _swap_back_axes(st: "SparseTensor") -> "SparseTensor":
     permutation = [0] * st.val.ndim
     for d in st.dims:
         if d.axis is not None:
-            if isinstance(d, DenseIndex) or d.id < getattr(d, "other_id", float("inf")):
+            if not d.is_sparse or d.id < getattr(d, "other_id", float("inf")):
                 permutation[i] = d.axis
                 i += 1
-        if isinstance(d, SparseIndex) and getattr(d, "block_axis", None) is not None:
+        if d.is_sparse and getattr(d, "block_axis", None) is not None:
             permutation[i] = d.block_axis
             i += 1
 
@@ -393,7 +334,7 @@ def _swap_back_axes(st: "SparseTensor") -> "SparseTensor":
 
         nv, nb = d.axis, getattr(d, "block_axis", None)
         if nv is not None:
-            if isinstance(d, DenseIndex) or d.id < d.other_id:
+            if not d.is_sparse or d.id < d.other_id:
                 nv = current_i
                 current_i += 1
             else:
@@ -405,7 +346,7 @@ def _swap_back_axes(st: "SparseTensor") -> "SparseTensor":
             current_i += 1
 
         new_d = replace(d, axis=nv)
-        if isinstance(new_d, SparseIndex):
+        if new_d.is_sparse:
             new_d = replace(new_d, block_axis=nb)
 
         processed_ids[d.id] = new_d

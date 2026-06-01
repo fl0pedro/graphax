@@ -1,12 +1,10 @@
-"""Bug: `_sort_val` crashed when `val` was a Python float.
+"""`SparseTensor.__init__` must accept Python float/int vals.
 
 Some elemental rules return Python floats — e.g. `lax.neg_p` returns
 `lambda x: -1.0` and `lax.sub_p` returns `(1.0, -1.0)`. `make_parallel_jacobian`
 in the singleton path does `SparseTensor([], [], elemental)` where
-`elemental` is the bare float, and the SparseTensor constructor calls
-`_sort_val` which accesses `val.ndim` -> `AttributeError`.
-
-Fix: in `_sort_val`, wrap non-array vals via `jnp.asarray(val)` first.
+`elemental` is a bare float. The constructor wraps with `jnp.asarray` when
+the val lacks `.dtype`, keeping these cases working.
 """
 
 import jax.numpy as jnp

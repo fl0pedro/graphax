@@ -336,7 +336,7 @@ class TestMixedMatmul(unittest.TestCase):
         )
         stres = matmul(stx, sty)
 
-        assert_matmul_result(stres, res, (3, 4), (5, 2), (3, 4, 5, 2))
+        assert_matmul_result(stres, res, (3, 4), (5, 2), (4, 3, 5, 2))
 
     def test_4d_sparse_cross_single_contraction(self):
         key = jrand.PRNGKey(42)
@@ -364,7 +364,7 @@ class TestMixedMatmul(unittest.TestCase):
         )
         stres = matmul(stx, sty)
 
-        assert_matmul_result(stres, res, (4, 3), (2, 5), (4, 3, 2, 5))
+        assert_matmul_result(stres, res, (4, 3), (2, 5), (4, 3, 5, 2))
 
     def test_4d_softmax_sparse_single_contraction(self):
         key = jrand.PRNGKey(42)
@@ -399,7 +399,7 @@ class TestMixedMatmul(unittest.TestCase):
 
         stres = matmul(stx, sty)
 
-        assert_matmul_result(stres, res, (4, 3), (2, 5), (4, 3, 2, 5))
+        assert_matmul_result(stres, res, (4, 3), (2, 5), (4, 3, 5, 2))
 
     def test_4d_softmax_sparse_single_contraction_2(self):
         key = jrand.PRNGKey(42)
@@ -428,7 +428,7 @@ class TestMixedMatmul(unittest.TestCase):
 
         stres = matmul(stx, sty)
 
-        assert_matmul_result(stres, res, (4, 3), (2, 5), (4, 3, 2, 5))
+        assert_matmul_result(stres, res, (4, 3), (2, 5), (4, 3, 5, 2))
 
     def test_4d_softmax_sparse_single_contraction_with_Nones(self):
         key = jrand.PRNGKey(42)
@@ -456,7 +456,7 @@ class TestMixedMatmul(unittest.TestCase):
         )
         stres = matmul(stx, sty)
 
-        assert_matmul_result(stres, res, (3, 4), (2, 5), (3, 4, 2, 5))
+        assert_matmul_result(stres, res, (3, 4), (2, 5), (4, 3, 5, 2))
 
     def test_4d_softmax_sparse_single_contraction_with_Nones_2(self):
         key = jrand.PRNGKey(42)
@@ -484,7 +484,7 @@ class TestMixedMatmul(unittest.TestCase):
         )
         stres = matmul(stx, sty)
 
-        assert_matmul_result(stres, res, (3, 4), (2, 5), (3, 4, 2, 5))
+        assert_matmul_result(stres, res, (3, 4), (2, 5), (4, 3, 5, 2))
 
     def test_4d_dense_double_contraction(self):
         key = jrand.PRNGKey(42)
@@ -536,7 +536,7 @@ class TestMixedMatmul(unittest.TestCase):
 
         stres = matmul(stx, sty)
 
-        assert_matmul_result(stres, res, (3, 4), (2, 5), (3, 4, 2, 5))
+        assert_matmul_result(stres, res, (3, 4), (2, 5), (3, 4, 5, 2))
 
     def test_4d_sparse_dense_with_only_Nones(self):
         key = jrand.PRNGKey(42)
@@ -678,7 +678,7 @@ class TestMixedMatmul(unittest.TestCase):
         )
         stres = matmul(stx, sty)
 
-        assert_matmul_result(stres, res, (3, 5), (4, 2), (3, 5, 4, 2))
+        assert_matmul_result(stres, res, (3, 5), (4, 2), (5, 3, 4, 2))
 
     def test_3d_4d_sparse(self):
         key = jrand.PRNGKey(42)

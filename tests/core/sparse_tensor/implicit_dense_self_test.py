@@ -183,7 +183,7 @@ class TestSelfDenseNones(unittest.TestCase):
                 self.assertEqual(len(st.dims), len(result.dims))
                 if result.val is not None:
                     self.assertEqual(st.shape, result.val.shape)
-                self.assertTrue(all(isinstance(d, DenseIndex) for d in result.dims))
+                self.assertTrue(all(not d.is_sparse for d in result.dims))
 
     def test_dense_twice(self):
         for fixture_fn in self.get_all_fixtures():

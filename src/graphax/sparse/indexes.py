@@ -2,50 +2,40 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# `typing.override` requires Python 3.12+ (matches pyproject.toml `requires-python = "==3.12.*"`).
-from typing import override
-
 
 @dataclass(frozen=True)
 class Index:
+    """Unified dim descriptor.
+
+    Discriminator: ``other_id is None`` ⇒ dense; otherwise sparse-paired.
+    ``block_size`` / ``block_axis`` are only meaningful for sparse pairs
+    (block-diagonal storage) and stay ``None`` for dense and plain sparse.
+
+    The ``DenseIndex`` and ``SparseIndex`` factory functions below construct
+    this class with the appropriate field set, so existing callsites stay
+    unchanged.
+    """
+
     id: int
     size: int
     axis: int | None
+    other_id: int | None = None
+    block_size: int | None = None
+    block_axis: int | None = None
 
     def __post_init__(self):
         if self.size < 0:
             raise ValueError(f"Index size must be non-negative, got {self.size}")
-
-    @property
-    def logical_size(self) -> int:
-        return self.size
-
-    @property
-    def shape(self) -> tuple[int, ...]:
-        return (self.size,)
-
-
-@dataclass(frozen=True)
-class DenseIndex(Index):
-    pass
-
-
-@dataclass(frozen=True)
-class SparseIndex(Index):
-    other_id: int
-    block_size: int | None = None
-    block_axis: int | None = None
-
-    @override
-    def __post_init__(self):
-        super().__post_init__()
         if self.block_size is not None and self.block_size <= 0:
             raise ValueError(
-                f"SparseIndex block_size must be positive, got {self.block_size}"
+                f"Index block_size must be positive, got {self.block_size}"
             )
 
     @property
-    @override
+    def is_sparse(self) -> bool:
+        return self.other_id is not None
+
+    @property
     def logical_size(self) -> int:
         return self.size * (self.block_size or 1)
 
@@ -53,5 +43,21 @@ class SparseIndex(Index):
     def shape(self) -> tuple[int, ...]:
         if self.block_size is None:
             return (self.size,)
-        else:
-            return (self.size, self.block_size)
+        return (self.size, self.block_size)
+
+
+def DenseIndex(id: int, size: int, axis: int | None) -> Index:
+    """Construct a dense ``Index`` (``other_id`` left ``None``)."""
+    return Index(id, size, axis)
+
+
+def SparseIndex(
+    id: int,
+    size: int,
+    axis: int | None,
+    other_id: int,
+    block_size: int | None = None,
+    block_axis: int | None = None,
+) -> Index:
+    """Construct a sparse-paired ``Index`` (``other_id`` points at the partner)."""
+    return Index(id, size, axis, other_id, block_size, block_axis)

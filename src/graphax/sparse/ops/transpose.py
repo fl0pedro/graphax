@@ -1,7 +1,10 @@
 """Transpose a ``SparseTensor`` by reordering its out and primal dimensions.
 
-Sparse pairs are required to straddle the out/primal split. If a permutation would land
-both ends on the same side, that pair is densified first.
+View-only: ``val`` is not permuted. Each dim's ``axis`` / ``block_axis`` already
+encodes the physical position in ``val``; consumers index by ``dim.axis``, so a
+logical reorder of the dims tuple needs no array work. Sparse pairs are still
+required to straddle the out/primal split — if a permutation would land both
+ends on the same side, that pair is densified first.
 """
 from __future__ import annotations
 
@@ -9,7 +12,7 @@ from typing import TYPE_CHECKING, Sequence
 from dataclasses import replace
 
 from .dense import dense
-from .utils import _sort_val, _copy
+from .utils import _copy
 
 from graphax.sparse.indexes import SparseIndex
 
@@ -42,7 +45,7 @@ def _ensure_valid_sparsity(tensor, out_axes, primal_axes):
     out_set, primal_set = set(out_axes), set(primal_axes)
     axes_to_densify = [
         i for i, dim in enumerate(tensor.dims)
-        if isinstance(dim, SparseIndex)
+        if dim.is_sparse
         and ((i in out_set and dim_id_to_index[dim.other_id] in out_set)
              or (i in primal_set and dim_id_to_index[dim.other_id] in primal_set))
     ]
@@ -66,10 +69,10 @@ def transpose(tensor: SparseTensor, out_axes: Sequence[int] | None = None,
     reordered = [tensor.dims[i] for i in full_perm]
     id_map = {d.id: i for i, d in enumerate(reordered)}
     updated = [
-        replace(d, id=i, **({"other_id": id_map[d.other_id]} if isinstance(d, SparseIndex) else {}))
+        replace(d, id=i, **({"other_id": id_map[d.other_id]} if d.is_sparse else {}))
         for i, d in enumerate(reordered)
     ]
 
     n_out = len(new_out_axes)
-    new_out_dims, new_primal_dims, new_val = _sort_val(updated[:n_out], updated[n_out:], tensor.val)
-    return _copy(tensor, val=new_val, out_dims=new_out_dims, primal_dims=new_primal_dims)
+    return _copy(tensor, val=tensor.val,
+                 out_dims=tuple(updated[:n_out]), primal_dims=tuple(updated[n_out:]))
