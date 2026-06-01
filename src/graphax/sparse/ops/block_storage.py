@@ -289,153 +289,338 @@ class IntersectionBlocks(NamedTuple):
         return _stitch_meta(per_meta, self.op(self.fill_lhs, self.fill_rhs))
 
 
+def _to_dense_banded(
+    data: Array,
+    M_primary: int,
+    M_secondary: int,
+    W: int,
+    B_p: int,
+    B_s: int,
+    offset_tuple: tuple[int, ...] | None,
+    centered_w: int | None,
+    fill_value: Array,
+    L: tuple[int, ...],
+    L_pad: tuple,
+) -> Array:
+    """Shared row-primary banded-densify kernel for :class:`BlockBanded`.
+
+    Treats ``data`` as ``(M_primary, W, B_p, B_s, *L)`` with ``data[a, w_idx]``
+    sitting at primary-meta ``a``, secondary-meta ``offset[a] + w_idx``.
+    Returns ``(M_primary * B_p, M_secondary * B_s, *L)``.
+
+    Two offset modes (mutually exclusive):
+      • ``centered_w`` given (``offset_tuple is None``): arithmetic centered
+        band, ``offset[a] = a - centered_w``. All masks/in-band checks are
+        pure arithmetic on ``jnp.arange`` — XLA emits no gather. This is the
+        legacy fast path.
+      • ``offset_tuple`` given: explicit per-primary offsets. The in-band
+        mask becomes ``offset_arr[blk_i]``, an unavoidable gather. Use this
+        for staircase / rectangular / non-centered bands.
+
+    For col-primary :class:`BlockBanded` the caller passes the sub-block
+    axes swapped and transposes the result at the boundary (see
+    ``BlockBanded.to_dense``).
+    """
+    # Step 1: tile data across a new secondary-axis (pure broadcast, no copy).
+    data_bcast = jnp.broadcast_to(
+        data[:, None, ...],  # (M_primary, 1, W, B_p, B_s, *L)
+        (M_primary, M_secondary, W, B_p, B_s, *L),
+    )
+
+    # Step 2: build one-hot ``w_idx == b - offset[a]`` selector along W.
+    bj_idx = jnp.arange(M_secondary, dtype=jnp.int32)  # (M_secondary,)
+    if centered_w is not None:
+        bi_idx = jnp.arange(M_primary, dtype=jnp.int32)[:, None]
+        target_w = bj_idx[None, :] - bi_idx + centered_w  # arithmetic, no gather
+    else:
+        off_arr = jnp.asarray(offset_tuple, dtype=jnp.int32)  # (M_primary,)
+        target_w = bj_idx[None, :] - off_arr[:, None]
+    select_mask = (
+        target_w[:, :, None] == jnp.arange(W, dtype=jnp.int32)[None, None, :]
+    )
+    select_mask = select_mask[..., None, None]  # (M_primary, M_secondary, W, 1, 1)
+    if L:
+        select_mask = select_mask[(..., *L_pad)]
+
+    # Step 3: where+sum collapses W → out_meta has data on the band, 0 elsewhere.
+    out_meta = jnp.where(select_mask, data_bcast, 0).sum(
+        axis=2
+    )  # (M_primary, M_secondary, B_p, B_s, *L)
+
+    # Step 4: interleave (a, si, b, sj) → (a*B_p+si, b*B_s+sj).
+    perm = (0, 2, 1, 3, *range(4, 4 + len(L)))
+    out_meta = out_meta.transpose(perm).reshape(M_primary * B_p, M_secondary * B_s, *L)
+
+    # Step 5: replace the zero-pad outside the band with fill_value.
+    blk_i = jnp.arange(M_primary * B_p) // B_p
+    blk_j = jnp.arange(M_secondary * B_s) // B_s
+    if centered_w is not None:
+        # offset[i] = i - centered_w. diff = j - (i - w) = j - i + w. No gather.
+        diff = blk_j[None, :] - blk_i[:, None] + centered_w
+    else:
+        off_arr_for_band = jnp.asarray(offset_tuple, dtype=jnp.int32)
+        co_per_row = off_arr_for_band[blk_i]  # gather (unavoidable for explicit)
+        diff = blk_j[None, :] - co_per_row[:, None]
+    in_band = (diff >= 0) & (diff < W)
+    if L:
+        in_band = in_band[(..., *L_pad)]
+    return jnp.where(in_band, out_meta, fill_value)
+
+
 # ----------------------------------------------------------------------------
 #  3.  BlockBanded — matmul of two block-diagonals (x @ y.T or x.T @ y)
 # ----------------------------------------------------------------------------
 class BlockBanded(NamedTuple):
-    """Block-banded matrix in skewed (rectangular) storage.
+    """Block-banded matrix with optional rectangular sub-blocks, asymmetric
+    meta-counts, and row/col-primary orientation.
 
-    Output of contracting two block-diagonal sources where the contracting axes'
-    block sizes don't divide evenly: the result is non-zero only within a finite
-    block-band, since each lhs block can only couple to a few rhs blocks whose
-    block-ranges along the contracted axis overlap with it.
+    Output of contracting two block-diagonal sources where the contracting
+    axes' block sizes don't divide evenly: the result is non-zero only within
+    a finite block-band. The band's natural orientation (along rows or along
+    cols) depends on which operand has more meta-blocks — matmul picks the
+    tighter orientation at emission time.
 
     Layout
     ------
-    ``data`` : ``(M, 2w+1, B, B, *L)``
-        ``data[k, b]`` is the block at meta-row ``k``, meta-column ``k+(b-w)``.
-        ``b == w`` is the main diagonal; ``b > w`` upper bands; ``b < w`` lower.
+    ``data`` : ``(M_primary, W, B_row, B_col, *L)``
+        ``data[a, w_idx]`` is the ``(B_row, B_col)`` sub-block at meta-coord
+        determined by ``primary_axis``:
+          • ``primary_axis=0`` (row-primary): row meta ``a``, col meta
+            ``offset[a] + w_idx``.
+          • ``primary_axis=1`` (col-primary): col meta ``a``, row meta
+            ``offset[a] + w_idx``.
+        ``W`` is the band width (max in-band sub-blocks per primary slot).
     ``fill_value`` : value at positions outside the band.
+    ``primary_axis`` : ``0`` (default; row-primary) or ``1`` (col-primary).
+    ``n_secondary`` : total meta-blocks along the secondary axis. ``-1``
+        sentinel = ``M_primary`` (square / legacy).
+    ``offset`` : per-primary integer offsets along secondary. ``()`` sentinel
+        = centered band: ``offset[a] = a - (W - 1) // 2`` (legacy behavior).
 
-    The half-bandwidth ``w = (data.shape[1] - 1) // 2`` is determined by the
-    storage. Out-of-range slots at the corners (``k+b-w < 0`` or ``≥ M``) are
-    masked out by ``to_dense``; this is the standard banded-matrix-storage
-    tradeoff for a rectangular buffer ("shifted into one tensor").
+    Backward-compat
+    ---------------
+    ``BlockBanded(data=(M, 2w+1, B, B, *L), fill_value=...)`` with the new
+    fields at their defaults reproduces the legacy symmetric centered square
+    band: ``primary_axis=0``, ``n_secondary=M``, ``offset[a]=a-w``,
+    ``B_row=B_col=B``.
+
+    Generalized cases (post Phase 5d)
+    --------------------------------
+    Rectangular sub-blocks (``B_row != B_col``), asymmetric meta-counts
+    (``n_secondary != M_primary``), skewed/staircase bands (explicit
+    ``offset``), and col-primary orientation are all encoded by setting the
+    new fields. These shapes arise from misaligned-contract matmuls where the
+    contracting block sizes have non-trivial LCM/GCD ratios.
     """
 
     data: Array
     fill_value: Array
+    primary_axis: int = 0
+    n_secondary: int = -1
+    offset: tuple[int, ...] = ()
+
+    @property
+    def _M_primary(self) -> int:
+        return self.data.shape[0]
+
+    @property
+    def _W(self) -> int:
+        return self.data.shape[1]
+
+    @property
+    def _B_row(self) -> int:
+        return self.data.shape[2]
+
+    @property
+    def _B_col(self) -> int:
+        return self.data.shape[3]
+
+    @property
+    def _M_secondary(self) -> int:
+        return self.n_secondary if self.n_secondary >= 0 else self._M_primary
+
+    @property
+    def _offset_arr(self) -> tuple[int, ...]:
+        if self.offset:
+            return self.offset
+        # Centered-band sentinel: offset[a] = a - (W-1)//2.
+        w = (self._W - 1) // 2
+        return tuple(a - w for a in range(self._M_primary))
+
+    @property
+    def _M_row(self) -> int:
+        return self._M_primary if self.primary_axis == 0 else self._M_secondary
+
+    @property
+    def _M_col(self) -> int:
+        return self._M_secondary if self.primary_axis == 0 else self._M_primary
 
     @property
     def half_bandwidth(self) -> int:
-        return (self.data.shape[1] - 1) // 2
+        """Legacy property: ``(W-1)//2`` for centered symmetric bands. For
+        non-centered / staircase / rectangular bands this concept doesn't
+        apply uniformly — callers should consult ``data.shape[1]`` (W) and
+        ``offset`` instead.
+        """
+        return (self._W - 1) // 2
 
     @property
     def shape(self) -> tuple[int, ...]:
-        M, _, B, _, *L = self.data.shape
-        return (M * B, M * B, *L)
+        L = self.data.shape[4:]
+        return (self._M_row * self._B_row, self._M_col * self._B_col, *L)
 
     @property
     def meta_block_shape(self) -> tuple[int, int, int] | None:
-        """``(M, B, B)`` when ``w == 0`` (pure block-diagonal); ``None`` for
-        ``w > 0`` because banded structure can't be expressed as a single
-        meta-block-diagonal SparseTensor pair."""
-        if self.half_bandwidth == 0:
-            M, _, B, _, *_ = self.data.shape
-            return (M, B, B)
-        return None
+        """``(M, B_row, B_col)`` when this is a pure meta-block-diagonal:
+        ``W=1`` + square meta-counts (``M_row == M_col``) + identity offset
+        (``offset[a] = a``). Returns ``None`` for any banded / rectangular /
+        skewed form (those can't be expressed as a single meta-block-diagonal
+        SparseTensor pair).
+
+        Note: square sub-blocks are NOT required — the existing block-diagonal
+        SparseTensor wrapper supports rectangular block_size pairs.
+        """
+        if self._W != 1:
+            return None
+        if self._M_row != self._M_col:
+            return None
+        # Check identity offset: data[a, 0] sits at primary-meta = secondary-meta = a.
+        off = self._offset_arr
+        if tuple(off) != tuple(range(self._M_primary)):
+            return None
+        return (self._M_primary, self._B_row, self._B_col)
 
     def to_meta_blocks(self) -> Array:
-        """``(M, B, B, *L)`` meta-diagonal blocks. Only defined when ``w == 0``;
-        for ``w > 0`` use :meth:`to_dense` directly."""
-        if self.half_bandwidth != 0:
+        """``(M, B_row, B_col, *L)`` meta-diagonal blocks. Only defined when
+        this is a pure meta-block-diagonal (see :py:meth:`meta_block_shape`);
+        for any banded / rectangular / skewed form use :meth:`to_dense`."""
+        if self.meta_block_shape is None:
             raise ValueError(
-                f"BlockBanded.to_meta_blocks requires w=0; got w={self.half_bandwidth}. "
-                f"Use to_dense() for banded forms."
+                "BlockBanded.to_meta_blocks requires W=1 + square meta-counts "
+                f"+ identity offset; got W={self._W}, M_primary={self._M_primary}, "
+                f"M_secondary={self._M_secondary}, offset={self._offset_arr}. "
+                "Use to_dense() for banded forms."
             )
-        return self.data[:, 0]   # (M, B, B, *L)
+        return self.data[:, 0]   # (M, B_row, B_col, *L)
 
     def to_dense(self) -> Array:
-        """Materialize the dense ``(M*B, M*B, *L)`` block-banded form via a
+        """Materialize the dense ``(M_row*B_row, M_col*B_col, *L)`` form via a
         single fused broadcast+select+sum chain — no scatter, **no gather**.
 
-        Algorithm. For each output meta-position ``(bi, bj)`` the in-band band
-        slot is ``b_target = bj - bi + w``; if ``b_target ∈ [0, W)`` the cell
-        is ``data[bi, b_target, si, sj]``, else ``fill_value``. We can avoid the
-        per-cell index lookup (which the prior implementation expressed as a
-        1-D fancy gather) by:
+        Algorithm. For each output meta-position ``(a, b)`` (primary, secondary)
+        the in-band slot is ``w_idx = b - offset[a]``; if ``w_idx ∈ [0, W)``
+        the sub-block is ``data[a, w_idx]``, else ``fill_value``. We avoid the
+        per-cell index lookup (which would be a 1-D fancy gather) by:
 
-          1. broadcasting ``data`` across a new meta-col axis to logical shape
-             ``(M, M, W, B, B, *L)`` (pure broadcast, zero-copy);
-          2. masking with a one-hot ``b == b_target`` selector along W;
+          1. broadcasting ``data`` across a new secondary-axis to logical
+             shape ``(M_primary, M_secondary, W, B_row, B_col, *L)``
+             (pure broadcast, zero-copy);
+          2. masking with a one-hot ``w_idx == b - offset[a]`` selector;
           3. summing over W to collapse the band axis.
 
-        Since exactly one ``b`` matches per in-band ``(bi, bj)`` (and zero
+        Since exactly one ``w_idx`` matches per in-band ``(a, b)`` (and zero
         match out-of-band), the sum is equivalent to a per-cell select. XLA
         fuses the broadcast+where+sum into one ``kLoop`` pass — no gather,
         no scatter, no W× HBM materialization. That makes the densify
         forward-fusable into a downstream consumer kernel (gathers force a
         materialization barrier; this no longer does).
 
-        Cost. The logical intermediate is W× the output size; for typical
-        small bandwidths (``W ∈ {1, 3, 5}``) this is negligible, and XLA's
-        loop-fuser collapses it.
+        For ``primary_axis=1`` (col-primary) we reuse the same kernel by
+        swapping the sub-block axes inside ``data`` and transposing the
+        final output — two cheap reshape/transpose ops on top of the same
+        fused chain.
         """
-        M, W, B, B_, *L = self.data.shape
-        if B != B_:
-            raise ValueError(f"banded blocks must be square, got ({B}, {B_})")
-        if W % 2 == 0:
-            raise ValueError(
-                f"BlockBanded data axis 1 must be 2w+1 (odd); got data.shape[1]={W}"
-            )
-        w = (W - 1) // 2
+        M_primary, W, B_row, B_col, *L = self.data.shape
+        M_secondary = self._M_secondary
         L_pad = (None,) * len(L)
 
-        if math.prod((M, M, W, B, B, *L)) > _BLOCK_BANDED_BROADCAST_LIMIT:
-            return self._to_dense_per_band(M, W, B, w, L)
+        # Two offset modes: centered (no gather) vs explicit (one unavoidable gather).
+        if self.offset:
+            offset_tuple = self.offset
+            centered_w = None
+            off_for_fallback = self.offset
+        else:
+            offset_tuple = None
+            centered_w = (W - 1) // 2
+            off_for_fallback = tuple(a - centered_w for a in range(M_primary))
 
-        # Step 1: tile data across a new meta-col axis (pure broadcast, no copy).
-        data_bcast = jnp.broadcast_to(
-            self.data[:, None, ...],  # (M, 1, W, B, B, *L)
-            (M, M, W, B, B, *L),
+        if (
+            math.prod((M_primary, M_secondary, W, B_row, B_col, *L))
+            > _BLOCK_BANDED_BROADCAST_LIMIT
+        ):
+            return self._to_dense_per_band(
+                M_primary, M_secondary, W, B_row, B_col, off_for_fallback, L
+            )
+
+        if self.primary_axis == 0:
+            # Row-primary: M_primary = M_row, M_secondary = M_col.
+            return _to_dense_banded(
+                self.data, M_primary, M_secondary, W, B_row, B_col,
+                offset_tuple, centered_w, self.fill_value, L, L_pad,
+            )
+
+        # Col-primary: data[b, w] is at (row meta off[b]+w, col meta b). Reuse
+        # the row-primary kernel on the transposed view (B_col, B_row sub-blocks
+        # swapped) producing (M_primary*B_col, M_secondary*B_row, *L) which is
+        # the TRANSPOSE of the desired dense; swap back at the end.
+        data_t = self.data.swapaxes(2, 3)  # (M_primary, W, B_col, B_row, *L)
+        dense_T = _to_dense_banded(
+            data_t, M_primary, M_secondary, W, B_col, B_row,
+            offset_tuple, centered_w, self.fill_value, L, L_pad,
         )
-
-        # Step 2: build the one-hot ``b == bj - bi + w`` selector along W.
-        bi_idx = jnp.arange(M)[:, None]
-        bj_idx = jnp.arange(M)[None, :]
-        select_mask = (bj_idx - bi_idx + w)[..., None] == jnp.arange(W)[None, None, :]
-        select_mask = select_mask[..., None, None]  # (M, M, W, 1, 1)
-        if L:
-            select_mask = select_mask[(..., *L_pad)]
-
-        # Step 3: where+sum collapses W → out_meta has data on the band, 0 elsewhere.
-        out_meta = jnp.where(select_mask, data_bcast, 0).sum(axis=2)  # (M, M, B, B, *L)
-
-        # Step 4: interleave (bi, si, bj, sj) → (bi*B+si, bj*B+sj).
-        perm = (0, 2, 1, 3, *range(4, 4 + len(L)))
-        out_meta = out_meta.transpose(perm).reshape(M * B, M * B, *L)
-
-        # Step 5: replace the zero-pad outside the band with fill_value.
-        blk_i = jnp.arange(M * B) // B
-        blk_j = jnp.arange(M * B) // B
-        in_band = jnp.abs(blk_j[None, :] - blk_i[:, None]) <= w  # (M*B, M*B)
-        if L:
-            in_band = in_band[(..., *L_pad)]
-        return jnp.where(in_band, out_meta, self.fill_value)
+        return dense_T.swapaxes(0, 1)
 
     def _to_dense_per_band(
-        self, M: int, W: int, B: int, w: int, L: tuple[int, ...]
+        self,
+        M_primary: int,
+        M_secondary: int,
+        W: int,
+        B_row: int,
+        B_col: int,
+        offset: tuple[int, ...],
+        L: tuple[int, ...],
     ) -> Array:
         """Per-band ``lax.fori_loop`` fallback for the dense materialization.
 
-        The broadcast path's logical intermediate is ``(M, M, W, B, B, *L)`` —
-        for ``M`` in the thousands the static shape exceeds practical limits
-        even though XLA fuses the ``where+sum`` at runtime. This path iterates
-        the ``M`` rows of each band and writes them into the result via
-        ``lax.dynamic_update_slice``, never materializing the ``M × M`` square.
+        The broadcast path's logical intermediate is
+        ``(M_primary, M_secondary, W, B_row, B_col, *L)`` — for large M the
+        static shape exceeds practical limits even though XLA fuses the
+        ``where+sum`` at runtime. This path iterates the primary slots and
+        writes their W in-band sub-blocks via ``lax.dynamic_update_slice``,
+        never materializing the ``(M_primary, M_secondary)`` square.
+
+        Handles both ``primary_axis=0`` (row-primary) and ``primary_axis=1``
+        (col-primary) — for col-primary the write coordinates swap.
         """
-        out = jnp.full((M * B, M * B, *L), self.fill_value, dtype=self.data.dtype)
+        M_row, M_col = (
+            (M_primary, M_secondary)
+            if self.primary_axis == 0
+            else (M_secondary, M_primary)
+        )
+        out = jnp.full(
+            (M_row * B_row, M_col * B_col, *L), self.fill_value, dtype=self.data.dtype
+        )
         zero_idx = (jnp.int32(0),) * len(L)
+        # ``offset[k]`` is read inside ``fori_loop`` where ``k`` is a tracer —
+        # the Python tuple has to become a JAX array so indexing works.
+        off_arr = jnp.asarray(offset, dtype=jnp.int32)
+        row_primary = self.primary_axis == 0
 
         def body(k, acc):
+            base = off_arr[k]
             for b in range(W):
-                col = k + (b - w)
-                in_range = jnp.logical_and(col >= 0, col < M)
-                row_start = jnp.int32(k * B)
-                col_start = jnp.int32(col * B)
+                sec = base + b
+                if row_primary:
+                    in_range = jnp.logical_and(sec >= 0, sec < M_col)
+                    row_start = jnp.int32(k * B_row)
+                    col_start = jnp.int32(sec * B_col)
+                else:
+                    in_range = jnp.logical_and(sec >= 0, sec < M_row)
+                    row_start = jnp.int32(sec * B_row)
+                    col_start = jnp.int32(k * B_col)
                 block = self.data[k, b]
                 existing = lax.dynamic_slice(
-                    acc, (row_start, col_start) + zero_idx, (B, B, *L)
+                    acc, (row_start, col_start) + zero_idx, (B_row, B_col, *L)
                 )
                 replacement = jnp.where(in_range, block, existing)
                 acc = lax.dynamic_update_slice(
@@ -443,7 +628,7 @@ class BlockBanded(NamedTuple):
                 )
             return acc
 
-        return lax.fori_loop(0, M, body, out)
+        return lax.fori_loop(0, M_primary, body, out)
 
 
 # ----------------------------------------------------------------------------
@@ -467,3 +652,24 @@ def _intersection_unflatten(aux, children):
 
 jax.tree_util.register_pytree_node(UnionBlocks, _blocks_flatten, _union_unflatten)
 jax.tree_util.register_pytree_node(IntersectionBlocks, _blocks_flatten, _intersection_unflatten)
+
+
+def _block_banded_flatten(bb):
+    """Flatten ``BlockBanded`` for pytree traversal. Two array leaves; the
+    static metadata (``primary_axis``, ``n_secondary``, ``offset``) goes into
+    aux_data so JIT treats it as compile-time constant."""
+    return (bb.data, bb.fill_value), (bb.primary_axis, bb.n_secondary, bb.offset)
+
+
+def _block_banded_unflatten(aux, children):
+    return BlockBanded(
+        *children,
+        primary_axis=aux[0],
+        n_secondary=aux[1],
+        offset=aux[2],
+    )
+
+
+jax.tree_util.register_pytree_node(
+    BlockBanded, _block_banded_flatten, _block_banded_unflatten
+)
