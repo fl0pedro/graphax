@@ -995,6 +995,79 @@ def _block_banded_geometry(
     return M_new, B_new, w_band
 
 
+class BandedGeom(NamedTuple):
+    """Static geometry describing a BlockBanded repack of a matmul output.
+
+    Computed by ``_should_emit_block_banded`` from input metadata alone — no
+    traced array shapes. The four fields below are the same numbers
+    ``_block_banded_geometry`` returns; ``M_eager`` and ``B_eager`` are the
+    pre-repack eager output dims that the contraction WOULD have written
+    in the absence of band-shape emission (kept for the legacy
+    ``_try_compressed_block_banded`` gather path).
+    """
+
+    M_eager: int
+    B_eager: int
+    M_new: int
+    B_new: int
+    w_band: int
+
+
+def _should_emit_block_banded(
+    ctx: "Ctx",
+    pairs: list["Pair"],
+    shared: list[int],
+    total: list[int],
+    final_lhs_lens: list[int],
+    final_rhs_lens: list[int],
+    lhs_leftover: list[int],
+    rhs_leftover: list[int],
+) -> BandedGeom | None:
+    """Static probe: would ``_build_output_tensor`` emit a ``BlockBanded``
+    compressed val for this contraction? Returns the banded geometry when
+    yes, else ``None``.
+
+    Mirrors the eligibility gates in ``_try_compressed_block_banded``
+    (matmul.py:1051-1067) but consults only static metadata — no traced
+    array shapes — so it can run *before* ``_finalize_output`` decides
+    the output layout. Phase 5d uses this to skip the eager
+    ``(M_eager, B_eager, B_eager)`` intermediate entirely.
+    """
+    lhs, rhs = ctx.lhs, ctx.rhs
+    if len(lhs.dims) != 2 or len(rhs.dims) != 2:
+        return None
+    if not all(d.is_sparse for d in (*lhs.dims, *rhs.dims)):
+        return None
+    if len(pairs) != 1 or pairs[0].pairing_type != "contract":
+        return None
+    if lhs_leftover or rhs_leftover:
+        return None
+    if len(total) != 1 or len(final_lhs_lens) != 1 or len(final_rhs_lens) != 1:
+        return None
+    M_eager = total[0]
+    B_eager = final_lhs_lens[0]
+    if B_eager != final_rhs_lens[0]:
+        return None  # Not meta-block-diagonal-square.
+    geom = _block_banded_geometry(
+        M_eager,
+        B_eager,
+        B_x_h=lhs.out_dims[0].block_size or 1,
+        B_x_w=lhs.primal_dims[0].block_size or 1,
+        B_y_h=rhs.out_dims[0].block_size or 1,
+        B_y_w=rhs.primal_dims[0].block_size or 1,
+    )
+    if geom is None:
+        return None
+    M_new, B_new, w_band = geom
+    return BandedGeom(
+        M_eager=M_eager,
+        B_eager=B_eager,
+        M_new=M_new,
+        B_new=B_new,
+        w_band=w_band,
+    )
+
+
 def _gather_banded_data(
     values: Array, M_eager: int, B_eager: int, M_new: int, B_new: int, w_band: int
 ) -> Array:
