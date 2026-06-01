@@ -95,6 +95,7 @@ class CRes(NamedTuple):
     lhs_block_lens: list[int]
     rhs_block_lens: list[int]
     scalar_mult: float
+    banded_geom: "BandedGeom | None" = None
 
 
 # --- Topology resolution ---------------------------------------------------
@@ -642,7 +643,7 @@ def _finalize_output(
     return res, final_lhs_lens, final_rhs_lens
 
 
-def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs):
+def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
     N = len(pairs)
     shared, total, split, scalar = _contraction_factors(pairs)
     lhs_view, rhs_view, lhs_bc, rhs_bc = _prepare_contraction_views(
@@ -676,7 +677,17 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs):
         lhs_leftover,
         rhs_leftover,
     )
-    return grid, shared, final_lhs_lens, final_rhs_lens, scalar
+    banded_geom = _should_emit_block_banded(
+        ctx,
+        pairs,
+        shared,
+        total,
+        final_lhs_lens,
+        final_rhs_lens,
+        lhs_leftover,
+        rhs_leftover,
+    )
+    return grid, shared, final_lhs_lens, final_rhs_lens, scalar, banded_geom
 
 
 # --- Output tensor build --------------------------------------------------
@@ -1344,8 +1355,8 @@ def _execute_tiled(ctx, rhs_dims):
     and broadcast / unmaterialized val axes."""
     lhs_val, rhs_val = _val_or_one(ctx.lhs), _val_or_one(ctx.rhs)
     lhs_val, rhs_val = _prepare_physical_arrays(lhs_val, rhs_val, ctx.pairs)
-    grid, shared, lhs_lens, rhs_lens, scalar = _execute_block_sparse_contraction(
-        lhs_val, rhs_val, ctx.pairs
+    grid, shared, lhs_lens, rhs_lens, scalar, banded_geom = (
+        _execute_block_sparse_contraction(lhs_val, rhs_val, ctx.pairs, ctx)
     )
     res = CRes(
         grid=grid,
@@ -1353,6 +1364,7 @@ def _execute_tiled(ctx, rhs_dims):
         lhs_block_lens=lhs_lens,
         rhs_block_lens=rhs_lens,
         scalar_mult=scalar,
+        banded_geom=banded_geom,
     )
     return _build_output_tensor(ctx, rhs_dims, res)
 
