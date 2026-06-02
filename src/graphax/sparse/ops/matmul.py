@@ -95,7 +95,7 @@ class CRes(NamedTuple):
     lhs_block_lens: list[int]
     rhs_block_lens: list[int]
     scalar_mult: float
-    banded_geom: "BandedGeom | None" = None
+    banded_geom: "BandedLayout | None" = None
 
 
 # --- Topology resolution ---------------------------------------------------
@@ -1006,22 +1006,64 @@ def _block_banded_geometry(
     return M_new, B_new, w_band
 
 
-class BandedGeom(NamedTuple):
-    """Static geometry describing a BlockBanded repack of a matmul output.
+class BandedLayout(NamedTuple):
+    """Static layout for emitting a ``BlockBanded`` matmul output.
 
-    Computed by ``_should_emit_block_banded`` from input metadata alone — no
-    traced array shapes. The four fields below are the same numbers
-    ``_block_banded_geometry`` returns; ``M_eager`` and ``B_eager`` are the
-    pre-repack eager output dims that the contraction WOULD have written
-    in the absence of band-shape emission (kept for the legacy
-    ``_try_compressed_block_banded`` gather path).
+    Computed by :func:`_should_emit_block_banded` from input metadata alone
+    (no traced array shapes). The new fields mirror the extended
+    :class:`~graphax.sparse.ops.block_storage.BlockBanded` pytree:
+
+      * ``primary_axis``: ``0`` = row-primary (band traverses cols), ``1`` =
+        col-primary (band traverses rows). The probe picks whichever
+        orientation packs tighter for the geometry at hand.
+      * ``m_primary``: meta-blocks along the primary axis (``M_row`` for
+        row-primary, ``M_col`` for col-primary). Equals ``data.shape[0]``.
+      * ``n_secondary``: meta-blocks along the non-primary axis.
+      * ``band_width``: ``W`` = max in-band sub-blocks per primary slot.
+        Equals ``data.shape[1]``.
+      * ``block_row`` / ``block_col``: sub-block dims. Equal
+        ``lhs.out_dims[0].block_size`` / ``rhs.primal_dims[0].block_size``.
+      * ``offset``: per-primary integer offsets along the secondary axis.
+
+    Replaces the legacy ``BandedGeom`` (which mirrored a dead emission gate
+    and never fired in practice). The new probe fires for misaligned-
+    contract cases (``B_a_w`` and ``B_b_h`` non-divisible), which the
+    pre-Phase-5d matmul stored as a fully-dense output.
     """
 
-    M_eager: int
-    B_eager: int
-    M_new: int
-    B_new: int
-    w_band: int
+    primary_axis: int
+    m_primary: int
+    n_secondary: int
+    band_width: int
+    block_row: int
+    block_col: int
+    offset: tuple[int, ...]
+
+
+def _row_band_spans(
+    M_a: int, B_a_w: int, B_b_h: int, M_b: int
+) -> list[tuple[int, int]]:
+    """For each output meta-row ``a in [0, M_a)``, return
+    ``(b_lo, b_hi)`` — the inclusive-exclusive range of overlapping
+    rhs meta-cols. ``b_lo`` is the smallest ``b`` with overlap, ``b_hi``
+    one past the largest.
+
+    The overlap condition (mathematician's derivation): row ``a`` covers
+    contracting range ``[a*B_a_w, (a+1)*B_a_w)``; col ``b`` covers
+    ``[b*B_b_h, (b+1)*B_b_h)``. Overlap iff
+    ``a*B_a_w < (b+1)*B_b_h ∧ b*B_b_h < (a+1)*B_a_w``.
+    """
+    spans: list[tuple[int, int]] = []
+    for a in range(M_a):
+        a_lo, a_hi = a * B_a_w, (a + 1) * B_a_w
+        # b_lo: smallest b such that (b+1)*B_b_h > a_lo, i.e., b >= a_lo // B_b_h.
+        b_lo = a_lo // B_b_h
+        # b_hi: smallest b such that b*B_b_h >= a_hi, i.e., b >= ceil(a_hi/B_b_h).
+        b_hi = -(-a_hi // B_b_h)
+        b_lo = builtins.max(0, b_lo)
+        b_hi = builtins.min(M_b, b_hi)
+        spans.append((b_lo, b_hi))
+    return spans
 
 
 def _should_emit_block_banded(
@@ -1033,16 +1075,22 @@ def _should_emit_block_banded(
     final_rhs_lens: list[int],
     lhs_leftover: list[int],
     rhs_leftover: list[int],
-) -> BandedGeom | None:
-    """Static probe: would ``_build_output_tensor`` emit a ``BlockBanded``
-    compressed val for this contraction? Returns the banded geometry when
-    yes, else ``None``.
+) -> BandedLayout | None:
+    """Static probe: detect whether the matmul output has a band-sparse
+    structure tighter than the fully-dense form, and choose the
+    row-primary vs col-primary orientation that packs tighter.
 
-    Mirrors the eligibility gates in ``_try_compressed_block_banded``
-    (matmul.py:1051-1067) but consults only static metadata — no traced
-    array shapes — so it can run *before* ``_finalize_output`` decides
-    the output layout. Phase 5d uses this to skip the eager
-    ``(M_eager, B_eager, B_eager)`` intermediate entirely.
+    Returns a :class:`BandedLayout` when emission is justified
+    (band-storage strictly less than the dense alternative), else ``None``
+    (matmul falls through to the legacy ``val=values`` path).
+
+    Gates (static, all decidable from operand metadata):
+
+      * 2-D single-contract-pair matmul on block-sparse inputs.
+      * Equal logical contracting size: ``M_a * B_a_w == M_b * B_b_h``.
+      * Band width > 1 OR row/col counts differ — i.e., something is
+        actually being compressed (pure-aligned cases stay on the existing
+        ``val=(M, B_h, B_w)`` storage, no BlockBanded wrap).
     """
     lhs, rhs = ctx.lhs, ctx.rhs
     if len(lhs.dims) != 2 or len(rhs.dims) != 2:
@@ -1055,27 +1103,75 @@ def _should_emit_block_banded(
         return None
     if len(total) != 1 or len(final_lhs_lens) != 1 or len(final_rhs_lens) != 1:
         return None
-    M_eager = total[0]
-    B_eager = final_lhs_lens[0]
-    if B_eager != final_rhs_lens[0]:
-        return None  # Not meta-block-diagonal-square.
-    geom = _block_banded_geometry(
-        M_eager,
-        B_eager,
-        B_x_h=lhs.out_dims[0].block_size or 1,
-        B_x_w=lhs.primal_dims[0].block_size or 1,
-        B_y_h=rhs.out_dims[0].block_size or 1,
-        B_y_w=rhs.primal_dims[0].block_size or 1,
-    )
-    if geom is None:
+
+    M_a = lhs.out_dims[0].size
+    B_a_h = lhs.out_dims[0].block_size or 1
+    B_a_w = lhs.primal_dims[0].block_size or 1
+    M_b = rhs.primal_dims[0].size
+    B_b_h = rhs.out_dims[0].block_size or 1
+    B_b_w = rhs.primal_dims[0].block_size or 1
+    if M_a * B_a_w != M_b * B_b_h:
+        return None  # logical contract sizes don't align — outside scope
+
+    M_row, M_col = M_a, M_b
+    B_row, B_col = B_a_h, B_b_w
+
+    # Compute both orientations' band spans.
+    row_spans = _row_band_spans(M_row, B_a_w, B_b_h, M_col)
+    col_spans = _row_band_spans(M_col, B_b_h, B_a_w, M_row)
+
+    # If any row has empty span (shouldn't happen given the logical-contract
+    # check above, but bail defensively) - no band, fall through.
+    if any(lo >= hi for lo, hi in row_spans):
         return None
-    M_new, B_new, w_band = geom
-    return BandedGeom(
-        M_eager=M_eager,
-        B_eager=B_eager,
-        M_new=M_new,
-        B_new=B_new,
-        w_band=w_band,
+
+    W_rp = builtins.max(hi - lo for lo, hi in row_spans)
+    W_cp = builtins.max(hi - lo for lo, hi in col_spans)
+    offset_rp = tuple(lo for lo, _ in row_spans)
+    offset_cp = tuple(lo for lo, _ in col_spans)
+
+    # Storage footprint (sub-block count × B_row × B_col floats).
+    rp_cost = M_row * W_rp * B_row * B_col
+    cp_cost = M_col * W_cp * B_row * B_col
+    dense_cost = (M_row * B_row) * (M_col * B_col)
+
+    # Fall through when no compression possible — keeps existing val=values path
+    # for aligned (divisor) cases that the natural meta-block storage already
+    # handles tightly.
+    if rp_cost >= dense_cost and cp_cost >= dense_cost:
+        return None
+
+    # Also fall through when the band is trivially the identity diagonal
+    # (W=1, identity offset, square): the existing val=(M, B_h, B_w) form is
+    # equivalent, no need for a BlockBanded wrap.
+    if (
+        W_rp == 1
+        and offset_rp == tuple(range(M_row))
+        and M_row == M_col
+        and W_cp == 1
+        and offset_cp == tuple(range(M_col))
+    ):
+        return None
+
+    # Pick the tighter orientation.
+    if cp_cost < rp_cost:
+        return BandedLayout(
+            primary_axis=1,
+            m_primary=M_col,
+            n_secondary=M_row,
+            band_width=W_cp,
+            block_row=B_row,
+            block_col=B_col,
+            offset=offset_cp,
+        )
+    return BandedLayout(
+        primary_axis=0,
+        m_primary=M_row,
+        n_secondary=M_col,
+        band_width=W_rp,
+        block_row=B_row,
+        block_col=B_col,
+        offset=offset_rp,
     )
 
 
