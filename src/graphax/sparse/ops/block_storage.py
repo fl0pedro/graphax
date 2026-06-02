@@ -99,6 +99,10 @@ def _to_meta_blocks(blocks_obj, op_default: Callable) -> Array:
     binary ``op`` whose only difference is the default (``jnp.add`` vs
     ``jnp.multiply``). ``op_default`` documents that default at the call
     site; the runtime op comes from ``blocks_obj.op``.
+
+    The leading ``M`` axis is ``blocks_obj.n_meta * M_per_batch`` —
+    ``_block_diag_per_meta`` processes all batches concurrently because
+    the per-batch diagonals concatenate naturally along the leading axis.
     """
     del op_default
     lhs_meta = _block_diag_per_meta(blocks_obj.lhs, blocks_obj.fill_lhs)
@@ -159,6 +163,7 @@ class UnionBlocks(NamedTuple):
     fill_lhs: Array
     fill_rhs: Array
     op: Callable = jnp.add
+    n_meta: int = 1
 
     @property
     def lcm_h(self) -> int:
@@ -172,15 +177,19 @@ class UnionBlocks(NamedTuple):
 
     @property
     def shape(self) -> tuple[int, ...]:
+        """Full dense output shape ``(M*LCM_h, M*LCM_w, *L)``. ``M`` is the
+        total meta-block count (= ``n_meta * M_per_batch``); the per-batch
+        diagonals concatenate seamlessly along the main meta-diagonal."""
         M = self.lhs.shape[0]
         L = self.lhs.shape[4:]
         return (M * self.lcm_h, M * self.lcm_w, *L)
 
     @property
     def meta_block_shape(self) -> tuple[int, int, int]:
-        """``(M, LCM_h, LCM_w)`` — the natural block-diagonal layout of this
-        compressed form: M meta-blocks each ``(LCM_h, LCM_w)``, sitting on the
-        meta-block-diagonal of the dense ``(M*LCM_h, M*LCM_w)`` shape."""
+        """``(M, LCM_h, LCM_w)`` — natural meta-block-diagonal layout. For
+        ``n_meta > 1`` the ``M`` axis is ``n_meta * M_per_batch`` flat;
+        downstream consumers that need per-batch indexing reshape via
+        ``self.n_meta`` to recover ``(n_meta, M_per_batch, ...)``."""
         return (self.lhs.shape[0], self.lcm_h, self.lcm_w)
 
     def to_meta_blocks(self) -> Array:
@@ -222,6 +231,7 @@ class UnionBlocks(NamedTuple):
         fill_lhs: Array,
         fill_rhs: Array,
         op: Callable = jnp.add,
+        n_meta: int = 1,
     ) -> "UnionBlocks":
         lhs_shape, rhs_shape = meta
         lhs_size = math.prod(lhs_shape)
@@ -231,6 +241,7 @@ class UnionBlocks(NamedTuple):
             fill_lhs=fill_lhs,
             fill_rhs=fill_rhs,
             op=op,
+            n_meta=n_meta,
         )
 
 
@@ -256,6 +267,7 @@ class IntersectionBlocks(NamedTuple):
     fill_lhs: Array
     fill_rhs: Array
     op: Callable = jnp.multiply
+    n_meta: int = 1
 
     @property
     def lcm_h(self) -> int:
@@ -269,12 +281,16 @@ class IntersectionBlocks(NamedTuple):
 
     @property
     def shape(self) -> tuple[int, ...]:
+        """Full dense output shape. ``M = n_meta * M_per_batch`` is the
+        flattened total meta-block count along the leading axis."""
         M = self.lhs.shape[0]
         L = self.lhs.shape[4:]
         return (M * self.lcm_h, M * self.lcm_w, *L)
 
     @property
     def meta_block_shape(self) -> tuple[int, int, int]:
+        """``(M, LCM_h, LCM_w)`` — same as :class:`UnionBlocks`. For
+        ``n_meta > 1`` the leading axis is ``n_meta * M_per_batch`` flat."""
         return (self.lhs.shape[0], self.lcm_h, self.lcm_w)
 
     def to_meta_blocks(self) -> Array:
@@ -352,6 +368,7 @@ class DivisorRemainder(NamedTuple):
     semantic: str = "union"
     include_remainder: bool = True
     op: Callable = jnp.add
+    n_meta: int = 1
 
     @property
     def lcm_h(self) -> int:
@@ -365,13 +382,19 @@ class DivisorRemainder(NamedTuple):
 
     @property
     def shape(self) -> tuple[int, ...]:
+        """Full dense output shape. ``M = n_meta * M_per_batch`` is the
+        flattened total meta-block count along the leading axis; per-batch
+        diagonals concatenate seamlessly along the main meta-diagonal."""
         M = self.divisor.shape[0]
         L = self.divisor.shape[4:]
         return (M * self.lcm_h, M * self.lcm_w, *L)
 
     @property
     def meta_block_shape(self) -> tuple[int, int, int]:
-        """``(M, LCM_h, LCM_w)`` — the natural meta-block-diagonal layout."""
+        """``(M, LCM_h, LCM_w)`` — natural meta-block-diagonal layout. For
+        ``n_meta > 1`` the leading axis is ``n_meta * M_per_batch`` flat;
+        downstream consumers reshape via ``self.n_meta`` for per-batch
+        indexing."""
         return (self.divisor.shape[0], self.lcm_h, self.lcm_w)
 
     def to_meta_blocks(self) -> Array:
@@ -804,15 +827,15 @@ class BlockBanded(NamedTuple):
 # with a custom split that pushes ``op`` into the static aux_data — same
 # treatment elementwise.py uses for its op closures.
 def _blocks_flatten(ub):
-    return (ub.lhs, ub.rhs, ub.fill_lhs, ub.fill_rhs), (ub.op,)
+    return (ub.lhs, ub.rhs, ub.fill_lhs, ub.fill_rhs), (ub.op, ub.n_meta)
 
 
 def _union_unflatten(aux, children):
-    return UnionBlocks(*children, op=aux[0])
+    return UnionBlocks(*children, op=aux[0], n_meta=aux[1])
 
 
 def _intersection_unflatten(aux, children):
-    return IntersectionBlocks(*children, op=aux[0])
+    return IntersectionBlocks(*children, op=aux[0], n_meta=aux[1])
 
 
 jax.tree_util.register_pytree_node(UnionBlocks, _blocks_flatten, _union_unflatten)
@@ -848,11 +871,12 @@ jax.tree_util.register_pytree_node(
 def _divisor_remainder_flatten(dr):
     """Flatten ``DivisorRemainder`` for pytree traversal. ``divisor`` and
     ``remainder`` (may be ``None``) are array children; ``fill_*`` are
-    array children too. ``semantic`` / ``include_remainder`` / ``op`` go
-    into aux_data — JIT treats them as compile-time constants."""
+    array children too. ``semantic`` / ``include_remainder`` / ``op`` /
+    ``n_meta`` go into aux_data — JIT treats them as compile-time
+    constants."""
     return (
         (dr.divisor, dr.remainder, dr.fill_divisor, dr.fill_remainder),
-        (dr.semantic, dr.include_remainder, dr.op),
+        (dr.semantic, dr.include_remainder, dr.op, dr.n_meta),
     )
 
 
@@ -865,6 +889,7 @@ def _divisor_remainder_unflatten(aux, children):
         semantic=aux[0],
         include_remainder=aux[1],
         op=aux[2],
+        n_meta=aux[3],
     )
 
 
