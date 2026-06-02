@@ -198,7 +198,9 @@ def _densify_compressed_dims(tensor, compact: bool = False):
     if (banded and len(banded) == 2 * K and isinstance(tensor.val, jax.Array)
             and all(isinstance(d, BandedIndex) for d in tensor.out_dims)
             and all(isinstance(d, BandedIndex) for d in tensor.primal_dims)):
-        from graphax.sparse.ops.block_storage import MultiAxisBlockBanded, BandAxisSpec
+        from graphax.sparse.ops.block_storage import (
+            _densify_multi_banded, BandAxisSpec,
+        )
 
         specs = tuple(
             BandAxisSpec(
@@ -209,9 +211,9 @@ def _densify_compressed_dims(tensor, compact: bool = False):
             )
             for o, p in zip(tensor.out_dims, tensor.primal_dims)
         )
-        dense = MultiAxisBlockBanded(
-            data=tensor.val, fill_value=fill, axes=specs
-        ).to_dense()  # (rows_0..rows_{K-1}, cols_0..cols_{K-1}, *L)
+        dense = _densify_multi_banded(
+            tensor.val, specs, fill,
+        )  # (rows_0..rows_{K-1}, cols_0..cols_{K-1}, *L)
         new_out = tuple(
             DenseIndex(tensor.out_dims[i].id, dense.shape[i], i) for i in range(K)
         )

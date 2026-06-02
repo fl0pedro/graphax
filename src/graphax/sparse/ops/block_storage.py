@@ -667,6 +667,134 @@ def _densify_band(
     return _stitch_meta(per_batch_dense, fill_value)
 
 
+def _densify_multi_banded(
+    data: Array,
+    axes: "tuple[BandAxisSpec, ...]",
+    fill_value: Array,
+) -> Array:
+    """Materialize the dense form of a K-axis block-banded buffer for ANY K
+    via a single fused per-axis broadcast+where+sum. Standalone successor to
+    ``MultiAxisBlockBanded.to_dense`` (Phase 8) so the K≥2 densify no longer
+    depends on the legacy ``MultiAxisBlockBanded`` pytree class.
+
+    ``data`` layout: ``(M_p_0, W_0, ..., M_p_{K-1}, W_{K-1}, B_row_0, ...,
+    B_row_{K-1}, B_col_0, ..., B_col_{K-1}, *L)``. ``axes`` is K
+    :class:`BandAxisSpec`, one per output axis pair.
+
+    Algorithm: insert per-axis ``M_s_i`` secondary axes (singleton broadcast),
+    build a one-hot band-selection mask per axis, AND them, ``where``+sum the
+    W axes in one reduction, then permute/reshape to the dense layout and apply
+    the per-axis in-band fill mask. K=1 routes to :func:`_densify_band`.
+    """
+    K = len(axes)
+
+    # Per-axis bookkeeping (Python ints — static at trace time).
+    M_p = [data.shape[2 * i] // ax.n_meta for i, ax in enumerate(axes)]
+    M_s = [
+        ax.n_secondary if ax.n_secondary >= 0 else M_p[i]
+        for i, ax in enumerate(axes)
+    ]
+    W = [ax.band_width for ax in axes]
+    B_row = [ax.block_row for ax in axes]
+    B_col = [ax.block_col for ax in axes]
+    offsets = []
+    for i, ax in enumerate(axes):
+        if ax.offset:
+            offsets.append(ax.offset)
+        else:
+            w = (ax.band_width - 1) // 2
+            offsets.append(tuple(a - w for a in range(M_p[i])))
+    L = data.shape[4 * K :]
+
+    if K == 1:
+        ax = axes[0]
+        return _densify_band(
+            data, M_p[0], M_s[0], W[0], B_row[0], B_col[0],
+            tuple(ax.offset), ax.primary_axis, ax.n_meta, fill_value, tuple(L),
+        )
+
+    for ax in axes:
+        if ax.n_meta != 1 or ax.primary_axis != 0:
+            raise NotImplementedError(
+                "multi-axis banded densify K>1 supports n_meta=1 + row-primary "
+                "per axis. Multi-batch and col-primary per-axis follow the "
+                "K=1 patterns; add when needed."
+            )
+
+    # Step 1: insert M_s_i singleton axes after each (M_p_i, W_i) pair.
+    indexer = []
+    for _ in range(K):
+        indexer.append(slice(None))  # M_p_i
+        indexer.append(None)          # M_s_i (inserted)
+        indexer.append(slice(None))  # W_i
+    indexer += [slice(None)] * (2 * K + len(L))  # B_row, B_col, L axes
+    data_e = data[tuple(indexer)]
+    expanded = []
+    for i in range(K):
+        expanded += [M_p[i], M_s[i], W[i]]
+    expanded += B_row
+    expanded += B_col
+    expanded += list(L)
+    data_b = jnp.broadcast_to(data_e, tuple(expanded))
+
+    # Step 2: per-axis one-hot band masks, combined via AND.
+    combined_mask = None
+    for i in range(K):
+        off_arr = jnp.asarray(offsets[i], dtype=jnp.int32)
+        bj = jnp.arange(M_s[i], dtype=jnp.int32)
+        target_w = bj[None, :] - off_arr[:, None]  # (M_p_i, M_s_i)
+        sel = target_w[:, :, None] == jnp.arange(W[i], dtype=jnp.int32)[None, None, :]
+        sel_shape = [1] * len(expanded)
+        sel_shape[3 * i] = M_p[i]
+        sel_shape[3 * i + 1] = M_s[i]
+        sel_shape[3 * i + 2] = W[i]
+        sel_r = sel.reshape(*sel_shape)
+        combined_mask = sel_r if combined_mask is None else (combined_mask & sel_r)
+
+    # Step 3: where + sum over all W_i axes in one fused reduction.
+    W_axes = tuple(3 * i + 2 for i in range(K))
+    out = jnp.where(combined_mask, data_b, 0).sum(axis=W_axes)
+
+    # Step 4: permute + reshape to dense layout.
+    perm = []
+    for i in range(K):
+        perm.append(2 * i)         # M_p_i
+        perm.append(2 * K + i)     # B_row_i
+    for i in range(K):
+        perm.append(2 * i + 1)     # M_s_i
+        perm.append(3 * K + i)     # B_col_i
+    perm += list(range(4 * K, 4 * K + len(L)))
+    out = out.transpose(perm)
+    final_shape = []
+    for i in range(K):
+        final_shape.append(M_p[i] * B_row[i])
+    for i in range(K):
+        final_shape.append(M_s[i] * B_col[i])
+    final_shape += list(L)
+    out = out.reshape(*final_shape)
+
+    # Step 5: AND per-axis in-band masks, swap fill_value for out-of-band cells.
+    per_axis_in_band = []
+    for i in range(K):
+        blk_r = jnp.arange(M_p[i] * B_row[i]) // B_row[i]
+        blk_c = jnp.arange(M_s[i] * B_col[i]) // B_col[i]
+        off_arr = jnp.asarray(offsets[i], dtype=jnp.int32)
+        co = off_arr[blk_r]
+        diff = blk_c[None, :] - co[:, None]
+        per_axis_in_band.append((diff >= 0) & (diff < W[i]))
+    full_mask = None
+    for i in range(K):
+        mask_shape = [1] * (2 * K)
+        mask_shape[i] = M_p[i] * B_row[i]
+        mask_shape[K + i] = M_s[i] * B_col[i]
+        m = per_axis_in_band[i].reshape(*mask_shape)
+        full_mask = m if full_mask is None else (full_mask & m)
+    if L:
+        L_pad = (None,) * len(L)
+        full_mask = full_mask[(..., *L_pad)]
+    return jnp.where(full_mask, out, fill_value)
+
+
 # ----------------------------------------------------------------------------
 #  3.  BlockBanded — matmul of two block-diagonals (x @ y.T or x.T @ y)
 # ----------------------------------------------------------------------------
@@ -1079,121 +1207,7 @@ class MultiAxisBlockBanded(NamedTuple):
             mirrors the K=1 swap+transpose pattern; will be added when
             an actual col-primary K>1 case arises).
         """
-        K = self.K
-        if K == 1:
-            spec = self.axes[0]
-            bb = BlockBanded(
-                data=self.data,
-                fill_value=self.fill_value,
-                primary_axis=spec.primary_axis,
-                n_secondary=spec.n_secondary,
-                offset=spec.offset,
-                n_meta=spec.n_meta,
-            )
-            return bb.to_dense()
-
-        # Per-axis bookkeeping (all Python int lists — static at trace time).
-        M_p = list(self._per_axis_M_p)
-        M_s = list(self._per_axis_M_secondary)
-        W = [ax.band_width for ax in self.axes]
-        B_row = [ax.block_row for ax in self.axes]
-        B_col = [ax.block_col for ax in self.axes]
-        offsets = list(self._per_axis_offset_arr)
-        L = self.data.shape[4 * K :]
-
-        for ax in self.axes:
-            if ax.n_meta != 1 or ax.primary_axis != 0:
-                raise NotImplementedError(
-                    "MultiAxisBlockBanded K>1 supports n_meta=1 + row-primary "
-                    "per axis. Multi-batch and col-primary per-axis follow the "
-                    "K=1 patterns; add when needed."
-                )
-
-        # Step 1: insert M_s_i singleton axes via slicing indexer.
-        # Original data axes (in order): M_p_0, W_0, M_p_1, W_1, ..., M_p_{K-1},
-        # W_{K-1}, B_row_0, ..., B_row_{K-1}, B_col_0, ..., B_col_{K-1}, *L
-        # We insert ``None`` after each M_p_i to make room for M_s_i:
-        # M_p_0, M_s_0(None), W_0, M_p_1, M_s_1(None), W_1, ...
-        indexer = []
-        for _ in range(K):
-            indexer.append(slice(None))  # M_p_i
-            indexer.append(None)          # M_s_i (inserted)
-            indexer.append(slice(None))  # W_i
-        indexer += [slice(None)] * (2 * K + len(L))  # B_row, B_col, L axes
-        data_e = self.data[tuple(indexer)]
-        # Broadcast to fill M_s_i sizes.
-        expanded = []
-        for i in range(K):
-            expanded += [M_p[i], M_s[i], W[i]]
-        expanded += B_row
-        expanded += B_col
-        expanded += list(L)
-        data_b = jnp.broadcast_to(data_e, tuple(expanded))
-
-        # Step 2: build per-axis selection masks and combine via AND.
-        combined_mask = None
-        for i in range(K):
-            off_arr = jnp.asarray(offsets[i], dtype=jnp.int32)
-            bj = jnp.arange(M_s[i], dtype=jnp.int32)
-            target_w = bj[None, :] - off_arr[:, None]  # (M_p_i, M_s_i)
-            sel = target_w[:, :, None] == jnp.arange(W[i], dtype=jnp.int32)[None, None, :]
-            # sel shape (M_p_i, M_s_i, W_i). Place at expanded axes
-            # (3i, 3i+1, 3i+2); 1 on every other expanded axis.
-            sel_shape = [1] * len(expanded)
-            sel_shape[3 * i] = M_p[i]
-            sel_shape[3 * i + 1] = M_s[i]
-            sel_shape[3 * i + 2] = W[i]
-            sel_r = sel.reshape(*sel_shape)
-            combined_mask = sel_r if combined_mask is None else (combined_mask & sel_r)
-
-        # Step 3: where + sum over all W_i axes (positions 2, 5, 8, ...).
-        W_axes = tuple(3 * i + 2 for i in range(K))
-        out = jnp.where(combined_mask, data_b, 0).sum(axis=W_axes)
-        # ``out`` shape after dropping W: per-axis (M_p_i, M_s_i) at
-        # positions (2i, 2i+1), then K B_row, K B_col, then *L.
-
-        # Step 4: permute + reshape to dense layout
-        # (M_p_0*B_row_0, ..., M_p_{K-1}*B_row_{K-1}, M_s_0*B_col_0,
-        #  ..., M_s_{K-1}*B_col_{K-1}, *L).
-        perm = []
-        for i in range(K):
-            perm.append(2 * i)         # M_p_i
-            perm.append(2 * K + i)     # B_row_i
-        for i in range(K):
-            perm.append(2 * i + 1)     # M_s_i
-            perm.append(3 * K + i)     # B_col_i
-        perm += list(range(4 * K, 4 * K + len(L)))
-        out = out.transpose(perm)
-        final_shape = []
-        for i in range(K):
-            final_shape.append(M_p[i] * B_row[i])
-        for i in range(K):
-            final_shape.append(M_s[i] * B_col[i])
-        final_shape += list(L)
-        out = out.reshape(*final_shape)
-
-        # Step 5: AND per-axis in-band masks to swap fill_value in for
-        # out-of-band cells along any axis.
-        per_axis_in_band = []
-        for i in range(K):
-            blk_r = jnp.arange(M_p[i] * B_row[i]) // B_row[i]
-            blk_c = jnp.arange(M_s[i] * B_col[i]) // B_col[i]
-            off_arr = jnp.asarray(offsets[i], dtype=jnp.int32)
-            co = off_arr[blk_r]
-            diff = blk_c[None, :] - co[:, None]
-            per_axis_in_band.append((diff >= 0) & (diff < W[i]))
-        # Combine via outer product over K axis pairs.
-        full_mask = None
-        for i in range(K):
-            mask_shape = [1] * (2 * K)
-            mask_shape[i] = M_p[i] * B_row[i]
-            mask_shape[K + i] = M_s[i] * B_col[i]
-            m = per_axis_in_band[i].reshape(*mask_shape)
-            full_mask = m if full_mask is None else (full_mask & m)
-        if L:
-            L_pad = (None,) * len(L)
-            full_mask = full_mask[(..., *L_pad)]
-        return jnp.where(full_mask, out, self.fill_value)
+        return _densify_multi_banded(self.data, self.axes, self.fill_value)
 
 
 class MultiAxisDivisorRemainder(NamedTuple):
