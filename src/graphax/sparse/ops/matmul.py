@@ -963,80 +963,72 @@ def _build_output_tensor(ctx, rhs_dims, res):
     # 2-D single-contract-pair geometry with no leftover, so ``values`` is
     # always 2-D dense at this point.
     if res.banded_geom is not None and values is not None:
-        from .block_storage import BlockBanded, MultiAxisBlockBanded, BandAxisSpec
+        from graphax.sparse.indexes import BandedIndex
 
         layout = res.banded_geom
-        # Multi-axis (K=2) branch: pack as MultiAxisBlockBanded.
-        if isinstance(layout, MultiAxisBandedLayout):
-            band_data = _pack_dense_to_multi_axis_banded(values, layout)
-            specs = tuple(
-                BandAxisSpec(
-                    primary_axis=ax.primary_axis,
-                    n_secondary=ax.n_secondary,
-                    offset=ax.offset,
-                    n_meta=ax.n_meta,
-                    band_width=ax.band_width,
-                    block_row=ax.block_row,
-                    block_col=ax.block_col,
-                )
-                for ax in layout.per_axis
-            )
-            mab = MultiAxisBlockBanded(
-                data=band_data,
-                fill_value=jnp.zeros((), dtype=values.dtype),
-                axes=specs,
-            )
-            mab_shape = mab.shape
-            out_id = final_out[0].id if final_out else 0
-            primal_id = final_primal[0].id if final_primal else (out_id + 1)
-            # K=2 → 4 output axes. Wrap behind 4 full-size DenseIndex dims
-            # matching the multi-axis dense shape (axes 0..K = rows, axes
-            # K..2K = cols).
-            K = len(layout.per_axis)
-            out_dims_new = tuple(
-                DenseIndex(out_id + i, mab_shape[i], axis=i) for i in range(K)
-            )
-            primal_dims_new = tuple(
-                DenseIndex(
-                    primal_id + i, mab_shape[K + i], axis=K + i
-                )
-                for i in range(K)
-            )
-            return SparseTensor(
-                out_dims_new,
-                primal_dims_new,
-                val=None,
-                compressed_val=mab,
-                scalar_mult=jnp.asarray(final_mult).astype(values.dtype),
-                check_consistency=False,
-                zero_fill=True,
-            )
-
-        band_data = _pack_dense_to_banded(values, layout)
-        bb = BlockBanded(
-            data=band_data,
-            fill_value=jnp.zeros((), dtype=values.dtype),
-            primary_axis=layout.primary_axis,
-            n_secondary=layout.n_secondary,
-            offset=layout.offset,
-            n_meta=layout.n_meta,
-        )
-        # ``BlockBanded`` carries the full ``(M_row*B_row, M_col*B_col)`` shape
-        # in its ``compressed_val``; wrap behind two full-size ``DenseIndex``
-        # dims so ``SparseTensor.dense()`` reads the dense shape directly
-        # rather than trying to assemble a meta-block-diagonal from the
-        # original (sparse-pair) ``final_out``/``final_primal`` (which for
-        # ``n_meta > 1`` describes the outer-batch sparse structure that the
-        # BlockBanded already absorbed via ``n_meta``).
-        bb_row, bb_col = bb.shape[0], bb.shape[1]
         out_id = final_out[0].id if final_out else 0
         primal_id = final_primal[0].id if final_primal else (out_id + 1)
+
+        # Multi-axis (K≥2) banded output: pack into the interleaved band
+        # buffer and emit K BandedIndex pairs describing each axis-pair's band.
+        if isinstance(layout, MultiAxisBandedLayout):
+            band_data = _pack_dense_to_multi_axis_banded(values, layout)
+            K = len(layout.per_axis)
+            out_dims_new = []
+            primal_dims_new = []
+            for i, ax in enumerate(layout.per_axis):
+                is_row_primary = ax.primary_axis == 0
+                M_row = ax.m_primary if is_row_primary else ax.n_secondary
+                M_col = ax.n_secondary if is_row_primary else ax.m_primary
+                # ``size`` is the META count (logical_size = size*block_size),
+                # matching DiagonalIndex convention.
+                out_dims_new.append(BandedIndex(
+                    id=out_id + i, size=ax.n_meta * M_row,
+                    axis=i, other_id=primal_id + i,
+                    block_size=ax.block_row, block_axis=K + i,
+                    band_width=ax.band_width, offset=ax.offset,
+                    primary=is_row_primary, n_secondary=ax.n_secondary,
+                    n_meta=ax.n_meta,
+                ))
+                primal_dims_new.append(BandedIndex(
+                    id=primal_id + i, size=ax.n_meta * M_col,
+                    axis=K + i, other_id=out_id + i,
+                    block_size=ax.block_col, block_axis=3 * K + i,
+                    band_width=ax.band_width, offset=ax.offset,
+                    primary=is_row_primary, n_secondary=ax.n_secondary,
+                    n_meta=ax.n_meta,
+                ))
+            return SparseTensor(
+                tuple(out_dims_new), tuple(primal_dims_new), band_data,
+                scalar_mult=jnp.asarray(final_mult).astype(values.dtype),
+                fill_value=jnp.zeros((), dtype=values.dtype),
+                check_consistency=False, zero_fill=True,
+            )
+
+        # K=1 banded output: band buffer in val + a single BandedIndex pair.
+        band_data = _pack_dense_to_banded(values, layout)
+        is_row_primary = layout.primary_axis == 0
+        M_row = layout.m_primary if is_row_primary else layout.n_secondary
+        M_col = layout.n_secondary if is_row_primary else layout.m_primary
+        # ``size`` is the META count (logical_size = size*block_size).
+        out_ix = BandedIndex(
+            id=out_id, size=layout.n_meta * M_row,
+            axis=0, other_id=primal_id, block_size=layout.block_row, block_axis=1,
+            band_width=layout.band_width, offset=layout.offset,
+            primary=is_row_primary, n_secondary=layout.n_secondary,
+            n_meta=layout.n_meta,
+        )
+        primal_ix = BandedIndex(
+            id=primal_id, size=layout.n_meta * M_col,
+            axis=1, other_id=out_id, block_size=layout.block_col, block_axis=1,
+            band_width=layout.band_width, offset=layout.offset,
+            primary=is_row_primary, n_secondary=layout.n_secondary,
+            n_meta=layout.n_meta,
+        )
         return SparseTensor(
-            (DenseIndex(out_id, bb_row, axis=0),),
-            (DenseIndex(primal_id, bb_col, axis=1),),
-            val=None,
-            compressed_val=bb,
+            (out_ix,), (primal_ix,), band_data,
             scalar_mult=jnp.asarray(final_mult).astype(values.dtype),
+            fill_value=jnp.zeros((), dtype=values.dtype),
             check_consistency=False,
             zero_fill=True,
         )

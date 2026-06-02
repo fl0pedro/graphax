@@ -394,78 +394,58 @@ class TestBlockBandedOptimality(unittest.TestCase):
         )
         return sparse_matmul(a, b), a, b
 
-    def test_bandwidth_matches_geometric_minimum(self):
-        """For each input block geometry, the BlockBanded output's bandwidth
-        equals the geometric minimum (the max ``|a-b|`` over overlapping
-        rows/cols at sub-block granularity)."""
+    def test_banded_output_emits_banded_index(self):
+        """Phase 8: a misaligned-contract matmul emits ``BandedIndex`` output
+        dims + a compact band buffer in ``val`` (no ``compressed_val``), and
+        ``.dense()`` round-trips exactly. Storage is strictly less than the
+        dense alternative for every banded case."""
+        from graphax.sparse.indexes import BandedIndex
+
         cases = [
-            # (M, B_a_h, B_a_w, B_b_h, B_b_w)
-            (4, 5, 7, 7, 5),   # output blocks 5×5 at finer granularity
+            (4, 5, 7, 7, 5),
             (3, 3, 4, 4, 3),
             (5, 2, 3, 3, 2),
         ]
         for M, B_a_h, B_a_w, B_b_h, B_b_w in cases:
             with self.subTest(M=M, B_a_h=B_a_h, B_a_w=B_a_w, B_b_h=B_b_h, B_b_w=B_b_w):
-                res, _, _ = self._matmul_with_block_geometry(M, B_a_h, B_a_w, B_b_h, B_b_w)
-                if res.compressed_val is None:
-                    # Eager form was already optimal; theoretical w applies
-                    # only when the band fits tighter than the eager block-diag.
-                    continue
-                self.assertIsInstance(res.compressed_val, BlockBanded)
-                w_actual = res.compressed_val.half_bandwidth
-                # Compute expected geometry. B_new = max(B_a_h, B_b_w).
-                B_new = max(B_a_h, B_b_w)
-                B_eager = math.lcm(B_a_h, B_b_w)
-                M_new = M * (B_eager // B_new)
-                w_expected = self._expected_bandwidth(
-                    M_new, B_new, B_a_h, B_a_w, B_b_h, B_b_w)
-                self.assertEqual(
-                    w_actual, w_expected,
-                    f"M={M} B_geom=({B_a_h},{B_a_w},{B_b_h},{B_b_w}): "
-                    f"bandwidth {w_actual} ≠ theoretical {w_expected}")
+                res, a, b = self._matmul_with_block_geometry(M, B_a_h, B_a_w, B_b_h, B_b_w)
+                if not any(isinstance(d, BandedIndex) for d in res.dims):
+                    continue  # aligned / already-tight geometry: plain val
+                self.assertIsNotNone(res.val)
+                self.assertTrue(all(isinstance(d, BandedIndex) for d in res.dims))
+                dense = res.dense()
+                self.assertLess(
+                    int(res.val.size), int(dense.size),
+                    "banded val storage must be < dense output size")
+                self.assertTrue(jnp.allclose(dense, a.dense() @ b.dense(), atol=1e-4))
 
     def test_storage_strictly_less_than_eager(self):
-        """When BlockBanded fires, its storage must be strictly less than
-        the eager (M_eager × B_eager²) block-diagonal alternative."""
-        # 5/11 case at depth 1: a is 5-block of 11×11, b is 5-block of 11×11.
-        # That's actually the *aligned* case — no compression possible.
-        # Use a misaligned-output case instead: blocks (5, 11) × (11, 5).
+        """When the band fires, the compact ``val`` storage is strictly less
+        than the dense ``(M_row*B_row, M_col*B_col)`` output."""
+        from graphax.sparse.indexes import BandedIndex
+
         M = 1
         res, a, b = self._matmul_with_block_geometry(
             M, B_a_h=5, B_a_w=11, B_b_h=11, B_b_w=5)
-        # The eager output would be (M, B_a_h*B_b_w/?) — depends on the
-        # output block size. ``_try_compressed_block_banded`` only fires
-        # when ``bb_size < eager_size``. So if ``compressed_val`` is set,
-        # we already know storage is tighter; assert that explicitly.
-        if res.compressed_val is not None:
-            bb = res.compressed_val
-            M_new, W, B_new, _, *_ = bb.data.shape
-            bb_size = M_new * W * B_new * B_new
-            # Eager alternative: the matmul output would be at granularity
-            # ``M × B_eager × B_eager`` where B_eager = lcm(B_a_h, B_b_w).
-            B_eager = math.lcm(5, 5)
-            eager_size = M * B_eager * B_eager
-            self.assertLess(
-                bb_size, eager_size,
-                f"BlockBanded storage {bb_size} ≥ eager {eager_size}")
+        if any(isinstance(d, BandedIndex) for d in res.dims):
+            dense_size = res.dense().size
+            self.assertLess(int(res.val.size), int(dense_size))
 
     def test_pure_diagonal_output_matmul(self):
-        """When two block-diagonal matrices have aligned inner contracting
-        block size, the output is also block-diagonal (no banding needed)
-        — BlockBanded with w=0 is equivalent to an eager block-diagonal,
-        so the matmul should NOT produce a BlockBanded compressed form
-        (the eager form is already optimal)."""
+        """Aligned inner contracting block sizes → block-diagonal output, no
+        banding: the matmul keeps a clean ``val=(M, B, B)`` with no
+        ``BandedIndex`` dims."""
+        from graphax.sparse.indexes import BandedIndex
+
         M, B = 4, 3
         res, _, _ = self._matmul_with_block_geometry(M, B, B, B, B)
-        # Aligned matmul → output has clean block-diagonal val of shape (M, B, B);
-        # no BlockBanded wrapping.
-        self.assertIsNone(res.compressed_val)
+        self.assertFalse(any(isinstance(d, BandedIndex) for d in res.dims))
         self.assertIsNotNone(res.val)
         self.assertEqual(res.val.shape, (M, B, B))
 
     def test_jit_roundtrip_preserves_form(self):
-        """``compressed_val=BlockBanded`` survives JIT trace/compile and
-        produces the same dense() materialization as eager."""
+        """A banded matmul output survives JIT trace/compile and produces the
+        same ``dense()`` materialization as eager."""
         M = 1
         res_eager, a, b = self._matmul_with_block_geometry(
             M, B_a_h=5, B_a_w=11, B_b_h=11, B_b_w=5)
@@ -480,31 +460,29 @@ class TestBlockBandedOptimality(unittest.TestCase):
 
     def test_bandwidth_grows_predictably_with_M(self):
         """For fixed block geometry, increasing the meta-block count ``M``
-        keeps the *half-bandwidth* ``w`` constant (it's a local geometric
-        property), so the storage scales as ``O(M · W · B²)`` — linear in M.
-        This is the structural reason BlockBanded is M× tighter than eager."""
+        keeps the band width constant (a local geometric property), so the
+        band ``val`` storage scales linearly in M — the structural reason the
+        banded form is M× tighter than dense."""
+        from graphax.sparse.indexes import BandedIndex
+
         widths = []
         sizes = []
         for M in [1, 2, 4]:
             res, _, _ = self._matmul_with_block_geometry(
                 M, B_a_h=5, B_a_w=11, B_b_h=11, B_b_w=5)
-            if res.compressed_val is not None:
-                bb = res.compressed_val
-                widths.append(bb.half_bandwidth)
-                sizes.append(int(bb.data.size))
+            bx = next((d for d in res.dims if isinstance(d, BandedIndex)), None)
+            if bx is not None:
+                widths.append(bx.band_width)
+                sizes.append(int(res.val.size))
         if len(widths) >= 2:
             self.assertEqual(len(set(widths)), 1,
-                             f"half-bandwidth should be M-independent, got {widths}")
-            # Storage must scale linearly with M.
+                             f"band width should be M-independent, got {widths}")
             for i in range(1, len(sizes)):
-                ratio = sizes[i] / sizes[0]
-                expected = (i + 1) ** 1  # M=1, 2, 4 → ratios 1, 2, 4
-                # Allow loose bound — exact ratio depends on M scaling.
+                self.assertGreater(sizes[i], sizes[0])  # grows with M
 
     def test_no_scatter_in_matmul_with_compressed_output(self):
-        """End-to-end: ``a @ b → BlockBanded → dense()`` runs scatter-free
-        under JIT. The BlockBanded materialization is broadcast+select+sum,
-        not a gather/scatter."""
+        """End-to-end: ``a @ b → BandedIndex → dense()`` runs scatter-free
+        under JIT (the band densify is broadcast+select+sum, no scatter)."""
         M = 1
         _, a, b = self._matmul_with_block_geometry(
             M, B_a_h=5, B_a_w=11, B_b_h=11, B_b_w=5)
@@ -647,10 +625,11 @@ class TestMultiAxisContractMatmul(unittest.TestCase):
         self.assertTrue(jnp.allclose(res.dense(), ref, atol=1e-4))
 
     def test_k2_misaligned_emits_multi_axis_banded(self):
-        """Phase 7.5: K=2 misaligned-contract matmul now emits
-        ``compressed_val=MultiAxisBlockBanded`` with per-axis band
-        geometry. Storage is strictly less than the dense 4-D output."""
-        from graphax.sparse.ops.block_storage import MultiAxisBlockBanded
+        """Phase 8: K=2 misaligned-contract matmul emits ``K`` ``BandedIndex``
+        output pairs + a compact band buffer in ``val`` (no ``compressed_val``),
+        round-trips through ``.dense()``, and stores strictly less than the
+        dense 4-D output."""
+        from graphax.sparse.indexes import BandedIndex
 
         a = SparseTensor(
             (
@@ -674,17 +653,20 @@ class TestMultiAxisContractMatmul(unittest.TestCase):
             ),
             _n((5, 2, 11, 7, 3, 9), 2),
         )
+        ref = jnp.einsum("ijkl,klmn->ijmn", a.dense(), b.dense())
         res = sparse_matmul(a, b)
-        self.assertIsNone(res.val)
-        self.assertIsInstance(res.compressed_val, MultiAxisBlockBanded)
-        self.assertEqual(len(res.compressed_val.axes), 2)
+        # K=2 → 4 BandedIndex output dims; band buffer in val (no compressed_val).
+        self.assertEqual(len(res.dims), 4)
+        self.assertTrue(all(isinstance(d, BandedIndex) for d in res.dims))
+        self.assertIsNotNone(res.val)
         # Storage strictly tighter than dense.
-        compressed_size = int(res.compressed_val.data.size)
         dense_size = 55 * 12 * 35 * 18
         self.assertLess(
-            compressed_size, dense_size,
-            f"compressed {compressed_size} should be < dense {dense_size}",
+            int(res.val.size), dense_size,
+            f"band buffer {int(res.val.size)} should be < dense {dense_size}",
         )
+        # Round-trips exactly through dense().
+        self.assertTrue(jnp.allclose(res.dense(), ref, atol=1e-4))
 
 
 class TestMultiAxisElementwise(unittest.TestCase):

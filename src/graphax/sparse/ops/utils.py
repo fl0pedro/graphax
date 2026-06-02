@@ -143,12 +143,13 @@ def _densify_compressed_dims(tensor, compact: bool = False):
     from graphax.sparse.tensor import SparseTensor
     from graphax.sparse.indexes import BandedIndex, DenseIndex, DiagonalIndex
 
-    # K=1 banded pair (Array val). Identify the primary BandedIndex.
     banded = [d for d in comp if isinstance(d, BandedIndex)]
+    fill = tensor.fill_value
+
+    # --- K=1 banded pair (Array val) ---
     if len(comp) == 2 and len(banded) == 2 and isinstance(tensor.val, jax.Array):
         primary = next((d for d in banded if d.primary), banded[0])
         o, p = tensor.out_dims[0], tensor.primal_dims[0]
-        fill = tensor.fill_value
         if compact and primary.reduces_to_diagonal():
             meta = primary.to_meta_blocks(tensor.val)  # (n_meta*M, B_row, B_col, *L)
             M, B_row, B_col = meta.shape[0], meta.shape[1], meta.shape[2]
@@ -168,10 +169,43 @@ def _densify_compressed_dims(tensor, compact: bool = False):
             zero_fill=getattr(tensor, "_zero_fill", None),
         )
 
+    # --- K≥2 banded (multi-axis interleaved Array val) ---
+    K = len(tensor.out_dims)
+    if (banded and len(banded) == 2 * K and isinstance(tensor.val, jax.Array)
+            and all(isinstance(d, BandedIndex) for d in tensor.out_dims)
+            and all(isinstance(d, BandedIndex) for d in tensor.primal_dims)):
+        from graphax.sparse.ops.block_storage import MultiAxisBlockBanded, BandAxisSpec
+
+        specs = tuple(
+            BandAxisSpec(
+                primary_axis=0 if o.primary else 1,
+                n_secondary=o.n_secondary, offset=o.offset, n_meta=o.n_meta,
+                band_width=o.band_width, block_row=o.block_size,
+                block_col=p.block_size,
+            )
+            for o, p in zip(tensor.out_dims, tensor.primal_dims)
+        )
+        dense = MultiAxisBlockBanded(
+            data=tensor.val, fill_value=fill, axes=specs
+        ).to_dense()  # (rows_0..rows_{K-1}, cols_0..cols_{K-1}, *L)
+        new_out = tuple(
+            DenseIndex(tensor.out_dims[i].id, dense.shape[i], i) for i in range(K)
+        )
+        new_primal = tuple(
+            DenseIndex(tensor.primal_dims[i].id, dense.shape[K + i], K + i)
+            for i in range(K)
+        )
+        return SparseTensor(
+            new_out, new_primal, dense,
+            scalar_mult=tensor.scalar_mult, fill_value=tensor.fill_value,
+            check_consistency=False,
+            zero_fill=getattr(tensor, "_zero_fill", None),
+        )
+
     raise NotImplementedError(
-        "densify of compressed dims is implemented for the single-pair banded "
-        f"(Array-val) case; got {len(comp)} compressed dims / "
-        f"val type {type(tensor.val).__name__} (Phase 8.E/8.F territory)."
+        f"densify of compressed dims: unhandled shape — {len(comp)} compressed "
+        f"dims, val type {type(tensor.val).__name__} (SetIndex dual-buffer is "
+        "Phase 8.F)."
     )
 
 

@@ -99,10 +99,15 @@ class BandedIndex(Index):
         ``band_width == 1`` with a centered (≡ identity, since W=1) offset and
         square per-batch meta counts. Such a band has no off-diagonal content,
         so it can be represented as a ``DiagonalIndex`` (the compact
-        meta-block form) instead of being materialized fully dense."""
+        meta-block form) instead of being materialized fully dense.
+
+        ``size`` is the meta count (``n_meta * M_primary``); the per-batch
+        primary count is ``size // n_meta``, which must equal ``n_secondary``
+        for the band to be square-diagonal."""
         if self.band_width != 1:
             return False
-        if self.n_secondary >= 0 and self.n_secondary != (self.size // (self.block_size or 1)) // self.n_meta:
+        m_primary = self.size // self.n_meta
+        if self.n_secondary >= 0 and self.n_secondary != m_primary:
             return False
         # offset () (centered, W=1 ⇒ offset[a]=a) or explicit identity.
         if self.offset and tuple(self.offset) != tuple(range(len(self.offset))):
