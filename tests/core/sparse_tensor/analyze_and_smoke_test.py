@@ -1012,7 +1012,7 @@ class TestSmokeScreen(unittest.TestCase):
             manual_03,
             a,
             b,
-            expected_path="divisor_fast",
+            expected_path="general",
             mem_ratio_max=2.0,
         )
         res = core_lor(a, b)

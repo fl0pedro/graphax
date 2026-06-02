@@ -351,141 +351,6 @@ def _reconstruct_result(value, lhs, sp, dp, output_meta, op, rhs):
     )
 
 
-def _try_divisor_fast_path(lhs, rhs, op, is_intersection):
-    """Single-buffer fast path for the *divisor* misaligned-block case: one
-    side's ``block_size`` equals the LCM along both axes (so its blocks are
-    whole meta-blocks), and the other side's blocks are sub-blocks that fit
-    on the meta-block-diagonal. The reference hand-coded path is
-    ``manual_03``: pre-allocate one buffer at the big side's granularity,
-    scatter the smaller side's diagonal sub-blocks into it, then ``op`` with
-    the big side. Total HBM = one buffer the size of the output.
-
-    The default LCM-promotion path here would instead materialize *both*
-    sides at ``(M, LCM_h, LCM_w)`` *and* the per-sub-block intermediate the
-    broadcast+where dance produces, doubling-or-worse the peak HBM
-    footprint. This path matches the reference: peak HBM = output size,
-    no intermediates beyond per-slice scratch (which XLA fuses).
-
-    Conditions that fire it:
-      - 2-D inputs, both single-sparse-pair, ``op`` zero-preserving.
-      - Block sizes such that one side has ``block_size == LCM`` along both
-        axes; the other has both axes evenly divisible by LCM (the *divisor*
-        case — coprime / shared-factor cases skip).
-      - ``exp_h == exp_w`` (block-diagonal sub-cell layout, the only one
-        ``_promote_to_unified``'s eye mask actually handles correctly).
-
-    Returns the result ``SparseTensor`` or ``None`` if conditions don't apply.
-    """
-    # Need ``op(0, x) == x`` (additive identity) — the path leaves big_v
-    # untouched at off-small-support positions, which is correct only when
-    # the missing side multiplies/adds to identity. ``mul`` zeros out, so
-    # it's excluded; same for non-additive ``min``/``max``/``and``.
-    if is_intersection or op not in _ADDITIVE_IDENTITY_OPS:
-        return None
-    if len(lhs.dims) != 2 or len(rhs.dims) != 2:
-        return None
-    if lhs.val is None or rhs.val is None:
-        return None
-    # The fast path assumes one out_dim + one primal_dim per side. Reject
-    # 2-D tensors that put both dims on the same side (e.g. ``out=(),
-    # primal=(d, d)``) — those won't satisfy the sparse-pair structural
-    # checks below anyway, but indexing them here would IndexError.
-    if not (lhs.out_dims and lhs.primal_dims and rhs.out_dims and rhs.primal_dims):
-        return None
-    ao, ai = lhs.out_dims[0], lhs.primal_dims[0]
-    bo, bi = rhs.out_dims[0], rhs.primal_dims[0]
-    if not all(d.is_sparse for d in (ao, ai, bo, bi)):
-        return None
-    if ao.other_id != ai.id or bo.other_id != bi.id:
-        return None
-    # All val axes must be materialized — otherwise the (M, B_h, B_w) reshape
-    # below misalignes implicit / broadcast axes. Defer to the general path.
-    if any(d.axis is None for d in (ao, ai, bo, bi)):
-        return None
-    if any(d.block_axis is None for d in (ao, ai, bo, bi)
-           if d.block_size is not None and d.block_size > 1):
-        return None
-    # Physical val-axis order must be (outer, block_h, block_w) — i.e. axes
-    # ``(0, 1, 2)`` — for the ``reshape(M, exp, b_h, b_w)`` step below to be
-    # semantically correct. A different physical order would silently scramble
-    # rows vs cols. Defer to the general path on a non-canonical layout rather
-    # than transposing here (the general path handles arbitrary axis orders).
-    canonical = lambda o, p: (o.axis, o.block_axis, p.block_axis) == (0, 1, 2)
-    if not (canonical(ao, ai) and canonical(bo, bi)):
-        return None
-    a_b_h, a_b_w = ao.block_size or 1, ai.block_size or 1
-    b_b_h, b_b_w = bo.block_size or 1, bi.block_size or 1
-    a_n, b_n = ao.size, bo.size
-    if a_n * a_b_h != b_n * b_b_h or a_n * a_b_w != b_n * b_b_w:
-        return None
-    lcm_h = math.lcm(a_b_h, b_b_h)
-    lcm_w = math.lcm(a_b_w, b_b_w)
-    a_is_big = (a_b_h == lcm_h and a_b_w == lcm_w)
-    b_is_big = (b_b_h == lcm_h and b_b_w == lcm_w)
-    if a_is_big == b_is_big:
-        return None  # Either both equal-block (no expansion needed) or both need expansion.
-
-    # Pick the big side as base; sub-block grid lives on the small side.
-    if a_is_big:
-        big, small = lhs, rhs
-        s_b_h, s_b_w = b_b_h, b_b_w
-    else:
-        big, small = rhs, lhs
-        s_b_h, s_b_w = a_b_h, a_b_w
-    # Off-diagonal cells of each meta-block stay at the literal ``big_v`` value
-    # because we represent the small side's missing entries as ``small_fill``
-    # and use the additive-identity property ``op(0, x) == x``. That argument
-    # only holds when ``small_fill`` is statically known to be 0; with a
-    # non-zero fill the off-diagonal cell would correctly be
-    # ``op(small_fill, big_v)`` and we'd lose the single-buffer save. Defer.
-    if not _is_zero_fill(small):
-        return None
-    exp_h = lcm_h // s_b_h
-    exp_w = lcm_w // s_b_w
-    if exp_h != exp_w:
-        return None  # Only block-diagonal layout supported (matches existing eye mask).
-    exp = exp_h
-    M = big.out_dims[0].size
-
-    # Absorb scalar_mults eagerly so the output's scalar_mult is canonical.
-    bool_op = lhs.dtype == jnp.bool_
-    big_v = big.val & big.scalar_mult.astype(jnp.bool_) if bool_op \
-        else big.val * big.scalar_mult
-    small_v = small.val & small.scalar_mult.astype(jnp.bool_) if bool_op \
-        else small.val * small.scalar_mult
-
-    # Single-buffer build via ``where(eye, op(big_diag, small), big)``:
-    #   * View ``big_v`` as a per-meta-block grid ``(M, exp_r, exp_c, b_h, b_w)``.
-    #   * View ``small_v`` as one block per meta-block-diagonal position
-    #     ``(M, exp, 1, b_h, b_w)`` (broadcasts trivially across the col-meta axis).
-    #   * Apply ``op`` between the two — XLA's broadcast yields a full
-    #     ``(M, exp, exp, b_h, b_w)`` op-applied tensor at trace time.
-    #   * Use ``eye(exp)`` to pick the op'd value on the diagonal cells and
-    #     the bare ``big`` value elsewhere — off-diagonal cells = ``big_v``
-    #     (correct because ``small_fill == 0`` and ``op(big, 0) == big``).
-    # Replaces the per-``i`` Python ``at[...].set(...)`` loop with one fused HLO.
-    big_grid = big_v.reshape(M, exp, s_b_h, exp, s_b_w).transpose(0, 1, 3, 2, 4)
-    small_diag = small_v.reshape(M, exp, 1, s_b_h, s_b_w)
-    if big is lhs:
-        op_applied = op(big_grid, small_diag)
-    else:
-        op_applied = op(small_diag, big_grid)
-    eye = jnp.eye(exp, dtype=jnp.bool_).reshape(1, exp, exp, 1, 1)
-    out = jnp.where(eye, op_applied, big_grid)
-    out = out.transpose(0, 1, 3, 2, 4).reshape(M, exp * s_b_h, exp * s_b_w)
-
-    new_fill = op(_scaled_fill(big), _scaled_fill(small)) if big is lhs \
-        else op(_scaled_fill(small), _scaled_fill(big))
-    s_mult = jnp.array(True) if bool_op else jnp.array(1.0, dtype=lhs.val.dtype)
-    zf = (getattr(lhs, "_zero_fill", False) and getattr(rhs, "_zero_fill", False)) or None
-
-    from graphax.sparse.tensor import SparseTensor
-    return SparseTensor(
-        big.out_dims, big.primal_dims, out,
-        scalar_mult=s_mult, fill_value=new_fill,
-        check_consistency=False, zero_fill=zf,
-    )
-
 
 def _try_compressed_union(lhs, rhs, op, is_intersection):
     """Fast path for misaligned 2-D block-diagonal union ops: output the meta-
@@ -608,13 +473,10 @@ def elementwise(
     falls back to the general expansion path.
 
     Dispatch order (first applicable wins):
-      1. ``divisor_fast``     — one side's block_size == LCM (single-buffer
-                                scatter+op on the big side; matches the
-                                hand-coded reference for the divisor case).
-      2. ``compressed_union`` — misaligned 2-D union with a zero-preserving
+      1. ``compressed_union`` — misaligned 2-D union with a zero-preserving
                                 op: emits ``compressed_val=UnionBlocks``
                                 (M× tighter HBM than eager LCM-grid form).
-      3. ``general``          — full broadcast / promote-to-unified / op /
+      2. ``general``          — full broadcast / promote-to-unified / op /
                                 demote pipeline. Handles every other case
                                 including aligned blocks, non-zero fills, and
                                 operations that aren't zero-preserving.
@@ -638,12 +500,6 @@ def elementwise(
     if count:
         n = _ew_op_count(lhs, rhs, is_intersection)
 
-    divisor = _try_divisor_fast_path(lhs, rhs, op, is_intersection)
-    if divisor is not None:
-        _record_path("divisor_fast")
-        if count:
-            return divisor, n
-        return divisor
     compressed = _try_compressed_union(lhs, rhs, op, is_intersection)
     if compressed is not None:
         _record_path("compressed_union")
