@@ -137,19 +137,23 @@ class TestBandedIndexGatherFree(unittest.TestCase):
 
 
 class TestSetIndexDensify(unittest.TestCase):
-    """`SetIndex.densify_axis` must match `DivisorRemainder.to_dense`."""
-
-    def _set(self, M, n_lhs, Bh, semantic):
-        return SetIndex(
-            id=0, size=M * n_lhs * Bh, axis=0, other_id=1,
-            block_size=n_lhs * Bh, block_axis=1,
-            semantic=semantic, n_lhs=n_lhs, n_rhs=2, include_remainder=True, n_meta=1,
-        )
+    """`SetIndex.densify_axis` (combined 1-D val + lhs/rhs shapes) must match
+    `DivisorRemainder.to_dense`."""
 
     def _bufs(self):
         lhs = _n((1, 3, 2, 2), 8)
         rhs = _n((1, 2, 3, 3), 9)
         return lhs, rhs
+
+    def _set_and_val(self, lhs, rhs, semantic):
+        combined = jnp.concatenate([lhs.reshape(-1), rhs.reshape(-1)])
+        sx = SetIndex(
+            id=0, size=1 * lhs.shape[1] * lhs.shape[2], axis=0, other_id=1,
+            block_size=lhs.shape[1] * lhs.shape[2], block_axis=1,
+            semantic=semantic, lhs_shape=lhs.shape, rhs_shape=rhs.shape,
+            include_remainder=True, n_meta=1,
+        )
+        return sx, combined
 
     def test_union_matches_divisor_remainder(self):
         lhs, rhs = self._bufs()
@@ -158,8 +162,8 @@ class TestSetIndexDensify(unittest.TestCase):
             divisor=lhs, remainder=rhs, fill_divisor=fl, fill_remainder=fr,
             semantic="union", include_remainder=True, op=jnp.add,
         ).to_dense()
-        sx = self._set(1, 3, 2, "union")
-        self.assertTrue(jnp.allclose(sx.densify_axis((lhs, rhs), (fl, fr)), ref, atol=1e-5))
+        sx, val = self._set_and_val(lhs, rhs, "union")
+        self.assertTrue(jnp.allclose(sx.densify_axis(val, (fl, fr)), ref, atol=1e-5))
 
     def test_intersection_matches_divisor_remainder(self):
         lhs, rhs = self._bufs()
@@ -168,8 +172,8 @@ class TestSetIndexDensify(unittest.TestCase):
             divisor=lhs, remainder=rhs, fill_divisor=fl, fill_remainder=fr,
             semantic="intersection", include_remainder=True, op=jnp.multiply,
         ).to_dense()
-        sx = self._set(1, 3, 2, "intersection")
-        self.assertTrue(jnp.allclose(sx.densify_axis((lhs, rhs), (fl, fr)), ref, atol=1e-5))
+        sx, val = self._set_and_val(lhs, rhs, "intersection")
+        self.assertTrue(jnp.allclose(sx.densify_axis(val, (fl, fr)), ref, atol=1e-5))
 
 
 class TestCompressedIndexInterface(unittest.TestCase):

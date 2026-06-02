@@ -141,10 +141,34 @@ def _densify_compressed_dims(tensor, compact: bool = False):
         return tensor
 
     from graphax.sparse.tensor import SparseTensor
-    from graphax.sparse.indexes import BandedIndex, DenseIndex, DiagonalIndex
+    from graphax.sparse.indexes import BandedIndex, SetIndex, DenseIndex, DiagonalIndex
 
     banded = [d for d in comp if isinstance(d, BandedIndex)]
     fill = tensor.fill_value
+
+    # --- K=1 SetIndex pair (combined 1-D Array val) ---
+    set_dims = [d for d in comp if isinstance(d, SetIndex)]
+    if len(comp) == 2 and len(set_dims) == 2 and isinstance(tensor.val, jax.Array):
+        sx = tensor.out_dims[0]
+        o, p = tensor.out_dims[0], tensor.primal_dims[0]
+        if compact:  # SetIndex always reduces to a meta-block-diagonal
+            meta = sx.to_meta_blocks(tensor.val, fill)  # (M, LCM_h, LCM_w, *L)
+            M, H, W = meta.shape[0], meta.shape[1], meta.shape[2]
+            new_out = (DiagonalIndex(o.id, M, 0, p.id, H, 1),)
+            new_primal = (DiagonalIndex(p.id, M, 0, o.id, W, 2),)
+            new_val = meta
+        else:
+            dense = sx.densify_axis(tensor.val, fill)  # (M*LCM_h, M*LCM_w, *L)
+            rows, cols = dense.shape[0], dense.shape[1]
+            new_out = (DenseIndex(o.id, rows, 0),)
+            new_primal = (DenseIndex(p.id, cols, 1),)
+            new_val = dense
+        return SparseTensor(
+            new_out, new_primal, new_val,
+            scalar_mult=tensor.scalar_mult, fill_value=tensor.fill_value,
+            check_consistency=False,
+            zero_fill=getattr(tensor, "_zero_fill", None),
+        )
 
     # --- K=1 banded pair (Array val) ---
     if len(comp) == 2 and len(banded) == 2 and isinstance(tensor.val, jax.Array):

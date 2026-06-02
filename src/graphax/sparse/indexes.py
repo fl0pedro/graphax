@@ -148,24 +148,31 @@ class SetIndex(Index):
     pair (linked by ``other_id``).
 
     Unifies the legacy ``UnionBlocks`` / ``IntersectionBlocks`` /
-    ``DivisorRemainder`` pytrees. The data ``val`` is a dual buffer
-    ``(lhs_blocks, rhs_blocks)`` (same layout the legacy types used):
-    ``lhs_blocks`` is ``(n_meta*M, n_lhs, B_lhs_h, B_lhs_w, *L)`` and
-    ``rhs_blocks`` is ``(n_meta*M, n_rhs, B_rhs_h, B_rhs_w, *L)``.
+    ``DivisorRemainder`` pytrees. The two per-side block buffers are stored as
+    a SINGLE concatenated 1-D ``val`` (like the legacy ``UnionBlocks.combined``)
+    so ``SparseTensor.val`` stays a plain ``Array`` — no constructor / unary-op
+    surgery. ``lhs_shape`` / ``rhs_shape`` reconstruct the buffers:
+    ``lhs_blocks = val[:prod(lhs_shape)].reshape(lhs_shape)`` etc., where
+    ``lhs_shape = (n_meta*M, n_lhs, B_lhs_h, B_lhs_w, *L)`` and similarly rhs.
 
     Extra fields:
-      * ``semantic``: ``'union'`` (densify = ``op(lhs_grid, rhs_grid)``) or
-        ``'intersection'``.
-      * ``n_lhs`` / ``n_rhs``: sub-blocks per meta per side.
-      * ``include_remainder``: when ``False`` the rhs buffer is omitted.
+      * ``semantic``: descriptive label ('union' | 'intersection').
+      * ``lhs_shape`` / ``rhs_shape``: per-side block-buffer shapes.
+      * ``include_remainder``: when ``False`` the rhs buffer is omitted
+        (``val`` is just the lhs buffer flat).
       * ``n_meta``: outer batch.
+      * ``op``: the actual binary densify op (e.g. ``jnp.add`` / ``jnp.multiply``)
+        — what densify uses. ``a * b`` routes with ``is_intersection=False``
+        (semantic 'union') yet ``op=multiply``, so ``op`` ≠ a function of
+        ``semantic``. Callables are hashable, safe in static-aux metadata.
     """
 
     semantic: str = "union"
-    n_lhs: int = 1
-    n_rhs: int = 1
+    lhs_shape: tuple[int, ...] = ()
+    rhs_shape: tuple[int, ...] = ()
     include_remainder: bool = True
     n_meta: int = 1
+    op: object = None
 
     @property
     def is_compressed(self) -> bool:
@@ -174,37 +181,48 @@ class SetIndex(Index):
     def reduces_to_diagonal(self) -> bool:
         """A SetIndex output is always meta-block-diagonal (its content sits on
         the M-meta diagonal of ``(M*LCM_h, M*LCM_w)``), so it ALWAYS reduces to
-        a compact ``DiagonalIndex`` via :meth:`to_meta_blocks` — no full-dense
-        materialization needed at an op boundary."""
+        a compact ``DiagonalIndex`` via :meth:`to_meta_blocks`."""
         return True
 
     def _op(self):
+        if self.op is not None:
+            return self.op
         import jax.numpy as _jnp
 
         return _jnp.multiply if self.semantic == "intersection" else _jnp.add
 
+    def _split(self, val):
+        """Split the concatenated 1-D ``val`` back into ``(lhs_blocks,
+        rhs_blocks)`` (rhs ``None`` when ``include_remainder`` is False)."""
+        import math as _math
+
+        n_lhs = _math.prod(self.lhs_shape)
+        lhs_blocks = val[:n_lhs].reshape(self.lhs_shape)
+        if self.include_remainder and self.rhs_shape:
+            rhs_blocks = val[n_lhs:].reshape(self.rhs_shape)
+        else:
+            rhs_blocks = None
+        return lhs_blocks, rhs_blocks
+
     def to_meta_blocks(self, val, fill):
         """Compact ``(n_meta*M, LCM_h, LCM_w, *L)`` meta-block grid — the
-        per-meta-diagonal contributions without the surrounding zero padding.
-        This is M× tighter than :meth:`densify_axis` and is what an op
-        boundary should consume (preserves the legacy ``to_meta_blocks``
-        storage win)."""
+        per-meta-diagonal contributions without surrounding zero padding
+        (M× tighter than :meth:`densify_axis`; the op-boundary form)."""
         from graphax.sparse.ops.block_storage import _block_diag_per_meta
 
-        lhs_blocks, rhs_blocks = (val if isinstance(val, tuple) else (val, None))
+        lhs_blocks, rhs_blocks = self._split(val)
         fill_lhs, fill_rhs = (fill if isinstance(fill, tuple) else (fill, fill))
         op = self._op()
         lhs_meta = _block_diag_per_meta(lhs_blocks, fill_lhs)
-        if self.include_remainder and rhs_blocks is not None:
+        if rhs_blocks is not None:
             rhs_meta = _block_diag_per_meta(rhs_blocks, fill_rhs)
             return op(lhs_meta, rhs_meta)
         return op(lhs_meta, fill_rhs)
 
     def densify_axis(self, val, fill):
-        """Densify the dual-buffer ``val=(lhs_blocks, rhs_blocks)`` to the FULL
-        dense ``(n_meta*M*LCM_h, n_meta*M*LCM_w, *L)`` form via
-        :meth:`to_meta_blocks` + ``_stitch_meta`` + the semantic ``op``.
-        Mirrors the legacy ``DivisorRemainder.to_dense`` chain (gather-free)."""
+        """Densify to the FULL dense ``(n_meta*M*LCM_h, n_meta*M*LCM_w, *L)``
+        form via :meth:`to_meta_blocks` + ``_stitch_meta`` + ``op``
+        (gather-free; mirrors the legacy ``DivisorRemainder.to_dense``)."""
         from graphax.sparse.ops.block_storage import _stitch_meta
 
         fill_lhs, fill_rhs = (fill if isinstance(fill, tuple) else (fill, fill))

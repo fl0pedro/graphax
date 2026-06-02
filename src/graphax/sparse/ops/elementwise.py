@@ -377,6 +377,11 @@ def _should_emit_divisor_remainder(lhs, rhs, op, is_intersection):
     """
     if op not in _ZERO_PRESERVING_OPS:
         return None
+    # SetIndex carries no per-side fill (hashable aux_data), so densify uses
+    # the output fill_value for both sides — exact only for zero fills
+    # (op(0,0)=0). Non-zero-fill operands fall through to the general path.
+    if not (_is_zero_fill(lhs) and _is_zero_fill(rhs)):
+        return None
     if len(lhs.dims) != 2 or len(rhs.dims) != 2:
         return None
     if lhs.val is None or rhs.val is None:
@@ -432,11 +437,13 @@ def _should_emit_divisor_remainder(lhs, rhs, op, is_intersection):
 
 
 def _emit_divisor_remainder(lhs, rhs, op, geom):
-    """Construct the ``SparseTensor(compressed_val=DivisorRemainder)`` from
-    operand vals + the geometry dict returned by
-    :func:`_should_emit_divisor_remainder`. Mirrors the assembly inside
-    ``_try_compressed_union`` (matmul.py:417-455) but emits the new
-    unified primitive."""
+    """Construct a ``SparseTensor`` whose dims are a ``SetIndex`` pair and whose
+    ``val`` is the two per-side block buffers concatenated into a single 1-D
+    Array (so ``val`` stays a plain Array — no constructor / unary-op surgery).
+    Geometry comes from :func:`_should_emit_divisor_remainder`."""
+    from graphax.sparse.indexes import SetIndex
+    from graphax.sparse.tensor import SparseTensor
+
     M = geom["M"]
     n_lhs, n_rhs = geom["n_lhs"], geom["n_rhs"]
     a_b_h, a_b_w = geom["a_b_h"], geom["a_b_w"]
@@ -450,49 +457,32 @@ def _emit_divisor_remainder(lhs, rhs, op, geom):
     else:
         lhs_v = lhs.val * lhs.scalar_mult
         rhs_v = rhs.val * rhs.scalar_mult
-    fill_l = _scaled_fill(lhs)
-    fill_r = _scaled_fill(rhs)
 
-    lhs_blocks = lhs_v.reshape(M, n_lhs, a_b_h, a_b_w)
-    rhs_blocks = rhs_v.reshape(M, n_rhs, b_b_h, b_b_w)
+    lhs_shape = (M, n_lhs, a_b_h, a_b_w)
+    rhs_shape = (M, n_rhs, b_b_h, b_b_w)
+    combined = jnp.concatenate([lhs_v.reshape(-1), rhs_v.reshape(-1)])
 
-    from .block_storage import DivisorRemainder
-
-    dr = DivisorRemainder(
-        divisor=lhs_blocks,
-        remainder=rhs_blocks if geom["include_remainder"] else None,
-        fill_divisor=fill_l,
-        fill_remainder=fill_r,
-        semantic=geom["semantic"],
-        include_remainder=geom["include_remainder"],
-        op=op,
-    )
-    new_fill = op(fill_l, fill_r)
+    new_fill = jnp.array(False) if bool_op else jnp.array(0.0, dtype=lhs.val.dtype)
     s_mult = jnp.array(True) if bool_op else jnp.array(1.0, dtype=lhs.val.dtype)
     zf = (
         getattr(lhs, "_zero_fill", False) and getattr(rhs, "_zero_fill", False)
     ) or None
     out_id, primal_id = geom["out_id"], geom["primal_id"]
 
-    from graphax.sparse.tensor import SparseTensor
-
+    out_ix = SetIndex(
+        id=out_id, size=M, axis=0, other_id=primal_id, block_size=lcm_h, block_axis=1,
+        semantic=geom["semantic"], lhs_shape=lhs_shape, rhs_shape=rhs_shape,
+        include_remainder=geom["include_remainder"], n_meta=1, op=op,
+    )
+    primal_ix = SetIndex(
+        id=primal_id, size=M, axis=0, other_id=out_id, block_size=lcm_w, block_axis=2,
+        semantic=geom["semantic"], lhs_shape=lhs_shape, rhs_shape=rhs_shape,
+        include_remainder=geom["include_remainder"], n_meta=1, op=op,
+    )
     return SparseTensor(
-        (
-            DiagonalIndex(
-                out_id, M, axis=0, other_id=primal_id, block_size=lcm_h, block_axis=1
-            ),
-        ),
-        (
-            DiagonalIndex(
-                primal_id, M, axis=0, other_id=out_id, block_size=lcm_w, block_axis=2
-            ),
-        ),
-        val=None,
-        compressed_val=dr,
-        scalar_mult=s_mult,
-        fill_value=new_fill,
-        check_consistency=False,
-        zero_fill=zf,
+        (out_ix,), (primal_ix,), combined,
+        scalar_mult=s_mult, fill_value=new_fill,
+        check_consistency=False, zero_fill=zf,
     )
 
 

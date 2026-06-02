@@ -164,14 +164,13 @@ class TestUnionBlocksOptimality(unittest.TestCase):
         )
         with track_paths() as paths:
             res = elementwise(a, b, jnp.add)
-        # Phase 6b.3 folded the ``compressed_union`` dispatcher into the
-        # general path; the path label is now ``general`` and the
-        # compressed primitive is ``DivisorRemainder`` (semantic='union').
-        from graphax.sparse.ops.block_storage import DivisorRemainder
+        # Phase 8.F: the general path emits SetIndex output dims (semantic
+        # 'union') + a combined 1-D band buffer in val (no compressed_val).
+        from graphax.sparse.indexes import SetIndex
         self.assertEqual(paths[-1], "general")
-        self.assertIsNotNone(res.compressed_val)
-        self.assertIsInstance(res.compressed_val, DivisorRemainder)
-        self.assertEqual(res.compressed_val.semantic, "union")
+        self.assertIsNotNone(res.val)
+        self.assertTrue(all(isinstance(d, SetIndex) for d in res.dims))
+        self.assertEqual(res.out_dims[0].semantic, "union")
 
     def test_chained_additions_stay_bounded(self):
         """``a + b + c`` where all three have different misaligned block
@@ -306,12 +305,12 @@ class TestIntersectionBlocksOptimality(unittest.TestCase):
         text = to_dense.lower(ib).compile().as_text()
         self.assertEqual(text.lower().count("scatter("), 0)
 
-    def test_elementwise_mul_emits_divisor_remainder(self):
-        """Phase 6b.3: intersection ``mul`` on misaligned 2-D block-diagonals
-        now compresses to ``compressed_val=DivisorRemainder(semantic='intersection')``
-        — same storage win as the union case (which the dispatcher already
-        handled). Pre-6b.3 this output was stored eagerly at LCM granularity."""
-        from graphax.sparse.ops.block_storage import DivisorRemainder
+    def test_elementwise_mul_emits_set_index(self):
+        """Phase 8.F: intersection ``mul`` on misaligned 2-D block-diagonals
+        compresses to ``SetIndex(semantic='intersection')`` output dims + a
+        combined band buffer in ``val`` (no ``compressed_val``). Storage is
+        strictly tighter than the LCM-grid and ``.dense()`` round-trips."""
+        from graphax.sparse.indexes import SetIndex
         # Use the canonical coprime 5/11 case so the storage win is large.
         a = SparseTensor(
             (DiagonalIndex(0, 11, axis=0, other_id=1, block_size=5, block_axis=1),),
@@ -324,22 +323,13 @@ class TestIntersectionBlocksOptimality(unittest.TestCase):
             _n((5, 11, 11), 2),
         )
         res = elementwise(a, b, jnp.multiply, is_intersection=True)
-        # Compressed form: intersection semantic.
-        self.assertIsNotNone(res.compressed_val)
-        self.assertIsInstance(res.compressed_val, DivisorRemainder)
-        self.assertEqual(res.compressed_val.semantic, "intersection")
-        # Storage bound: divisor + remainder buffers strictly tighter than
-        # ``M × LCM_h × LCM_w`` for this coprime geometry.
-        dr = res.compressed_val
-        stored = int(dr.divisor.size) + (
-            int(dr.remainder.size) if dr.remainder is not None else 0
-        )
-        lcm_h = math.lcm(5, 11)
-        lcm_w = math.lcm(5, 11)
-        M = 1
-        meta_size = M * lcm_h * lcm_w
-        self.assertLess(stored, meta_size,
-                        f"compressed should be < eager LCM-grid: {stored} ≥ {meta_size}")
+        self.assertIsNotNone(res.val)
+        self.assertTrue(all(isinstance(d, SetIndex) for d in res.dims))
+        self.assertEqual(res.out_dims[0].semantic, "intersection")
+        # Storage bound: combined band buffer strictly tighter than M·LCM_h·LCM_w.
+        meta_size = 1 * math.lcm(5, 11) * math.lcm(5, 11)
+        self.assertLess(int(res.val.size), meta_size,
+                        f"compressed should be < eager LCM-grid: {int(res.val.size)} ≥ {meta_size}")
         # Dense round-trip matches the reference intersection product.
         ref = a.dense() * b.dense()
         self.assertTrue(jnp.allclose(res.dense(), ref, atol=1e-5))

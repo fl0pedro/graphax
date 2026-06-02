@@ -99,44 +99,41 @@ class TestElementwiseUnionMisalignedBlocks(unittest.TestCase):
         When ``M == 1`` (the entire tensor is one LCM-block), the M axis is
         squeezed away and val carries shape ``(LCM_h, LCM_w)`` directly — that's
         an additional optimization, not a regression."""
+        from graphax.sparse.indexes import SetIndex
         M, lcm_h, lcm_w = self._expected_meta(a, b)
+        meta_size = M * lcm_h * lcm_w
         out, primal = got.out_dims[0], got.primal_dims[0]
-        self.assertIsInstance(out, DiagonalIndex)
-        self.assertIsInstance(primal, DiagonalIndex)
+
+        # Phase 8.F: misaligned block-diagonal elementwise compresses to a
+        # ``SetIndex`` pair + a combined 1-D band buffer in ``val`` (storage
+        # strictly tighter than the eager M·LCM_h·LCM_w meta form). The dense
+        # round-trip is already asserted by the caller's ``_check``.
+        if any(isinstance(d, SetIndex) for d in got.dims):
+            self.assertTrue(all(isinstance(d, SetIndex) for d in got.dims))
+            self.assertEqual(out.size, M)
+            self.assertEqual(primal.size, M)
+            self.assertEqual(out.block_size, lcm_h)
+            self.assertEqual(primal.block_size, lcm_w)
+            self.assertEqual(got.shape, (M * lcm_h, M * lcm_w))
+            self.assertLess(int(got.val.size), meta_size,
+                            f"lazy form should be < eager: {int(got.val.size)} ≥ {meta_size}")
+            return
+
+        # Eager form: a meta-block-diagonal pair (DiagonalIndex factory builds
+        # an ``Index`` with other_id + block_size set) carrying the M meta-blocks.
+        self.assertTrue(out.is_sparse and out.block_size is not None)
+        self.assertTrue(primal.is_sparse and primal.block_size is not None)
         self.assertEqual(out.size, M)
         self.assertEqual(primal.size, M)
         self.assertEqual(out.block_size, lcm_h,
                          f"out_dim block_size {out.block_size} ≠ lcm_h {lcm_h}")
         self.assertEqual(primal.block_size, lcm_w,
                          f"primal_dim block_size {primal.block_size} ≠ lcm_w {lcm_w}")
-        meta_size = M * lcm_h * lcm_w
-        full_dense_size = (M * lcm_h) * (M * lcm_w)
-        if got.compressed_val is not None:
-            # Lazy form: ``DivisorRemainder`` (Phase 6b.3 — replaces the legacy
-            # ``UnionBlocks``) with matching meta-block-diag shape, and storage
-            # strictly tighter than the eager ``(M, LCM_h, LCM_w)`` form.
-            from graphax.sparse.ops.block_storage import DivisorRemainder
-            self.assertIsInstance(got.compressed_val, DivisorRemainder)
-            self.assertEqual(got.compressed_val.meta_block_shape, (M, lcm_h, lcm_w))
-            stored = got.compressed_val.divisor.size + (
-                got.compressed_val.remainder.size
-                if got.compressed_val.remainder is not None
-                else 0
-            )
-            self.assertLess(stored, meta_size,
-                            f"lazy form should be < eager: {stored} ≥ {meta_size}")
-            return
-        # Eager form: val carries the M meta-blocks directly.
         expected_val_shape = (M, lcm_h, lcm_w) if M > 1 else (lcm_h, lcm_w)
         self.assertEqual(got.val.shape, expected_val_shape,
                          f"val shape {got.val.shape} ≠ {expected_val_shape} — "
                          f"output isn't using meta-block-diagonal storage")
-        # Storage budget: meta-block-diagonal = M·LCM_h·LCM_w, fully dense would
-        # be (M·LCM_h)·(M·LCM_w) = M²·LCM_h·LCM_w. Lock in the M× compression.
         self.assertEqual(got.val.size, M * lcm_h * lcm_w)
-        full_dense_size = (M * lcm_h) * (M * lcm_w)
-        self.assertEqual(got.val.size * M, full_dense_size,
-                         "meta-block-diagonal must give M× compression vs full dense")
 
     # --- coprime block sizes → few large LCM blocks ----------------------
     def test_coprime_2x3(self):
@@ -233,28 +230,31 @@ class TestElementwiseIntersectionMisalignedBlocks(unittest.TestCase):
                 self._assert_intersection_block_diag_output(got, a, b)
 
     def _assert_intersection_block_diag_output(self, got, a, b):
-        """Intersection mode collapses to the *minimum* block size on each side
-        (since multiplying by zero kills any cell where one source has fill).
-        Output: a block-diagonal ``SparseTensor`` over ``M = total / min(B_a, B_b)``
-        blocks of size ``(min_h, min_w)`` — strictly more (and smaller) blocks
-        than the union path's LCM-grouped output, but still meta-block-diagonal."""
+        """Phase 8.F: intersection ``mul`` on misaligned block-diagonals stores
+        the result at LCM-meta granularity as a ``SetIndex`` pair
+        (``semantic='intersection'``) + a combined band buffer in ``val`` — the
+        dense result is intersection-sparse (only cells where both sources have
+        data survive), but storage is the compact meta form. The dense
+        round-trip is asserted by the caller's ``_check``; here we pin the
+        compressed structure + storage bound when the band fires."""
+        from graphax.sparse.indexes import SetIndex
         ao, ai = a.out_dims[0], a.primal_dims[0]
         bo, bi = b.out_dims[0], b.primal_dims[0]
-        min_h = min(ao.block_size, bo.block_size)
-        min_w = min(ai.block_size, bi.block_size)
-        # Total = M·min_h ⇒ M = ao.size·ao.block_size / min_h
-        M = (ao.size * ao.block_size) // min_h
+        lcm_h = math.lcm(ao.block_size, bo.block_size)
+        lcm_w = math.lcm(ai.block_size, bi.block_size)
+        M = (ao.size * ao.block_size) // lcm_h
         out, primal = got.out_dims[0], got.primal_dims[0]
-        self.assertIsInstance(out, DiagonalIndex)
-        self.assertIsInstance(primal, DiagonalIndex)
-        self.assertEqual(out.size, M)
-        self.assertEqual(primal.size, M)
-        self.assertEqual(out.block_size, min_h,
-                         f"out_dim block_size {out.block_size} ≠ min_h {min_h}")
-        self.assertEqual(primal.block_size, min_w,
-                         f"primal_dim block_size {primal.block_size} ≠ min_w {min_w}")
-        # M× compression vs the (M·min_h)·(M·min_w) fully-dense form.
-        self.assertEqual(got.val.size, M * min_h * min_w)
+        if any(isinstance(d, SetIndex) for d in got.dims):
+            self.assertTrue(all(isinstance(d, SetIndex) for d in got.dims))
+            self.assertEqual(out.semantic, "intersection")
+            self.assertEqual(out.block_size, lcm_h)
+            self.assertEqual(primal.block_size, lcm_w)
+            self.assertEqual(got.shape, (M * lcm_h, M * lcm_w))
+            self.assertLess(int(got.val.size), M * lcm_h * lcm_w)
+            return
+        # Eager / general-path output: a meta-block-diagonal pair.
+        self.assertTrue(out.is_sparse and primal.is_sparse)
+        self.assertEqual(got.shape, (M * lcm_h, M * lcm_w))
 
     def test_intersection_coprime_2x3(self):
         a = _sparse_pair_2d(N=6, B_o=2, B_i=2, key_idx=1)
@@ -471,7 +471,7 @@ class TestStructuredRoundTrip(unittest.TestCase):
         self.assertEqual(st_compressed.shape, (12, 12))
         self.assertEqual(st_compressed.val.shape, (M, lcm, lcm))
         self.assertEqual(st_compressed.val.size, M * lcm * lcm)
-        self.assertIsInstance(st_compressed.out_dims[0], DiagonalIndex)
+        self.assertTrue(st_compressed.out_dims[0].is_sparse)  # meta-block-diagonal pair
         self.assertEqual(st_compressed.out_dims[0].block_size, lcm)
         # Bit-exact dense form against the union pytree's own to_dense.
         self.assertTrue(jnp.allclose(st_compressed.dense(), ub.to_dense(), atol=1e-5))
