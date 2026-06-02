@@ -12,9 +12,9 @@ Status today (after the `apply_dynamic_sparsity` rewrite):
 * ``factor == 0``   — drop axes (legacy behaviour preserved).
 * ``factor == 1``   — recognised as a no-op (one block ⇒ dense). The rule
   is silently dropped instead of producing a degenerate
-  ``SparseIndex(size=1, block_size=N)`` that the matmul cannot consume.
+  ``DiagonalIndex(size=1, block_size=N)`` that the matmul cannot consume.
 * ``factor == K``   with ``K > 1`` and ``K | N1`` and ``K | N2`` — produces
-  a real block-diagonal (``SparseIndex(size=K, block_size=N/K)``) with both
+  a real block-diagonal (``DiagonalIndex(size=K, block_size=N/K)``) with both
   ``axis`` and ``block_axis`` pointing to dedicated physical axes; the val
   is reshaped to expose the block axis.
 * ``factor == K`` that does *not* divide both dims — falls back to the
@@ -131,7 +131,7 @@ def test_factor_one_is_treated_as_noop():
 
 
 def test_factor_two_block_diagonal_is_finite():
-    """Factor=2 on a size-4 dim produces ``SparseIndex(size=2, block=2)``
+    """Factor=2 on a size-4 dim produces ``DiagonalIndex(size=2, block=2)``
     with a real block axis in the val. Used to crash with an "Incompatible
     shapes for broadcasting" error in `_prepare_contraction_views`."""
     args = _make_args(out_dim=4)  # 4 % 2 == 0

@@ -20,7 +20,7 @@ from jax import Array
 
 from .utils import _arr2st, _is_sparse, _val_or_one, _prepare_physical_array, _materialize_compressed, _is_zero_fill
 from .layout import generate_block_permutation
-from graphax.sparse.indexes import SparseIndex, DenseIndex
+from graphax.sparse.indexes import DiagonalIndex, DenseIndex
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
@@ -94,8 +94,8 @@ def _normalize_inputs(lhs, rhs):
 
 
 def _promote_dense(d, partner_id):
-    """Wrap a DenseIndex into a synthetic 1-block SparseIndex paired with `partner_id`."""
-    return SparseIndex(d.id, 1, axis=None, other_id=partner_id,
+    """Wrap a DenseIndex into a synthetic 1-block DiagonalIndex paired with `partner_id`."""
+    return DiagonalIndex(d.id, 1, axis=None, other_id=partner_id,
                            block_size=d.size, block_axis=d.axis)
 
 
@@ -475,12 +475,12 @@ def _emit_divisor_remainder(lhs, rhs, op, geom):
 
     return SparseTensor(
         (
-            SparseIndex(
+            DiagonalIndex(
                 out_id, M, axis=0, other_id=primal_id, block_size=lcm_h, block_axis=1
             ),
         ),
         (
-            SparseIndex(
+            DiagonalIndex(
                 primal_id, M, axis=0, other_id=out_id, block_size=lcm_w, block_axis=2
             ),
         ),

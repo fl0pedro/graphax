@@ -11,9 +11,13 @@ class Index:
     ``block_size`` / ``block_axis`` are only meaningful for sparse pairs
     (block-diagonal storage) and stay ``None`` for dense and plain sparse.
 
-    The ``DenseIndex`` and ``SparseIndex`` factory functions below construct
-    this class with the appropriate field set, so existing callsites stay
-    unchanged.
+    The ``DenseIndex`` and ``DiagonalIndex`` factory functions below construct
+    this class with the appropriate field set. ``DiagonalIndex`` was
+    historically named ``SparseIndex``; the new name is clearer because the
+    underlying structure is always a meta-block-diagonal pair (an outer-meta
+    + per-meta-block-diagonal block). ``SparseIndex`` is kept as an alias
+    at the bottom of this file for in-flight callers; it will be deleted
+    after the Phase 8 migration completes.
     """
 
     id: int
@@ -51,7 +55,7 @@ def DenseIndex(id: int, size: int, axis: int | None) -> Index:
     return Index(id, size, axis)
 
 
-def SparseIndex(
+def DiagonalIndex(
     id: int,
     size: int,
     axis: int | None,
@@ -59,5 +63,13 @@ def SparseIndex(
     block_size: int | None = None,
     block_axis: int | None = None,
 ) -> Index:
-    """Construct a sparse-paired ``Index`` (``other_id`` points at the partner)."""
+    """Construct a meta-block-diagonal ``Index`` (``other_id`` points at the
+    partner; together the pair encodes a meta-block-diagonal storage layout).
+    Historically named ``SparseIndex``; the new name better describes the
+    underlying structure."""
     return Index(id, size, axis, other_id, block_size, block_axis)
+
+
+# Back-compat alias for the rename in Phase 8.A. Delete after every call
+# site migrates to ``DiagonalIndex``.
+SparseIndex = DiagonalIndex

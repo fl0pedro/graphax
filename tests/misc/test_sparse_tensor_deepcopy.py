@@ -8,7 +8,7 @@ import copy
 
 import jax.numpy as jnp
 
-from graphax.sparse.indexes import DenseIndex, SparseIndex
+from graphax.sparse.indexes import DenseIndex, DiagonalIndex
 from graphax.sparse.tensor import SparseTensor
 
 

@@ -5,7 +5,7 @@ import jax.lax as lax
 from .base import elemental_rules, elemental_only_rules, get_shape
 from ..sparse.tensor import (
     DenseIndex,
-    SparseIndex,
+    DiagonalIndex,
     SparseTensor,
     _swap_back_axes,
 )
@@ -18,7 +18,7 @@ def _dot_general_elementals(primals, out_shape, **params):
     # Which dimensions of the tensors are contracted
     dimension_numbers = params["dimension_numbers"][0]
     batch_dims = params["dimension_numbers"][1]
-    # NOTE: Batch dimensions are just treated as SparseIndex.
+    # NOTE: Batch dimensions are just treated as DiagonalIndex.
 
     lhs_contracting_dims = dimension_numbers[0]
     rhs_contracting_dims = dimension_numbers[1]
@@ -45,17 +45,17 @@ def _dot_general_elementals(primals, out_shape, **params):
             i += 1
         else:
             if lid in lhs_batch_dims:
-                # If it is a batch dimension, we need to treat it as a SparseIndex
+                # If it is a batch dimension, we need to treat it as a DiagonalIndex
                 # with a valid `axis`
                 dim = rhs_batch_dims[ii]
                 ii += 1
 
                 lhs_out_dims.insert(
                     batch_dim_counter,
-                    SparseIndex(batch_dim_counter, ld, dim, other_lid)
+                    DiagonalIndex(batch_dim_counter, ld, dim, other_lid)
                 )
                 lhs_primal_dims.append(
-                    SparseIndex(other_lid, ld, dim, batch_dim_counter)
+                    DiagonalIndex(other_lid, ld, dim, batch_dim_counter)
                 )
                 batch_dim_counter += 1
                 for k in range(batch_dim_counter, len(lhs_out_dims)):
@@ -70,8 +70,8 @@ def _dot_general_elementals(primals, out_shape, **params):
             else:
                 # Otherwise, we can just set `axis` to None
                 _lid = len(lhs_out_dims)
-                lhs_out_dims.append(SparseIndex(_lid, ld, None, other_lid))
-                lhs_primal_dims.append(SparseIndex(other_lid, ld, None, _lid))
+                lhs_out_dims.append(DiagonalIndex(_lid, ld, None, other_lid))
+                lhs_primal_dims.append(DiagonalIndex(other_lid, ld, None, _lid))
                 rhs_out_dims.append(DenseIndex(len(rhs_out_dims), ld, lid))
 
     j, jj = 0, 0
@@ -86,15 +86,15 @@ def _dot_general_elementals(primals, out_shape, **params):
         else:
             if rid in rhs_batch_dims:
                 # If it is a batch dimension, we need to treat it as a
-                # SparseIndex with a valid `axis`
+                # DiagonalIndex with a valid `axis`
                 dim = lhs_batch_dims[jj]
                 jj += 1
                 rhs_out_dims.insert(
                     batch_dim_counter,
-                    SparseIndex(batch_dim_counter, rd, dim, other_rid)
+                    DiagonalIndex(batch_dim_counter, rd, dim, other_rid)
                 )
                 rhs_primal_dims.append(
-                    SparseIndex(other_rid, rd, dim, batch_dim_counter)
+                    DiagonalIndex(other_rid, rd, dim, batch_dim_counter)
                 )
                 batch_dim_counter += 1
                 for k in range(batch_dim_counter, len(rhs_out_dims)):
@@ -109,8 +109,8 @@ def _dot_general_elementals(primals, out_shape, **params):
             else:
                 # Otherwise, we can just set `axis` to None
                 _rid = len(rhs_out_dims)
-                rhs_out_dims.append(SparseIndex(_rid, rd, None, other_rid))
-                rhs_primal_dims.append(SparseIndex(other_rid, rd, None, _rid))
+                rhs_out_dims.append(DiagonalIndex(_rid, rd, None, other_rid))
+                rhs_primal_dims.append(DiagonalIndex(other_rid, rd, None, _rid))
                 lhs_out_dims.append(DenseIndex(len(lhs_out_dims), rd, rid))
 
     lhs_tensor = SparseTensor(lhs_out_dims, lhs_primal_dims, rhs)

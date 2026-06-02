@@ -15,7 +15,7 @@ from jax import Array
 from jax.tree_util import register_pytree_node_class
 from jax.typing import DTypeLike
 
-from graphax.sparse.indexes import DenseIndex, Index, SparseIndex
+from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
 from graphax.sparse.ops.dense import dense
 from graphax.sparse.ops.elementwise import elementwise
 from graphax.sparse.ops.matmul import matmul
@@ -384,7 +384,7 @@ class SparseTensor(SparseMathMixin):
             n_left = len(leftover_dims) // 2
             return cls(
                 (
-                    SparseIndex(
+                    DiagonalIndex(
                         out_id,
                         M,
                         axis=0,
@@ -395,7 +395,7 @@ class SparseTensor(SparseMathMixin):
                 )
                 + leftover_dims[:n_left],
                 (
-                    SparseIndex(
+                    DiagonalIndex(
                         primal_id,
                         M,
                         axis=0,
@@ -950,7 +950,7 @@ def _apply_block_diagonal(
     The two paired physical val axes (one of size ``size*b1``, one of
     ``size*b2``) are reshaped to ``(size, b)`` then collapsed via
     ``jnp.diagonal`` so a single ``size`` axis survives. The block axes
-    survive as the SparseIndex block axes — exactly what matmul needs to
+    survive as the DiagonalIndex block axes — exactly what matmul needs to
     broadcast and reduce a true block-diagonal.
 
     Special cases:
@@ -1058,7 +1058,7 @@ def _apply_block_diagonal(
         return p + 1 if p >= other_shift_threshold else p
 
     def _build(d, other_d, axis, block_axis, b_size):
-        return SparseIndex(
+        return DiagonalIndex(
             id=d.id,
             size=size,
             axis=axis,

@@ -25,7 +25,7 @@ Legality
 --------
 The atomic helpers raise :class:`ValueError` on structural illegality —
 ``i == j``, axes out of range, duplicate physical axes, mismatched
-``SparseIndex`` pairings, etc. Policy code is expected to either mask these
+``DiagonalIndex`` pairings, etc. Policy code is expected to either mask these
 choices out before sampling or catch the ValueError at rollout time.
 
 This module's atomic helpers raise on structural illegality rather than
@@ -41,7 +41,7 @@ from typing import Callable, Sequence, Union
 
 import jax.numpy as jnp
 
-from graphax.sparse.indexes import DenseIndex, Index, SparseIndex
+from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
 from graphax.sparse.tensor import SparseTensor, _apply_block_diagonal
 
 
@@ -56,7 +56,7 @@ class Diag:
 
     ``i`` and ``j`` index into ``st.out_dims + st.primal_dims`` (the
     concatenated logical axis list). ``factor`` is the block size — the
-    resulting :class:`SparseIndex` will have ``size=factor`` and
+    resulting :class:`DiagonalIndex` will have ``size=factor`` and
     ``block_size = N // factor`` for each side. ``factor`` must be a positive
     divisor of both logical sizes. If you want gcd-collapse, pass
     ``factor = math.gcd(N_i, N_j)`` explicitly.

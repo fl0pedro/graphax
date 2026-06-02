@@ -14,7 +14,7 @@ from dataclasses import replace
 from .dense import dense
 from .utils import _copy
 
-from graphax.sparse.indexes import SparseIndex
+from graphax.sparse.indexes import DiagonalIndex
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor

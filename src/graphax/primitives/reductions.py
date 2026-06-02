@@ -12,7 +12,7 @@ from .base import (
 )
 from ..sparse.tensor import (
     DenseIndex,
-    SparseIndex,
+    DiagonalIndex,
     SparseTensor,
     _swap_back_axes,
 )
@@ -35,10 +35,10 @@ def _select_elementals(primals, val_out, **params):
         if out_ndim == 0:
             return SparseTensor([], [], mask)
         out_dims = [
-            SparseIndex(i, s, None, out_ndim + i) for i, s in enumerate(out_shape)
+            DiagonalIndex(i, s, None, out_ndim + i) for i, s in enumerate(out_shape)
         ]
         primal_dims = [
-            SparseIndex(out_ndim + i, s, None, i) for i, s in enumerate(out_shape)
+            DiagonalIndex(out_ndim + i, s, None, i) for i, s in enumerate(out_shape)
         ]
         return SparseTensor(out_dims, primal_dims, mask)
 
@@ -86,8 +86,8 @@ def _reduce_sum_elementals(primals, val_out_ndim, **params):
             count += 1
         else:
             ll = len(new_out_dims)
-            new_out_dims.append(SparseIndex(ll, size, None, l + i))
-            new_primal_dims.append(SparseIndex(l + i, size, None, ll))
+            new_out_dims.append(DiagonalIndex(ll, size, None, l + i))
+            new_primal_dims.append(DiagonalIndex(l + i, size, None, ll))
 
     val = jnp.ones(shape, dtype=jnp.float32)
     return [SparseTensor(new_out_dims, new_primal_dims, val)]
@@ -130,8 +130,8 @@ def _reduce_max_elementals(primals, val_out, **params):
             _shape.append(size)
         else:
             ll = len(new_out_dims)
-            new_out_dims.append(SparseIndex(ll, size, i, l + i))
-            new_primal_dims.append(SparseIndex(l + i, size, i, ll))
+            new_out_dims.append(DiagonalIndex(ll, size, i, l + i))
+            new_primal_dims.append(DiagonalIndex(l + i, size, i, ll))
 
     _val_out = val_out.reshape(shape)
     new_val = jnp.where(primal == _val_out, 1, 0)
@@ -179,8 +179,8 @@ def _reduce_min_elementals(primals, val_out, **params):
             count += 1
         else:
             ll = len(new_out_dims)
-            new_out_dims.append(SparseIndex(ll, size, i, l + i))
-            new_primal_dims.append(SparseIndex(l + i, size, i, ll))
+            new_out_dims.append(DiagonalIndex(ll, size, i, l + i))
+            new_primal_dims.append(DiagonalIndex(l + i, size, i, ll))
 
     new_val = jnp.where(primal == val_out, 1, 0)
     # NOTE: Normalization is important if the minimum is not unique
@@ -237,8 +237,8 @@ def reduce_elemental_rule(primals, agg, **params):
         else:
             ll = len(new_out_dims)
             val = None if "sum" else i
-            new_out_dims.append(SparseIndex(ll, size, val, l + i))
-            new_primal_dims.append(SparseIndex(l + i, size, val, ll))
+            new_out_dims.append(DiagonalIndex(ll, size, val, l + i))
+            new_primal_dims.append(DiagonalIndex(l + i, size, val, ll))
 
     if agg == "sum":
         new_val = jnp.ones(_shape, dtype=jnp.float32)

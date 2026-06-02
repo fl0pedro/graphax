@@ -38,7 +38,7 @@ import jax.numpy as jnp
 import jax.random as jr
 
 from graphax.sparse.tensor import SparseTensor
-from graphax.sparse.indexes import SparseIndex, DenseIndex
+from graphax.sparse.indexes import DiagonalIndex, DenseIndex
 from graphax.sparse.ops.block_storage import UnionBlocks, IntersectionBlocks, BlockBanded
 from graphax.sparse.ops.elementwise import elementwise
 from graphax.sparse.ops.matmul import matmul as sparse_matmul
@@ -54,8 +54,8 @@ def _block_diag(M, B, key):
     """Build a 2-D ``SparseTensor`` representing a square block-diagonal matrix
     with ``M`` blocks of size ``B`` × ``B``."""
     return SparseTensor(
-        (SparseIndex(0, M, axis=0, other_id=1, block_size=B, block_axis=1),),
-        (SparseIndex(1, M, axis=0, other_id=0, block_size=B, block_axis=2),),
+        (DiagonalIndex(0, M, axis=0, other_id=1, block_size=B, block_axis=1),),
+        (DiagonalIndex(1, M, axis=0, other_id=0, block_size=B, block_axis=2),),
         _n((M, B, B), key),
     )
 
@@ -153,13 +153,13 @@ class TestUnionBlocksOptimality(unittest.TestCase):
         # Make logical sizes match: M_a*B_a == M_b*B_b. Use 11 outer blocks
         # of 5 vs 5 outer blocks of 11.
         a = SparseTensor(
-            (SparseIndex(0, 11, axis=0, other_id=1, block_size=5, block_axis=1),),
-            (SparseIndex(1, 11, axis=0, other_id=0, block_size=5, block_axis=2),),
+            (DiagonalIndex(0, 11, axis=0, other_id=1, block_size=5, block_axis=1),),
+            (DiagonalIndex(1, 11, axis=0, other_id=0, block_size=5, block_axis=2),),
             _n((11, 5, 5), 1),
         )
         b = SparseTensor(
-            (SparseIndex(0, 5, axis=0, other_id=1, block_size=11, block_axis=1),),
-            (SparseIndex(1, 5, axis=0, other_id=0, block_size=11, block_axis=2),),
+            (DiagonalIndex(0, 5, axis=0, other_id=1, block_size=11, block_axis=1),),
+            (DiagonalIndex(1, 5, axis=0, other_id=0, block_size=11, block_axis=2),),
             _n((5, 11, 11), 2),
         )
         with track_paths() as paths:
@@ -179,20 +179,20 @@ class TestUnionBlocksOptimality(unittest.TestCase):
         subsequent ``+ c`` must materialize without spending O(LCM³) memory.
         Bound: peak memory ≤ 4 × output_size during the whole chain."""
         a = SparseTensor(
-            (SparseIndex(0, 11, axis=0, other_id=1, block_size=5, block_axis=1),),
-            (SparseIndex(1, 11, axis=0, other_id=0, block_size=5, block_axis=2),),
+            (DiagonalIndex(0, 11, axis=0, other_id=1, block_size=5, block_axis=1),),
+            (DiagonalIndex(1, 11, axis=0, other_id=0, block_size=5, block_axis=2),),
             _n((11, 5, 5), 1),
         )
         b = SparseTensor(
-            (SparseIndex(0, 5, axis=0, other_id=1, block_size=11, block_axis=1),),
-            (SparseIndex(1, 5, axis=0, other_id=0, block_size=11, block_axis=2),),
+            (DiagonalIndex(0, 5, axis=0, other_id=1, block_size=11, block_axis=1),),
+            (DiagonalIndex(1, 5, axis=0, other_id=0, block_size=11, block_axis=2),),
             _n((5, 11, 11), 2),
         )
         # c has the same logical shape (55, 55) but yet another block geometry —
         # 55 blocks of 1×1 (= a pure diagonal of 55).
         c = SparseTensor(
-            (SparseIndex(0, 55, axis=0, other_id=1),),
-            (SparseIndex(1, 55, axis=0, other_id=0),),
+            (DiagonalIndex(0, 55, axis=0, other_id=1),),
+            (DiagonalIndex(1, 55, axis=0, other_id=0),),
             _n((55,), 3),
         )
 
@@ -220,13 +220,13 @@ class TestUnionBlocksOptimality(unittest.TestCase):
         through the SparseTensor wrapping (the compressed_val materialization
         must remain scatter-free)."""
         a = SparseTensor(
-            (SparseIndex(0, 11, axis=0, other_id=1, block_size=5, block_axis=1),),
-            (SparseIndex(1, 11, axis=0, other_id=0, block_size=5, block_axis=2),),
+            (DiagonalIndex(0, 11, axis=0, other_id=1, block_size=5, block_axis=1),),
+            (DiagonalIndex(1, 11, axis=0, other_id=0, block_size=5, block_axis=2),),
             _n((11, 5, 5), 1),
         )
         b = SparseTensor(
-            (SparseIndex(0, 5, axis=0, other_id=1, block_size=11, block_axis=1),),
-            (SparseIndex(1, 5, axis=0, other_id=0, block_size=11, block_axis=2),),
+            (DiagonalIndex(0, 5, axis=0, other_id=1, block_size=11, block_axis=1),),
+            (DiagonalIndex(1, 5, axis=0, other_id=0, block_size=11, block_axis=2),),
             _n((5, 11, 11), 2),
         )
 
@@ -314,13 +314,13 @@ class TestIntersectionBlocksOptimality(unittest.TestCase):
         from graphax.sparse.ops.block_storage import DivisorRemainder
         # Use the canonical coprime 5/11 case so the storage win is large.
         a = SparseTensor(
-            (SparseIndex(0, 11, axis=0, other_id=1, block_size=5, block_axis=1),),
-            (SparseIndex(1, 11, axis=0, other_id=0, block_size=5, block_axis=2),),
+            (DiagonalIndex(0, 11, axis=0, other_id=1, block_size=5, block_axis=1),),
+            (DiagonalIndex(1, 11, axis=0, other_id=0, block_size=5, block_axis=2),),
             _n((11, 5, 5), 1),
         )
         b = SparseTensor(
-            (SparseIndex(0, 5, axis=0, other_id=1, block_size=11, block_axis=1),),
-            (SparseIndex(1, 5, axis=0, other_id=0, block_size=11, block_axis=2),),
+            (DiagonalIndex(0, 5, axis=0, other_id=1, block_size=11, block_axis=1),),
+            (DiagonalIndex(1, 5, axis=0, other_id=0, block_size=11, block_axis=2),),
             _n((5, 11, 11), 2),
         )
         res = elementwise(a, b, jnp.multiply, is_intersection=True)
@@ -379,16 +379,16 @@ class TestBlockBandedOptimality(unittest.TestCase):
         # Logical contracting axis must match: M·B_a_w == M·B_b_h.
         assert B_a_w == B_b_h, "contracting block must match"
         a = SparseTensor(
-            (SparseIndex(0, M, axis=0, other_id=1,
+            (DiagonalIndex(0, M, axis=0, other_id=1,
                              block_size=B_a_h, block_axis=1),),
-            (SparseIndex(1, M, axis=0, other_id=0,
+            (DiagonalIndex(1, M, axis=0, other_id=0,
                              block_size=B_a_w, block_axis=2),),
             _n((M, B_a_h, B_a_w), key),
         )
         b = SparseTensor(
-            (SparseIndex(0, M, axis=0, other_id=1,
+            (DiagonalIndex(0, M, axis=0, other_id=1,
                              block_size=B_b_h, block_axis=1),),
-            (SparseIndex(1, M, axis=0, other_id=0,
+            (DiagonalIndex(1, M, axis=0, other_id=0,
                              block_size=B_b_w, block_axis=2),),
             _n((M, B_b_h, B_b_w), key + 1),
         )
@@ -534,13 +534,13 @@ class TestEndToEndPeakMemoryBound(unittest.TestCase):
         """``a + b`` on the canonical 5/11 block diagonals — peak memory
         must not exceed roughly ``|a| + |b| + |compressed_output|``."""
         a = SparseTensor(
-            (SparseIndex(0, 11, axis=0, other_id=1, block_size=5, block_axis=1),),
-            (SparseIndex(1, 11, axis=0, other_id=0, block_size=5, block_axis=2),),
+            (DiagonalIndex(0, 11, axis=0, other_id=1, block_size=5, block_axis=1),),
+            (DiagonalIndex(1, 11, axis=0, other_id=0, block_size=5, block_axis=2),),
             _n((11, 5, 5), 1),
         )
         b = SparseTensor(
-            (SparseIndex(0, 5, axis=0, other_id=1, block_size=11, block_axis=1),),
-            (SparseIndex(1, 5, axis=0, other_id=0, block_size=11, block_axis=2),),
+            (DiagonalIndex(0, 5, axis=0, other_id=1, block_size=11, block_axis=1),),
+            (DiagonalIndex(1, 5, axis=0, other_id=0, block_size=11, block_axis=2),),
             _n((5, 11, 11), 2),
         )
 
@@ -568,13 +568,13 @@ class TestEndToEndPeakMemoryBound(unittest.TestCase):
         eager block-diagonal."""
         M = 2  # 2 meta-blocks of 11×11
         a = SparseTensor(
-            (SparseIndex(0, M, axis=0, other_id=1, block_size=5, block_axis=1),),
-            (SparseIndex(1, M, axis=0, other_id=0, block_size=11, block_axis=2),),
+            (DiagonalIndex(0, M, axis=0, other_id=1, block_size=5, block_axis=1),),
+            (DiagonalIndex(1, M, axis=0, other_id=0, block_size=11, block_axis=2),),
             _n((M, 5, 11), 1),
         )
         b = SparseTensor(
-            (SparseIndex(0, M, axis=0, other_id=1, block_size=11, block_axis=1),),
-            (SparseIndex(1, M, axis=0, other_id=0, block_size=5, block_axis=2),),
+            (DiagonalIndex(0, M, axis=0, other_id=1, block_size=11, block_axis=1),),
+            (DiagonalIndex(1, M, axis=0, other_id=0, block_size=5, block_axis=2),),
             _n((M, 11, 5), 2),
         )
 
@@ -622,23 +622,23 @@ class TestMultiAxisContractMatmul(unittest.TestCase):
         2/3). Output must equal a hand-rolled einsum reference."""
         a = SparseTensor(
             (
-                SparseIndex(0, 11, axis=0, other_id=2, block_size=5, block_axis=2),
-                SparseIndex(1, 3,  axis=1, other_id=3, block_size=4, block_axis=4),
+                DiagonalIndex(0, 11, axis=0, other_id=2, block_size=5, block_axis=2),
+                DiagonalIndex(1, 3,  axis=1, other_id=3, block_size=4, block_axis=4),
             ),
             (
-                SparseIndex(2, 11, axis=0, other_id=0, block_size=5, block_axis=3),
-                SparseIndex(3, 3,  axis=1, other_id=1, block_size=2, block_axis=5),
+                DiagonalIndex(2, 11, axis=0, other_id=0, block_size=5, block_axis=3),
+                DiagonalIndex(3, 3,  axis=1, other_id=1, block_size=2, block_axis=5),
             ),
             _n((11, 3, 5, 5, 4, 2), 1),
         )
         b = SparseTensor(
             (
-                SparseIndex(0, 5, axis=0, other_id=2, block_size=11, block_axis=2),
-                SparseIndex(1, 2, axis=1, other_id=3, block_size=3,  block_axis=4),
+                DiagonalIndex(0, 5, axis=0, other_id=2, block_size=11, block_axis=2),
+                DiagonalIndex(1, 2, axis=1, other_id=3, block_size=3,  block_axis=4),
             ),
             (
-                SparseIndex(2, 5, axis=0, other_id=0, block_size=7, block_axis=3),
-                SparseIndex(3, 2, axis=1, other_id=1, block_size=9, block_axis=5),
+                DiagonalIndex(2, 5, axis=0, other_id=0, block_size=7, block_axis=3),
+                DiagonalIndex(3, 2, axis=1, other_id=1, block_size=9, block_axis=5),
             ),
             _n((5, 2, 11, 7, 3, 9), 2),
         )
@@ -654,23 +654,23 @@ class TestMultiAxisContractMatmul(unittest.TestCase):
 
         a = SparseTensor(
             (
-                SparseIndex(0, 11, axis=0, other_id=2, block_size=5, block_axis=2),
-                SparseIndex(1, 3,  axis=1, other_id=3, block_size=4, block_axis=4),
+                DiagonalIndex(0, 11, axis=0, other_id=2, block_size=5, block_axis=2),
+                DiagonalIndex(1, 3,  axis=1, other_id=3, block_size=4, block_axis=4),
             ),
             (
-                SparseIndex(2, 11, axis=0, other_id=0, block_size=5, block_axis=3),
-                SparseIndex(3, 3,  axis=1, other_id=1, block_size=2, block_axis=5),
+                DiagonalIndex(2, 11, axis=0, other_id=0, block_size=5, block_axis=3),
+                DiagonalIndex(3, 3,  axis=1, other_id=1, block_size=2, block_axis=5),
             ),
             _n((11, 3, 5, 5, 4, 2), 1),
         )
         b = SparseTensor(
             (
-                SparseIndex(0, 5, axis=0, other_id=2, block_size=11, block_axis=2),
-                SparseIndex(1, 2, axis=1, other_id=3, block_size=3,  block_axis=4),
+                DiagonalIndex(0, 5, axis=0, other_id=2, block_size=11, block_axis=2),
+                DiagonalIndex(1, 2, axis=1, other_id=3, block_size=3,  block_axis=4),
             ),
             (
-                SparseIndex(2, 5, axis=0, other_id=0, block_size=7, block_axis=3),
-                SparseIndex(3, 2, axis=1, other_id=1, block_size=9, block_axis=5),
+                DiagonalIndex(2, 5, axis=0, other_id=0, block_size=7, block_axis=3),
+                DiagonalIndex(3, 2, axis=1, other_id=1, block_size=9, block_axis=5),
             ),
             _n((5, 2, 11, 7, 3, 9), 2),
         )
@@ -713,23 +713,23 @@ class TestMultiAxisElementwise(unittest.TestCase):
         3/4). Output must equal dense add."""
         a = SparseTensor(
             (
-                SparseIndex(0, 7, axis=0, other_id=2, block_size=5, block_axis=2),
-                SparseIndex(1, 4, axis=1, other_id=3, block_size=3, block_axis=4),
+                DiagonalIndex(0, 7, axis=0, other_id=2, block_size=5, block_axis=2),
+                DiagonalIndex(1, 4, axis=1, other_id=3, block_size=3, block_axis=4),
             ),
             (
-                SparseIndex(2, 7, axis=0, other_id=0, block_size=5, block_axis=3),
-                SparseIndex(3, 4, axis=1, other_id=1, block_size=3, block_axis=5),
+                DiagonalIndex(2, 7, axis=0, other_id=0, block_size=5, block_axis=3),
+                DiagonalIndex(3, 4, axis=1, other_id=1, block_size=3, block_axis=5),
             ),
             _n((7, 4, 5, 5, 3, 3), 1),
         )
         b = SparseTensor(
             (
-                SparseIndex(0, 5, axis=0, other_id=2, block_size=7, block_axis=2),
-                SparseIndex(1, 3, axis=1, other_id=3, block_size=4, block_axis=4),
+                DiagonalIndex(0, 5, axis=0, other_id=2, block_size=7, block_axis=2),
+                DiagonalIndex(1, 3, axis=1, other_id=3, block_size=4, block_axis=4),
             ),
             (
-                SparseIndex(2, 5, axis=0, other_id=0, block_size=7, block_axis=3),
-                SparseIndex(3, 3, axis=1, other_id=1, block_size=4, block_axis=5),
+                DiagonalIndex(2, 5, axis=0, other_id=0, block_size=7, block_axis=3),
+                DiagonalIndex(3, 3, axis=1, other_id=1, block_size=4, block_axis=5),
             ),
             _n((5, 3, 7, 7, 4, 4), 2),
         )
@@ -743,23 +743,23 @@ class TestMultiAxisElementwise(unittest.TestCase):
         the general path still produces the correct dense result."""
         a = SparseTensor(
             (
-                SparseIndex(0, 7, axis=0, other_id=2, block_size=5, block_axis=2),
-                SparseIndex(1, 4, axis=1, other_id=3, block_size=3, block_axis=4),
+                DiagonalIndex(0, 7, axis=0, other_id=2, block_size=5, block_axis=2),
+                DiagonalIndex(1, 4, axis=1, other_id=3, block_size=3, block_axis=4),
             ),
             (
-                SparseIndex(2, 7, axis=0, other_id=0, block_size=5, block_axis=3),
-                SparseIndex(3, 4, axis=1, other_id=1, block_size=3, block_axis=5),
+                DiagonalIndex(2, 7, axis=0, other_id=0, block_size=5, block_axis=3),
+                DiagonalIndex(3, 4, axis=1, other_id=1, block_size=3, block_axis=5),
             ),
             _n((7, 4, 5, 5, 3, 3), 1),
         )
         b = SparseTensor(
             (
-                SparseIndex(0, 5, axis=0, other_id=2, block_size=7, block_axis=2),
-                SparseIndex(1, 3, axis=1, other_id=3, block_size=4, block_axis=4),
+                DiagonalIndex(0, 5, axis=0, other_id=2, block_size=7, block_axis=2),
+                DiagonalIndex(1, 3, axis=1, other_id=3, block_size=4, block_axis=4),
             ),
             (
-                SparseIndex(2, 5, axis=0, other_id=0, block_size=7, block_axis=3),
-                SparseIndex(3, 3, axis=1, other_id=1, block_size=4, block_axis=5),
+                DiagonalIndex(2, 5, axis=0, other_id=0, block_size=7, block_axis=3),
+                DiagonalIndex(3, 3, axis=1, other_id=1, block_size=4, block_axis=5),
             ),
             _n((5, 3, 7, 7, 4, 4), 2),
         )
@@ -772,27 +772,27 @@ class TestMultiAxisElementwise(unittest.TestCase):
         2/3 coprime). Output must equal dense add."""
         a3 = SparseTensor(
             (
-                SparseIndex(0, 3, axis=0, other_id=3, block_size=2, block_axis=3),
-                SparseIndex(1, 3, axis=1, other_id=4, block_size=2, block_axis=5),
-                SparseIndex(2, 3, axis=2, other_id=5, block_size=2, block_axis=7),
+                DiagonalIndex(0, 3, axis=0, other_id=3, block_size=2, block_axis=3),
+                DiagonalIndex(1, 3, axis=1, other_id=4, block_size=2, block_axis=5),
+                DiagonalIndex(2, 3, axis=2, other_id=5, block_size=2, block_axis=7),
             ),
             (
-                SparseIndex(3, 3, axis=0, other_id=0, block_size=2, block_axis=4),
-                SparseIndex(4, 3, axis=1, other_id=1, block_size=2, block_axis=6),
-                SparseIndex(5, 3, axis=2, other_id=2, block_size=2, block_axis=8),
+                DiagonalIndex(3, 3, axis=0, other_id=0, block_size=2, block_axis=4),
+                DiagonalIndex(4, 3, axis=1, other_id=1, block_size=2, block_axis=6),
+                DiagonalIndex(5, 3, axis=2, other_id=2, block_size=2, block_axis=8),
             ),
             _n((3, 3, 3, 2, 2, 2, 2, 2, 2), 1),
         )
         b3 = SparseTensor(
             (
-                SparseIndex(0, 2, axis=0, other_id=3, block_size=3, block_axis=3),
-                SparseIndex(1, 2, axis=1, other_id=4, block_size=3, block_axis=5),
-                SparseIndex(2, 2, axis=2, other_id=5, block_size=3, block_axis=7),
+                DiagonalIndex(0, 2, axis=0, other_id=3, block_size=3, block_axis=3),
+                DiagonalIndex(1, 2, axis=1, other_id=4, block_size=3, block_axis=5),
+                DiagonalIndex(2, 2, axis=2, other_id=5, block_size=3, block_axis=7),
             ),
             (
-                SparseIndex(3, 2, axis=0, other_id=0, block_size=3, block_axis=4),
-                SparseIndex(4, 2, axis=1, other_id=1, block_size=3, block_axis=6),
-                SparseIndex(5, 2, axis=2, other_id=2, block_size=3, block_axis=8),
+                DiagonalIndex(3, 2, axis=0, other_id=0, block_size=3, block_axis=4),
+                DiagonalIndex(4, 2, axis=1, other_id=1, block_size=3, block_axis=6),
+                DiagonalIndex(5, 2, axis=2, other_id=2, block_size=3, block_axis=8),
             ),
             _n((2, 2, 2, 3, 3, 3, 3, 3, 3), 2),
         )
@@ -807,23 +807,23 @@ class TestMultiAxisElementwise(unittest.TestCase):
         assertion when multi-axis DivisorRemainder lands."""
         a = SparseTensor(
             (
-                SparseIndex(0, 7, axis=0, other_id=2, block_size=5, block_axis=2),
-                SparseIndex(1, 4, axis=1, other_id=3, block_size=3, block_axis=4),
+                DiagonalIndex(0, 7, axis=0, other_id=2, block_size=5, block_axis=2),
+                DiagonalIndex(1, 4, axis=1, other_id=3, block_size=3, block_axis=4),
             ),
             (
-                SparseIndex(2, 7, axis=0, other_id=0, block_size=5, block_axis=3),
-                SparseIndex(3, 4, axis=1, other_id=1, block_size=3, block_axis=5),
+                DiagonalIndex(2, 7, axis=0, other_id=0, block_size=5, block_axis=3),
+                DiagonalIndex(3, 4, axis=1, other_id=1, block_size=3, block_axis=5),
             ),
             _n((7, 4, 5, 5, 3, 3), 1),
         )
         b = SparseTensor(
             (
-                SparseIndex(0, 5, axis=0, other_id=2, block_size=7, block_axis=2),
-                SparseIndex(1, 3, axis=1, other_id=3, block_size=4, block_axis=4),
+                DiagonalIndex(0, 5, axis=0, other_id=2, block_size=7, block_axis=2),
+                DiagonalIndex(1, 3, axis=1, other_id=3, block_size=4, block_axis=4),
             ),
             (
-                SparseIndex(2, 5, axis=0, other_id=0, block_size=7, block_axis=3),
-                SparseIndex(3, 3, axis=1, other_id=1, block_size=4, block_axis=5),
+                DiagonalIndex(2, 5, axis=0, other_id=0, block_size=7, block_axis=3),
+                DiagonalIndex(3, 3, axis=1, other_id=1, block_size=4, block_axis=5),
             ),
             _n((5, 3, 7, 7, 4, 4), 2),
         )

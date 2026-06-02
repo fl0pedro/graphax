@@ -206,7 +206,7 @@ class PrimitiveTest(unittest.TestCase):
     def test_concatenate_sparse_none(self):
         # f(x, y) = concat(x, y) is the identity on the concat output.
         # In rev mode the accumulated Jacobian at the concat node is the full
-        # identity tensor, represented as a SparseIndex pair with axis=None.
+        # identity tensor, represented as a DiagonalIndex pair with axis=None.
         # This directly exercises the else-branch of inverse_concatenate_transform.
         def f(x, y):
             z, w = jnp.sin(x), jnp.log(y)

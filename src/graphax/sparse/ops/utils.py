@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-from graphax.sparse.indexes import Index, DenseIndex, SparseIndex
+from graphax.sparse.indexes import Index, DenseIndex, DiagonalIndex
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
@@ -182,7 +182,7 @@ def _check_block_axis(d, dim_map, block_axiss):
         other = dim_map.get(d.other_id)
         if not (other.is_sparse and other.block_axis == d.block_axis):
             raise ValueError(
-                f"Topology Error: Duplicate block_axis {d.block_axis} in SparseIndex {d.id}"
+                f"Topology Error: Duplicate block_axis {d.block_axis} in DiagonalIndex {d.id}"
             )
     block_axiss.add(d.block_axis)
 
@@ -190,7 +190,7 @@ def _check_block_axis(d, dim_map, block_axiss):
 def _assert_sparse_tensor_consistency(st: SparseTensor):
     # Raise (not ``assert``) so the invariant survives ``python -O`` /
     # ``PYTHONOPTIMIZE`` — every downstream op assumes contiguous IDs and
-    # paired SparseIndex links, and silently dropping the check has caused
+    # paired DiagonalIndex links, and silently dropping the check has caused
     # wrong-shape Jacobians in the past.
     dim_ids = [d.id for d in st.dims]
     if set(dim_ids) != set(range(len(dim_ids))):

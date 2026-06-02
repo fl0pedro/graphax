@@ -2,7 +2,7 @@
 
 Under ``python -O`` (or ``PYTHONOPTIMIZE=1``) the bytecode compiler strips
 ``assert`` statements entirely, so the contiguous-IDs invariant and the
-SparseIndex pairing invariant — which every downstream op assumes — would
+DiagonalIndex pairing invariant — which every downstream op assumes — would
 silently disappear. A mismatched-id ``SparseTensor`` would then be
 constructed without protest and propagate misaligned dims into matmul /
 elementwise, producing wildly wrong shapes downstream.
@@ -17,7 +17,7 @@ This test is also run under ``-O`` from the unit's verification step:
 import jax.numpy as jnp
 import pytest
 
-from graphax.sparse.indexes import DenseIndex, SparseIndex
+from graphax.sparse.indexes import DenseIndex, DiagonalIndex
 from graphax.sparse.tensor import SparseTensor
 
 
@@ -36,11 +36,11 @@ def test_mismatched_dim_ids_raise_not_assert():
 
 
 def test_unpaired_sparse_dim_raises_not_assert():
-    """A SparseIndex whose ``other_id`` doesn't point to a matching sibling
+    """A DiagonalIndex whose ``other_id`` doesn't point to a matching sibling
     must be rejected by the consistency check — under ``-O`` too."""
-    # SparseIndex.other_id=99 is bogus; no sibling in the tensor.
-    bad_out = (SparseIndex(0, 3, 0, other_id=99),)
-    bad_primal = (SparseIndex(1, 3, 1, other_id=0),)
+    # DiagonalIndex.other_id=99 is bogus; no sibling in the tensor.
+    bad_out = (DiagonalIndex(0, 3, 0, other_id=99),)
+    bad_primal = (DiagonalIndex(1, 3, 1, other_id=0),)
     val = jnp.zeros((3, 3))
     with pytest.raises(ValueError, match="sparse dimension pair"):
         SparseTensor(bad_out, bad_primal, val)

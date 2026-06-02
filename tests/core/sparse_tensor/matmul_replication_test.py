@@ -5,7 +5,7 @@ import jax.lax as lax
 import jax.numpy as jnp
 import jax.random as jrand
 
-from graphax.sparse.indexes import DenseIndex, SparseIndex
+from graphax.sparse.indexes import DenseIndex, DiagonalIndex
 from graphax.sparse.tensor import SparseTensor
 from utils import assert_matmul_result
 
@@ -60,13 +60,13 @@ class TestReplicationMatmul(unittest.TestCase):
         res = jnp.einsum("ijk,jkl->il", _x, _y)
 
         stx = SparseTensor(
-            [SparseIndex(0, 4, 0, 1)],
-            [SparseIndex(1, 4, 0, 0), DenseIndex(2, 5, None)],
+            [DiagonalIndex(0, 4, 0, 1)],
+            [DiagonalIndex(1, 4, 0, 0), DenseIndex(2, 5, None)],
             x,
         )
         sty = SparseTensor(
-            [DenseIndex(0, 4, 0), SparseIndex(1, 5, 1, 2)],
-            [SparseIndex(2, 5, 1, 1)],
+            [DenseIndex(0, 4, 0), DiagonalIndex(1, 5, 1, 2)],
+            [DiagonalIndex(2, 5, 1, 1)],
             y,
         )
         stres = stx @ sty
@@ -88,13 +88,13 @@ class TestReplicationMatmul(unittest.TestCase):
         res = jnp.einsum("ijk,jkl->il", _x, _y)
 
         stx = SparseTensor(
-            [SparseIndex(0, 4, 0, 1)],
-            [SparseIndex(1, 4, 0, 0), DenseIndex(2, 5, 1)],
+            [DiagonalIndex(0, 4, 0, 1)],
+            [DiagonalIndex(1, 4, 0, 0), DenseIndex(2, 5, 1)],
             x,
         )
         sty = SparseTensor(
-            [DenseIndex(0, 4, None), SparseIndex(1, 5, 0, 2)],
-            [SparseIndex(2, 5, 0, 1)],
+            [DenseIndex(0, 4, None), DiagonalIndex(1, 5, 0, 2)],
+            [DiagonalIndex(2, 5, 0, 1)],
             y,
         )
         stres = stx @ sty
@@ -114,8 +114,8 @@ class TestReplicationMatmul(unittest.TestCase):
         res = jnp.einsum("ijkl,klm->ijm", _x, _y)
 
         stx = SparseTensor(
-            [DenseIndex(0, 3, 0), SparseIndex(1, 4, 1, 2)],
-            [SparseIndex(2, 4, 1, 1), DenseIndex(3, 5, 2)],
+            [DenseIndex(0, 3, 0), DiagonalIndex(1, 4, 1, 2)],
+            [DiagonalIndex(2, 4, 1, 1), DenseIndex(3, 5, 2)],
             x,
         )
         sty = SparseTensor(

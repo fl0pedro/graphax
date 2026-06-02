@@ -20,7 +20,7 @@ Sparsity assertions
 Beyond correctness, every union / intersection test also pins down the *structure*
 of the output: the elementwise output of two block-diagonal sources with LCM-block
 size ``L`` over an ``M``-meta-block grid must be a meta-block-diagonal
-``SparseTensor`` (one ``SparseIndex`` pair of size ``M`` with ``block_size = L``,
+``SparseTensor`` (one ``DiagonalIndex`` pair of size ``M`` with ``block_size = L``,
 val of shape ``(M, L_h, L_w, *L)``) — *not* a fully dense ``(M*L_h, M*L_w)`` buffer.
 That's the structure ``SparseTensor.from_compressed(UnionBlocks(...))`` produces, and
 the structure that lets every downstream sparse op stay on the block-diagonal fast
@@ -37,7 +37,7 @@ import jax.numpy as jnp
 import jax.random as jr
 
 from graphax.sparse.tensor import SparseTensor
-from graphax.sparse.indexes import DenseIndex, SparseIndex
+from graphax.sparse.indexes import DenseIndex, DiagonalIndex
 from graphax.sparse.ops.matmul import matmul
 from graphax.sparse.ops.elementwise import elementwise
 from graphax.sparse.ops.block_storage import UnionBlocks, IntersectionBlocks
@@ -50,8 +50,8 @@ def _n(shape, key_idx, dtype=jnp.float32):
 def _sparse_pair_2d(N, B_o, B_i, key_idx):
     """A 2-D SparseTensor with one sparse pair of size ``N`` and block_sizes ``(B_o, B_i)``."""
     return SparseTensor(
-        (SparseIndex(0, N, axis=0, other_id=1, block_size=B_o, block_axis=1),),
-        (SparseIndex(1, N, axis=0, other_id=0, block_size=B_i, block_axis=2),),
+        (DiagonalIndex(0, N, axis=0, other_id=1, block_size=B_o, block_axis=1),),
+        (DiagonalIndex(1, N, axis=0, other_id=0, block_size=B_i, block_axis=2),),
         _n((N, B_o, B_i), key_idx),
     )
 
@@ -101,8 +101,8 @@ class TestElementwiseUnionMisalignedBlocks(unittest.TestCase):
         an additional optimization, not a regression."""
         M, lcm_h, lcm_w = self._expected_meta(a, b)
         out, primal = got.out_dims[0], got.primal_dims[0]
-        self.assertIsInstance(out, SparseIndex)
-        self.assertIsInstance(primal, SparseIndex)
+        self.assertIsInstance(out, DiagonalIndex)
+        self.assertIsInstance(primal, DiagonalIndex)
         self.assertEqual(out.size, M)
         self.assertEqual(primal.size, M)
         self.assertEqual(out.block_size, lcm_h,
@@ -197,13 +197,13 @@ class TestElementwiseUnionMisalignedBlocks(unittest.TestCase):
         # lhs: outer=12*B_o, inner=12*B_i must match rhs: outer=N_r*B_o', inner=N_r*B_i'
         # Choose N_l=12, B_lo=2, B_li=3 → 24x36; N_r=6, B_ro=4, B_ri=6 → 24x36 ✓
         a = SparseTensor(
-            (SparseIndex(0, 12, axis=0, other_id=1, block_size=2, block_axis=1),),
-            (SparseIndex(1, 12, axis=0, other_id=0, block_size=3, block_axis=2),),
+            (DiagonalIndex(0, 12, axis=0, other_id=1, block_size=2, block_axis=1),),
+            (DiagonalIndex(1, 12, axis=0, other_id=0, block_size=3, block_axis=2),),
             _n((12, 2, 3), 1),
         )
         b = SparseTensor(
-            (SparseIndex(0, 6, axis=0, other_id=1, block_size=4, block_axis=1),),
-            (SparseIndex(1, 6, axis=0, other_id=0, block_size=6, block_axis=2),),
+            (DiagonalIndex(0, 6, axis=0, other_id=1, block_size=4, block_axis=1),),
+            (DiagonalIndex(1, 6, axis=0, other_id=0, block_size=6, block_axis=2),),
             _n((6, 4, 6), 2),
         )
         self.assertEqual(a.shape, (24, 36))
@@ -245,8 +245,8 @@ class TestElementwiseIntersectionMisalignedBlocks(unittest.TestCase):
         # Total = M·min_h ⇒ M = ao.size·ao.block_size / min_h
         M = (ao.size * ao.block_size) // min_h
         out, primal = got.out_dims[0], got.primal_dims[0]
-        self.assertIsInstance(out, SparseIndex)
-        self.assertIsInstance(primal, SparseIndex)
+        self.assertIsInstance(out, DiagonalIndex)
+        self.assertIsInstance(primal, DiagonalIndex)
         self.assertEqual(out.size, M)
         self.assertEqual(primal.size, M)
         self.assertEqual(out.block_size, min_h,
@@ -311,13 +311,13 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
     def test_2d_coprime_3x5_contract(self):
         # Bigger coprime: LCM(3,5)=15 along the contracting axis
         a = SparseTensor(
-            (SparseIndex(0, 10, axis=0, other_id=1, block_size=3, block_axis=1),),
-            (SparseIndex(1, 10, axis=0, other_id=0, block_size=3, block_axis=2),),
+            (DiagonalIndex(0, 10, axis=0, other_id=1, block_size=3, block_axis=1),),
+            (DiagonalIndex(1, 10, axis=0, other_id=0, block_size=3, block_axis=2),),
             _n((10, 3, 3), 1),
         )
         b = SparseTensor(
-            (SparseIndex(0, 6, axis=0, other_id=1, block_size=5, block_axis=1),),
-            (SparseIndex(1, 6, axis=0, other_id=0, block_size=5, block_axis=2),),
+            (DiagonalIndex(0, 6, axis=0, other_id=1, block_size=5, block_axis=1),),
+            (DiagonalIndex(1, 6, axis=0, other_id=0, block_size=5, block_axis=2),),
             _n((6, 5, 5), 2),
         )
         # logical: a is 30x30, b is 30x30 → result 30x30
@@ -344,17 +344,17 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
         a = SparseTensor(
             (
                 DenseIndex(0, s1, 0),
-                SparseIndex(1, 6, axis=1, other_id=2, block_size=2, block_axis=2),
+                DiagonalIndex(1, 6, axis=1, other_id=2, block_size=2, block_axis=2),
             ),
-            (SparseIndex(2, 6, axis=1, other_id=1, block_size=2, block_axis=3),),
+            (DiagonalIndex(2, 6, axis=1, other_id=1, block_size=2, block_axis=3),),
             _n((s1, 6, 2, 2), 1),  # (s1, N, B_o, B_i)
         )
         b = SparseTensor(
             (
                 DenseIndex(0, s1, 0),
-                SparseIndex(1, 4, axis=1, other_id=2, block_size=3, block_axis=2),
+                DiagonalIndex(1, 4, axis=1, other_id=2, block_size=3, block_axis=2),
             ),
-            (SparseIndex(2, 4, axis=1, other_id=1, block_size=3, block_axis=3),),
+            (DiagonalIndex(2, 4, axis=1, other_id=1, block_size=3, block_axis=3),),
             _n((s1, 4, 3, 3), 2),
         )
         # logical a: (s1, 12, 12), b: (s1, 12, 12)
@@ -368,18 +368,18 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
             (
                 DenseIndex(0, s1, 0),
                 DenseIndex(1, s2, 1),
-                SparseIndex(2, 6, axis=2, other_id=3, block_size=2, block_axis=3),
+                DiagonalIndex(2, 6, axis=2, other_id=3, block_size=2, block_axis=3),
             ),
-            (SparseIndex(3, 6, axis=2, other_id=2, block_size=2, block_axis=4),),
+            (DiagonalIndex(3, 6, axis=2, other_id=2, block_size=2, block_axis=4),),
             _n((s1, s2, 6, 2, 2), 1),  # (s1, s2, N, B_o, B_i)
         )
         b = SparseTensor(
             (
                 DenseIndex(0, s1, 0),
                 DenseIndex(1, s2, 1),
-                SparseIndex(2, 4, axis=2, other_id=3, block_size=3, block_axis=3),
+                DiagonalIndex(2, 4, axis=2, other_id=3, block_size=3, block_axis=3),
             ),
-            (SparseIndex(3, 4, axis=2, other_id=2, block_size=3, block_axis=4),),
+            (DiagonalIndex(3, 4, axis=2, other_id=2, block_size=3, block_axis=4),),
             _n((s1, s2, 4, 3, 3), 2),
         )
         # logical a: (s1, s2, 12, 12), b: (s1, s2, 12, 12)
@@ -393,23 +393,23 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
         # Use dot_general for the reference (jnp.matmul wouldn't contract two axes).
         a = SparseTensor(
             (
-                SparseIndex(0, 6, axis=0, other_id=2, block_size=2, block_axis=1),
-                SparseIndex(1, 8, axis=2, other_id=3, block_size=2, block_axis=3),
+                DiagonalIndex(0, 6, axis=0, other_id=2, block_size=2, block_axis=1),
+                DiagonalIndex(1, 8, axis=2, other_id=3, block_size=2, block_axis=3),
             ),
             (
-                SparseIndex(2, 6, axis=0, other_id=0, block_size=2, block_axis=4),
-                SparseIndex(3, 8, axis=2, other_id=1, block_size=2, block_axis=5),
+                DiagonalIndex(2, 6, axis=0, other_id=0, block_size=2, block_axis=4),
+                DiagonalIndex(3, 8, axis=2, other_id=1, block_size=2, block_axis=5),
             ),
             _n((6, 2, 8, 2, 2, 2), 1),  # (N1, B_o1, N2, B_o2, B_i1, B_i2)
         )
         b = SparseTensor(
             (
-                SparseIndex(0, 4, axis=0, other_id=2, block_size=3, block_axis=1),
-                SparseIndex(1, 4, axis=2, other_id=3, block_size=4, block_axis=3),
+                DiagonalIndex(0, 4, axis=0, other_id=2, block_size=3, block_axis=1),
+                DiagonalIndex(1, 4, axis=2, other_id=3, block_size=4, block_axis=3),
             ),
             (
-                SparseIndex(2, 4, axis=0, other_id=0, block_size=3, block_axis=4),
-                SparseIndex(3, 4, axis=2, other_id=1, block_size=4, block_axis=5),
+                DiagonalIndex(2, 4, axis=0, other_id=0, block_size=3, block_axis=4),
+                DiagonalIndex(3, 4, axis=2, other_id=1, block_size=4, block_axis=5),
             ),
             _n((4, 3, 4, 4, 3, 4), 2),
         )
@@ -471,7 +471,7 @@ class TestStructuredRoundTrip(unittest.TestCase):
         self.assertEqual(st_compressed.shape, (12, 12))
         self.assertEqual(st_compressed.val.shape, (M, lcm, lcm))
         self.assertEqual(st_compressed.val.size, M * lcm * lcm)
-        self.assertIsInstance(st_compressed.out_dims[0], SparseIndex)
+        self.assertIsInstance(st_compressed.out_dims[0], DiagonalIndex)
         self.assertEqual(st_compressed.out_dims[0].block_size, lcm)
         # Bit-exact dense form against the union pytree's own to_dense.
         self.assertTrue(jnp.allclose(st_compressed.dense(), ub.to_dense(), atol=1e-5))

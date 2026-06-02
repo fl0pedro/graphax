@@ -198,7 +198,7 @@ class UnionBlocks(NamedTuple):
         without the surrounding zero-padding of the full dense form.
 
         This is the storage that lets a ``SparseTensor`` represent the union
-        as a meta-block-diagonal pair (``SparseIndex(M, block_size=LCM_*)``)
+        as a meta-block-diagonal pair (``DiagonalIndex(M, block_size=LCM_*)``)
         — M× less storage than ``to_dense`` and lets every downstream sparse
         op (matmul / elementwise) leverage the block-diagonal fast path
         instead of touching the M²-many zero meta-blocks."""

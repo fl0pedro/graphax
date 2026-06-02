@@ -8,7 +8,7 @@ import jax.numpy as jnp
 
 from ..sparse.tensor import (
     DenseIndex,
-    SparseIndex,
+    DiagonalIndex,
     SparseTensor,
     _materialize_indexes,
     _swap_back_axes,
@@ -303,7 +303,7 @@ def _broadcast_elementals(primals, val_out, **params):
         if i in dims:
             primal_idx = dims.index(i)
             if primal_shape[primal_idx] == shape[i]:
-                new_out_dims.append(SparseIndex(i, shape[i], None, l + primal_idx))
+                new_out_dims.append(DiagonalIndex(i, shape[i], None, l + primal_idx))
             else:
                 new_out_dims.append(DenseIndex(i, shape[i], None))
         else:
@@ -312,7 +312,7 @@ def _broadcast_elementals(primals, val_out, **params):
     for j in range(n):
         out_pos = dims[j]
         if primal_shape[j] == shape[out_pos]:
-            new_primal_dims.append(SparseIndex(l + j, primal_shape[j], None, out_pos))
+            new_primal_dims.append(DiagonalIndex(l + j, primal_shape[j], None, out_pos))
         else:
             new_primal_dims.append(DenseIndex(l + j, primal_shape[j], None))
     return [SparseTensor(new_out_dims, new_primal_dims, 1.0)]
@@ -717,7 +717,7 @@ def _concatenate_elementals(primals, val_out, **params):
                 # d and _d were already replaced in the lists above; the prior
                 # d.size/_d.size mutations targeted orphaned objects (no-op).
             else:
-                # d is SparseIndex with axis=None:
+                # d is DiagonalIndex with axis=None:
                 # Both d and its partner _d are implicit Kronecker factors not stored
                 # in val. Slicing the primal axis at [s, e] yields columns [s:e] of
                 # the implicit identity, which in general is not a square Kronecker

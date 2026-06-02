@@ -5,7 +5,7 @@ import jax.lax as lax
 import jax.numpy as jnp
 import jax.random as jrand
 
-from graphax.sparse.indexes import DenseIndex, SparseIndex
+from graphax.sparse.indexes import DenseIndex, DiagonalIndex
 from graphax.sparse.tensor import SparseTensor, matmul
 from utils import assert_matmul_result
 
@@ -19,7 +19,7 @@ class TestMixedMatmul(unittest.TestCase):
         res = x @ jnp.diag(y)
 
         stx = SparseTensor([DenseIndex(0, 3, 0)], [DenseIndex(1, 4, 1)], x)
-        sty = SparseTensor([SparseIndex(0, 4, 0, 1)], [SparseIndex(1, 4, 0, 0)], y)
+        sty = SparseTensor([DiagonalIndex(0, 4, 0, 1)], [DiagonalIndex(1, 4, 0, 0)], y)
         stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3,), (4,), (3, 4))
@@ -31,7 +31,7 @@ class TestMixedMatmul(unittest.TestCase):
         y = jrand.normal(ykey, (4, 3))
         res = jnp.diag(x) @ y
 
-        stx = SparseTensor([SparseIndex(0, 4, 0, 1)], [SparseIndex(1, 4, 0, 0)], x)
+        stx = SparseTensor([DiagonalIndex(0, 4, 0, 1)], [DiagonalIndex(1, 4, 0, 0)], x)
         sty = SparseTensor([DenseIndex(0, 4, 0)], [DenseIndex(1, 3, 1)], y)
         stres = matmul(stx, sty)
 
@@ -46,7 +46,7 @@ class TestMixedMatmul(unittest.TestCase):
 
         stx = SparseTensor([DenseIndex(0, 3, 0)], [DenseIndex(1, 3, 1)], _x)
         sty = SparseTensor(
-            [SparseIndex(0, 3, None, 1)], [SparseIndex(1, 3, None, 0)], None
+            [DiagonalIndex(0, 3, None, 1)], [DiagonalIndex(1, 3, None, 0)], None
         )
         stres = matmul(stx, sty)
 
@@ -60,7 +60,7 @@ class TestMixedMatmul(unittest.TestCase):
         res = _x @ _y
 
         stx = SparseTensor(
-            [SparseIndex(0, 3, None, 1)], [SparseIndex(1, 3, None, 0)], None
+            [DiagonalIndex(0, 3, None, 1)], [DiagonalIndex(1, 3, None, 0)], None
         )
         sty = SparseTensor([DenseIndex(0, 3, 0)], [DenseIndex(1, 3, 1)], _y)
         stres = matmul(stx, sty)
@@ -82,14 +82,14 @@ class TestMixedMatmul(unittest.TestCase):
         stx = SparseTensor(
             [
                 DenseIndex(0, 3, 0),
-                SparseIndex(1, 5, 1, 2),
+                DiagonalIndex(1, 5, 1, 2),
             ],
-            [SparseIndex(2, 5, 1, 1)],
+            [DiagonalIndex(2, 5, 1, 1)],
             x,
         )
         sty = SparseTensor(
-            [SparseIndex(0, 5, 0, 2)],
-            [DenseIndex(1, 2, 1), SparseIndex(2, 5, 0, 0)],
+            [DiagonalIndex(0, 5, 0, 2)],
+            [DenseIndex(1, 2, 1), DiagonalIndex(2, 5, 0, 0)],
             y,
         )
         stres = matmul(stx, sty)
@@ -109,11 +109,11 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijk,kl->ijl", _x, _y)
 
         stx = SparseTensor(
-            [DenseIndex(0, 3, 0), SparseIndex(1, 5, 1, 2)],
-            [SparseIndex(2, 5, 1, 1)],
+            [DenseIndex(0, 3, 0), DiagonalIndex(1, 5, 1, 2)],
+            [DiagonalIndex(2, 5, 1, 1)],
             x,
         )
-        sty = SparseTensor([SparseIndex(0, 5, 0, 1)], [SparseIndex(1, 5, 0, 0)], y)
+        sty = SparseTensor([DiagonalIndex(0, 5, 0, 1)], [DiagonalIndex(1, 5, 0, 0)], y)
         stres = matmul(stx, sty)
 
         assert_matmul_result(stres, res, (3, 5), (5,), (5, 3))
@@ -131,10 +131,10 @@ class TestMixedMatmul(unittest.TestCase):
         _y = jnp.einsum("ij,jk->ijk", d, y)
         res = jnp.einsum("ij,jkl->ikl", _x, _y)
 
-        stx = SparseTensor([SparseIndex(0, 5, 0, 1)], [SparseIndex(1, 5, 0, 0)], x)
+        stx = SparseTensor([DiagonalIndex(0, 5, 0, 1)], [DiagonalIndex(1, 5, 0, 0)], x)
         sty = SparseTensor(
-            [SparseIndex(0, 5, 0, 1)],
-            [SparseIndex(1, 5, 0, 0), DenseIndex(2, 2, 1)],
+            [DiagonalIndex(0, 5, 0, 1)],
+            [DiagonalIndex(1, 5, 0, 0), DenseIndex(2, 2, 1)],
             y,
         )
         stres = matmul(stx, sty)
@@ -150,8 +150,8 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijk,jkl->il", _x, y)
 
         stx = SparseTensor(
-            [SparseIndex(0, 3, 0, 1)],
-            [SparseIndex(1, 3, 0, 0), DenseIndex(2, 4, 1)],
+            [DiagonalIndex(0, 3, 0, 1)],
+            [DiagonalIndex(1, 3, 0, 0), DenseIndex(2, 4, 1)],
             x,
         )
         sty = SparseTensor(
@@ -172,8 +172,8 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijk,jkl->il", _x, y)
 
         stx = SparseTensor(
-            [SparseIndex(0, 3, 0, 2)],
-            [DenseIndex(1, 4, 1), SparseIndex(2, 3, 0, 0)],
+            [DiagonalIndex(0, 3, 0, 2)],
+            [DenseIndex(1, 4, 1), DiagonalIndex(2, 3, 0, 0)],
             x,
         )
         sty = SparseTensor(
@@ -200,8 +200,8 @@ class TestMixedMatmul(unittest.TestCase):
             x,
         )
         sty = SparseTensor(
-            [SparseIndex(0, 4, 0, 2), DenseIndex(1, 5, 1)],
-            [SparseIndex(2, 4, 0, 0)],
+            [DiagonalIndex(0, 4, 0, 2), DenseIndex(1, 5, 1)],
+            [DiagonalIndex(2, 4, 0, 0)],
             y,
         )
         stres = matmul(stx, sty)
@@ -227,8 +227,8 @@ class TestMixedMatmul(unittest.TestCase):
             x,
         )
         sty = SparseTensor(
-            [DenseIndex(0, 4, 0), SparseIndex(1, 5, 1, 2)],
-            [SparseIndex(2, 5, 1, 1)],
+            [DenseIndex(0, 4, 0), DiagonalIndex(1, 5, 1, 2)],
+            [DiagonalIndex(2, 5, 1, 1)],
             y,
         )
         stres = matmul(stx, sty)
@@ -246,13 +246,13 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijk,jkl->il", _x, _y)
 
         stx = SparseTensor(
-            [SparseIndex(0, 3, 0, 2)],
-            [DenseIndex(1, 4, 1), SparseIndex(2, 3, 0, 0)],
+            [DiagonalIndex(0, 3, 0, 2)],
+            [DenseIndex(1, 4, 1), DiagonalIndex(2, 3, 0, 0)],
             x,
         )
         sty = SparseTensor(
-            [DenseIndex(0, 4, 0), SparseIndex(1, 3, 1, 2)],
-            [SparseIndex(2, 3, 1, 1)],
+            [DenseIndex(0, 4, 0), DiagonalIndex(1, 3, 1, 2)],
+            [DiagonalIndex(2, 3, 1, 1)],
             y,
         )
         stres = matmul(stx, sty)
@@ -270,13 +270,13 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijk,jkl->il", _x, _y)
 
         stx = SparseTensor(
-            [SparseIndex(0, 4, 0, 1)],
-            [SparseIndex(1, 4, 0, 0), DenseIndex(2, 3, 1)],
+            [DiagonalIndex(0, 4, 0, 1)],
+            [DiagonalIndex(1, 4, 0, 0), DenseIndex(2, 3, 1)],
             x,
         )
         sty = SparseTensor(
-            [SparseIndex(0, 4, 0, 2), DenseIndex(1, 3, 1)],
-            [SparseIndex(2, 4, 0, 0)],
+            [DiagonalIndex(0, 4, 0, 2), DenseIndex(1, 3, 1)],
+            [DiagonalIndex(2, 4, 0, 0)],
             y,
         )
         stres = matmul(stx, sty)
@@ -297,13 +297,13 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
 
         stx = SparseTensor(
-            [DenseIndex(0, 3, 0), SparseIndex(1, 4, None, 3)],
-            [DenseIndex(2, 5, 1), SparseIndex(3, 4, None, 1)],
+            [DenseIndex(0, 3, 0), DiagonalIndex(1, 4, None, 3)],
+            [DenseIndex(2, 5, 1), DiagonalIndex(3, 4, None, 1)],
             x,
         )
         sty = SparseTensor(
-            [DenseIndex(0, 5, 0), SparseIndex(1, 4, 1, 2)],
-            [SparseIndex(2, 4, 1, 1), DenseIndex(3, 2, 2)],
+            [DenseIndex(0, 5, 0), DiagonalIndex(1, 4, 1, 2)],
+            [DiagonalIndex(2, 4, 1, 1), DenseIndex(3, 2, 2)],
             y,
         )
         stres = matmul(stx, sty)
@@ -325,13 +325,13 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
 
         stx = SparseTensor(
-            [DenseIndex(0, 3, 0), SparseIndex(1, 4, 1, 3)],
-            [DenseIndex(2, 5, 2), SparseIndex(3, 4, 1, 1)],
+            [DenseIndex(0, 3, 0), DiagonalIndex(1, 4, 1, 3)],
+            [DenseIndex(2, 5, 2), DiagonalIndex(3, 4, 1, 1)],
             x,
         )
         sty = SparseTensor(
-            [SparseIndex(0, 5, 0, 2), DenseIndex(1, 4, 1)],
-            [SparseIndex(2, 5, 0, 0), DenseIndex(3, 2, 2)],
+            [DiagonalIndex(0, 5, 0, 2), DenseIndex(1, 4, 1)],
+            [DiagonalIndex(2, 5, 0, 0), DenseIndex(3, 2, 2)],
             y,
         )
         stres = matmul(stx, sty)
@@ -353,13 +353,13 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
 
         stx = SparseTensor(
-            [SparseIndex(0, 4, 0, 3), DenseIndex(1, 3, 1)],
-            [DenseIndex(2, 5, 2), SparseIndex(3, 4, 0, 0)],
+            [DiagonalIndex(0, 4, 0, 3), DenseIndex(1, 3, 1)],
+            [DenseIndex(2, 5, 2), DiagonalIndex(3, 4, 0, 0)],
             x,
         )
         sty = SparseTensor(
-            [SparseIndex(0, 5, 0, 3), DenseIndex(1, 4, 1)],
-            [DenseIndex(2, 2, 2), SparseIndex(3, 5, 0, 0)],
+            [DiagonalIndex(0, 5, 0, 3), DenseIndex(1, 4, 1)],
+            [DenseIndex(2, 2, 2), DiagonalIndex(3, 5, 0, 0)],
             y,
         )
         stres = matmul(stx, sty)
@@ -382,18 +382,18 @@ class TestMixedMatmul(unittest.TestCase):
 
         stx = SparseTensor(
             [
-                SparseIndex(0, 4, 0, 2),
+                DiagonalIndex(0, 4, 0, 2),
                 DenseIndex(1, 3, 1),
             ],
-            [SparseIndex(2, 4, 0, 0), DenseIndex(3, 5, 2)],
+            [DiagonalIndex(2, 4, 0, 0), DenseIndex(3, 5, 2)],
             x,
         )
         sty = SparseTensor(
             [
                 DenseIndex(0, 4, 0),
-                SparseIndex(1, 5, 1, 3),
+                DiagonalIndex(1, 5, 1, 3),
             ],
-            [DenseIndex(2, 2, 2), SparseIndex(3, 5, 1, 1)],
+            [DenseIndex(2, 2, 2), DiagonalIndex(3, 5, 1, 1)],
             y,
         )
 
@@ -416,13 +416,13 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
 
         stx = SparseTensor(
-            [SparseIndex(0, 4, 0, 2), DenseIndex(1, 3, 1)],
-            [SparseIndex(2, 4, 0, 0), DenseIndex(3, 5, 2)],
+            [DiagonalIndex(0, 4, 0, 2), DenseIndex(1, 3, 1)],
+            [DiagonalIndex(2, 4, 0, 0), DenseIndex(3, 5, 2)],
             x,
         )
         sty = SparseTensor(
-            [DenseIndex(0, 4, 0), SparseIndex(1, 5, 1, 3)],
-            [DenseIndex(2, 2, 2), SparseIndex(3, 5, 1, 1)],
+            [DenseIndex(0, 4, 0), DiagonalIndex(1, 5, 1, 3)],
+            [DenseIndex(2, 2, 2), DiagonalIndex(3, 5, 1, 1)],
             y,
         )
 
@@ -445,13 +445,13 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
 
         stx = SparseTensor(
-            [DenseIndex(0, 3, 0), SparseIndex(1, 4, None, 3)],
-            [DenseIndex(2, 5, 1), SparseIndex(3, 4, None, 1)],
+            [DenseIndex(0, 3, 0), DiagonalIndex(1, 4, None, 3)],
+            [DenseIndex(2, 5, 1), DiagonalIndex(3, 4, None, 1)],
             x,
         )
         sty = SparseTensor(
-            [SparseIndex(0, 5, 0, 3), DenseIndex(1, 4, 1)],
-            [DenseIndex(2, 2, 2), SparseIndex(3, 5, 0, 0)],
+            [DiagonalIndex(0, 5, 0, 3), DenseIndex(1, 4, 1)],
+            [DenseIndex(2, 2, 2), DiagonalIndex(3, 5, 0, 0)],
             y,
         )
         stres = matmul(stx, sty)
@@ -473,13 +473,13 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
 
         stx = SparseTensor(
-            [DenseIndex(0, 3, 0), SparseIndex(1, 4, None, 3)],
-            [DenseIndex(2, 5, 1), SparseIndex(3, 4, None, 1)],
+            [DenseIndex(0, 3, 0), DiagonalIndex(1, 4, None, 3)],
+            [DenseIndex(2, 5, 1), DiagonalIndex(3, 4, None, 1)],
             x,
         )
         sty = SparseTensor(
-            [SparseIndex(0, 5, 0, 3), DenseIndex(1, 4, 1)],
-            [DenseIndex(2, 2, 2), SparseIndex(3, 5, 0, 0)],
+            [DiagonalIndex(0, 5, 0, 3), DenseIndex(1, 4, 1)],
+            [DenseIndex(2, 2, 2), DiagonalIndex(3, 5, 0, 0)],
             y,
         )
         stres = matmul(stx, sty)
@@ -524,13 +524,13 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
 
         stx = SparseTensor(
-            [SparseIndex(0, 3, None, 2), DenseIndex(1, 4, 0)],
-            [SparseIndex(2, 3, None, 0), DenseIndex(3, 5, 1)],
+            [DiagonalIndex(0, 3, None, 2), DenseIndex(1, 4, 0)],
+            [DiagonalIndex(2, 3, None, 0), DenseIndex(3, 5, 1)],
             x,
         )
         sty = SparseTensor(
-            [DenseIndex(0, 3, 0), SparseIndex(1, 5, None, 3)],
-            [DenseIndex(2, 2, 1), SparseIndex(3, 5, None, 1)],
+            [DenseIndex(0, 3, 0), DiagonalIndex(1, 5, None, 3)],
+            [DenseIndex(2, 2, 1), DiagonalIndex(3, 5, None, 1)],
             y,
         )
 
@@ -551,13 +551,13 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
 
         stx = SparseTensor(
-            [SparseIndex(0, 3, 0, 2), DenseIndex(1, 5, 1)],
-            [SparseIndex(2, 3, 0, 0), DenseIndex(3, 4, 2)],
+            [DiagonalIndex(0, 3, 0, 2), DenseIndex(1, 5, 1)],
+            [DiagonalIndex(2, 3, 0, 0), DenseIndex(3, 4, 2)],
             x,
         )
         sty = SparseTensor(
-            [SparseIndex(0, 3, None, 3), SparseIndex(1, 4, None, 2)],
-            [SparseIndex(2, 4, None, 1), SparseIndex(3, 3, None, 0)],
+            [DiagonalIndex(0, 3, None, 3), DiagonalIndex(1, 4, None, 2)],
+            [DiagonalIndex(2, 4, None, 1), DiagonalIndex(3, 3, None, 0)],
             None,
         )
         stres = matmul(stx, sty)
@@ -581,13 +581,13 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
 
         stx = SparseTensor(
-            [SparseIndex(0, 3, 0, 2), DenseIndex(1, 5, 1)],
-            [SparseIndex(2, 3, 0, 0), DenseIndex(3, 4, 2)],
+            [DiagonalIndex(0, 3, 0, 2), DenseIndex(1, 5, 1)],
+            [DiagonalIndex(2, 3, 0, 0), DenseIndex(3, 4, 2)],
             x,
         )
         sty = SparseTensor(
-            [SparseIndex(0, 3, 0, 3), SparseIndex(1, 4, None, 2)],
-            [SparseIndex(2, 4, None, 1), SparseIndex(3, 3, 0, 0)],
+            [DiagonalIndex(0, 3, 0, 3), DiagonalIndex(1, 4, None, 2)],
+            [DiagonalIndex(2, 4, None, 1), DiagonalIndex(3, 3, 0, 0)],
             y,
         )
         stres = matmul(stx, sty)
@@ -610,13 +610,13 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
 
         stx = SparseTensor(
-            [SparseIndex(0, 3, 0, 3), SparseIndex(1, 4, 1, 2)],
-            [SparseIndex(2, 4, 1, 1), SparseIndex(3, 3, 0, 0)],
+            [DiagonalIndex(0, 3, 0, 3), DiagonalIndex(1, 4, 1, 2)],
+            [DiagonalIndex(2, 4, 1, 1), DiagonalIndex(3, 3, 0, 0)],
             x,
         )
         sty = SparseTensor(
-            [SparseIndex(0, 4, None, 2), DenseIndex(1, 3, 0)],
-            [SparseIndex(2, 4, None, 0), DenseIndex(3, 5, 1)],
+            [DiagonalIndex(0, 4, None, 2), DenseIndex(1, 3, 0)],
+            [DiagonalIndex(2, 4, None, 0), DenseIndex(3, 5, 1)],
             y,
         )
         stres = matmul(stx, sty)
@@ -639,13 +639,13 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
 
         stx = SparseTensor(
-            [SparseIndex(0, 3, 0, 3), SparseIndex(1, 4, 1, 2)],
-            [SparseIndex(2, 4, 1, 1), SparseIndex(3, 3, 0, 0)],
+            [DiagonalIndex(0, 3, 0, 3), DiagonalIndex(1, 4, 1, 2)],
+            [DiagonalIndex(2, 4, 1, 1), DiagonalIndex(3, 3, 0, 0)],
             x,
         )
         sty = SparseTensor(
-            [DenseIndex(0, 4, 0), SparseIndex(1, 3, None, 3)],
-            [DenseIndex(2, 5, 1), SparseIndex(3, 3, None, 1)],
+            [DenseIndex(0, 4, 0), DiagonalIndex(1, 3, None, 3)],
+            [DenseIndex(2, 5, 1), DiagonalIndex(3, 3, None, 1)],
             y,
         )
         stres = matmul(stx, sty)
@@ -667,13 +667,13 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijkl,klmn->ijmn", _x, _y)
 
         stx = SparseTensor(
-            [DenseIndex(0, 3, 0), SparseIndex(1, 5, None, 3)],
-            [DenseIndex(2, 4, 1), SparseIndex(3, 5, None, 1)],
+            [DenseIndex(0, 3, 0), DiagonalIndex(1, 5, None, 3)],
+            [DenseIndex(2, 4, 1), DiagonalIndex(3, 5, None, 1)],
             x,
         )
         sty = SparseTensor(
-            [SparseIndex(0, 4, None, 2), DenseIndex(1, 5, 0)],
-            [SparseIndex(2, 4, None, 0), DenseIndex(3, 2, 1)],
+            [DiagonalIndex(0, 4, None, 2), DenseIndex(1, 5, 0)],
+            [DiagonalIndex(2, 4, None, 0), DenseIndex(3, 2, 1)],
             y,
         )
         stres = matmul(stx, sty)
@@ -693,13 +693,13 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijk,jklm->ilm", _x, _y)
 
         stx = SparseTensor(
-            [SparseIndex(0, 4, 0, 2)],
-            [DenseIndex(1, 5, 1), SparseIndex(2, 4, 0, 0)],
+            [DiagonalIndex(0, 4, 0, 2)],
+            [DenseIndex(1, 5, 1), DiagonalIndex(2, 4, 0, 0)],
             x,
         )
         sty = SparseTensor(
-            [SparseIndex(0, 5, 0, 2), DenseIndex(1, 4, 1)],
-            [SparseIndex(2, 5, 0, 0), DenseIndex(3, 3, 2)],
+            [DiagonalIndex(0, 5, 0, 2), DenseIndex(1, 4, 1)],
+            [DiagonalIndex(2, 5, 0, 0), DenseIndex(3, 3, 2)],
             y,
         )
         stres = matmul(stx, sty)
@@ -720,13 +720,13 @@ class TestMixedMatmul(unittest.TestCase):
         res = jnp.einsum("ijk,jklm->ilm", _x, _y)
 
         stx = SparseTensor(
-            [SparseIndex(0, 2, 0, 1)],
-            [SparseIndex(1, 2, 0, 0), DenseIndex(2, 4, 1)],
+            [DiagonalIndex(0, 2, 0, 1)],
+            [DiagonalIndex(1, 2, 0, 0), DenseIndex(2, 4, 1)],
             x,
         )
         sty = SparseTensor(
-            [SparseIndex(0, 2, 0, 2), SparseIndex(1, 4, 1, 3)],
-            [SparseIndex(2, 2, 0, 0), SparseIndex(3, 4, 1, 1)],
+            [DiagonalIndex(0, 2, 0, 2), DiagonalIndex(1, 4, 1, 3)],
+            [DiagonalIndex(2, 2, 0, 0), DiagonalIndex(3, 4, 1, 1)],
             y,
         )
 

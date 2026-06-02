@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import jax.random as jr
 
 from graphax.sparse.tensor import SparseTensor
-from graphax.sparse.indexes import DenseIndex, SparseIndex
+from graphax.sparse.indexes import DenseIndex, DiagonalIndex
 from graphax.sparse.ops.matmul import matmul
 
 
@@ -71,8 +71,8 @@ class TestMatmulBatchedSparsePair(unittest.TestCase):
         N, A, K, B = 3, 2, 4, 5
         a = SparseTensor(
             (
-                SparseIndex(0, N, axis=0, other_id=1),
-                SparseIndex(1, N, axis=0, other_id=0),
+                DiagonalIndex(0, N, axis=0, other_id=1),
+                DiagonalIndex(1, N, axis=0, other_id=0),
                 DenseIndex(2, A, axis=1),
             ),
             (DenseIndex(3, K, axis=2),),
@@ -81,8 +81,8 @@ class TestMatmulBatchedSparsePair(unittest.TestCase):
         )
         b = SparseTensor(
             (
-                SparseIndex(0, N, axis=0, other_id=1),
-                SparseIndex(1, N, axis=0, other_id=0),
+                DiagonalIndex(0, N, axis=0, other_id=1),
+                DiagonalIndex(1, N, axis=0, other_id=0),
                 DenseIndex(2, K, axis=1),  # contracts with a.primal DenseDim(3)
             ),
             (DenseIndex(3, B, axis=2),),
@@ -101,7 +101,7 @@ class TestMatmulBatchedSparsePair(unittest.TestCase):
             f"batch_sparse mismatch: max diff "
             f"{float(jnp.max(jnp.abs(got.dense() - ref_dense)))}",
         )
-        # Sanity-check that the result actually carries a SparseIndex pair (the proof
+        # Sanity-check that the result actually carries a DiagonalIndex pair (the proof
         # that the `batch_sparse` arm built the output and not, say, a `spatial_*` arm).
         sparse_dims_out = [d for d in got.dims if d.is_sparse]
         self.assertEqual(len(sparse_dims_out), 2, "expected one sparse pair in output")
@@ -167,8 +167,8 @@ class TestZeroFillFlagSurvivesJit(unittest.TestCase):
     def _zero_fill_tensor(self, shape, key_idx, fill_value=None):
         return SparseTensor(
             (DenseIndex(0, shape[0], axis=0),
-             SparseIndex(1, shape[1], axis=1, other_id=2)),
-            (SparseIndex(2, shape[1], axis=1, other_id=1),),
+             DiagonalIndex(1, shape[1], axis=1, other_id=2)),
+            (DiagonalIndex(2, shape[1], axis=1, other_id=1),),
             _n(shape, key_idx),
             **({"fill_value": fill_value} if fill_value is not None else {}),
         )

@@ -18,7 +18,7 @@ import importlib
 import jax.numpy as jnp
 import numpy as np
 
-from graphax.sparse.indexes import DenseIndex, SparseIndex
+from graphax.sparse.indexes import DenseIndex, DiagonalIndex
 from graphax.sparse.ops.dense import dense_for_matmul
 from graphax.sparse.tensor import SparseTensor
 
@@ -37,10 +37,10 @@ def test_fallback_does_not_crash_with_none_densified_val(monkeypatch):
     """
     # Build a 3-dim tensor that defeats the fully-dense and single-pair
     # fast paths so the fallback runs.
-    out_a = SparseIndex(id=0, size=3, axis=0, other_id=2)
-    out_b = SparseIndex(id=1, size=2, axis=1, other_id=3)
-    primal_a = SparseIndex(id=2, size=3, axis=0, other_id=0)
-    primal_b = SparseIndex(id=3, size=2, axis=1, other_id=1)
+    out_a = DiagonalIndex(id=0, size=3, axis=0, other_id=2)
+    out_b = DiagonalIndex(id=1, size=2, axis=1, other_id=3)
+    primal_a = DiagonalIndex(id=2, size=3, axis=0, other_id=0)
+    primal_b = DiagonalIndex(id=3, size=2, axis=1, other_id=1)
 
     val = jnp.ones((3, 2), dtype=jnp.float32)
     st = SparseTensor(
@@ -85,10 +85,10 @@ def test_fallback_works_with_compressed_pytree_val(monkeypatch):
     try ``pytree * scalar_mult`` which is ill-typed. The fix routes through
     ``_resolve_val`` which materializes the pytree first.
     """
-    out_a = SparseIndex(id=0, size=3, axis=0, other_id=2)
-    out_b = SparseIndex(id=1, size=2, axis=1, other_id=3)
-    primal_a = SparseIndex(id=2, size=3, axis=0, other_id=0)
-    primal_b = SparseIndex(id=3, size=2, axis=1, other_id=1)
+    out_a = DiagonalIndex(id=0, size=3, axis=0, other_id=2)
+    out_b = DiagonalIndex(id=1, size=2, axis=1, other_id=3)
+    primal_a = DiagonalIndex(id=2, size=3, axis=0, other_id=0)
+    primal_b = DiagonalIndex(id=3, size=2, axis=1, other_id=1)
     val = jnp.ones((3, 2), dtype=jnp.float32)
     st = SparseTensor(
         out_dims=(out_a, out_b),

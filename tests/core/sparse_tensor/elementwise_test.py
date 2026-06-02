@@ -4,7 +4,7 @@ import operator
 import jax.numpy as jnp
 import jax.random as jrand
 from utils import generate_tensors, idfn
-from graphax.sparse.indexes import SparseIndex, DenseIndex
+from graphax.sparse.indexes import DiagonalIndex, DenseIndex
 from graphax.sparse.tensor import SparseTensor
 from graphax.sparse.ops.elementwise import elementwise, _arr2st
 
@@ -82,8 +82,8 @@ class TestElementwise(unittest.TestCase):
                 self._run_elementwise_test(ndim, ta, tb, operator.mul)
 
     def test_aligned_blocks(self):
-        d0 = SparseIndex(0, 2, axis=0, other_id=1, block_size=2, block_axis=1)
-        d1 = SparseIndex(1, 2, axis=0, other_id=0, block_size=2, block_axis=2)
+        d0 = DiagonalIndex(0, 2, axis=0, other_id=1, block_size=2, block_axis=1)
+        d1 = DiagonalIndex(1, 2, axis=0, other_id=0, block_size=2, block_axis=2)
 
         val_a = jnp.ones((2, 2, 2))
         val_b = jnp.full((2, 2, 2), 2.0)
@@ -102,19 +102,19 @@ class TestElementwise(unittest.TestCase):
         )
 
     def test_perfect_intersect_blocks(self):
-        d0_a = SparseIndex(
+        d0_a = DiagonalIndex(
             0, 1, axis=0, other_id=1, block_size=4, block_axis=1
         )
-        d1_a = SparseIndex(
+        d1_a = DiagonalIndex(
             1, 1, axis=0, other_id=0, block_size=4, block_axis=2
         )
         val_a = jnp.arange(16.0).reshape(1, 4, 4)
         ta = SparseTensor((d0_a,), (d1_a,), val_a)
 
-        d0_b = SparseIndex(
+        d0_b = DiagonalIndex(
             0, 2, axis=0, other_id=1, block_size=2, block_axis=1
         )
-        d1_b = SparseIndex(
+        d1_b = DiagonalIndex(
             1, 2, axis=0, other_id=0, block_size=2, block_axis=2
         )
         val_b = jnp.ones((2, 2, 2))
@@ -136,19 +136,19 @@ class TestElementwise(unittest.TestCase):
         self.assertTrue(jnp.allclose(dense_mul_ref, (ta * tb).dense()))
 
     def test_unaligned_diff_blocks(self):
-        d0_a = SparseIndex(
+        d0_a = DiagonalIndex(
             0, 2, axis=0, other_id=1, block_size=3, block_axis=1
         )
-        d1_a = SparseIndex(
+        d1_a = DiagonalIndex(
             1, 2, axis=0, other_id=0, block_size=3, block_axis=2
         )
         val_a = jnp.ones((2, 3, 3)) * 2
         ta = SparseTensor((d0_a,), (d1_a,), val_a)
 
-        d0_b = SparseIndex(
+        d0_b = DiagonalIndex(
             0, 3, axis=0, other_id=1, block_size=2, block_axis=1
         )
-        d1_b = SparseIndex(
+        d1_b = DiagonalIndex(
             1, 3, axis=0, other_id=0, block_size=2, block_axis=2
         )
         val_b = jnp.ones((3, 2, 2)) * 3
@@ -193,18 +193,18 @@ class TestElementwise(unittest.TestCase):
         self.assertTrue(jnp.allclose(res.dense(), st_lhs.dense() + rhs_dense))
 
     def test_elementwise_intersection_summing(self):
-        d0_l = SparseIndex(
+        d0_l = DiagonalIndex(
             0, 4, axis=0, other_id=1, block_size=2, block_axis=1
         )
-        d1_l = SparseIndex(
+        d1_l = DiagonalIndex(
             1, 4, axis=0, other_id=0, block_size=2, block_axis=2
         )
         st_l = SparseTensor((d0_l,), (d1_l,), jnp.arange(16).reshape(4, 2, 2))
 
-        d0_r = SparseIndex(
+        d0_r = DiagonalIndex(
             0, 2, axis=0, other_id=1, block_size=4, block_axis=1
         )
-        d1_r = SparseIndex(
+        d1_r = DiagonalIndex(
             1, 2, axis=0, other_id=0, block_size=4, block_axis=2
         )
         st_r = SparseTensor((d0_r,), (d1_r,), jnp.arange(32).reshape(2, 4, 4))

@@ -1,7 +1,7 @@
-"""Bug: rev-mode through concat hit the SparseIndex-with-axis=None branch.
+"""Bug: rev-mode through concat hit the DiagonalIndex-with-axis=None branch.
 
 In rev mode, the accumulated Jacobian at the concat node is the full identity
-tensor, represented as a SparseIndex pair with `axis=None`. This exercises
+tensor, represented as a DiagonalIndex pair with `axis=None`. This exercises
 the else-branch of `inverse_concatenate_transform` — the same one that did
 positional `SparseTensor(...)` construction and was therefore broken.
 

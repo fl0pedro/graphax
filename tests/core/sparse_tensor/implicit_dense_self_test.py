@@ -5,7 +5,7 @@ import jax.numpy as jnp
 
 from graphax.sparse.tensor import (
     DenseIndex,
-    SparseIndex,
+    DiagonalIndex,
     SparseTensor,
     dense,
 )
@@ -14,60 +14,60 @@ from graphax.sparse.tensor import (
 class TestSelfDenseNones(unittest.TestCase):
     def st_2d(self):
         return SparseTensor(
-            (SparseIndex(0, 100, None, 1),),
-            (SparseIndex(1, 100, None, 0),),
+            (DiagonalIndex(0, 100, None, 1),),
+            (DiagonalIndex(1, 100, None, 0),),
             None,
         )
 
     def bst_2d(self):
         return SparseTensor(
-            (SparseIndex(0, 4, None, 1, 5),),
-            (SparseIndex(1, 4, None, 0, 5),),
+            (DiagonalIndex(0, 4, None, 1, 5),),
+            (DiagonalIndex(1, 4, None, 0, 5),),
             None,
         )
 
     def bst_3d(self):
         return SparseTensor(
-            (SparseIndex(0, 3, None, 2, 4),),
-            (DenseIndex(1, 5, None), SparseIndex(2, 3, None, 0, 6)),
+            (DiagonalIndex(0, 3, None, 2, 4),),
+            (DenseIndex(1, 5, None), DiagonalIndex(2, 3, None, 0, 6)),
             None,
         )
 
     def bst_3d_val_dense(self):
         x = jnp.arange(5)
         return SparseTensor(
-            (SparseIndex(0, 3, None, 2, 4),),
-            (DenseIndex(1, 5, 0), SparseIndex(2, 3, None, 0, 6)),
+            (DiagonalIndex(0, 3, None, 2, 4),),
+            (DenseIndex(1, 5, 0), DiagonalIndex(2, 3, None, 0, 6)),
             x,
         )
 
     def st_4d(self):
         return SparseTensor(
-            (SparseIndex(0, 3, None, 2), SparseIndex(1, 4, None, 3)),
-            (SparseIndex(2, 3, None, 0), SparseIndex(3, 4, None, 1)),
+            (DiagonalIndex(0, 3, None, 2), DiagonalIndex(1, 4, None, 3)),
+            (DiagonalIndex(2, 3, None, 0), DiagonalIndex(3, 4, None, 1)),
             None,
         )
 
     def st_4d_val_sparse_1(self):
         x = jnp.arange(3).reshape(3, 1, 1)
         return SparseTensor(
-            (SparseIndex(0, 3, 0, 2), SparseIndex(1, 4, None, 3)),
-            (SparseIndex(2, 3, 0, 0), SparseIndex(3, 4, None, 1)),
+            (DiagonalIndex(0, 3, 0, 2), DiagonalIndex(1, 4, None, 3)),
+            (DiagonalIndex(2, 3, 0, 0), DiagonalIndex(3, 4, None, 1)),
             x,
         )
 
     def st_4d_val_sparse_2(self):
         x = jnp.arange(4).reshape(4, 1, 1)
         return SparseTensor(
-            (SparseIndex(0, 3, None, 2), SparseIndex(1, 4, 0, 3)),
-            (SparseIndex(2, 3, None, 0), SparseIndex(3, 4, 0, 1)),
+            (DiagonalIndex(0, 3, None, 2), DiagonalIndex(1, 4, 0, 3)),
+            (DiagonalIndex(2, 3, None, 0), DiagonalIndex(3, 4, 0, 1)),
             x,
         )
 
     def bst_4d_1(self):
         return SparseTensor(
-            (SparseIndex(0, 3, None, 2, 5), SparseIndex(1, 4, None, 3, 6)),
-            (SparseIndex(2, 3, None, 0, 7), SparseIndex(3, 4, None, 1, 8)),
+            (DiagonalIndex(0, 3, None, 2, 5), DiagonalIndex(1, 4, None, 3, 6)),
+            (DiagonalIndex(2, 3, None, 0, 7), DiagonalIndex(3, 4, None, 1, 8)),
             None,
         )
 
@@ -75,12 +75,12 @@ class TestSelfDenseNones(unittest.TestCase):
         x = jnp.arange(3 * 5 * 7).reshape(3, 5, 7)
         return SparseTensor(
             (
-                SparseIndex(0, 3, 0, 2, 5, 1),
-                SparseIndex(1, 4, None, 3, 6, None),
+                DiagonalIndex(0, 3, 0, 2, 5, 1),
+                DiagonalIndex(1, 4, None, 3, 6, None),
             ),
             (
-                SparseIndex(2, 3, 0, 0, 7, 2),
-                SparseIndex(3, 4, None, 1, 8, None),
+                DiagonalIndex(2, 3, 0, 0, 7, 2),
+                DiagonalIndex(3, 4, None, 1, 8, None),
             ),
             x,
         )
@@ -89,60 +89,60 @@ class TestSelfDenseNones(unittest.TestCase):
         x = jnp.arange(4 * 6 * 8).reshape(4, 6, 8)
         return SparseTensor(
             (
-                SparseIndex(0, 3, None, 2, 5, None),
-                SparseIndex(1, 4, 0, 3, 6, 1),
+                DiagonalIndex(0, 3, None, 2, 5, None),
+                DiagonalIndex(1, 4, 0, 3, 6, 1),
             ),
             (
-                SparseIndex(2, 3, None, 0, 7, None),
-                SparseIndex(3, 4, 0, 1, 8, 2),
+                DiagonalIndex(2, 3, None, 0, 7, None),
+                DiagonalIndex(3, 4, 0, 1, 8, 2),
             ),
             x,
         )
 
     def bst_4d_2(self):
         return SparseTensor(
-            (SparseIndex(0, 3, None, 2, 4), DenseIndex(1, 5, None)),
-            (SparseIndex(2, 3, None, 0, 6), DenseIndex(3, 7, None)),
+            (DiagonalIndex(0, 3, None, 2, 4), DenseIndex(1, 5, None)),
+            (DiagonalIndex(2, 3, None, 0, 6), DenseIndex(3, 7, None)),
             None,
         )
 
     def bst_4d_2_val_sparse(self):
         x = jnp.arange(3 * 4 * 6).reshape(3, 4, 6)
         return SparseTensor(
-            (SparseIndex(0, 3, 0, 2, 4, 1), DenseIndex(1, 5, None)),
-            (SparseIndex(2, 3, 0, 0, 6, 2), DenseIndex(3, 7, None)),
+            (DiagonalIndex(0, 3, 0, 2, 4, 1), DenseIndex(1, 5, None)),
+            (DiagonalIndex(2, 3, 0, 0, 6, 2), DenseIndex(3, 7, None)),
             x,
         )
 
     def bst_4d_2_val_dense_1(self):
         x = jnp.arange(5)
         return SparseTensor(
-            (SparseIndex(0, 3, None, 2, 4), DenseIndex(1, 5, 0)),
-            (SparseIndex(2, 3, None, 0, 6), DenseIndex(3, 7, None)),
+            (DiagonalIndex(0, 3, None, 2, 4), DenseIndex(1, 5, 0)),
+            (DiagonalIndex(2, 3, None, 0, 6), DenseIndex(3, 7, None)),
             x,
         )
 
     def bst_4d_2_val_dense_2(self):
         x = jnp.arange(7)
         return SparseTensor(
-            (SparseIndex(0, 3, None, 2, 4), DenseIndex(1, 5, None)),
-            (SparseIndex(2, 3, None, 0, 6), DenseIndex(3, 7, 0)),
+            (DiagonalIndex(0, 3, None, 2, 4), DenseIndex(1, 5, None)),
+            (DiagonalIndex(2, 3, None, 0, 6), DenseIndex(3, 7, 0)),
             x,
         )
 
     def bst_4d_2_val_dense_3(self):
         x = jnp.arange(5 * 7).reshape(5, 7)
         return SparseTensor(
-            (SparseIndex(0, 3, None, 2, 4), DenseIndex(1, 5, 0)),
-            (SparseIndex(2, 3, None, 0, 6), DenseIndex(3, 7, 1)),
+            (DiagonalIndex(0, 3, None, 2, 4), DenseIndex(1, 5, 0)),
+            (DiagonalIndex(2, 3, None, 0, 6), DenseIndex(3, 7, 1)),
             x,
         )
 
     def bst_4d_2_val_sparse_and_dense(self):
         x = jnp.arange(3 * 4 * 6 * 7).reshape(3, 4, 6, 7)
         return SparseTensor(
-            (SparseIndex(0, 3, 0, 2, 4, 1), DenseIndex(1, 5, None)),
-            (SparseIndex(2, 3, 0, 0, 6, 2), DenseIndex(3, 7, 3)),
+            (DiagonalIndex(0, 3, 0, 2, 4, 1), DenseIndex(1, 5, None)),
+            (DiagonalIndex(2, 3, 0, 0, 6, 2), DenseIndex(3, 7, 3)),
             x,
         )
 

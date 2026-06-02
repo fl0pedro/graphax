@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import jax.random as jrand
 from chex import Array
 
-from graphax.sparse.indexes import DenseIndex, SparseIndex
+from graphax.sparse.indexes import DenseIndex, DiagonalIndex
 from graphax.sparse.ops.utils import _arr2st
 from graphax.sparse.tensor import SparseTensor
 
@@ -139,7 +139,7 @@ def generate_dimension_specs(
         return blocks_shape[phys] if phys is not None else 1
 
     def make_sparse(id, other_id, sparse_idx, dense_idx):
-        return SparseIndex(
+        return DiagonalIndex(
             id,
             get_sparse_size(sparse_idx),
             axis=map_sparse(sparse_idx),
@@ -283,7 +283,7 @@ def drop_physical_axes(st, axes_to_drop):
     new_dims = []
     for d in st.dims:
         if d.is_sparse:
-            new_d = SparseIndex(
+            new_d = DiagonalIndex(
                 d.id,
                 d.size,
                 axis=map_dim_idx(d.axis),
@@ -514,11 +514,11 @@ class TestUtils(unittest.TestCase):
         with self.assertRaises(AssertionError):
             verify_dimensions([d1], [d1])
 
-        s1 = SparseIndex(0, 2, 0, 1)
+        s1 = DiagonalIndex(0, 2, 0, 1)
         with self.assertRaises(AssertionError):
             verify_dimensions([s1], [])
 
-        s2 = SparseIndex(1, 3, 1, 0)
+        s2 = DiagonalIndex(1, 3, 1, 0)
         with self.assertRaises(AssertionError):
             verify_dimensions([s1], [s2])
 

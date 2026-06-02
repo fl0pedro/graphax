@@ -21,7 +21,7 @@ import jax.lax as lax
 import jax.numpy as jnp
 from jax import Array
 
-from graphax.sparse.indexes import DenseIndex, Index, SparseIndex
+from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
@@ -59,8 +59,8 @@ def dense(
     Worked example — a single sparse pair with ``N=2`` blocks of size ``B=3``::
 
         a = SparseTensor(
-            (SparseIndex(0, 2, axis=0, other_id=1, block_size=3, block_axis=1),),
-            (SparseIndex(1, 2, axis=0, other_id=0, block_size=3, block_axis=2),),
+            (DiagonalIndex(0, 2, axis=0, other_id=1, block_size=3, block_axis=1),),
+            (DiagonalIndex(1, 2, axis=0, other_id=0, block_size=3, block_axis=2),),
             val,  # shape (2, 3, 3) — two 3×3 blocks
         )
         a.dense()  # SparseTensor with val shape (6, 6) — blocks on the diagonal,

@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-from graphax.sparse.indexes import DenseIndex, Index, SparseIndex
+from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
 
 from .dense import dense_for_matmul
 from .layout import generate_block_permutation, generate_grouped_permutation
@@ -745,7 +745,7 @@ def _build_sparse(
 ):
     if outer_sz == 1:
         return DenseIndex(dim_id, inner_sz, axis=inner_val if inner_pres else None)
-    return SparseIndex(
+    return DiagonalIndex(
         dim_id,
         outer_sz,
         axis=outer_val if outer_pres else None,
@@ -1816,7 +1816,7 @@ def _matmul_contraction_depth(lhs, rhs) -> int:
 
     For sparse operands the contracting dims are the last ``min(len(lhs.primal),
     len(rhs.out))`` of each side; depth is the product of their *logical*
-    sizes (a ``SparseIndex`` of size N with block_size B contributes ``N*B``,
+    sizes (a ``DiagonalIndex`` of size N with block_size B contributes ``N*B``,
     matching what ``dot_general`` actually contracts over after densification).
     """
     if hasattr(lhs, "primal_dims") and hasattr(rhs, "out_dims"):
@@ -1849,7 +1849,7 @@ def _compute_matmul_count(lhs, rhs, out) -> tuple[int, int, int]:
     * ``fmas = output_size * (K - 1)`` (accumulating multiply-adds)
 
     where ``output_size`` is the logical product of all kept dims and ``K``
-    is the contraction depth (a ``SparseIndex(size=N, block_size=B)``
+    is the contraction depth (a ``DiagonalIndex(size=N, block_size=B)``
     contributes ``N*B``, matching what ``dot_general`` actually contracts
     after densification).
 
