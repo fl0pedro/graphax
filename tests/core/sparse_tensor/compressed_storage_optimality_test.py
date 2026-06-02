@@ -684,5 +684,154 @@ class TestMultiAxisContractMatmul(unittest.TestCase):
         self.assertIsNotNone(res.val)
 
 
+class TestMultiAxisElementwise(unittest.TestCase):
+    """K>2 elementwise on operands with multiple misaligned sparse pairs.
+
+    Phase 7.4 verification: graphax's elementwise supports arbitrarily
+    many sparse pairs per operand. When ``K > 2`` of those pairs are
+    misaligned, the OUTPUT carries independent block-diagonal compression
+    structure along each pair's axes — same logic as K=1 (single sparse
+    pair) but factorized along K independent axis groups.
+
+    Currently the probe ``_should_emit_divisor_remainder`` gates on
+    ``len(lhs.dims) != 2`` so K>1 cases fall through to the general
+    expansion path: **output is correct, but no DivisorRemainder
+    compression is applied**. Multi-axis DivisorRemainder compression is
+    a Phase 7.5 extension (storage needs per-axis ``(M, n, B_h, B_w)``
+    buffers, densify chains ``_block_diag_per_meta`` along each axis).
+
+    These tests lock in the *correctness* of K>2 multi-misalignment
+    elementwise output. When multi-axis compression lands, the storage
+    assertion below should flip to assert compression.
+    """
+
+    def test_k2_misaligned_add_matches_dense(self):
+        """4-D elementwise add, both sparse pairs misaligned (5/7 and
+        3/4). Output must equal dense add."""
+        a = SparseTensor(
+            (
+                SparseIndex(0, 7, axis=0, other_id=2, block_size=5, block_axis=2),
+                SparseIndex(1, 4, axis=1, other_id=3, block_size=3, block_axis=4),
+            ),
+            (
+                SparseIndex(2, 7, axis=0, other_id=0, block_size=5, block_axis=3),
+                SparseIndex(3, 4, axis=1, other_id=1, block_size=3, block_axis=5),
+            ),
+            _n((7, 4, 5, 5, 3, 3), 1),
+        )
+        b = SparseTensor(
+            (
+                SparseIndex(0, 5, axis=0, other_id=2, block_size=7, block_axis=2),
+                SparseIndex(1, 3, axis=1, other_id=3, block_size=4, block_axis=4),
+            ),
+            (
+                SparseIndex(2, 5, axis=0, other_id=0, block_size=7, block_axis=3),
+                SparseIndex(3, 3, axis=1, other_id=1, block_size=4, block_axis=5),
+            ),
+            _n((5, 3, 7, 7, 4, 4), 2),
+        )
+        ref = a.dense() + b.dense()
+        res = a + b
+        self.assertTrue(jnp.allclose(res.dense(), ref, atol=1e-4))
+
+    def test_k2_misaligned_mul_matches_dense(self):
+        """Same operand shape as the add case, but with intersection
+        (multiply) semantics. K>1 cases fall through the dispatcher and
+        the general path still produces the correct dense result."""
+        a = SparseTensor(
+            (
+                SparseIndex(0, 7, axis=0, other_id=2, block_size=5, block_axis=2),
+                SparseIndex(1, 4, axis=1, other_id=3, block_size=3, block_axis=4),
+            ),
+            (
+                SparseIndex(2, 7, axis=0, other_id=0, block_size=5, block_axis=3),
+                SparseIndex(3, 4, axis=1, other_id=1, block_size=3, block_axis=5),
+            ),
+            _n((7, 4, 5, 5, 3, 3), 1),
+        )
+        b = SparseTensor(
+            (
+                SparseIndex(0, 5, axis=0, other_id=2, block_size=7, block_axis=2),
+                SparseIndex(1, 3, axis=1, other_id=3, block_size=4, block_axis=4),
+            ),
+            (
+                SparseIndex(2, 5, axis=0, other_id=0, block_size=7, block_axis=3),
+                SparseIndex(3, 3, axis=1, other_id=1, block_size=4, block_axis=5),
+            ),
+            _n((5, 3, 7, 7, 4, 4), 2),
+        )
+        ref = a.dense() * b.dense()
+        res = a * b
+        self.assertTrue(jnp.allclose(res.dense(), ref, atol=1e-4))
+
+    def test_k3_misaligned_add_matches_dense(self):
+        """6-D elementwise add with 3 sparse pairs, all misaligned (each
+        2/3 coprime). Output must equal dense add."""
+        a3 = SparseTensor(
+            (
+                SparseIndex(0, 3, axis=0, other_id=3, block_size=2, block_axis=3),
+                SparseIndex(1, 3, axis=1, other_id=4, block_size=2, block_axis=5),
+                SparseIndex(2, 3, axis=2, other_id=5, block_size=2, block_axis=7),
+            ),
+            (
+                SparseIndex(3, 3, axis=0, other_id=0, block_size=2, block_axis=4),
+                SparseIndex(4, 3, axis=1, other_id=1, block_size=2, block_axis=6),
+                SparseIndex(5, 3, axis=2, other_id=2, block_size=2, block_axis=8),
+            ),
+            _n((3, 3, 3, 2, 2, 2, 2, 2, 2), 1),
+        )
+        b3 = SparseTensor(
+            (
+                SparseIndex(0, 2, axis=0, other_id=3, block_size=3, block_axis=3),
+                SparseIndex(1, 2, axis=1, other_id=4, block_size=3, block_axis=5),
+                SparseIndex(2, 2, axis=2, other_id=5, block_size=3, block_axis=7),
+            ),
+            (
+                SparseIndex(3, 2, axis=0, other_id=0, block_size=3, block_axis=4),
+                SparseIndex(4, 2, axis=1, other_id=1, block_size=3, block_axis=6),
+                SparseIndex(5, 2, axis=2, other_id=2, block_size=3, block_axis=8),
+            ),
+            _n((2, 2, 2, 3, 3, 3, 3, 3, 3), 2),
+        )
+        ref = a3.dense() + b3.dense()
+        res = a3 + b3
+        self.assertTrue(jnp.allclose(res.dense(), ref, atol=1e-4))
+
+    def test_k2_misaligned_currently_stores_dense(self):
+        """Documents the current limitation: K>1 elementwise misalignment
+        falls through to the general path's dense ``val=values`` storage
+        (no DivisorRemainder compression yet). Phase 7.5 will flip this
+        assertion when multi-axis DivisorRemainder lands."""
+        a = SparseTensor(
+            (
+                SparseIndex(0, 7, axis=0, other_id=2, block_size=5, block_axis=2),
+                SparseIndex(1, 4, axis=1, other_id=3, block_size=3, block_axis=4),
+            ),
+            (
+                SparseIndex(2, 7, axis=0, other_id=0, block_size=5, block_axis=3),
+                SparseIndex(3, 4, axis=1, other_id=1, block_size=3, block_axis=5),
+            ),
+            _n((7, 4, 5, 5, 3, 3), 1),
+        )
+        b = SparseTensor(
+            (
+                SparseIndex(0, 5, axis=0, other_id=2, block_size=7, block_axis=2),
+                SparseIndex(1, 3, axis=1, other_id=3, block_size=4, block_axis=4),
+            ),
+            (
+                SparseIndex(2, 5, axis=0, other_id=0, block_size=7, block_axis=3),
+                SparseIndex(3, 3, axis=1, other_id=1, block_size=4, block_axis=5),
+            ),
+            _n((5, 3, 7, 7, 4, 4), 2),
+        )
+        res = a + b
+        self.assertIsNone(
+            res.compressed_val,
+            "K>1 multi-axis elementwise compression not implemented yet — "
+            "flip this assertion when multi-axis DivisorRemainder lands.",
+        )
+        self.assertIsNotNone(res.val)
+
+
 if __name__ == "__main__":
     unittest.main()
