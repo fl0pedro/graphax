@@ -1668,6 +1668,12 @@ def _normalize_inputs(lhs, rhs):
         lhs = _copy(lhs, val=_materialize_compressed(lhs))
     if getattr(rhs, "compressed_val", None) is not None:
         rhs = _copy(rhs, val=_materialize_compressed(rhs))
+    # Phase 8: pre-densify any compressed Index dims (BandedIndex / SetIndex)
+    # to DiagonalIndex / DenseIndex — the tiled matmul consumes only those.
+    # No-op when the operand has no compressed dims.
+    from .utils import _materialize_for_op
+    lhs = _materialize_for_op(lhs)
+    rhs = _materialize_for_op(rhs)
     return lhs, rhs
 
 

@@ -80,11 +80,14 @@ def _normalize_inputs(lhs, rhs):
     # already meta-block-diagonal — keeps storage at ``M·H·W`` rather than the
     # ``M²·H·W`` of the full dense form, and keeps every downstream op on the
     # block-diagonal fast path. XLA fuses either expression into the consumer.
-    from .utils import _copy
+    from .utils import _copy, _materialize_for_op
     if getattr(lhs, "compressed_val", None) is not None:
         lhs = _copy(lhs, val=_materialize_compressed(lhs))
     if getattr(rhs, "compressed_val", None) is not None:
         rhs = _copy(rhs, val=_materialize_compressed(rhs))
+    # Phase 8: pre-densify compressed Index dims (no-op when there are none).
+    lhs = _materialize_for_op(lhs)
+    rhs = _materialize_for_op(rhs)
     # Static shape comparison: ``SparseTensor.shape`` returns Python ints
     # derived from the dim metadata, so this is a trace-time check (no runtime
     # branching on traced shapes).

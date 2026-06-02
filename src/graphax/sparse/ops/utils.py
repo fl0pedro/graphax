@@ -107,6 +107,85 @@ def _has_meta_block_diag_dims(tensor, meta_block_shape) -> bool:
     )
 
 
+def _compressed_dims(tensor) -> list:
+    """The ``out_dims`` + ``primal_dims`` that are compressed Index types
+    (``BandedIndex`` / ``SetIndex``). Empty when the tensor carries no
+    compressed structure — the common case, for which the densify helpers
+    below are no-ops."""
+    return [d for d in (*tensor.out_dims, *tensor.primal_dims)
+            if getattr(d, "is_compressed", False)]
+
+
+def _densify_compressed_dims(tensor, compact: bool = False):
+    """Replace a tensor's compressed Index dims (``BandedIndex`` / ``SetIndex``)
+    with their densified ``DenseIndex`` / ``DiagonalIndex`` equivalents, writing
+    the expanded data into ``val``.
+
+    * ``compact=False`` (for ``dense()``): full materialization — each
+      compressed pair becomes a ``DenseIndex`` pair over the dense
+      ``(rows, cols)`` block.
+    * ``compact=True`` (for ``_materialize_for_op``): the meta-block-diagonal
+      form when the pair ``reduces_to_diagonal`` (``SetIndex`` always;
+      ``BandedIndex`` when W=1 identity), yielding a ``DiagonalIndex`` pair at
+      ``M×`` lower storage; full dense otherwise.
+
+    No-op (returns ``tensor`` unchanged) when there are no compressed dims.
+
+    Currently handles the single-compressed-pair (K=1) banded case whose
+    ``val`` is the canonical ``(n_meta*M_p, W, B_row, B_col, *L)`` Array.
+    Multi-axis (K≥2) and the ``SetIndex`` dual-buffer ``val`` are wired with
+    their producers (Phase 8.E / 8.F).
+    """
+    comp = _compressed_dims(tensor)
+    if not comp:
+        return tensor
+
+    from graphax.sparse.tensor import SparseTensor
+    from graphax.sparse.indexes import BandedIndex, DenseIndex, DiagonalIndex
+
+    # K=1 banded pair (Array val). Identify the primary BandedIndex.
+    banded = [d for d in comp if isinstance(d, BandedIndex)]
+    if len(comp) == 2 and len(banded) == 2 and isinstance(tensor.val, jax.Array):
+        primary = next((d for d in banded if d.primary), banded[0])
+        o, p = tensor.out_dims[0], tensor.primal_dims[0]
+        fill = tensor.fill_value
+        if compact and primary.reduces_to_diagonal():
+            meta = primary.to_meta_blocks(tensor.val)  # (n_meta*M, B_row, B_col, *L)
+            M, B_row, B_col = meta.shape[0], meta.shape[1], meta.shape[2]
+            new_out = (DiagonalIndex(o.id, M, 0, p.id, B_row, 1),)
+            new_primal = (DiagonalIndex(p.id, M, 0, o.id, B_col, 2),)
+            new_val = meta
+        else:
+            dense = primary.densify_axis(tensor.val, fill)  # (rows, cols, *L)
+            rows, cols = dense.shape[0], dense.shape[1]
+            new_out = (DenseIndex(o.id, rows, 0),)
+            new_primal = (DenseIndex(p.id, cols, 1),)
+            new_val = dense
+        return SparseTensor(
+            new_out, new_primal, new_val,
+            scalar_mult=tensor.scalar_mult, fill_value=tensor.fill_value,
+            check_consistency=False,
+            zero_fill=getattr(tensor, "_zero_fill", None),
+        )
+
+    raise NotImplementedError(
+        "densify of compressed dims is implemented for the single-pair banded "
+        f"(Array-val) case; got {len(comp)} compressed dims / "
+        f"val type {type(tensor.val).__name__} (Phase 8.E/8.F territory)."
+    )
+
+
+def _materialize_for_op(tensor):
+    """Pre-densify a tensor's compressed Index dims to ``DiagonalIndex`` /
+    ``DenseIndex`` so matmul / elementwise — which consume only those — never
+    see a ``BandedIndex`` / ``SetIndex``. No-op when the tensor has no
+    compressed dims (the case for every operand today, until the Phase 8.E/8.F
+    producers land)."""
+    if not _compressed_dims(tensor):
+        return tensor
+    return _densify_compressed_dims(tensor, compact=True)
+
+
 def _val_or_one(tensor: SparseTensor) -> Array:
     """A tensor's stored value, or a scalar 1 in its dtype if the tensor carries pure structure.
 

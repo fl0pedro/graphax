@@ -94,6 +94,27 @@ class BandedIndex(Index):
     def is_compressed(self) -> bool:
         return True
 
+    def reduces_to_diagonal(self) -> bool:
+        """``True`` iff this band is actually a pure meta-block-diagonal —
+        ``band_width == 1`` with a centered (≡ identity, since W=1) offset and
+        square per-batch meta counts. Such a band has no off-diagonal content,
+        so it can be represented as a ``DiagonalIndex`` (the compact
+        meta-block form) instead of being materialized fully dense."""
+        if self.band_width != 1:
+            return False
+        if self.n_secondary >= 0 and self.n_secondary != (self.size // (self.block_size or 1)) // self.n_meta:
+            return False
+        # offset () (centered, W=1 ⇒ offset[a]=a) or explicit identity.
+        if self.offset and tuple(self.offset) != tuple(range(len(self.offset))):
+            return False
+        return True
+
+    def to_meta_blocks(self, val):
+        """Compact ``(n_meta*M, B_row, B_col, *L)`` meta-diagonal blocks.
+        Only valid when :meth:`reduces_to_diagonal` (W=1 identity band); the
+        band's single in-band slot per row IS the diagonal block."""
+        return val[:, 0]  # (n_meta*M, B_row, B_col, *L)
+
     def densify_axis(self, val, fill):
         """Expand this band pair's canonical ``val`` layout
         ``(n_meta*M_primary, W, B_row, B_col, *L)`` into the dense
@@ -145,28 +166,45 @@ class SetIndex(Index):
     def is_compressed(self) -> bool:
         return True
 
-    def densify_axis(self, val, fill):
-        """Densify the dual-buffer ``val=(lhs_blocks, rhs_blocks)`` to the
-        meta-block-diagonal grid via ``_block_diag_per_meta`` + ``_stitch_meta``
-        + the semantic ``op``. ``fill`` is ``(fill_lhs, fill_rhs)`` or a single
-        scalar applied to both. Mirrors the legacy ``DivisorRemainder.to_dense``
-        densify chain (gather-free)."""
-        from graphax.sparse.ops.block_storage import (
-            _block_diag_per_meta, _stitch_meta,
-        )
+    def reduces_to_diagonal(self) -> bool:
+        """A SetIndex output is always meta-block-diagonal (its content sits on
+        the M-meta diagonal of ``(M*LCM_h, M*LCM_w)``), so it ALWAYS reduces to
+        a compact ``DiagonalIndex`` via :meth:`to_meta_blocks` — no full-dense
+        materialization needed at an op boundary."""
+        return True
+
+    def _op(self):
         import jax.numpy as _jnp
+
+        return _jnp.multiply if self.semantic == "intersection" else _jnp.add
+
+    def to_meta_blocks(self, val, fill):
+        """Compact ``(n_meta*M, LCM_h, LCM_w, *L)`` meta-block grid — the
+        per-meta-diagonal contributions without the surrounding zero padding.
+        This is M× tighter than :meth:`densify_axis` and is what an op
+        boundary should consume (preserves the legacy ``to_meta_blocks``
+        storage win)."""
+        from graphax.sparse.ops.block_storage import _block_diag_per_meta
 
         lhs_blocks, rhs_blocks = (val if isinstance(val, tuple) else (val, None))
         fill_lhs, fill_rhs = (fill if isinstance(fill, tuple) else (fill, fill))
-        op = _jnp.multiply if self.semantic == "intersection" else _jnp.add
-
+        op = self._op()
         lhs_meta = _block_diag_per_meta(lhs_blocks, fill_lhs)
         if self.include_remainder and rhs_blocks is not None:
             rhs_meta = _block_diag_per_meta(rhs_blocks, fill_rhs)
-            per_meta = op(lhs_meta, rhs_meta)
-        else:
-            per_meta = op(lhs_meta, fill_rhs)
-        return _stitch_meta(per_meta, op(fill_lhs, fill_rhs))
+            return op(lhs_meta, rhs_meta)
+        return op(lhs_meta, fill_rhs)
+
+    def densify_axis(self, val, fill):
+        """Densify the dual-buffer ``val=(lhs_blocks, rhs_blocks)`` to the FULL
+        dense ``(n_meta*M*LCM_h, n_meta*M*LCM_w, *L)`` form via
+        :meth:`to_meta_blocks` + ``_stitch_meta`` + the semantic ``op``.
+        Mirrors the legacy ``DivisorRemainder.to_dense`` chain (gather-free)."""
+        from graphax.sparse.ops.block_storage import _stitch_meta
+
+        fill_lhs, fill_rhs = (fill if isinstance(fill, tuple) else (fill, fill))
+        per_meta = self.to_meta_blocks(val, fill)
+        return _stitch_meta(per_meta, self._op()(fill_lhs, fill_rhs))
 
 
 def DenseIndex(id: int, size: int, axis: int | None) -> Index:

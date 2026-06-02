@@ -538,7 +538,12 @@ class SparseTensor(SparseMathMixin):
         return prod(self.shape)
 
     def dense(self) -> Array:
-        return dense(self, hard=True).val * self.scalar_mult
+        # Compressed Index dims (BandedIndex / SetIndex) carry structure the
+        # scatter-based ``dense`` flow doesn't understand; densify them to
+        # plain DenseIndex / DiagonalIndex first (no-op when there are none).
+        from graphax.sparse.ops.utils import _compressed_dims, _densify_compressed_dims
+        t = _densify_compressed_dims(self) if _compressed_dims(self) else self
+        return dense(t, hard=True).val * t.scalar_mult
 
     @property
     def T(self) -> SparseTensor:
