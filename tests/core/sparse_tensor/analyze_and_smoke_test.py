@@ -2080,7 +2080,7 @@ class TestSmokeScreen(unittest.TestCase):
             (SparseIndex(1, n_rhs, axis=0, other_id=0, block_size=b_rhs, block_axis=2),),
             self._n((n_rhs, b_rhs, b_rhs), 130),
         )
-        _expect_path(core_plus, a, rhs, expected_path="compressed_union")
+        _expect_path(core_plus, a, rhs, expected_path="general")
         expected = a.dense() + rhs.dense()
         res = core_plus(a, rhs)
         self.assertEqual(res.shape, expected.shape)
@@ -2108,7 +2108,7 @@ class TestSmokeScreen(unittest.TestCase):
             (SparseIndex(1, n_rhs, axis=0, other_id=0, block_size=b_rhs, block_axis=2),),
             self._n((n_rhs, b_rhs, b_rhs), 131),
         )
-        _expect_path(core_plus, a, rhs, expected_path="compressed_union")
+        _expect_path(core_plus, a, rhs, expected_path="general")
         expected = a.dense() + rhs.dense()
         res = core_plus(a, rhs)
         self.assertEqual(res.shape, expected.shape)

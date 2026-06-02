@@ -352,108 +352,6 @@ def _reconstruct_result(value, lhs, sp, dp, output_meta, op, rhs):
 
 
 
-def _try_compressed_union(lhs, rhs, op, is_intersection):
-    """Fast path for misaligned 2-D block-diagonal union ops: output the meta-
-    block-diagonal sum *lazily* as ``compressed_val=UnionBlocks(...)`` rather
-    than eagerly building the ``(M, LCM_h, LCM_w)`` materialized form. Saves
-    storage from ``M·LCM_h·LCM_w`` to ``M·(n_lhs·B_lhs² + n_rhs·B_rhs²)`` —
-    a meaningful win whenever the source blocks are sufficiently misaligned
-    (``B_a + B_b < lcm(B_a, B_b)``, e.g. user's coprime 5/11 ⇒ 3.4× tighter).
-
-    The expression that goes into the JAXPR is identical to the eager path
-    (``UnionBlocks.to_meta_blocks`` is the same broadcast+select+sum chain
-    that the eager promote-to-unified used), so XLA fuses both into the same
-    consumer kernel — same latency, M× less HBM footprint between ops.
-
-    Returns the lazy ``SparseTensor`` or ``None`` if conditions don't apply.
-    """
-    if is_intersection or op not in _ZERO_PRESERVING_OPS:
-        return None
-    if len(lhs.dims) != 2 or len(rhs.dims) != 2:
-        return None
-    if lhs.val is None or rhs.val is None:
-        return None
-    # The fast path assumes one out_dim + one primal_dim per side (the sparse
-    # pair straddles the split). 2-D tensors with both dims on the same side
-    # don't satisfy the structural checks below; reject them up-front so we
-    # don't IndexError on the indexing.
-    if not (lhs.out_dims and lhs.primal_dims and rhs.out_dims and rhs.primal_dims):
-        return None
-    ao, ai = lhs.out_dims[0], lhs.primal_dims[0]
-    bo, bi = rhs.out_dims[0], rhs.primal_dims[0]
-    if not all(d.is_sparse for d in (ao, ai, bo, bi)):
-        return None
-    # Sparse pair siblings must match on each side.
-    if ao.other_id != ai.id or ai.other_id != ao.id: return None
-    if bo.other_id != bi.id or bi.other_id != bo.id: return None
-    # All val axes must be materialized. ``axis=None`` means the sib outer
-    # is an implicit broadcast (val is missing that axis); the reshape below
-    # assumes ``val.shape == (N, B_h, B_w)`` so we'd fail on a smaller-rank val.
-    # ``block_axis=None`` similarly means the block axis is broadcast — the
-    # ``UnionBlocks.to_meta_blocks`` path expects fully materialized blocks.
-    if any(d.axis is None for d in (ao, ai, bo, bi)):
-        return None
-    if any(d.block_axis is None for d in (ao, ai, bo, bi)
-           if d.block_size is not None and d.block_size > 1):
-        return None
-    a_b_h, a_b_w = ao.block_size or 1, ai.block_size or 1
-    b_b_h, b_b_w = bo.block_size or 1, bi.block_size or 1
-    a_n, b_n = ao.size, bo.size
-    if a_n * a_b_h != b_n * b_b_h or a_n * a_b_w != b_n * b_b_w:
-        return None
-    lcm_h = math.lcm(a_b_h, b_b_h)
-    lcm_w = math.lcm(a_b_w, b_b_w)
-    if (a_n * a_b_h) % lcm_h or (a_n * a_b_w) % lcm_w:
-        return None
-    M = (a_n * a_b_h) // lcm_h
-    n_lhs, n_rhs = a_n // M, b_n // M
-    # Storage comparison: only commit to compressed_val if it's strictly tighter
-    # than the meta-block-diagonal val we'd otherwise emit. ``UnionBlocks`` is
-    # tighter exactly when ``B_a_h·B_a_w·n_lhs + B_b_h·B_b_w·n_rhs < LCM_h·LCM_w``.
-    union_size = n_lhs * a_b_h * a_b_w + n_rhs * b_b_h * b_b_w
-    meta_size = lcm_h * lcm_w
-    if union_size >= meta_size:
-        return None
-
-    # Absorb scalar_mults into the compressed buffers so the output's scalar_mult
-    # is the canonical 1.0 / True (matches the eager path's ``s_mult`` choice).
-    bool_op = lhs.dtype == jnp.bool_
-    if bool_op:
-        lhs_v = lhs.val & lhs.scalar_mult.astype(jnp.bool_)
-        rhs_v = rhs.val & rhs.scalar_mult.astype(jnp.bool_)
-    else:
-        lhs_v = lhs.val * lhs.scalar_mult
-        rhs_v = rhs.val * rhs.scalar_mult
-    fill_l = _scaled_fill(lhs)
-    fill_r = _scaled_fill(rhs)
-
-    lhs_blocks = lhs_v.reshape(M, n_lhs, a_b_h, a_b_w)
-    rhs_blocks = rhs_v.reshape(M, n_rhs, b_b_h, b_b_w)
-
-    from .block_storage import UnionBlocks
-    ub = UnionBlocks(lhs=lhs_blocks, rhs=rhs_blocks,
-                     fill_lhs=fill_l, fill_rhs=fill_r, op=op)
-    new_fill = op(fill_l, fill_r)
-    s_mult = jnp.array(True) if bool_op else jnp.array(1.0, dtype=lhs.val.dtype)
-    zf = (getattr(lhs, "_zero_fill", False) and getattr(rhs, "_zero_fill", False)) or None
-
-    # Preserve source IDs from lhs's sparse pair — hardcoding ``0, 1`` produces
-    # silent dim-id collisions when lhs sits inside a larger tensor whose IDs
-    # already use 0/1 (the divisor fast path correctly reuses ``big.out_dims``
-    # / ``big.primal_dims`` and so keeps the IDs; mirror that here).
-    out_id, primal_id = lhs.out_dims[0].id, lhs.primal_dims[0].id
-
-    from graphax.sparse.tensor import SparseTensor
-    return SparseTensor(
-        (SparseIndex(out_id, M, axis=0, other_id=primal_id,
-                         block_size=lcm_h, block_axis=1),),
-        (SparseIndex(primal_id, M, axis=0, other_id=out_id,
-                         block_size=lcm_w, block_axis=2),),
-        val=None, compressed_val=ub,
-        scalar_mult=s_mult, fill_value=new_fill,
-        check_consistency=False, zero_fill=zf,
-    )
-
 
 # --- Phase 6b: DivisorRemainder emission (probe + helper) -----------------
 # Inhabits the *general* dispatcher branch (path string stays "general").
@@ -467,14 +365,13 @@ def _should_emit_divisor_remainder(lhs, rhs, op, is_intersection):
     diagonal val? Returns a dict of geometry / IDs on success, ``None``
     otherwise.
 
-    Gates mirror ``_try_compressed_union`` (so behavior matches for the
-    union case the dispatcher already handles). The ``is_intersection``
-    arm is gated off in 6b.2 — enabled in 6b.3 when the dispatcher
-    branch is deleted.
+    Gates mirror the legacy ``_try_compressed_union`` (deleted in 6b.3) and
+    additionally cover ``is_intersection=True`` so multiplicative ops on
+    misaligned 2-D block-diagonals get the same compression. The
+    ``include_remainder`` field is always set to ``True`` for now —
+    structural-identity detection (drop a provably-zero side) is a future
+    refinement.
     """
-    # Phase 6b.2 gate: intersection arm dormant. Phase 6b.3 drops this gate.
-    if is_intersection:
-        return None
     if op not in _ZERO_PRESERVING_OPS:
         return None
     if len(lhs.dims) != 2 or len(rhs.dims) != 2:
@@ -610,17 +507,16 @@ def elementwise(
     is_intersection: bool = False,
     count: bool = False,
 ):
-    """Sparse elementwise op dispatcher. Tries fast paths in priority order,
-    falls back to the general expansion path.
+    """Sparse elementwise op dispatcher.
 
-    Dispatch order (first applicable wins):
-      1. ``compressed_union`` — misaligned 2-D union with a zero-preserving
-                                op: emits ``compressed_val=UnionBlocks``
-                                (M× tighter HBM than eager LCM-grid form).
-      2. ``general``          — full broadcast / promote-to-unified / op /
-                                demote pipeline. Handles every other case
-                                including aligned blocks, non-zero fills, and
-                                operations that aren't zero-preserving.
+    Single ``general`` path that handles every case: misaligned 2-D
+    block-diagonal union AND intersection emissions land as
+    ``compressed_val=DivisorRemainder`` early in the path; aligned blocks,
+    non-zero fills, broadcast cases, and non-zero-preserving ops fall
+    through the full promote-to-unified pipeline. The ``compressed_union``
+    dispatcher branch (Phase 6b.3) was folded into this general path; its
+    path label is gone. The ``divisor_fast`` dispatcher branch
+    (Phase 6a) was deleted as HLO-redundant.
 
     With ``count=True`` returns ``(result, n_ops)`` — the number of element
     positions where ``op`` actually fires, computed from the *static*
@@ -641,18 +537,11 @@ def elementwise(
     if count:
         n = _ew_op_count(lhs, rhs, is_intersection)
 
-    compressed = _try_compressed_union(lhs, rhs, op, is_intersection)
-    if compressed is not None:
-        _record_path("compressed_union")
-        if count:
-            return compressed, n
-        return compressed
     _record_path("general")
-    # Phase 6b: DivisorRemainder emission. The gate is dormant in 6b.2 (mirrors
-    # the dispatcher-stage ``_try_compressed_union``, so this branch never
-    # fires when that dispatcher catches first). 6b.3 deletes the dispatcher
-    # and broadens the probe to intersection ops — this becomes the live
-    # compression path.
+    # Phase 6b: DivisorRemainder emission for both union and intersection ops
+    # on misaligned 2-D block-diagonals. Subsumes the deleted dispatcher
+    # ``_try_compressed_union`` branch and additionally compresses
+    # intersection (mul/etc.) outputs that the dispatcher never handled.
     _dr_geom = _should_emit_divisor_remainder(lhs, rhs, op, is_intersection)
     if _dr_geom is not None:
         out = _emit_divisor_remainder(lhs, rhs, op, _dr_geom)

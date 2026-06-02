@@ -112,12 +112,17 @@ class TestElementwiseUnionMisalignedBlocks(unittest.TestCase):
         meta_size = M * lcm_h * lcm_w
         full_dense_size = (M * lcm_h) * (M * lcm_w)
         if got.compressed_val is not None:
-            # Lazy form: ``UnionBlocks`` with matching meta-block-diag shape, and
-            # storage strictly tighter than the eager ``(M, LCM_h, LCM_w)`` form.
-            from graphax.sparse.ops.block_storage import UnionBlocks
-            self.assertIsInstance(got.compressed_val, UnionBlocks)
+            # Lazy form: ``DivisorRemainder`` (Phase 6b.3 — replaces the legacy
+            # ``UnionBlocks``) with matching meta-block-diag shape, and storage
+            # strictly tighter than the eager ``(M, LCM_h, LCM_w)`` form.
+            from graphax.sparse.ops.block_storage import DivisorRemainder
+            self.assertIsInstance(got.compressed_val, DivisorRemainder)
             self.assertEqual(got.compressed_val.meta_block_shape, (M, lcm_h, lcm_w))
-            stored = got.compressed_val.lhs.size + got.compressed_val.rhs.size
+            stored = got.compressed_val.divisor.size + (
+                got.compressed_val.remainder.size
+                if got.compressed_val.remainder is not None
+                else 0
+            )
             self.assertLess(stored, meta_size,
                             f"lazy form should be < eager: {stored} ≥ {meta_size}")
             return

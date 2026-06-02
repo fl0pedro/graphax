@@ -164,9 +164,14 @@ class TestUnionBlocksOptimality(unittest.TestCase):
         )
         with track_paths() as paths:
             res = elementwise(a, b, jnp.add)
-        self.assertEqual(paths[-1], "compressed_union")
+        # Phase 6b.3 folded the ``compressed_union`` dispatcher into the
+        # general path; the path label is now ``general`` and the
+        # compressed primitive is ``DivisorRemainder`` (semantic='union').
+        from graphax.sparse.ops.block_storage import DivisorRemainder
+        self.assertEqual(paths[-1], "general")
         self.assertIsNotNone(res.compressed_val)
-        self.assertIsInstance(res.compressed_val, UnionBlocks)
+        self.assertIsInstance(res.compressed_val, DivisorRemainder)
+        self.assertEqual(res.compressed_val.semantic, "union")
 
     def test_chained_additions_stay_bounded(self):
         """``a + b + c`` where all three have different misaligned block
@@ -300,6 +305,44 @@ class TestIntersectionBlocksOptimality(unittest.TestCase):
 
         text = to_dense.lower(ib).compile().as_text()
         self.assertEqual(text.lower().count("scatter("), 0)
+
+    def test_elementwise_mul_emits_divisor_remainder(self):
+        """Phase 6b.3: intersection ``mul`` on misaligned 2-D block-diagonals
+        now compresses to ``compressed_val=DivisorRemainder(semantic='intersection')``
+        — same storage win as the union case (which the dispatcher already
+        handled). Pre-6b.3 this output was stored eagerly at LCM granularity."""
+        from graphax.sparse.ops.block_storage import DivisorRemainder
+        # Use the canonical coprime 5/11 case so the storage win is large.
+        a = SparseTensor(
+            (SparseIndex(0, 11, axis=0, other_id=1, block_size=5, block_axis=1),),
+            (SparseIndex(1, 11, axis=0, other_id=0, block_size=5, block_axis=2),),
+            _n((11, 5, 5), 1),
+        )
+        b = SparseTensor(
+            (SparseIndex(0, 5, axis=0, other_id=1, block_size=11, block_axis=1),),
+            (SparseIndex(1, 5, axis=0, other_id=0, block_size=11, block_axis=2),),
+            _n((5, 11, 11), 2),
+        )
+        res = elementwise(a, b, jnp.multiply, is_intersection=True)
+        # Compressed form: intersection semantic.
+        self.assertIsNotNone(res.compressed_val)
+        self.assertIsInstance(res.compressed_val, DivisorRemainder)
+        self.assertEqual(res.compressed_val.semantic, "intersection")
+        # Storage bound: divisor + remainder buffers strictly tighter than
+        # ``M × LCM_h × LCM_w`` for this coprime geometry.
+        dr = res.compressed_val
+        stored = int(dr.divisor.size) + (
+            int(dr.remainder.size) if dr.remainder is not None else 0
+        )
+        lcm_h = math.lcm(5, 11)
+        lcm_w = math.lcm(5, 11)
+        M = 1
+        meta_size = M * lcm_h * lcm_w
+        self.assertLess(stored, meta_size,
+                        f"compressed should be < eager LCM-grid: {stored} ≥ {meta_size}")
+        # Dense round-trip matches the reference intersection product.
+        ref = a.dense() * b.dense()
+        self.assertTrue(jnp.allclose(res.dense(), ref, atol=1e-5))
 
 
 # ============================================================================
