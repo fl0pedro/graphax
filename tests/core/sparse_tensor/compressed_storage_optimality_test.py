@@ -646,12 +646,12 @@ class TestMultiAxisContractMatmul(unittest.TestCase):
         res = sparse_matmul(a, b)
         self.assertTrue(jnp.allclose(res.dense(), ref, atol=1e-4))
 
-    def test_k2_misaligned_currently_stores_dense(self):
-        """Documenting the current behavior: K>1 misalignment falls
-        through to the dense ``val=values`` path (no BlockBanded
-        compression yet). When multi-axis BlockBanded compression lands,
-        flip this assertion to ``compressed_val is not None`` and add
-        the storage-bound check."""
+    def test_k2_misaligned_emits_multi_axis_banded(self):
+        """Phase 7.5: K=2 misaligned-contract matmul now emits
+        ``compressed_val=MultiAxisBlockBanded`` with per-axis band
+        geometry. Storage is strictly less than the dense 4-D output."""
+        from graphax.sparse.ops.block_storage import MultiAxisBlockBanded
+
         a = SparseTensor(
             (
                 SparseIndex(0, 11, axis=0, other_id=2, block_size=5, block_axis=2),
@@ -675,13 +675,16 @@ class TestMultiAxisContractMatmul(unittest.TestCase):
             _n((5, 2, 11, 7, 3, 9), 2),
         )
         res = sparse_matmul(a, b)
-        self.assertIsNone(
-            res.compressed_val,
-            "K>1 multi-misalignment compression not implemented yet — "
-            "if this fires, the storage bound check below needs to be "
-            "added (and this assertion flipped).",
+        self.assertIsNone(res.val)
+        self.assertIsInstance(res.compressed_val, MultiAxisBlockBanded)
+        self.assertEqual(len(res.compressed_val.axes), 2)
+        # Storage strictly tighter than dense.
+        compressed_size = int(res.compressed_val.data.size)
+        dense_size = 55 * 12 * 35 * 18
+        self.assertLess(
+            compressed_size, dense_size,
+            f"compressed {compressed_size} should be < dense {dense_size}",
         )
-        self.assertIsNotNone(res.val)
 
 
 class TestMultiAxisElementwise(unittest.TestCase):

@@ -95,7 +95,7 @@ class CRes(NamedTuple):
     lhs_block_lens: list[int]
     rhs_block_lens: list[int]
     scalar_mult: float
-    banded_geom: "BandedLayout | None" = None
+    banded_geom: "BandedLayout | MultiAxisBandedLayout | None" = None
 
 
 # --- Topology resolution ---------------------------------------------------
@@ -687,6 +687,19 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
         lhs_leftover,
         rhs_leftover,
     )
+    if banded_geom is None:
+        # Fall through to the K>1 multi-axis probe when the K=1 single-pair
+        # probe didn't fire (typically because ``len(pairs) != 1``).
+        banded_geom = _should_emit_multi_axis_banded(
+            ctx,
+            pairs,
+            shared,
+            total,
+            final_lhs_lens,
+            final_rhs_lens,
+            lhs_leftover,
+            rhs_leftover,
+        )
     return grid, shared, final_lhs_lens, final_rhs_lens, scalar, banded_geom
 
 
@@ -950,9 +963,55 @@ def _build_output_tensor(ctx, rhs_dims, res):
     # 2-D single-contract-pair geometry with no leftover, so ``values`` is
     # always 2-D dense at this point.
     if res.banded_geom is not None and values is not None:
-        from .block_storage import BlockBanded
+        from .block_storage import BlockBanded, MultiAxisBlockBanded, BandAxisSpec
 
         layout = res.banded_geom
+        # Multi-axis (K=2) branch: pack as MultiAxisBlockBanded.
+        if isinstance(layout, MultiAxisBandedLayout):
+            band_data = _pack_dense_to_multi_axis_banded(values, layout)
+            specs = tuple(
+                BandAxisSpec(
+                    primary_axis=ax.primary_axis,
+                    n_secondary=ax.n_secondary,
+                    offset=ax.offset,
+                    n_meta=ax.n_meta,
+                    band_width=ax.band_width,
+                    block_row=ax.block_row,
+                    block_col=ax.block_col,
+                )
+                for ax in layout.per_axis
+            )
+            mab = MultiAxisBlockBanded(
+                data=band_data,
+                fill_value=jnp.zeros((), dtype=values.dtype),
+                axes=specs,
+            )
+            mab_shape = mab.shape
+            out_id = final_out[0].id if final_out else 0
+            primal_id = final_primal[0].id if final_primal else (out_id + 1)
+            # K=2 → 4 output axes. Wrap behind 4 full-size DenseIndex dims
+            # matching the multi-axis dense shape (axes 0..K = rows, axes
+            # K..2K = cols).
+            K = len(layout.per_axis)
+            out_dims_new = tuple(
+                DenseIndex(out_id + i, mab_shape[i], axis=i) for i in range(K)
+            )
+            primal_dims_new = tuple(
+                DenseIndex(
+                    primal_id + i, mab_shape[K + i], axis=K + i
+                )
+                for i in range(K)
+            )
+            return SparseTensor(
+                out_dims_new,
+                primal_dims_new,
+                val=None,
+                compressed_val=mab,
+                scalar_mult=jnp.asarray(final_mult).astype(values.dtype),
+                check_consistency=False,
+                zero_fill=True,
+            )
+
         band_data = _pack_dense_to_banded(values, layout)
         bb = BlockBanded(
             data=band_data,
@@ -992,6 +1051,18 @@ def _build_output_tensor(ctx, rhs_dims, res):
         scalar_mult=jnp.asarray(final_mult).astype(out_dtype),
         zero_fill=True,
     )
+
+
+class MultiAxisBandedLayout(NamedTuple):
+    """Multi-axis (K>1) banded layout returned by the multi-contract probe.
+
+    Each axis-pair carries its own :class:`BandedLayout`-equivalent
+    metadata (orientation, band width, sub-block dims, offset). Currently
+    populated for K=2; the structure naturally extends to K>2 once the
+    emission kernel supports it.
+    """
+
+    per_axis: tuple["BandedLayout", ...]
 
 
 class BandedLayout(NamedTuple):
@@ -1186,6 +1257,92 @@ def _should_emit_block_banded(
     )
 
 
+def _should_emit_multi_axis_banded(
+    ctx: "Ctx",
+    pairs: list["Pair"],
+    shared: list[int],
+    total: list[int],
+    final_lhs_lens: list[int],
+    final_rhs_lens: list[int],
+    lhs_leftover: list[int],
+    rhs_leftover: list[int],
+) -> MultiAxisBandedLayout | None:
+    """K=2 multi-contract probe: detect when both contract pairs are
+    misaligned and emission as :class:`MultiAxisBlockBanded` strictly
+    beats the dense 4-D output.
+
+    K=2 only for now; K>2 would mirror the same per-pair logic and emit
+    a higher-rank ``MultiAxisBlockBanded`` once the
+    ``MultiAxisBlockBanded.to_dense`` kernel extends to K>2.
+    """
+    if len(pairs) != 2:
+        return None
+    if any(p.pairing_type != "contract" for p in pairs):
+        return None
+    if lhs_leftover or rhs_leftover:
+        return None
+
+    lhs, rhs = ctx.lhs, ctx.rhs
+    if len(lhs.out_dims) != 2 or len(lhs.primal_dims) != 2:
+        return None
+    if len(rhs.out_dims) != 2 or len(rhs.primal_dims) != 2:
+        return None
+    if not all(d.is_sparse for d in (*lhs.dims, *rhs.dims)):
+        return None
+
+    per_axis: list[BandedLayout] = []
+    for pair_i in range(2):
+        M_a = lhs.out_dims[pair_i].size
+        B_a_h = lhs.out_dims[pair_i].block_size or 1
+        B_a_w = lhs.primal_dims[pair_i].block_size or 1
+        M_b = rhs.primal_dims[pair_i].size
+        B_b_h = rhs.out_dims[pair_i].block_size or 1
+        B_b_w = rhs.primal_dims[pair_i].block_size or 1
+        if M_a * B_a_w != M_b * B_b_h:
+            return None
+        # Per-axis divisibility gate (same as K=1 single-axis probe).
+        if B_a_w % B_b_h == 0 or B_b_h % B_a_w == 0:
+            return None
+        # K=2 multi-axis with per-axis n_meta>1 is a follow-up (would
+        # require ``MultiAxisBlockBanded.to_dense`` per-batch handling).
+        if math.gcd(M_a, M_b) > 1:
+            return None
+
+        row_spans = _row_band_spans(M_a, B_a_w, B_b_h, M_b)
+        if any(lo >= hi for lo, hi in row_spans):
+            return None
+        W_rp = builtins.max(hi - lo for lo, hi in row_spans)
+        offset_rp = tuple(lo for lo, _ in row_spans)
+        # K=2 multi-axis: row-primary only for now (col-primary follows the
+        # same swap+transpose pattern but the kernel doesn't yet implement it).
+        per_axis.append(
+            BandedLayout(
+                primary_axis=0,
+                m_primary=M_a,
+                n_secondary=M_b,
+                band_width=W_rp,
+                block_row=B_a_h,
+                block_col=B_b_w,
+                offset=offset_rp,
+                n_meta=1,
+            )
+        )
+
+    # Storage check: combined K=2 compressed < combined dense.
+    # Compressed = prod over axes of (M_p * W * B_row * B_col).
+    # Dense     = prod over axes of (M_p * n_sec * B_row * B_col).
+    # Ratio = prod(W_i / n_sec_i). Compression iff prod(W_i) < prod(n_sec_i).
+    compressed_factor = 1
+    dense_factor = 1
+    for ax in per_axis:
+        compressed_factor *= ax.band_width
+        dense_factor *= ax.n_secondary
+    if compressed_factor >= dense_factor:
+        return None
+
+    return MultiAxisBandedLayout(per_axis=tuple(per_axis))
+
+
 def _pack_dense_to_banded(values: Array, layout: BandedLayout) -> Array:
     """Pack a dense ``(M_row*B_row, M_col*B_col)`` matmul output into
     ``BlockBanded`` data shape ``(m_primary, W, B_row, B_col)`` via
@@ -1256,6 +1413,80 @@ def _pack_dense_to_banded(values: Array, layout: BandedLayout) -> Array:
     # Flatten the leading ``(N, M_p)`` into ``(N * M_p)`` — the layout
     # BlockBanded expects on its ``data`` axis-0 (``n_meta * M_per_primary``).
     return out.reshape(N * M_p, W, B_row, B_col)
+
+
+def _pack_dense_to_multi_axis_banded(
+    values: Array, layout: MultiAxisBandedLayout
+) -> Array:
+    """Pack a dense ``(M_row_0*B_row_0, M_row_1*B_row_1, M_col_0*B_col_0,
+    M_col_1*B_col_1, *L)`` K=2 matmul output into ``MultiAxisBlockBanded``
+    data shape ``(M_p_0, W_0, M_p_1, W_1, B_row_0, B_row_1, B_col_0,
+    B_col_1, *L)`` via per-axis broadcast+where+sum — no gather,
+    XLA-fusable with the producing dot_general.
+
+    Algorithm:
+      1. Reshape dense to ``(M_p_0, B_row_0, M_p_1, B_row_1, M_s_0,
+         B_col_0, M_s_1, B_col_1, *L)`` — splits each output axis into
+         (meta, sub-block).
+      2. Permute to ``(M_p_0, M_s_0, M_p_1, M_s_1, B_row_0, B_row_1,
+         B_col_0, B_col_1, *L)`` — group axes by (primary, secondary).
+      3. Insert ``W_i`` axes via broadcast.
+      4. Build per-axis one-hot masks (``M_p, M_s, W``); combine via AND.
+      5. Sum over both ``M_s_i`` axes — packs each (M_p_i, W_i) cell to
+         the unique secondary slot that matches.
+
+    K=2 only; K>2 generalizes by adding one more (M_p, M_s, W) prefix
+    pair per axis.
+    """
+    if len(layout.per_axis) != 2:
+        raise NotImplementedError(
+            f"_pack_dense_to_multi_axis_banded supports K=2 only; got K="
+            f"{len(layout.per_axis)}"
+        )
+    a0, a1 = layout.per_axis
+    M_p_0, W_0 = a0.m_primary, a0.band_width
+    B_r_0, B_c_0 = a0.block_row, a0.block_col
+    M_s_0 = a0.n_secondary
+    M_p_1, W_1 = a1.m_primary, a1.band_width
+    B_r_1, B_c_1 = a1.block_row, a1.block_col
+    M_s_1 = a1.n_secondary
+
+    # Step 1: reshape (R_0, R_1, C_0, C_1, *L) → (M_p_0, B_r_0, M_p_1, B_r_1, M_s_0, B_c_0, M_s_1, B_c_1, *L)
+    L = values.shape[4:]
+    grid = values.reshape(M_p_0, B_r_0, M_p_1, B_r_1, M_s_0, B_c_0, M_s_1, B_c_1, *L)
+    # Step 2: permute to (M_p_0, M_s_0, M_p_1, M_s_1, B_r_0, B_r_1, B_c_0, B_c_1, *L)
+    grid = grid.transpose(0, 4, 2, 6, 1, 3, 5, 7, *range(8, 8 + len(L)))
+
+    # Step 3+4: insert W axes via broadcast, build masks per axis.
+    off_0 = jnp.asarray(a0.offset, dtype=jnp.int32)
+    off_1 = jnp.asarray(a1.offset, dtype=jnp.int32)
+    bj_0 = jnp.arange(M_s_0, dtype=jnp.int32)
+    bj_1 = jnp.arange(M_s_1, dtype=jnp.int32)
+    target_w_0 = bj_0[None, :] - off_0[:, None]  # (M_p_0, M_s_0)
+    target_w_1 = bj_1[None, :] - off_1[:, None]
+    sel_0 = target_w_0[:, :, None] == jnp.arange(W_0, dtype=jnp.int32)[None, None, :]
+    sel_1 = target_w_1[:, :, None] == jnp.arange(W_1, dtype=jnp.int32)[None, None, :]
+
+    # grid: 8 + len(L) axes. Insert W_0 at position 2, W_1 at position 5.
+    grid_b = grid[:, :, None, :, :, None, :, :, :, :]
+    L_pad = (None,) * len(L)
+    if L:
+        grid_b = grid_b[..., None][..., 0]  # noop, just type-stable
+    grid_b = jnp.broadcast_to(
+        grid_b,
+        (M_p_0, M_s_0, W_0, M_p_1, M_s_1, W_1, B_r_0, B_r_1, B_c_0, B_c_1, *L),
+    )
+    mask_0 = sel_0[:, :, :, None, None, None, None, None, None, None]
+    mask_1 = sel_1[None, None, None, :, :, :, None, None, None, None]
+    if L:
+        mask_0 = mask_0[(..., *L_pad)]
+        mask_1 = mask_1[(..., *L_pad)]
+    mask = mask_0 & mask_1
+    # Step 5: sum over M_s_0 (axis 1) and M_s_1 (axis 4) — both reductions
+    # in one fused pass.
+    out = jnp.where(mask, grid_b, 0).sum(axis=(1, 4))
+    # Result shape: (M_p_0, W_0, M_p_1, W_1, B_r_0, B_r_1, B_c_0, B_c_1, *L)
+    return out
 
 
 # --- Late-densification escape hatch for non-zero fill_value --------------
