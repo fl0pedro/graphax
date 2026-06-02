@@ -942,10 +942,36 @@ def _build_output_tensor(ctx, rhs_dims, res):
     if not has_val and values is not None and values.size == 1:
         final_mult = final_mult * jnp.squeeze(values)
         values = None
-    # Lazy compressed form: when the output is meta-block-diagonal-square AND
-    # a tighter BlockBanded (smaller B + bandwidth w) exists, repack the val
-    # into ``compressed_val=BlockBanded`` to drop the structured-zero portion
-    # of the meta-block-diagonal storage.
+    # Banded emission: when ``_should_emit_block_banded`` (run upstream in
+    # ``_execute_block_sparse_contraction``) finds a band-storage form
+    # strictly tighter than the natural dense output, pack ``values`` into
+    # the extended ``BlockBanded`` pytree via broadcast+where+sum (gather-
+    # free; XLA fuses with the producing dot_general). The probe gates on
+    # 2-D single-contract-pair geometry with no leftover, so ``values`` is
+    # always 2-D dense at this point.
+    if res.banded_geom is not None and values is not None:
+        from .block_storage import BlockBanded
+
+        layout = res.banded_geom
+        band_data = _pack_dense_to_banded(values, layout)
+        bb = BlockBanded(
+            data=band_data,
+            fill_value=jnp.zeros((), dtype=values.dtype),
+            primary_axis=layout.primary_axis,
+            n_secondary=layout.n_secondary,
+            offset=layout.offset,
+        )
+        return SparseTensor(
+            final_out,
+            final_primal,
+            val=None,
+            compressed_val=bb,
+            scalar_mult=jnp.asarray(final_mult).astype(values.dtype),
+            check_consistency=False,
+            zero_fill=True,
+        )
+    # Lazy compressed form (legacy, dead — replaced by the banded-emission
+    # branch above. Deleted in the next commit once we confirm parity.)
     cv_st = _try_compressed_block_banded(
         ctx,
         final_out,
@@ -1113,6 +1139,24 @@ def _should_emit_block_banded(
     if M_a * B_a_w != M_b * B_b_h:
         return None  # logical contract sizes don't align — outside scope
 
+    # Divisibility gate: when one contract block divides the other, the natural
+    # matmul output preserves meta-block structure (stored as ``val=(M, B_h, B_w)``
+    # — tight already). BlockBanded only helps when neither divides the other
+    # — that's when the LCM-grid expansion forces the natural output to be
+    # 2-D dense, losing the meta-block dim.
+    if B_a_w % B_b_h == 0 or B_b_h % B_a_w == 0:
+        return None
+
+    # GCD gate: when ``gcd(M_a, M_b) > 1`` the matmul output splits into
+    # ``k = gcd`` independent banded meta-blocks stacked on the outer batch
+    # axis (Case A in the mathematician's taxonomy — ``N > 1`` outer batch of
+    # bands). The current emission packs a single band; N>1 is deferred to a
+    # follow-up (would require BlockBanded.data to gain a leading N axis).
+    # For now skip — the existing ``val=(k, ...)`` meta-block storage is
+    # already a real compression vs dense, just not as tight as BandedLike(N).
+    if math.gcd(M_a, M_b) > 1:
+        return None
+
     M_row, M_col = M_a, M_b
     B_row, B_col = B_a_h, B_b_w
 
@@ -1173,6 +1217,66 @@ def _should_emit_block_banded(
         block_col=B_col,
         offset=offset_rp,
     )
+
+
+def _pack_dense_to_banded(values: Array, layout: BandedLayout) -> Array:
+    """Pack a dense ``(M_row*B_row, M_col*B_col)`` matmul output into
+    ``BlockBanded`` data shape ``(m_primary, W, B_row, B_col)`` via
+    broadcast+where+sum — no gather, XLA-fusable with the producing
+    dot_general so the dense intermediate stays in SMEM, not HBM.
+
+    Layout:
+      * ``values``: dense output of the matmul.
+      * ``layout``: computed by ``_should_emit_block_banded``; determines
+        primary-axis orientation, band width, sub-block sizes, offsets.
+
+    Algorithm (uniform for row- and col-primary):
+
+      1. Reshape dense ``(M_row * B_row, M_col * B_col)`` to
+         ``(M_row, B_row, M_col, B_col)``.
+      2. Transpose so the primary-axis becomes axis-0:
+         ``(M_primary, M_secondary, B_row, B_col)``.
+      3. Insert a W-axis via broadcast: ``(M_p, W, M_s, B_row, B_col)``.
+      4. Build a one-hot mask ``m == offset[p] + w`` of shape ``(M_p, W, M_s)``
+         and ``jnp.where(mask, ., 0).sum(axis=2)`` to collapse the secondary
+         axis. Exactly one ``m`` matches per ``(p, w)``, so the sum acts as a
+         per-cell select — XLA fuses into a single ``kLoop`` pass.
+    """
+    M_p = layout.m_primary
+    N_s = layout.n_secondary
+    W = layout.band_width
+    B_row = layout.block_row
+    B_col = layout.block_col
+
+    # Step 1: reshape (M_row*B_row, M_col*B_col) -> (M_row, B_row, M_col, B_col).
+    if layout.primary_axis == 0:
+        M_row, M_col = M_p, N_s
+    else:
+        M_row, M_col = N_s, M_p
+    grid_4d = values.reshape(M_row, B_row, M_col, B_col)
+
+    # Step 2: permute so axis-0 is the primary, axis-1 is the secondary.
+    if layout.primary_axis == 0:
+        # Row-primary: M_row already at axis-0, need M_col at axis-1.
+        grid_t = grid_4d.transpose(0, 2, 1, 3)  # (M_p, N_s, B_row, B_col)
+    else:
+        # Col-primary: M_col currently at axis-2, M_row at axis-0; swap.
+        grid_t = grid_4d.transpose(2, 0, 1, 3)  # (M_p, N_s, B_row, B_col)
+
+    # Step 3: insert W axis via broadcast (pure broadcast, zero-copy).
+    grid_b = jnp.broadcast_to(
+        grid_t[:, None, ...],  # (M_p, 1, N_s, B_row, B_col)
+        (M_p, W, N_s, B_row, B_col),
+    )
+
+    # Step 4: one-hot mask along the secondary axis + sum collapse.
+    offset_arr = jnp.asarray(layout.offset, dtype=jnp.int32)  # (M_p,)
+    target = (
+        offset_arr[:, None] + jnp.arange(W, dtype=jnp.int32)[None, :]
+    )  # (M_p, W); target[p, w] = offset[p] + w (the secondary-meta index)
+    mask = target[:, :, None] == jnp.arange(N_s, dtype=jnp.int32)[None, None, :]
+    mask = mask[..., None, None]  # (M_p, W, N_s, 1, 1)
+    return jnp.where(mask, grid_b, 0).sum(axis=2)  # (M_p, W, B_row, B_col)
 
 
 def _gather_banded_data(

@@ -416,9 +416,10 @@ class TestExplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
+        # Phase 5d-rescope: misaligned-contract matmul now emits BlockBanded
+        # compressed_val. Compare densified forms (raw .val is None when
+        # compression fires).
         assert jnp.allclose(R_ref.dense(), R_st.dense())
-        assert (R_st == R_ref).all()
-        assert jnp.allclose(R, R_ref.val)
 
     def test_block_block_coprime_a_greater_b(self):
         rng_key = self.rng_key
@@ -451,7 +452,10 @@ class TestExplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
-        assert jnp.allclose(R_st.val, R_ref.val)
+        # Phase 5d-rescope: misaligned-contract matmul emits BlockBanded
+        # compressed_val (val=None). Compare densified forms; structural
+        # shape / dim count is still preserved.
+        assert jnp.allclose(R_st.dense(), R_ref.dense())
         assert R_st.shape == R_ref.shape
         assert len(R_st.dims) == len(R_ref.dims)
 
@@ -486,7 +490,10 @@ class TestExplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
-        assert jnp.allclose(R_st.val, R_ref.val)
+        # Phase 5d-rescope: misaligned-contract matmul emits BlockBanded
+        # compressed_val (val=None). Compare densified forms; structural
+        # shape / dim count is still preserved.
+        assert jnp.allclose(R_st.dense(), R_ref.dense())
         assert R_st.shape == R_ref.shape
         assert len(R_st.dims) == len(R_ref.dims)
 
