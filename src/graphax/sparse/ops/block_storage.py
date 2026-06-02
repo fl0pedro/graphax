@@ -535,10 +535,17 @@ class BlockBanded(NamedTuple):
     primary_axis: int = 0
     n_secondary: int = -1
     offset: tuple[int, ...] = ()
+    n_meta: int = 1
 
     @property
     def _M_primary(self) -> int:
-        return self.data.shape[0]
+        """Per-batch primary meta-block count.
+
+        ``data.shape[0]`` is the *flattened* leading axis ``n_meta * M_per``;
+        this property returns ``M_per`` so length-checks (``offset`` length,
+        in-band gating) operate at per-batch granularity.
+        """
+        return self.data.shape[0] // self.n_meta
 
     @property
     def _W(self) -> int:
@@ -554,23 +561,34 @@ class BlockBanded(NamedTuple):
 
     @property
     def _M_secondary(self) -> int:
+        """Per-batch secondary meta-block count. ``-1`` sentinel infers
+        ``M_per_primary`` (square)."""
         return self.n_secondary if self.n_secondary >= 0 else self._M_primary
 
     @property
     def _offset_arr(self) -> tuple[int, ...]:
         if self.offset:
             return self.offset
-        # Centered-band sentinel: offset[a] = a - (W-1)//2.
+        # Centered-band sentinel: offset[a] = a - (W-1)//2. Length = M_per_primary
+        # (each of the ``n_meta`` batches uses the SAME offset pattern).
         w = (self._W - 1) // 2
         return tuple(a - w for a in range(self._M_primary))
 
     @property
     def _M_row(self) -> int:
-        return self._M_primary if self.primary_axis == 0 else self._M_secondary
+        """Total row meta-blocks in the dense output (= n_meta * per-batch row)."""
+        per_batch = (
+            self._M_primary if self.primary_axis == 0 else self._M_secondary
+        )
+        return self.n_meta * per_batch
 
     @property
     def _M_col(self) -> int:
-        return self._M_secondary if self.primary_axis == 0 else self._M_primary
+        """Total col meta-blocks in the dense output (= n_meta * per-batch col)."""
+        per_batch = (
+            self._M_secondary if self.primary_axis == 0 else self._M_primary
+        )
+        return self.n_meta * per_batch
 
     @property
     def half_bandwidth(self) -> int:
@@ -588,37 +606,47 @@ class BlockBanded(NamedTuple):
 
     @property
     def meta_block_shape(self) -> tuple[int, int, int] | None:
-        """``(M, B_row, B_col)`` when this is a pure meta-block-diagonal:
-        ``W=1`` + square meta-counts (``M_row == M_col``) + identity offset
-        (``offset[a] = a``). Returns ``None`` for any banded / rectangular /
-        skewed form (those can't be expressed as a single meta-block-diagonal
-        SparseTensor pair).
+        """``(M_total, B_row, B_col)`` when this is a pure meta-block-diagonal:
+        ``W=1`` + square per-batch meta-counts (``M_per_row == M_per_col``) +
+        identity offset (``offset[a] = a``). ``M_total = n_meta * M_per`` —
+        the full meta-block count across all batches.
 
-        Note: square sub-blocks are NOT required — the existing block-diagonal
-        SparseTensor wrapper supports rectangular block_size pairs.
+        Returns ``None`` for any banded / rectangular / skewed form (those
+        can't be expressed as a single meta-block-diagonal SparseTensor pair).
+
+        Note: square sub-blocks are NOT required — the existing
+        block-diagonal SparseTensor wrapper supports rectangular block_size
+        pairs.
         """
         if self._W != 1:
             return None
         if self._M_row != self._M_col:
             return None
-        # Check identity offset: data[a, 0] sits at primary-meta = secondary-meta = a.
+        # Identity per-batch offset: data[a, 0] sits at primary-meta = secondary-meta = a.
         off = self._offset_arr
         if tuple(off) != tuple(range(self._M_primary)):
             return None
-        return (self._M_primary, self._B_row, self._B_col)
+        return (self.data.shape[0], self._B_row, self._B_col)
 
     def to_meta_blocks(self) -> Array:
-        """``(M, B_row, B_col, *L)`` meta-diagonal blocks. Only defined when
-        this is a pure meta-block-diagonal (see :py:meth:`meta_block_shape`);
-        for any banded / rectangular / skewed form use :meth:`to_dense`."""
+        """``(M_total, B_row, B_col, *L)`` meta-diagonal blocks. Only defined
+        when this is a pure meta-block-diagonal (see
+        :py:meth:`meta_block_shape`); for any banded / rectangular / skewed
+        form use :meth:`to_dense`.
+
+        ``M_total = n_meta * M_per`` — for ``n_meta > 1`` the per-batch
+        diagonals concatenate naturally since each batch's diagonal continues
+        the previous batch's at the same meta-pitch.
+        """
         if self.meta_block_shape is None:
             raise ValueError(
-                "BlockBanded.to_meta_blocks requires W=1 + square meta-counts "
-                f"+ identity offset; got W={self._W}, M_primary={self._M_primary}, "
-                f"M_secondary={self._M_secondary}, offset={self._offset_arr}. "
-                "Use to_dense() for banded forms."
+                "BlockBanded.to_meta_blocks requires W=1 + square per-batch "
+                f"meta-counts + identity offset; got W={self._W}, "
+                f"M_per_primary={self._M_primary}, "
+                f"M_per_secondary={self._M_secondary}, "
+                f"offset={self._offset_arr}. Use to_dense() for banded forms."
             )
-        return self.data[:, 0]   # (M, B_row, B_col, *L)
+        return self.data[:, 0]   # (M_total, B_row, B_col, *L)
 
     def to_dense(self) -> Array:
         """Materialize the dense ``(M_row*B_row, M_col*B_col, *L)`` form via a
@@ -646,9 +674,17 @@ class BlockBanded(NamedTuple):
         swapping the sub-block axes inside ``data`` and transposing the
         final output — two cheap reshape/transpose ops on top of the same
         fused chain.
+
+        For ``n_meta > 1`` the ``data`` leading axis encodes ``n_meta``
+        independent banded blocks stacked on the output's meta-diagonal:
+        reshape ``data`` to ``(n_meta, M_per, W, B_row, B_col, *L)``, build
+        each batch's banded dense via the per-batch kernel, then stitch
+        onto an ``n_meta × n_meta`` meta-block-diagonal via
+        :func:`_stitch_meta` (same broadcast+where pattern, no gather).
         """
-        M_primary, W, B_row, B_col, *L = self.data.shape
-        M_secondary = self._M_secondary
+        _, W, B_row, B_col, *L = self.data.shape
+        M_per_primary = self._M_primary  # per-batch
+        M_per_secondary = self._M_secondary  # per-batch
         L_pad = (None,) * len(L)
 
         # Two offset modes: centered (no gather) vs explicit (one unavoidable gather).
@@ -659,33 +695,45 @@ class BlockBanded(NamedTuple):
         else:
             offset_tuple = None
             centered_w = (W - 1) // 2
-            off_for_fallback = tuple(a - centered_w for a in range(M_primary))
+            off_for_fallback = tuple(a - centered_w for a in range(M_per_primary))
 
         if (
-            math.prod((M_primary, M_secondary, W, B_row, B_col, *L))
+            math.prod(
+                (M_per_primary, M_per_secondary, W, B_row, B_col, *L)
+            ) * self.n_meta
             > _BLOCK_BANDED_BROADCAST_LIMIT
         ):
             return self._to_dense_per_band(
-                M_primary, M_secondary, W, B_row, B_col, off_for_fallback, L
+                M_per_primary, M_per_secondary, W, B_row, B_col, off_for_fallback, L
             )
 
-        if self.primary_axis == 0:
-            # Row-primary: M_primary = M_row, M_secondary = M_col.
-            return _to_dense_banded(
-                self.data, M_primary, M_secondary, W, B_row, B_col,
+        def _one_batch_dense(data_batch: Array) -> Array:
+            """Per-batch banded densify: ``data_batch`` shape
+            ``(M_per_primary, W, B_row, B_col, *L)`` → per-batch dense
+            ``(M_per_primary * B_row, M_per_secondary * B_col, *L)`` for
+            row-primary; transposed for col-primary."""
+            if self.primary_axis == 0:
+                return _to_dense_banded(
+                    data_batch, M_per_primary, M_per_secondary, W, B_row, B_col,
+                    offset_tuple, centered_w, self.fill_value, L, L_pad,
+                )
+            data_t = data_batch.swapaxes(2, 3)
+            dense_T = _to_dense_banded(
+                data_t, M_per_primary, M_per_secondary, W, B_col, B_row,
                 offset_tuple, centered_w, self.fill_value, L, L_pad,
             )
+            return dense_T.swapaxes(0, 1)
 
-        # Col-primary: data[b, w] is at (row meta off[b]+w, col meta b). Reuse
-        # the row-primary kernel on the transposed view (B_col, B_row sub-blocks
-        # swapped) producing (M_primary*B_col, M_secondary*B_row, *L) which is
-        # the TRANSPOSE of the desired dense; swap back at the end.
-        data_t = self.data.swapaxes(2, 3)  # (M_primary, W, B_col, B_row, *L)
-        dense_T = _to_dense_banded(
-            data_t, M_primary, M_secondary, W, B_col, B_row,
-            offset_tuple, centered_w, self.fill_value, L, L_pad,
+        if self.n_meta == 1:
+            return _one_batch_dense(self.data)
+
+        # n_meta > 1: reshape, vmap, stitch.
+        data_b = self.data.reshape(
+            self.n_meta, M_per_primary, W, B_row, B_col, *L
         )
-        return dense_T.swapaxes(0, 1)
+        per_batch_dense = jax.vmap(_one_batch_dense)(data_b)
+        # per_batch_dense shape: (n_meta, M_per_row * B_row, M_per_col * B_col, *L)
+        return _stitch_meta(per_batch_dense, self.fill_value)
 
     def _to_dense_per_band(
         self,
@@ -773,9 +821,13 @@ jax.tree_util.register_pytree_node(IntersectionBlocks, _blocks_flatten, _interse
 
 def _block_banded_flatten(bb):
     """Flatten ``BlockBanded`` for pytree traversal. Two array leaves; the
-    static metadata (``primary_axis``, ``n_secondary``, ``offset``) goes into
-    aux_data so JIT treats it as compile-time constant."""
-    return (bb.data, bb.fill_value), (bb.primary_axis, bb.n_secondary, bb.offset)
+    static metadata (``primary_axis``, ``n_secondary``, ``offset``,
+    ``n_meta``) goes into aux_data so JIT treats it as compile-time
+    constant."""
+    return (
+        (bb.data, bb.fill_value),
+        (bb.primary_axis, bb.n_secondary, bb.offset, bb.n_meta),
+    )
 
 
 def _block_banded_unflatten(aux, children):
@@ -784,6 +836,7 @@ def _block_banded_unflatten(aux, children):
         primary_axis=aux[0],
         n_secondary=aux[1],
         offset=aux[2],
+        n_meta=aux[3],
     )
 
 

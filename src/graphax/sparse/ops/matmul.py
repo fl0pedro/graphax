@@ -960,10 +960,21 @@ def _build_output_tensor(ctx, rhs_dims, res):
             primary_axis=layout.primary_axis,
             n_secondary=layout.n_secondary,
             offset=layout.offset,
+            n_meta=layout.n_meta,
         )
+        # ``BlockBanded`` carries the full ``(M_row*B_row, M_col*B_col)`` shape
+        # in its ``compressed_val``; wrap behind two full-size ``DenseIndex``
+        # dims so ``SparseTensor.dense()`` reads the dense shape directly
+        # rather than trying to assemble a meta-block-diagonal from the
+        # original (sparse-pair) ``final_out``/``final_primal`` (which for
+        # ``n_meta > 1`` describes the outer-batch sparse structure that the
+        # BlockBanded already absorbed via ``n_meta``).
+        bb_row, bb_col = bb.shape[0], bb.shape[1]
+        out_id = final_out[0].id if final_out else 0
+        primal_id = final_primal[0].id if final_primal else (out_id + 1)
         return SparseTensor(
-            final_out,
-            final_primal,
+            (DenseIndex(out_id, bb_row, axis=0),),
+            (DenseIndex(primal_id, bb_col, axis=1),),
             val=None,
             compressed_val=bb,
             scalar_mult=jnp.asarray(final_mult).astype(values.dtype),
@@ -1015,6 +1026,7 @@ class BandedLayout(NamedTuple):
     block_row: int
     block_col: int
     offset: tuple[int, ...]
+    n_meta: int = 1
 
 
 def _row_band_spans(
@@ -1098,22 +1110,20 @@ def _should_emit_block_banded(
     if B_a_w % B_b_h == 0 or B_b_h % B_a_w == 0:
         return None
 
-    # GCD gate: when ``gcd(M_a, M_b) > 1`` the matmul output splits into
-    # ``k = gcd`` independent banded meta-blocks stacked on the outer batch
-    # axis (Case A in the mathematician's taxonomy — ``N > 1`` outer batch of
-    # bands). The current emission packs a single band; N>1 is deferred to a
-    # follow-up (would require BlockBanded.data to gain a leading N axis).
-    # For now skip — the existing ``val=(k, ...)`` meta-block storage is
-    # already a real compression vs dense, just not as tight as BandedLike(N).
-    if math.gcd(M_a, M_b) > 1:
-        return None
+    # When ``gcd(M_a, M_b) > 1`` the matmul output splits into ``N = gcd``
+    # independent banded meta-blocks stacked along the meta-diagonal (Case A
+    # of the mathematician's taxonomy). The per-batch geometry is the same
+    # as a smaller ``(M_per_a, B_a) × (M_per_b, B_b)`` matmul; ``BlockBanded``'s
+    # ``n_meta`` field carries the outer batch count.
+    N = math.gcd(M_a, M_b)
+    M_per_a = M_a // N
+    M_per_b = M_b // N
 
-    M_row, M_col = M_a, M_b
     B_row, B_col = B_a_h, B_b_w
 
-    # Compute both orientations' band spans.
-    row_spans = _row_band_spans(M_row, B_a_w, B_b_h, M_col)
-    col_spans = _row_band_spans(M_col, B_b_h, B_a_w, M_row)
+    # Compute both orientations' band spans at *per-batch* granularity.
+    row_spans = _row_band_spans(M_per_a, B_a_w, B_b_h, M_per_b)
+    col_spans = _row_band_spans(M_per_b, B_b_h, B_a_w, M_per_a)
 
     # If any row has empty span (shouldn't happen given the logical-contract
     # check above, but bail defensively) - no band, fall through.
@@ -1125,10 +1135,12 @@ def _should_emit_block_banded(
     offset_rp = tuple(lo for lo, _ in row_spans)
     offset_cp = tuple(lo for lo, _ in col_spans)
 
-    # Storage footprint (sub-block count × B_row × B_col floats).
-    rp_cost = M_row * W_rp * B_row * B_col
-    cp_cost = M_col * W_cp * B_row * B_col
-    dense_cost = (M_row * B_row) * (M_col * B_col)
+    # Storage footprint per orientation. ``N`` factors out — pick whichever
+    # per-batch slot count is smaller. Compare against the natural per-batch
+    # dense (which is what the eager path materializes when N>1).
+    rp_cost = N * M_per_a * W_rp * B_row * B_col
+    cp_cost = N * M_per_b * W_cp * B_row * B_col
+    dense_cost = N * (M_per_a * B_row) * (M_per_b * B_col)
 
     # Fall through when no compression possible — keeps existing val=values path
     # for aligned (divisor) cases that the natural meta-block storage already
@@ -1136,15 +1148,17 @@ def _should_emit_block_banded(
     if rp_cost >= dense_cost and cp_cost >= dense_cost:
         return None
 
-    # Also fall through when the band is trivially the identity diagonal
-    # (W=1, identity offset, square): the existing val=(M, B_h, B_w) form is
-    # equivalent, no need for a BlockBanded wrap.
+    # Also fall through when the per-batch band is the trivial identity
+    # diagonal (``W=1``, identity offset, square per-batch counts). The
+    # existing 3-D ``val=(N, M_per*B_h, M_per*B_w)`` storage is equivalent to
+    # a per-batch pure block-diagonal and the wrapping doesn't add value at
+    # such granularity.
     if (
         W_rp == 1
-        and offset_rp == tuple(range(M_row))
-        and M_row == M_col
+        and offset_rp == tuple(range(M_per_a))
+        and M_per_a == M_per_b
         and W_cp == 1
-        and offset_cp == tuple(range(M_col))
+        and offset_cp == tuple(range(M_per_b))
     ):
         return None
 
@@ -1152,21 +1166,23 @@ def _should_emit_block_banded(
     if cp_cost < rp_cost:
         return BandedLayout(
             primary_axis=1,
-            m_primary=M_col,
-            n_secondary=M_row,
+            m_primary=M_per_b,
+            n_secondary=M_per_a,
             band_width=W_cp,
             block_row=B_row,
             block_col=B_col,
             offset=offset_cp,
+            n_meta=N,
         )
     return BandedLayout(
         primary_axis=0,
-        m_primary=M_row,
-        n_secondary=M_col,
+        m_primary=M_per_a,
+        n_secondary=M_per_b,
         band_width=W_rp,
         block_row=B_row,
         block_col=B_col,
         offset=offset_rp,
+        n_meta=N,
     )
 
 
@@ -1198,36 +1214,48 @@ def _pack_dense_to_banded(values: Array, layout: BandedLayout) -> Array:
     W = layout.band_width
     B_row = layout.block_row
     B_col = layout.block_col
+    N = layout.n_meta
 
-    # Step 1: reshape (M_row*B_row, M_col*B_col) -> (M_row, B_row, M_col, B_col).
     if layout.primary_axis == 0:
         M_row, M_col = M_p, N_s
     else:
         M_row, M_col = N_s, M_p
-    grid_4d = values.reshape(M_row, B_row, M_col, B_col)
 
-    # Step 2: permute so axis-0 is the primary, axis-1 is the secondary.
-    if layout.primary_axis == 0:
-        # Row-primary: M_row already at axis-0, need M_col at axis-1.
-        grid_t = grid_4d.transpose(0, 2, 1, 3)  # (M_p, N_s, B_row, B_col)
+    # Step 1: reshape to ``(N, M_row, B_row, M_col, B_col)``. For ``N=1`` values
+    # arrives as 2-D dense ``(M_row*B_row, M_col*B_col)``; for ``N>1`` it arrives
+    # 3-D ``(N, M_row*B_row, M_col*B_col)`` (the matmul writes the per-batch
+    # diagonals into a leading axis already).
+    if N == 1:
+        grid_5d = values.reshape(1, M_row, B_row, M_col, B_col)
     else:
-        # Col-primary: M_col currently at axis-2, M_row at axis-0; swap.
-        grid_t = grid_4d.transpose(2, 0, 1, 3)  # (M_p, N_s, B_row, B_col)
+        grid_5d = values.reshape(N, M_row, B_row, M_col, B_col)
+
+    # Step 2: permute so axis-1 is the primary, axis-2 is the secondary.
+    # (Axis-0 stays as the batch axis.)
+    if layout.primary_axis == 0:
+        # Row-primary: M_row at axis-1, M_col at axis-3 → bring M_col to axis-2.
+        grid_t = grid_5d.transpose(0, 1, 3, 2, 4)  # (N, M_p, N_s, B_row, B_col)
+    else:
+        # Col-primary: M_col at axis-3 (= M_p), M_row at axis-1 (= N_s).
+        grid_t = grid_5d.transpose(0, 3, 1, 2, 4)  # (N, M_p, N_s, B_row, B_col)
 
     # Step 3: insert W axis via broadcast (pure broadcast, zero-copy).
     grid_b = jnp.broadcast_to(
-        grid_t[:, None, ...],  # (M_p, 1, N_s, B_row, B_col)
-        (M_p, W, N_s, B_row, B_col),
+        grid_t[:, :, None, ...],  # (N, M_p, 1, N_s, B_row, B_col)
+        (N, M_p, W, N_s, B_row, B_col),
     )
 
     # Step 4: one-hot mask along the secondary axis + sum collapse.
     offset_arr = jnp.asarray(layout.offset, dtype=jnp.int32)  # (M_p,)
     target = (
         offset_arr[:, None] + jnp.arange(W, dtype=jnp.int32)[None, :]
-    )  # (M_p, W); target[p, w] = offset[p] + w (the secondary-meta index)
+    )  # (M_p, W); target[p, w] = offset[p] + w
     mask = target[:, :, None] == jnp.arange(N_s, dtype=jnp.int32)[None, None, :]
-    mask = mask[..., None, None]  # (M_p, W, N_s, 1, 1)
-    return jnp.where(mask, grid_b, 0).sum(axis=2)  # (M_p, W, B_row, B_col)
+    mask = mask[None, ..., None, None]  # (1, M_p, W, N_s, 1, 1)
+    out = jnp.where(mask, grid_b, 0).sum(axis=3)  # (N, M_p, W, B_row, B_col)
+    # Flatten the leading ``(N, M_p)`` into ``(N * M_p)`` — the layout
+    # BlockBanded expects on its ``data`` axis-0 (``n_meta * M_per_primary``).
+    return out.reshape(N * M_p, W, B_row, B_col)
 
 
 # --- Late-densification escape hatch for non-zero fill_value --------------
