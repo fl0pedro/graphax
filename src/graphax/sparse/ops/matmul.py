@@ -1275,23 +1275,24 @@ def _should_emit_multi_axis_banded(
     a higher-rank ``MultiAxisBlockBanded`` once the
     ``MultiAxisBlockBanded.to_dense`` kernel extends to K>2.
     """
-    if len(pairs) != 2:
-        return None
+    K = len(pairs)
+    if K < 2:
+        return None  # K=1 handled by single-axis probe upstream.
     if any(p.pairing_type != "contract" for p in pairs):
         return None
     if lhs_leftover or rhs_leftover:
         return None
 
     lhs, rhs = ctx.lhs, ctx.rhs
-    if len(lhs.out_dims) != 2 or len(lhs.primal_dims) != 2:
+    if len(lhs.out_dims) != K or len(lhs.primal_dims) != K:
         return None
-    if len(rhs.out_dims) != 2 or len(rhs.primal_dims) != 2:
+    if len(rhs.out_dims) != K or len(rhs.primal_dims) != K:
         return None
     if not all(d.is_sparse for d in (*lhs.dims, *rhs.dims)):
         return None
 
     per_axis: list[BandedLayout] = []
-    for pair_i in range(2):
+    for pair_i in range(K):
         M_a = lhs.out_dims[pair_i].size
         B_a_h = lhs.out_dims[pair_i].block_size or 1
         B_a_w = lhs.primal_dims[pair_i].block_size or 1
@@ -1418,74 +1419,91 @@ def _pack_dense_to_banded(values: Array, layout: BandedLayout) -> Array:
 def _pack_dense_to_multi_axis_banded(
     values: Array, layout: MultiAxisBandedLayout
 ) -> Array:
-    """Pack a dense ``(M_row_0*B_row_0, M_row_1*B_row_1, M_col_0*B_col_0,
-    M_col_1*B_col_1, *L)`` K=2 matmul output into ``MultiAxisBlockBanded``
-    data shape ``(M_p_0, W_0, M_p_1, W_1, B_row_0, B_row_1, B_col_0,
-    B_col_1, *L)`` via per-axis broadcast+where+sum — no gather,
-    XLA-fusable with the producing dot_general.
+    """Pack a dense ``(M_row_0*B_row_0, ..., M_row_{K-1}*B_row_{K-1},
+    M_col_0*B_col_0, ..., M_col_{K-1}*B_col_{K-1}, *L)`` K-axis matmul
+    output into ``MultiAxisBlockBanded`` data shape
+    ``(M_p_0, W_0, ..., M_p_{K-1}, W_{K-1}, B_row_0, ..., B_row_{K-1},
+       B_col_0, ..., B_col_{K-1}, *L)`` via per-axis broadcast+where+sum.
 
-    Algorithm:
-      1. Reshape dense to ``(M_p_0, B_row_0, M_p_1, B_row_1, M_s_0,
-         B_col_0, M_s_1, B_col_1, *L)`` — splits each output axis into
-         (meta, sub-block).
-      2. Permute to ``(M_p_0, M_s_0, M_p_1, M_s_1, B_row_0, B_row_1,
-         B_col_0, B_col_1, *L)`` — group axes by (primary, secondary).
-      3. Insert ``W_i`` axes via broadcast.
-      4. Build per-axis one-hot masks (``M_p, M_s, W``); combine via AND.
-      5. Sum over both ``M_s_i`` axes — packs each (M_p_i, W_i) cell to
-         the unique secondary slot that matches.
-
-    K=2 only; K>2 generalizes by adding one more (M_p, M_s, W) prefix
-    pair per axis.
+    Generalizes the K=1 packing kernel by adding one ``(M_p, M_s, W)``
+    prefix triple per axis, combined via AND of per-axis one-hot masks.
+    Both per-axis ``M_s`` reductions happen in one fused pass.
     """
-    if len(layout.per_axis) != 2:
-        raise NotImplementedError(
-            f"_pack_dense_to_multi_axis_banded supports K=2 only; got K="
-            f"{len(layout.per_axis)}"
-        )
-    a0, a1 = layout.per_axis
-    M_p_0, W_0 = a0.m_primary, a0.band_width
-    B_r_0, B_c_0 = a0.block_row, a0.block_col
-    M_s_0 = a0.n_secondary
-    M_p_1, W_1 = a1.m_primary, a1.band_width
-    B_r_1, B_c_1 = a1.block_row, a1.block_col
-    M_s_1 = a1.n_secondary
+    K = len(layout.per_axis)
+    M_p = [ax.m_primary for ax in layout.per_axis]
+    M_s = [ax.n_secondary for ax in layout.per_axis]
+    W = [ax.band_width for ax in layout.per_axis]
+    B_row = [ax.block_row for ax in layout.per_axis]
+    B_col = [ax.block_col for ax in layout.per_axis]
+    offsets = [ax.offset for ax in layout.per_axis]
+    L = values.shape[2 * K :]
 
-    # Step 1: reshape (R_0, R_1, C_0, C_1, *L) → (M_p_0, B_r_0, M_p_1, B_r_1, M_s_0, B_c_0, M_s_1, B_c_1, *L)
-    L = values.shape[4:]
-    grid = values.reshape(M_p_0, B_r_0, M_p_1, B_r_1, M_s_0, B_c_0, M_s_1, B_c_1, *L)
-    # Step 2: permute to (M_p_0, M_s_0, M_p_1, M_s_1, B_r_0, B_r_1, B_c_0, B_c_1, *L)
-    grid = grid.transpose(0, 4, 2, 6, 1, 3, 5, 7, *range(8, 8 + len(L)))
+    # Step 1: reshape dense to ``(M_p_0, B_row_0, ..., M_p_{K-1}, B_row_{K-1},
+    # M_s_0, B_col_0, ..., M_s_{K-1}, B_col_{K-1}, *L)`` — split each
+    # output axis into (meta, sub-block).
+    split_shape = []
+    for i in range(K):
+        split_shape += [M_p[i], B_row[i]]
+    for i in range(K):
+        split_shape += [M_s[i], B_col[i]]
+    split_shape += list(L)
+    grid = values.reshape(*split_shape)
 
-    # Step 3+4: insert W axes via broadcast, build masks per axis.
-    off_0 = jnp.asarray(a0.offset, dtype=jnp.int32)
-    off_1 = jnp.asarray(a1.offset, dtype=jnp.int32)
-    bj_0 = jnp.arange(M_s_0, dtype=jnp.int32)
-    bj_1 = jnp.arange(M_s_1, dtype=jnp.int32)
-    target_w_0 = bj_0[None, :] - off_0[:, None]  # (M_p_0, M_s_0)
-    target_w_1 = bj_1[None, :] - off_1[:, None]
-    sel_0 = target_w_0[:, :, None] == jnp.arange(W_0, dtype=jnp.int32)[None, None, :]
-    sel_1 = target_w_1[:, :, None] == jnp.arange(W_1, dtype=jnp.int32)[None, None, :]
+    # Step 2: permute to group per-axis (M_p_i, M_s_i, B_row_i, B_col_i):
+    # Target order: M_p_0, M_s_0, M_p_1, M_s_1, ..., M_p_{K-1}, M_s_{K-1},
+    # B_row_0, B_row_1, ..., B_row_{K-1}, B_col_0, ..., B_col_{K-1}, *L.
+    perm: list[int] = []
+    for i in range(K):
+        perm.append(2 * i)              # M_p_i (rows split)
+        perm.append(2 * K + 2 * i)      # M_s_i (cols split)
+    for i in range(K):
+        perm.append(2 * i + 1)          # B_row_i
+    for i in range(K):
+        perm.append(2 * K + 2 * i + 1)  # B_col_i
+    perm += list(range(4 * K, 4 * K + len(L)))
+    grid = grid.transpose(perm)
+    # Shape now: (M_p_0, M_s_0, M_p_1, M_s_1, ..., M_p_{K-1}, M_s_{K-1},
+    #             B_row_0, ..., B_row_{K-1}, B_col_0, ..., B_col_{K-1}, *L)
 
-    # grid: 8 + len(L) axes. Insert W_0 at position 2, W_1 at position 5.
-    grid_b = grid[:, :, None, :, :, None, :, :, :, :]
-    L_pad = (None,) * len(L)
-    if L:
-        grid_b = grid_b[..., None][..., 0]  # noop, just type-stable
-    grid_b = jnp.broadcast_to(
-        grid_b,
-        (M_p_0, M_s_0, W_0, M_p_1, M_s_1, W_1, B_r_0, B_r_1, B_c_0, B_c_1, *L),
-    )
-    mask_0 = sel_0[:, :, :, None, None, None, None, None, None, None]
-    mask_1 = sel_1[None, None, None, :, :, :, None, None, None, None]
-    if L:
-        mask_0 = mask_0[(..., *L_pad)]
-        mask_1 = mask_1[(..., *L_pad)]
-    mask = mask_0 & mask_1
-    # Step 5: sum over M_s_0 (axis 1) and M_s_1 (axis 4) — both reductions
-    # in one fused pass.
-    out = jnp.where(mask, grid_b, 0).sum(axis=(1, 4))
-    # Result shape: (M_p_0, W_0, M_p_1, W_1, B_r_0, B_r_1, B_c_0, B_c_1, *L)
+    # Step 3: insert W axes via singleton broadcast. Each (M_p_i, M_s_i)
+    # gets a W_i axis right after the pair.
+    indexer = []
+    for i in range(K):
+        indexer.append(slice(None))  # M_p_i
+        indexer.append(slice(None))  # M_s_i
+        indexer.append(None)          # W_i (inserted)
+    indexer += [slice(None)] * (2 * K + len(L))  # B_row, B_col, L
+    grid_b = grid[tuple(indexer)]
+    # Broadcast W axes to their actual sizes.
+    expanded = []
+    for i in range(K):
+        expanded += [M_p[i], M_s[i], W[i]]
+    expanded += B_row
+    expanded += B_col
+    expanded += list(L)
+    grid_b = jnp.broadcast_to(grid_b, tuple(expanded))
+
+    # Step 4: build per-axis selection masks ``w_idx == b - offset[a]``
+    # and AND them.
+    combined_mask = None
+    for i in range(K):
+        off_arr = jnp.asarray(offsets[i], dtype=jnp.int32)
+        bj = jnp.arange(M_s[i], dtype=jnp.int32)
+        target_w = bj[None, :] - off_arr[:, None]
+        sel = target_w[:, :, None] == jnp.arange(W[i], dtype=jnp.int32)[None, None, :]
+        sel_shape = [1] * len(expanded)
+        sel_shape[3 * i] = M_p[i]
+        sel_shape[3 * i + 1] = M_s[i]
+        sel_shape[3 * i + 2] = W[i]
+        sel_r = sel.reshape(*sel_shape)
+        combined_mask = sel_r if combined_mask is None else (combined_mask & sel_r)
+
+    # Step 5: where + sum over all M_s_i axes (positions 1, 4, 7, ...) in
+    # one fused reduction.
+    Ms_axes = tuple(3 * i + 1 for i in range(K))
+    out = jnp.where(combined_mask, grid_b, 0).sum(axis=Ms_axes)
+    # Shape: (M_p_0, W_0, M_p_1, W_1, ..., B_row_0, ..., B_col_{K-1}, *L)
+    # — matches MultiAxisBlockBanded data layout.
     return out
 
 

@@ -927,16 +927,31 @@ class MultiAxisBlockBanded(NamedTuple):
         return (*out_axes, *L)
 
     def to_dense(self) -> Array:
-        """Materialize the dense form via per-axis broadcast+where+sum.
+        """Materialize the dense form for ANY K via per-axis
+        broadcast+where+sum.
 
-        For K=2: apply axis-0 banded select then axis-1 banded select.
-        Each axis's mask is independent so the combined select is the
-        elementwise AND of per-axis masks — both reductions happen in
-        the same fused chain. For K>2: recursively chain.
+        Algorithm:
+          1. Insert ``M_s_i`` secondary axes after each (M_p_i, W_i) pair
+             via singleton broadcast — pure metadata, zero copy.
+          2. For each axis i, build a one-hot selection mask of shape
+             ``(M_p_i, M_s_i, W_i)`` and broadcast to the full expanded
+             tensor shape; AND all per-axis masks together.
+          3. ``where(mask, data, 0).sum(axis=W_axes)`` — collapse all K
+             W axes in a single fused reduction. Each (M_p_i, M_s_i)
+             cell gets exactly one matching W slot, so the sum acts as
+             per-axis selection.
+          4. Permute / reshape to the dense output layout
+             ``(M_p_0*B_row_0, ..., M_s_0*B_col_0, ..., *L)``.
+          5. Apply the K per-axis in-band masks (ANDed across axes) to
+             swap ``fill_value`` in for any out-of-band cell along any
+             axis.
 
-        Currently implements K=1 (delegates to ``BlockBanded`` equivalent)
-        and K=2 explicitly; K>2 raises ``NotImplementedError`` until the
-        chain is generalized.
+        Constraints (until follow-up extensions):
+          * ``n_meta`` per axis must be 1 (per-axis batching is a
+            straightforward fori_loop wrap on top of this kernel).
+          * ``primary_axis`` per axis must be 0 (col-primary per-axis
+            mirrors the K=1 swap+transpose pattern; will be added when
+            an actual col-primary K>1 case arises).
         """
         K = self.K
         if K == 1:
@@ -950,99 +965,463 @@ class MultiAxisBlockBanded(NamedTuple):
                 n_meta=spec.n_meta,
             )
             return bb.to_dense()
-        if K != 2:
-            raise NotImplementedError(
-                f"MultiAxisBlockBanded.to_dense for K={K} not yet implemented; "
-                "K=1 and K=2 supported. K>2 needs the per-axis broadcast+where+sum "
-                "chain to recursively extend over additional leading axes."
-            )
 
-        # K=2: data shape (M1_tot, W1, M2_tot, W2, B_r1, B_r2, B_c1, B_c2, *L)
-        # where M_i_tot = n_meta_i * M_p_i.
-        spec_0, spec_1 = self.axes
-        M_p_0, M_p_1 = self._per_axis_M_p
-        M_s_0, M_s_1 = self._per_axis_M_secondary
-        W_0, W_1 = spec_0.band_width, spec_1.band_width
-        B_r_0, B_r_1 = spec_0.block_row, spec_1.block_row
-        B_c_0, B_c_1 = spec_0.block_col, spec_1.block_col
-        L = self.data.shape[8:]
-        n_meta_0, n_meta_1 = spec_0.n_meta, spec_1.n_meta
+        # Per-axis bookkeeping (all Python int lists — static at trace time).
+        M_p = list(self._per_axis_M_p)
+        M_s = list(self._per_axis_M_secondary)
+        W = [ax.band_width for ax in self.axes]
+        B_row = [ax.block_row for ax in self.axes]
+        B_col = [ax.block_col for ax in self.axes]
+        offsets = list(self._per_axis_offset_arr)
+        L = self.data.shape[4 * K :]
 
-        if n_meta_0 != 1 or n_meta_1 != 1:
-            raise NotImplementedError(
-                "MultiAxisBlockBanded K=2 with n_meta>1 not yet implemented; "
-                "fall back to per-batch loop is straightforward but out of "
-                "scope for the initial Phase 7.5 landing."
-            )
-        if spec_0.primary_axis != 0 or spec_1.primary_axis != 0:
-            raise NotImplementedError(
-                "MultiAxisBlockBanded K=2 supports row-primary only for now; "
-                "col-primary per-axis swap follows the same pattern as the "
-                "K=1 case (swapaxes + transpose)."
-            )
+        for ax in self.axes:
+            if ax.n_meta != 1 or ax.primary_axis != 0:
+                raise NotImplementedError(
+                    "MultiAxisBlockBanded K>1 supports n_meta=1 + row-primary "
+                    "per axis. Multi-batch and col-primary per-axis follow the "
+                    "K=1 patterns; add when needed."
+                )
 
-        off_0 = self._per_axis_offset_arr[0]
-        off_1 = self._per_axis_offset_arr[1]
-        off_0_arr = jnp.asarray(off_0, dtype=jnp.int32)
-        off_1_arr = jnp.asarray(off_1, dtype=jnp.int32)
-        L_pad = (None,) * len(L)
+        # Step 1: insert M_s_i singleton axes via slicing indexer.
+        # Original data axes (in order): M_p_0, W_0, M_p_1, W_1, ..., M_p_{K-1},
+        # W_{K-1}, B_row_0, ..., B_row_{K-1}, B_col_0, ..., B_col_{K-1}, *L
+        # We insert ``None`` after each M_p_i to make room for M_s_i:
+        # M_p_0, M_s_0(None), W_0, M_p_1, M_s_1(None), W_1, ...
+        indexer = []
+        for _ in range(K):
+            indexer.append(slice(None))  # M_p_i
+            indexer.append(None)          # M_s_i (inserted)
+            indexer.append(slice(None))  # W_i
+        indexer += [slice(None)] * (2 * K + len(L))  # B_row, B_col, L axes
+        data_e = self.data[tuple(indexer)]
+        # Broadcast to fill M_s_i sizes.
+        expanded = []
+        for i in range(K):
+            expanded += [M_p[i], M_s[i], W[i]]
+        expanded += B_row
+        expanded += B_col
+        expanded += list(L)
+        data_b = jnp.broadcast_to(data_e, tuple(expanded))
 
-        # Build per-axis selection masks (axis-1: (M_p_0, M_s_0, W_0); axis-2: (M_p_1, M_s_1, W_1)).
-        bj_0 = jnp.arange(M_s_0, dtype=jnp.int32)
-        bj_1 = jnp.arange(M_s_1, dtype=jnp.int32)
-        target_w_0 = bj_0[None, :] - off_0_arr[:, None]  # (M_p_0, M_s_0)
-        target_w_1 = bj_1[None, :] - off_1_arr[:, None]  # (M_p_1, M_s_1)
-        select_0 = target_w_0[:, :, None] == jnp.arange(W_0, dtype=jnp.int32)[None, None, :]
-        select_1 = target_w_1[:, :, None] == jnp.arange(W_1, dtype=jnp.int32)[None, None, :]
+        # Step 2: build per-axis selection masks and combine via AND.
+        combined_mask = None
+        for i in range(K):
+            off_arr = jnp.asarray(offsets[i], dtype=jnp.int32)
+            bj = jnp.arange(M_s[i], dtype=jnp.int32)
+            target_w = bj[None, :] - off_arr[:, None]  # (M_p_i, M_s_i)
+            sel = target_w[:, :, None] == jnp.arange(W[i], dtype=jnp.int32)[None, None, :]
+            # sel shape (M_p_i, M_s_i, W_i). Place at expanded axes
+            # (3i, 3i+1, 3i+2); 1 on every other expanded axis.
+            sel_shape = [1] * len(expanded)
+            sel_shape[3 * i] = M_p[i]
+            sel_shape[3 * i + 1] = M_s[i]
+            sel_shape[3 * i + 2] = W[i]
+            sel_r = sel.reshape(*sel_shape)
+            combined_mask = sel_r if combined_mask is None else (combined_mask & sel_r)
 
-        # Broadcast data to insert the per-axis M_s axes.
-        # data: (M_p_0, W_0, M_p_1, W_1, B_r_0, B_r_1, B_c_0, B_c_1, *L)
-        # Add M_s_0 axis at position 1, M_s_1 at position 4 →
-        # (M_p_0, M_s_0, W_0, M_p_1, M_s_1, W_1, B_r_0, B_r_1, B_c_0, B_c_1, *L)
-        data_b = self.data[:, None, :, :, None, :, ...]
-        data_b = jnp.broadcast_to(
-            data_b,
-            (M_p_0, M_s_0, W_0, M_p_1, M_s_1, W_1, B_r_0, B_r_1, B_c_0, B_c_1, *L),
-        )
-        mask_0 = select_0[:, :, :, None, None, None, None, None, None, None]  # broadcast over remaining axes
-        mask_1 = select_1[None, None, None, :, :, :, None, None, None, None]
+        # Step 3: where + sum over all W_i axes (positions 2, 5, 8, ...).
+        W_axes = tuple(3 * i + 2 for i in range(K))
+        out = jnp.where(combined_mask, data_b, 0).sum(axis=W_axes)
+        # ``out`` shape after dropping W: per-axis (M_p_i, M_s_i) at
+        # positions (2i, 2i+1), then K B_row, K B_col, then *L.
+
+        # Step 4: permute + reshape to dense layout
+        # (M_p_0*B_row_0, ..., M_p_{K-1}*B_row_{K-1}, M_s_0*B_col_0,
+        #  ..., M_s_{K-1}*B_col_{K-1}, *L).
+        perm = []
+        for i in range(K):
+            perm.append(2 * i)         # M_p_i
+            perm.append(2 * K + i)     # B_row_i
+        for i in range(K):
+            perm.append(2 * i + 1)     # M_s_i
+            perm.append(3 * K + i)     # B_col_i
+        perm += list(range(4 * K, 4 * K + len(L)))
+        out = out.transpose(perm)
+        final_shape = []
+        for i in range(K):
+            final_shape.append(M_p[i] * B_row[i])
+        for i in range(K):
+            final_shape.append(M_s[i] * B_col[i])
+        final_shape += list(L)
+        out = out.reshape(*final_shape)
+
+        # Step 5: AND per-axis in-band masks to swap fill_value in for
+        # out-of-band cells along any axis.
+        per_axis_in_band = []
+        for i in range(K):
+            blk_r = jnp.arange(M_p[i] * B_row[i]) // B_row[i]
+            blk_c = jnp.arange(M_s[i] * B_col[i]) // B_col[i]
+            off_arr = jnp.asarray(offsets[i], dtype=jnp.int32)
+            co = off_arr[blk_r]
+            diff = blk_c[None, :] - co[:, None]
+            per_axis_in_band.append((diff >= 0) & (diff < W[i]))
+        # Combine via outer product over K axis pairs.
+        full_mask = None
+        for i in range(K):
+            mask_shape = [1] * (2 * K)
+            mask_shape[i] = M_p[i] * B_row[i]
+            mask_shape[K + i] = M_s[i] * B_col[i]
+            m = per_axis_in_band[i].reshape(*mask_shape)
+            full_mask = m if full_mask is None else (full_mask & m)
         if L:
-            mask_0 = mask_0[(..., *L_pad)]
-            mask_1 = mask_1[(..., *L_pad)]
-        mask = mask_0 & mask_1
-        # Sum over W_0 (axis 2) and W_1 (axis 5) — both reductions in one pass.
-        out_meta = jnp.where(mask, data_b, 0).sum(axis=(2, 5))
-        # Shape: (M_p_0, M_s_0, M_p_1, M_s_1, B_r_0, B_r_1, B_c_0, B_c_1, *L)
-
-        # Permute + reshape to (M_p_0*B_r_0, M_p_1*B_r_1, M_s_0*B_c_0, M_s_1*B_c_1, *L).
-        # Current order: (a0, c0, a1, c1, sr0, sr1, sc0, sc1, *L)
-        # Target: (a0, sr0, a1, sr1, c0, sc0, c1, sc1, *L) →
-        # reshape to (a0*sr0, a1*sr1, c0*sc0, c1*sc1, *L)
-        perm = (0, 4, 2, 5, 1, 6, 3, 7, *range(8, 8 + len(L)))
-        out_meta = out_meta.transpose(perm)
-        out_meta = out_meta.reshape(
-            M_p_0 * B_r_0, M_p_1 * B_r_1, M_s_0 * B_c_0, M_s_1 * B_c_1, *L
-        )
-
-        # Apply fill_value at out-of-band positions (either axis out-of-band).
-        blk_r_0 = jnp.arange(M_p_0 * B_r_0) // B_r_0
-        blk_c_0 = jnp.arange(M_s_0 * B_c_0) // B_c_0
-        blk_r_1 = jnp.arange(M_p_1 * B_r_1) // B_r_1
-        blk_c_1 = jnp.arange(M_s_1 * B_c_1) // B_c_1
-        co_0 = off_0_arr[blk_r_0]  # (M_p_0 * B_r_0,)
-        co_1 = off_1_arr[blk_r_1]
-        diff_0 = blk_c_0[None, :] - co_0[:, None]  # (M_p_0*B_r_0, M_s_0*B_c_0)
-        diff_1 = blk_c_1[None, :] - co_1[:, None]  # (M_p_1*B_r_1, M_s_1*B_c_1)
-        in_band_0 = (diff_0 >= 0) & (diff_0 < W_0)
-        in_band_1 = (diff_1 >= 0) & (diff_1 < W_1)
-        # Combine the two in_band masks via outer product:
-        # in_band[r_0, r_1, c_0, c_1] = in_band_0[r_0, c_0] & in_band_1[r_1, c_1]
-        full_mask = (
-            in_band_0[:, None, :, None] & in_band_1[None, :, None, :]
-        )  # (M_p_0*B_r_0, M_p_1*B_r_1, M_s_0*B_c_0, M_s_1*B_c_1)
-        if L:
+            L_pad = (None,) * len(L)
             full_mask = full_mask[(..., *L_pad)]
-        return jnp.where(full_mask, out_meta, self.fill_value)
+        return jnp.where(full_mask, out, self.fill_value)
+
+
+class MultiAxisDivisorRemainder(NamedTuple):
+    """K-axis elementwise compressed storage. K=1 reduces to
+    :class:`DivisorRemainder`. Subsumes the K-axis analogue of
+    :class:`UnionBlocks` / :class:`IntersectionBlocks` under one type
+    via the same ``semantic`` enum.
+
+    For each of K independent output axis pairs, the operand carries
+    its own ``(M_i, n_i, B_h_i, B_w_i)`` per-meta-block structure. The
+    full data is a single multi-dim buffer with all K axis groups
+    interleaved.
+
+    Layout (K=2 example, ``divisor`` shape)
+    ----------------------------------------
+    ``(M_0, n_d_0, M_1, n_d_1, B_d_h_0, B_d_w_0, B_d_h_1, B_d_w_1, *L)``
+
+    Per axis i: ``M_i`` meta-blocks each containing ``n_i`` sub-blocks
+    of shape ``(B_h_i, B_w_i)`` arranged on the meta-block-diagonal.
+    The output dense shape is the Cartesian product:
+    ``(M_0 * LCM_h_0, M_0 * LCM_w_0, M_1 * LCM_h_1, M_1 * LCM_w_1, *L)``
+    where ``LCM_h_i = n_d_i * B_d_h_i`` (and matches the rhs side's
+    ``n_r_i * B_r_h_i`` by the same logical-size constraint as K=1).
+
+    Currently K=1 (back-compat alias) and K=2 are implemented; K>2
+    follows the same per-axis chaining of ``_block_diag_per_meta``.
+    """
+
+    divisor: Array
+    remainder: Array | None
+    fill_divisor: Array
+    fill_remainder: Array
+    semantic: str = "union"
+    include_remainder: bool = True
+    op: Callable = jnp.add
+    K: int = 1
+    # Per-axis ``(M_i, n_d_i, n_r_i, B_h_i, B_w_i)`` metadata. Inferred
+    # from ``divisor`` shape when K=1; explicit for K>1.
+    axes_meta: tuple[tuple[int, int, int, int, int], ...] = ()
+
+    def _per_axis(self) -> tuple[tuple[int, int, int, int, int], ...]:
+        """Per-axis ``(M_i, n_d_i, n_r_i, B_h_i, B_w_i)`` tuple."""
+        if self.axes_meta:
+            return self.axes_meta
+        # K=1 inference from divisor shape: (M, n_d, B_h, B_w, *L).
+        if self.K != 1:
+            raise ValueError(
+                f"axes_meta required when K={self.K} > 1"
+            )
+        M, n_d, B_h, B_w, *_ = self.divisor.shape
+        if self.remainder is not None:
+            _, n_r, _, _, *_ = self.remainder.shape
+        else:
+            n_r = 0
+        return ((M, n_d, n_r, B_h, B_w),)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """Full dense output shape ``(M_0*LCM_h_0, M_0*LCM_w_0, M_1*LCM_h_1,
+        M_1*LCM_w_1, ..., *L)``."""
+        per_axis = self._per_axis()
+        K = self.K
+        # Locate the leftover L axes: divisor has 2K (M_i, n_d_i) + 2K (B_h, B_w) prefix axes.
+        L = self.divisor.shape[4 * K :] if K > 1 else self.divisor.shape[4:]
+        out_axes: list[int] = []
+        for M_i, n_d_i, _, B_h_i, B_w_i in per_axis:
+            out_axes.append(M_i * n_d_i * B_h_i)
+            out_axes.append(M_i * n_d_i * B_w_i)
+        return (*out_axes, *L)
+
+    def to_dense(self) -> Array:
+        """Materialize the dense form via per-axis ``_block_diag_per_meta``
+        chaining + ``_stitch_meta`` on each meta-axis.
+
+        K=1: delegates to :class:`DivisorRemainder` (identical semantics).
+        K=2: per-axis densify + op combine + per-axis stitch.
+        K>2: ``NotImplementedError``.
+        """
+        if self.K == 1:
+            # Back-compat: behave like DivisorRemainder.
+            dr = DivisorRemainder(
+                divisor=self.divisor,
+                remainder=self.remainder,
+                fill_divisor=self.fill_divisor,
+                fill_remainder=self.fill_remainder,
+                semantic=self.semantic,
+                include_remainder=self.include_remainder,
+                op=self.op,
+            )
+            return dr.to_dense()
+
+        # General K. Per-axis bookkeeping.
+        K = self.K
+        per_axis = self._per_axis()
+        M = [t[0] for t in per_axis]
+        n_d = [t[1] for t in per_axis]
+        n_r = [t[2] for t in per_axis]
+        B_h = [t[3] for t in per_axis]
+        B_w = [t[4] for t in per_axis]
+        L = self.divisor.shape[4 * K :]
+
+        # Step 1: per-axis ``_block_diag_per_meta`` chain on divisor (and
+        # remainder if included). Apply axis-i by bringing
+        # ``(M_i, n_d_i, B_h_i, B_w_i)`` to the leading 4 axes via
+        # transpose, applying the kernel, then moving the resulting
+        # ``(M_i, n_d_i*B_h_i, n_d_i*B_w_i)`` to its target slot.
+
+        def _chain_block_diag(buf: Array, n: list[int], B_h_list: list[int],
+                              B_w_list: list[int], fill: Array) -> Array:
+            """Apply ``_block_diag_per_meta`` along each of K axes.
+
+            ``buf`` starts in layout ``(M_0, n_0, M_1, n_1, ..., M_{K-1},
+            n_{K-1}, B_h_0, ..., B_h_{K-1}, B_w_0, ..., B_w_{K-1}, *L)``.
+            After K applications: ``(M_0, H_0, M_1, H_1, ..., M_{K-1},
+            H_{K-1}, W_0, ..., W_{K-1}, *L)`` where
+            ``H_i = n_i * B_h_i`` and ``W_i = n_i * B_w_i``.
+            """
+            cur = buf
+            # Process axes left-to-right. After processing axis i:
+            #   leading axes: (M_0, H_0, M_1, H_1, ..., M_i, H_i, ...
+            #                  remaining (M_{i+1}, n_{i+1}, ..., M_{K-1},
+            #                  n_{K-1}), B_h_{i+1}, ..., B_h_{K-1},
+            #                  W_0, W_1, ..., W_i, B_w_{i+1}, ..., B_w_{K-1}, *L)
+            # We always bring (M_i, n_i, B_h_i, B_w_i) to the front via
+            # transpose, apply, then transpose back.
+            for i in range(K):
+                # Current layout (after i prior applications):
+                #   indices 0..(2i-1): (M_0, H_0, M_1, H_1, ..., M_{i-1}, H_{i-1})
+                #   index 2i: M_i
+                #   index 2i+1: n_i
+                #   indices 2i+2..(2K-1): M_{i+1}, n_{i+1}, ..., M_{K-1}, n_{K-1}
+                #   indices 2K..(2K+i-1): W_0, W_1, ..., W_{i-1}
+                #   index 2K + i: B_h_i (preceded by B_h_{i-1} which got consumed)
+                #
+                # Hmm — tracking shape positions is delicate. Take a
+                # different approach: use ``jnp.moveaxis`` to bring the
+                # relevant axes to the front, apply
+                # ``_block_diag_per_meta``, then move output axes back.
+
+                # Find current positions of (M_i, n_i, B_h_i, B_w_i).
+                # After ``i`` prior axes processed, the layout is:
+                #   [M_0, H_0, M_1, H_1, ..., M_{i-1}, H_{i-1},
+                #    M_i, n_i, M_{i+1}, n_{i+1}, ..., M_{K-1}, n_{K-1},
+                #    B_h_i, B_h_{i+1}, ..., B_h_{K-1},
+                #    W_0, ..., W_{i-1}, B_w_i, B_w_{i+1}, ..., B_w_{K-1}, *L]
+                # Position of M_i:    2*i
+                # Position of n_i:    2*i + 1
+                # Position of B_h_i:  2*K + (i)             — first B_h slot after i-th processing
+                # Position of B_w_i:  2*K + (K - i) + i     — first B_w slot after i-th processing
+                #                   = 3*K
+                # Hmm this depends on remaining unprocessed. Let me redo.
+                #
+                # The simplest robust approach: track shape positions by
+                # scanning. For axis i, compute the current positions.
+                ndim = cur.ndim
+                # Build position map. After processing axes 0..i-1:
+                #   - 2 axes per processed: (M_j, H_j) for j < i  →  positions 0..2i-1
+                #   - 2 axes per unprocessed of the (M, n) pairs: positions 2i..2K-1 (M_i, n_i, M_{i+1}, n_{i+1}, ...)
+                #   - 1 axis per processed: W_j for j < i → positions 2K..2K+i-1
+                #   - 1 axis per unprocessed B_h: positions 2K+i..3K-1 (B_h_i, B_h_{i+1}, ...)
+                #   - 1 axis per unprocessed B_w: positions 3K..3K + (K-i) - 1 (B_w_i, B_w_{i+1}, ...)
+                #     Wait this should be 1 axis per ALL B_w (we haven't consumed any B_w_j with j < i).
+                #     Hmm but for processed axes, the B_w_j became W_j and is now between the (M, H) pairs and the (B_h, B_w) section. So B_w axes for processed don't appear separately — they're folded into H/W via _block_diag_per_meta.
+                #
+                # Actually, _block_diag_per_meta produces (M, n*B_h, n*B_w, *L) = (M, H, W, *L). So after processing axis i, we have M_i, H_i, W_i in the output. The W_i ends up at a specific position.
+                pos_M_i = 2 * i
+                pos_n_i = 2 * i + 1
+                # B_h_i sits among the unprocessed B_h block: position 2K + i (counting K unprocessed M/n pairs from 2i to 2K, then 0 processed W positions... wait).
+                # After i prior applications, layout was reassembled to:
+                #   (M_0, H_0, ..., M_{i-1}, H_{i-1}, M_i, n_i, M_{i+1}, n_{i+1}, ..., B_h_i, ..., W_0, ..., W_{i-1}, B_w_i, ...)
+                # Hmm this is getting complicated. Let me use moveaxis explicitly.
+                # M_i is at axis 2*i (the next un-processed pair's M slot).
+                # n_i is at axis 2*i + 1.
+                # B_h_i and B_w_i positions depend on what's left.
+                #
+                # Simpler: at the start of each iteration, we know the
+                # layout positions. After processing axis i:
+                #   * (M_i, n_i, B_h_i, B_w_i) get consumed
+                #   * (M_i, H_i = n_i*B_h_i, W_i = n_i*B_w_i) get produced
+                # The kernel ``_block_diag_per_meta`` returns
+                # ``(M, n*B_h, n*B_w, *trailing)``. So if we put (M_i, n_i, B_h_i, B_w_i, *rest) at the LEAD, then the kernel produces (M_i, H_i, W_i, *rest).
+                # Then we move (M_i, H_i) to position (2i, 2i+1) of the output, and W_i to position 2K + i of the output.
+
+                # Find current axis indices.
+                # We need to track them since the layout changes after each iteration.
+                # Approach: at iteration i, the layout has structure as documented above.
+                # Compute the explicit positions:
+                #   M_i at 2i, n_i at 2i+1.
+                #   The remaining axes after position 2K: W_0..W_{i-1}, then B_h_i, B_h_{i+1}, ..., B_h_{K-1}, then B_w_i, ..., B_w_{K-1}, *L.
+                # So B_h_i is at position 2K + i.
+                # B_w_i is at position 2K + i + (K - i) = 3K, since there are (K - i) remaining B_h axes after B_h_i, then B_w_i comes next... wait no, all remaining B_h's come first.
+                # Number of remaining B_h: K - i (B_h_i ... B_h_{K-1}). Position of B_h_i: 2K + i (since W_0..W_{i-1} take positions 2K..2K+i-1).
+                # Position of B_w_i: 2K + i + (K - i) = 3K + 0... wait that's still K - i positions for B_h. So after B_h block (positions 2K+i to 3K+i-1 ?), B_w starts at 3K+i. Hmm.
+                # Let me recount.
+                # At start of iteration i, the layout has these groups (and counts):
+                #   * processed (M, H) pairs: 2i axes (positions 0..2i-1)
+                #   * unprocessed (M, n) pairs: 2(K-i) axes (positions 2i..2K-1)
+                #   * processed W axes: i axes (positions 2K..2K+i-1)
+                #   * unprocessed B_h axes: K-i axes (positions 2K+i..3K-1)
+                #   * unprocessed B_w axes: K-i axes (positions 3K..3K + K-i-1 = 4K-i-1)
+                #   * L: len(L) axes (positions 4K-i..)
+                # Total: 2i + 2(K-i) + i + (K-i) + (K-i) + len(L) = 2i + 2K - 2i + i + K - i + K - i + len(L) = 4K - i + len(L)
+                # That looks wrong (should be invariant at 4K + len(L) since we're transforming, not removing axes).
+                # Actually after each application, we LOSE 1 axis (n_i fuses with B_h_i into H_i, and n_i also fuses with B_w_i into W_i; n_i appears only once but contributes to both H and W). Wait the kernel consumes (M, n, B_h, B_w) — 4 axes — and produces (M, H, W) — 3 axes. So we lose 1 axis per iteration.
+                # Starting axes: 4K + len(L). After K iterations: 4K - K + len(L) = 3K + len(L).
+                # Final layout: M_0, H_0, ..., M_{K-1}, H_{K-1}, W_0, ..., W_{K-1}, *L = 2K + K + len(L) = 3K + len(L). ✓
+
+                # So during iteration i:
+                #   axes so far: 4K + len(L) - i
+                #   - 2i (processed M, H)
+                #   - 2(K-i) (unprocessed M, n)
+                #   - i (processed W)
+                #   - (K-i) (unprocessed B_h)
+                #   - (K-i) (unprocessed B_w)
+                #   - len(L)
+                # Total: 2i + 2(K-i) + i + (K-i) + (K-i) + len(L) = 4K - i + len(L). Matches!
+                #
+                # Positions:
+                #   M_i:     2i
+                #   n_i:     2i + 1
+                #   W_(j<i): 2K..2K+i-1
+                #   B_h_i:   2K + i
+                #   B_w_i:   2K + i + (K-i) = 3K (since B_h block has K-i elements)
+                #   L:       3K + (K-i) = 4K - i
+
+                pos_M = 2 * i
+                pos_n = 2 * i + 1
+                pos_B_h = 2 * K + i
+                pos_B_w = 3 * K  # always 3K because unprocessed B_h takes positions 2K+i..3K-1; B_w_i starts at 3K (regardless of i because by the time we get there, 3K is constant since len(L) shifts)
+                # Hmm wait, I said B_w_i at 3K + i + (K-i) = 3K. Let me re-verify.
+                # 2i (M, H pairs) + 2(K-i) (M, n pairs) + i (W) + (K-i) (B_h) = 2i + 2K - 2i + i + K - i = 3K.
+                # So B_w block starts at 3K. ✓
+
+                # Move (M_i, n_i, B_h_i, B_w_i) to positions (0, 1, 2, 3).
+                cur_t = jnp.moveaxis(
+                    cur,
+                    (pos_M, pos_n, pos_B_h, pos_B_w),
+                    (0, 1, 2, 3),
+                )
+                # Apply _block_diag_per_meta: produces (M_i, H_i=n_i*B_h_i, W_i=n_i*B_w_i, *rest)
+                applied = _block_diag_per_meta(cur_t, fill)
+                # Now applied has axes: (M_i, H_i, W_i, *rest). Total axes = 3 + (cur.ndim - 4) = cur.ndim - 1.
+                # The "rest" axes are in the ORIGINAL ORDER (minus the 4 we moved).
+                # We want the new layout to have (M_i, H_i) at positions (2i, 2i+1) and W_i at position 2K + i (of the new layout, which has 1 fewer axis).
+                # The "rest" axes count: original ndim - 4. Their order: M_0, H_0, ..., M_{i-1}, H_{i-1}, M_{i+1}, n_{i+1}, ..., M_{K-1}, n_{K-1}, W_0, ..., W_{i-1}, B_h_{i+1}, ..., B_h_{K-1}, B_w_{i+1}, ..., B_w_{K-1}, *L.
+                # Source positions in `applied`: M_i at 0, H_i at 1, W_i at 2, then rest at 3.. .
+                # Target positions in the new layout:
+                #   M_i at 2i
+                #   H_i at 2i + 1
+                #   M_{i+1} at 2(i+1) = 2i + 2
+                #   n_{i+1} at 2i + 3
+                #   ...
+                #   W_0 at 2K
+                #   ...
+                #   W_i at 2K + i
+                #   B_h_{i+1} at 2K + i + 1
+                #
+                # The "rest" axes order is already what we need IF we move M_i, H_i to (2i, 2i+1) and W_i to 2K + i (in the new layout's indexing).
+                # In the `applied` tensor:
+                #   axis 0 = M_i  → target 2i
+                #   axis 1 = H_i  → target 2i + 1
+                #   axis 2 = W_i  → target 2K + i (in new layout numbering, which has 1 fewer axis)
+                #   axes 3.. = M_0, H_0, ..., M_{i-1}, H_{i-1}, M_{i+1}, n_{i+1}, ..., B_w_{K-1}, *L → these need to fill the OTHER positions in the new layout.
+                new_ndim = cur.ndim - 1
+                cur = jnp.moveaxis(
+                    applied,
+                    (0, 1, 2),
+                    (2 * i, 2 * i + 1, 2 * K + i),
+                )
+            return cur
+
+        d_meta = _chain_block_diag(self.divisor, n_d, B_h, B_w, self.fill_divisor)
+        # d_meta shape: (M_0, H_0, M_1, H_1, ..., M_{K-1}, H_{K-1},
+        #                W_0, ..., W_{K-1}, *L). H_i = n_d_i*B_h_i,
+        #                W_i = n_d_i*B_w_i.
+
+        if not (self.include_remainder and self.remainder is not None):
+            grid_meta = d_meta
+        else:
+            r_meta = _chain_block_diag(
+                self.remainder, n_r, B_h, B_w, self.fill_remainder
+            )
+            grid_meta = self.op(d_meta, r_meta)
+
+        outside_fill = self.op(self.fill_divisor, self.fill_remainder)
+
+        # Step 2: stitch onto K-dim meta-block-diagonal.
+        # ``grid_meta`` shape (3K + len(L) axes):
+        #   (M_0, H_0, M_1, H_1, ..., M_{K-1}, H_{K-1},
+        #    W_0, ..., W_{K-1}, *L)
+        # For each axis i we need to insert an M_i_c (col-side meta) axis
+        # after H_i. Build via slicing + broadcast.
+        H = [n_d[i] * B_h[i] for i in range(K)]
+        W = [n_d[i] * B_w[i] for i in range(K)]
+        indexer = []
+        for _ in range(K):
+            indexer.append(slice(None))  # M_i_r
+            indexer.append(slice(None))  # H_i
+            indexer.append(None)          # M_i_c (inserted)
+        indexer += [slice(None)] * K       # W axes
+        indexer += [slice(None)] * len(L)  # L axes
+        g_e = grid_meta[tuple(indexer)]
+        expanded = []
+        for i in range(K):
+            expanded += [M[i], H[i], M[i]]
+        expanded += W
+        expanded += list(L)
+        g_b = jnp.broadcast_to(g_e, tuple(expanded))
+
+        # Build per-axis diagonal mask M_i_r == M_i_c.
+        combined_mask = None
+        for i in range(K):
+            m_idx = jnp.arange(M[i], dtype=jnp.int32)
+            diag = m_idx[:, None] == m_idx[None, :]  # (M_i, M_i)
+            sel_shape = [1] * len(expanded)
+            sel_shape[3 * i] = M[i]
+            sel_shape[3 * i + 2] = M[i]
+            d_r = diag.reshape(*sel_shape)
+            combined_mask = d_r if combined_mask is None else (combined_mask & d_r)
+
+        L_pad = (None,) * len(L)
+        if L:
+            combined_mask = combined_mask[(..., *L_pad)]
+        gathered = jnp.where(combined_mask, g_b, outside_fill)
+
+        # Permute + reshape to dense, per-axis interleaved layout:
+        # ``(M_0*H_0, M_0*W_0, M_1*H_1, M_1*W_1, ..., M_{K-1}*H_{K-1},
+        #    M_{K-1}*W_{K-1}, *L)``.
+        # Matches the natural multi-axis operand layout (each axis-pair
+        # contributes (h, w) consecutively), so chaining elementwise ops
+        # preserves the per-axis grouping.
+        #
+        # Current ``gathered`` axes (positions):
+        #   per i: M_i_r at 3i, H_i at 3i+1, M_i_c at 3i+2
+        #   then W axes at positions 3K..4K-1
+        #   then L axes.
+        # Target permutation: for each i, [M_i_r, H_i, M_i_c, W_i]
+        # consecutively, so source positions (3i, 3i+1, 3i+2, 3K+i)
+        # → target positions (4i, 4i+1, 4i+2, 4i+3).
+        perm = []
+        for i in range(K):
+            perm.append(3 * i)         # M_i_r
+            perm.append(3 * i + 1)     # H_i
+            perm.append(3 * i + 2)     # M_i_c
+            perm.append(3 * K + i)     # W_i
+        perm += list(range(4 * K, 4 * K + len(L)))
+        out = gathered.transpose(perm)
+        # Reshape: combine (M_i_r, H_i) → axis 2i, (M_i_c, W_i) → axis 2i+1.
+        final_shape = []
+        for i in range(K):
+            final_shape.append(M[i] * H[i])
+            final_shape.append(M[i] * W[i])
+        final_shape += list(L)
+        return out.reshape(*final_shape)
 
 
 # ----------------------------------------------------------------------------
@@ -1145,4 +1524,33 @@ def _multi_axis_bb_unflatten(aux, children):
 
 jax.tree_util.register_pytree_node(
     MultiAxisBlockBanded, _multi_axis_bb_flatten, _multi_axis_bb_unflatten
+)
+
+
+def _multi_axis_dr_flatten(mdr):
+    """Flatten ``MultiAxisDivisorRemainder``. Array children: divisor,
+    remainder (may be None), fill_*. Aux: semantic, include_remainder,
+    op, K, axes_meta."""
+    return (
+        (mdr.divisor, mdr.remainder, mdr.fill_divisor, mdr.fill_remainder),
+        (mdr.semantic, mdr.include_remainder, mdr.op, mdr.K, mdr.axes_meta),
+    )
+
+
+def _multi_axis_dr_unflatten(aux, children):
+    return MultiAxisDivisorRemainder(
+        divisor=children[0],
+        remainder=children[1],
+        fill_divisor=children[2],
+        fill_remainder=children[3],
+        semantic=aux[0],
+        include_remainder=aux[1],
+        op=aux[2],
+        K=aux[3],
+        axes_meta=aux[4],
+    )
+
+
+jax.tree_util.register_pytree_node(
+    MultiAxisDivisorRemainder, _multi_axis_dr_flatten, _multi_axis_dr_unflatten
 )
