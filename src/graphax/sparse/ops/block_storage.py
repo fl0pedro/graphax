@@ -820,6 +820,232 @@ class BlockBanded(NamedTuple):
 
 
 # ----------------------------------------------------------------------------
+#  4.  Multi-axis primitives — K>1 independent bands / block-diagonals
+# ----------------------------------------------------------------------------
+class BandAxisSpec(NamedTuple):
+    """Per-axis metadata for one band in :class:`MultiAxisBlockBanded`.
+
+    Mirrors the single-axis ``BlockBanded`` fields. Each axis-pair of the
+    output gets one of these — together encoding K independent bands.
+    """
+
+    primary_axis: int = 0     # 0 = row-primary, 1 = col-primary (this axis pair)
+    n_secondary: int = -1     # -1 = M_per_primary (square per-batch)
+    offset: tuple[int, ...] = ()  # () = centered band; else explicit per-row offsets
+    n_meta: int = 1           # outer batch over independent bands within this axis
+    band_width: int = 1       # W for this axis
+    block_row: int = 1        # B_row of sub-blocks for this axis
+    block_col: int = 1        # B_col of sub-blocks for this axis
+
+
+class MultiAxisBlockBanded(NamedTuple):
+    """K-axis block-banded storage for multi-contract matmul output.
+
+    For each of K independent output axis pairs (each pair = one
+    contract pair from the source matmul), this carries a band geometry
+    via :class:`BandAxisSpec`. The dense form is the Cartesian product
+    of K per-axis bands: cell ``(a_1, ..., a_K, b_1, ..., b_K)`` is
+    non-zero iff EVERY axis pair ``(a_i, b_i)`` is in its corresponding
+    band.
+
+    Layout
+    ------
+    ``data`` : ``(M_p_1, W_1, M_p_2, W_2, ..., M_p_K, W_K,
+                  B_row_1, B_row_2, ..., B_row_K,
+                  B_col_1, B_col_2, ..., B_col_K, *L)``
+        2K + 2K + leftover = 4K + len(L) axes total. The leading
+        ``(M_p_i * n_meta_i)`` axes interleave with ``W_i`` axes; then
+        K B_row axes, K B_col axes, then leftover.
+    ``axes`` : tuple of K :class:`BandAxisSpec`, one per axis pair.
+
+    For K=1: identical-semantics to :class:`BlockBanded` (kept separate
+    for back-compat — existing 1-axis call sites use BlockBanded).
+
+    Currently implemented for K=2 only; K>2 reduces by ``vmap`` over
+    additional leading axes once the K=2 path is verified.
+    """
+
+    data: Array
+    fill_value: Array
+    axes: tuple[BandAxisSpec, ...]
+
+    @property
+    def K(self) -> int:
+        return len(self.axes)
+
+    @property
+    def _per_axis_M_p(self) -> tuple[int, ...]:
+        """Per-axis ``M_per_primary`` (= ``data axis size`` // ``n_meta``)."""
+        return tuple(
+            self.data.shape[2 * i] // spec.n_meta
+            for i, spec in enumerate(self.axes)
+        )
+
+    @property
+    def _per_axis_M_secondary(self) -> tuple[int, ...]:
+        """Per-axis ``M_per_secondary`` (= ``n_secondary`` or ``M_per_primary``)."""
+        return tuple(
+            spec.n_secondary if spec.n_secondary >= 0 else self._per_axis_M_p[i]
+            for i, spec in enumerate(self.axes)
+        )
+
+    @property
+    def _per_axis_offset_arr(self) -> tuple[tuple[int, ...], ...]:
+        """Per-axis offset tuple; centered-band sentinel ``()`` expands to
+        ``a - (W-1)//2``. Length = ``M_per_primary`` for that axis."""
+        result = []
+        for i, spec in enumerate(self.axes):
+            if spec.offset:
+                result.append(spec.offset)
+            else:
+                w = (spec.band_width - 1) // 2
+                M_p = self._per_axis_M_p[i]
+                result.append(tuple(a - w for a in range(M_p)))
+        return tuple(result)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """Logical dense output shape: 2K + len(L) axes.
+
+        For K=2 row-primary: ``(M_p_1*B_row_1, M_p_2*B_row_2,
+        M_col_1*B_col_1, M_col_2*B_col_2, *L)``. Total
+        ``n_meta_i * M_p_i * B_row_i`` per row-axis i, etc.
+        """
+        K = self.K
+        M_p = self._per_axis_M_p
+        M_s = self._per_axis_M_secondary
+        L = self.data.shape[4 * K :]
+        out_axes: list[int] = []
+        # Row axes (one per pair).
+        for i, spec in enumerate(self.axes):
+            m_row = M_p[i] if spec.primary_axis == 0 else M_s[i]
+            out_axes.append(spec.n_meta * m_row * spec.block_row)
+        # Col axes (one per pair).
+        for i, spec in enumerate(self.axes):
+            m_col = M_s[i] if spec.primary_axis == 0 else M_p[i]
+            out_axes.append(spec.n_meta * m_col * spec.block_col)
+        return (*out_axes, *L)
+
+    def to_dense(self) -> Array:
+        """Materialize the dense form via per-axis broadcast+where+sum.
+
+        For K=2: apply axis-0 banded select then axis-1 banded select.
+        Each axis's mask is independent so the combined select is the
+        elementwise AND of per-axis masks — both reductions happen in
+        the same fused chain. For K>2: recursively chain.
+
+        Currently implements K=1 (delegates to ``BlockBanded`` equivalent)
+        and K=2 explicitly; K>2 raises ``NotImplementedError`` until the
+        chain is generalized.
+        """
+        K = self.K
+        if K == 1:
+            spec = self.axes[0]
+            bb = BlockBanded(
+                data=self.data,
+                fill_value=self.fill_value,
+                primary_axis=spec.primary_axis,
+                n_secondary=spec.n_secondary,
+                offset=spec.offset,
+                n_meta=spec.n_meta,
+            )
+            return bb.to_dense()
+        if K != 2:
+            raise NotImplementedError(
+                f"MultiAxisBlockBanded.to_dense for K={K} not yet implemented; "
+                "K=1 and K=2 supported. K>2 needs the per-axis broadcast+where+sum "
+                "chain to recursively extend over additional leading axes."
+            )
+
+        # K=2: data shape (M1_tot, W1, M2_tot, W2, B_r1, B_r2, B_c1, B_c2, *L)
+        # where M_i_tot = n_meta_i * M_p_i.
+        spec_0, spec_1 = self.axes
+        M_p_0, M_p_1 = self._per_axis_M_p
+        M_s_0, M_s_1 = self._per_axis_M_secondary
+        W_0, W_1 = spec_0.band_width, spec_1.band_width
+        B_r_0, B_r_1 = spec_0.block_row, spec_1.block_row
+        B_c_0, B_c_1 = spec_0.block_col, spec_1.block_col
+        L = self.data.shape[8:]
+        n_meta_0, n_meta_1 = spec_0.n_meta, spec_1.n_meta
+
+        if n_meta_0 != 1 or n_meta_1 != 1:
+            raise NotImplementedError(
+                "MultiAxisBlockBanded K=2 with n_meta>1 not yet implemented; "
+                "fall back to per-batch loop is straightforward but out of "
+                "scope for the initial Phase 7.5 landing."
+            )
+        if spec_0.primary_axis != 0 or spec_1.primary_axis != 0:
+            raise NotImplementedError(
+                "MultiAxisBlockBanded K=2 supports row-primary only for now; "
+                "col-primary per-axis swap follows the same pattern as the "
+                "K=1 case (swapaxes + transpose)."
+            )
+
+        off_0 = self._per_axis_offset_arr[0]
+        off_1 = self._per_axis_offset_arr[1]
+        off_0_arr = jnp.asarray(off_0, dtype=jnp.int32)
+        off_1_arr = jnp.asarray(off_1, dtype=jnp.int32)
+        L_pad = (None,) * len(L)
+
+        # Build per-axis selection masks (axis-1: (M_p_0, M_s_0, W_0); axis-2: (M_p_1, M_s_1, W_1)).
+        bj_0 = jnp.arange(M_s_0, dtype=jnp.int32)
+        bj_1 = jnp.arange(M_s_1, dtype=jnp.int32)
+        target_w_0 = bj_0[None, :] - off_0_arr[:, None]  # (M_p_0, M_s_0)
+        target_w_1 = bj_1[None, :] - off_1_arr[:, None]  # (M_p_1, M_s_1)
+        select_0 = target_w_0[:, :, None] == jnp.arange(W_0, dtype=jnp.int32)[None, None, :]
+        select_1 = target_w_1[:, :, None] == jnp.arange(W_1, dtype=jnp.int32)[None, None, :]
+
+        # Broadcast data to insert the per-axis M_s axes.
+        # data: (M_p_0, W_0, M_p_1, W_1, B_r_0, B_r_1, B_c_0, B_c_1, *L)
+        # Add M_s_0 axis at position 1, M_s_1 at position 4 →
+        # (M_p_0, M_s_0, W_0, M_p_1, M_s_1, W_1, B_r_0, B_r_1, B_c_0, B_c_1, *L)
+        data_b = self.data[:, None, :, :, None, :, ...]
+        data_b = jnp.broadcast_to(
+            data_b,
+            (M_p_0, M_s_0, W_0, M_p_1, M_s_1, W_1, B_r_0, B_r_1, B_c_0, B_c_1, *L),
+        )
+        mask_0 = select_0[:, :, :, None, None, None, None, None, None, None]  # broadcast over remaining axes
+        mask_1 = select_1[None, None, None, :, :, :, None, None, None, None]
+        if L:
+            mask_0 = mask_0[(..., *L_pad)]
+            mask_1 = mask_1[(..., *L_pad)]
+        mask = mask_0 & mask_1
+        # Sum over W_0 (axis 2) and W_1 (axis 5) — both reductions in one pass.
+        out_meta = jnp.where(mask, data_b, 0).sum(axis=(2, 5))
+        # Shape: (M_p_0, M_s_0, M_p_1, M_s_1, B_r_0, B_r_1, B_c_0, B_c_1, *L)
+
+        # Permute + reshape to (M_p_0*B_r_0, M_p_1*B_r_1, M_s_0*B_c_0, M_s_1*B_c_1, *L).
+        # Current order: (a0, c0, a1, c1, sr0, sr1, sc0, sc1, *L)
+        # Target: (a0, sr0, a1, sr1, c0, sc0, c1, sc1, *L) →
+        # reshape to (a0*sr0, a1*sr1, c0*sc0, c1*sc1, *L)
+        perm = (0, 4, 2, 5, 1, 6, 3, 7, *range(8, 8 + len(L)))
+        out_meta = out_meta.transpose(perm)
+        out_meta = out_meta.reshape(
+            M_p_0 * B_r_0, M_p_1 * B_r_1, M_s_0 * B_c_0, M_s_1 * B_c_1, *L
+        )
+
+        # Apply fill_value at out-of-band positions (either axis out-of-band).
+        blk_r_0 = jnp.arange(M_p_0 * B_r_0) // B_r_0
+        blk_c_0 = jnp.arange(M_s_0 * B_c_0) // B_c_0
+        blk_r_1 = jnp.arange(M_p_1 * B_r_1) // B_r_1
+        blk_c_1 = jnp.arange(M_s_1 * B_c_1) // B_c_1
+        co_0 = off_0_arr[blk_r_0]  # (M_p_0 * B_r_0,)
+        co_1 = off_1_arr[blk_r_1]
+        diff_0 = blk_c_0[None, :] - co_0[:, None]  # (M_p_0*B_r_0, M_s_0*B_c_0)
+        diff_1 = blk_c_1[None, :] - co_1[:, None]  # (M_p_1*B_r_1, M_s_1*B_c_1)
+        in_band_0 = (diff_0 >= 0) & (diff_0 < W_0)
+        in_band_1 = (diff_1 >= 0) & (diff_1 < W_1)
+        # Combine the two in_band masks via outer product:
+        # in_band[r_0, r_1, c_0, c_1] = in_band_0[r_0, c_0] & in_band_1[r_1, c_1]
+        full_mask = (
+            in_band_0[:, None, :, None] & in_band_1[None, :, None, :]
+        )  # (M_p_0*B_r_0, M_p_1*B_r_1, M_s_0*B_c_0, M_s_1*B_c_1)
+        if L:
+            full_mask = full_mask[(..., *L_pad)]
+        return jnp.where(full_mask, out_meta, self.fill_value)
+
+
+# ----------------------------------------------------------------------------
 #  PyTree registration: ``op`` is static (Callable, hashable), buffers are leaves
 # ----------------------------------------------------------------------------
 # Auto-NamedTuple flattening would put ``op`` in the children list, which
@@ -895,4 +1121,28 @@ def _divisor_remainder_unflatten(aux, children):
 
 jax.tree_util.register_pytree_node(
     DivisorRemainder, _divisor_remainder_flatten, _divisor_remainder_unflatten
+)
+
+
+def _multi_axis_bb_flatten(mab):
+    """Flatten ``MultiAxisBlockBanded`` for pytree traversal. Two array
+    leaves; the ``axes`` tuple-of-BandAxisSpec goes into aux_data as a
+    plain tuple of int/tuple fields."""
+    aux_axes = tuple(
+        (s.primary_axis, s.n_secondary, s.offset, s.n_meta, s.band_width,
+         s.block_row, s.block_col)
+        for s in mab.axes
+    )
+    return (mab.data, mab.fill_value), aux_axes
+
+
+def _multi_axis_bb_unflatten(aux, children):
+    axes = tuple(BandAxisSpec(*t) for t in aux)
+    return MultiAxisBlockBanded(
+        data=children[0], fill_value=children[1], axes=axes
+    )
+
+
+jax.tree_util.register_pytree_node(
+    MultiAxisBlockBanded, _multi_axis_bb_flatten, _multi_axis_bb_unflatten
 )
