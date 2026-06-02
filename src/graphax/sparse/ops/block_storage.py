@@ -429,6 +429,18 @@ class DivisorRemainder(NamedTuple):
         return _stitch_meta(per_meta, outside_fill)
 
 
+def _is_static_zero(x) -> bool:
+    """True iff ``x`` is a compile-time-constant zero (Python scalar or a
+    concrete, non-traced array equal to 0). Used to skip redundant
+    ``where(..., fill)`` masks when the fill is provably zero (CR-4)."""
+    try:
+        import numpy as _np
+
+        return bool(_np.asarray(x) == 0) if _np.ndim(x) == 0 else False
+    except Exception:
+        return False
+
+
 def _to_dense_banded(
     data: Array,
     M_primary: int,
@@ -441,6 +453,7 @@ def _to_dense_banded(
     fill_value: Array,
     L: tuple[int, ...],
     L_pad: tuple,
+    skip_fill_mask: bool = False,
 ) -> Array:
     """Shared row-primary banded-densify kernel for :class:`BlockBanded`.
 
@@ -491,7 +504,13 @@ def _to_dense_banded(
     perm = (0, 2, 1, 3, *range(4, 4 + len(L)))
     out_meta = out_meta.transpose(perm).reshape(M_primary * B_p, M_secondary * B_s, *L)
 
-    # Step 5: replace the zero-pad outside the band with fill_value.
+    # Step 5: replace the zero-pad outside the band with fill_value. Out-of-band
+    # cells of ``out_meta`` are already 0 (the where+sum in Step 3 left them
+    # zero), so when ``fill_value`` is a static zero (CR-4 — the matmul path
+    # always builds ``fill=0``) this mask is a no-op; skip it to avoid a second
+    # dense-sized boolean + where over the whole output.
+    if skip_fill_mask or _is_static_zero(fill_value):
+        return out_meta
     blk_i = jnp.arange(M_primary * B_p) // B_p
     blk_j = jnp.arange(M_secondary * B_s) // B_s
     if centered_w is not None:
@@ -505,6 +524,147 @@ def _to_dense_banded(
     if L:
         in_band = in_band[(..., *L_pad)]
     return jnp.where(in_band, out_meta, fill_value)
+
+
+def _centered_offset(offset: tuple[int, ...], W: int) -> bool:
+    """True iff ``offset`` is the centered band ``offset[a] = a - (W-1)//2``
+    (CR-3). When centered, the densify can take the gather-free arithmetic
+    branch instead of the explicit ``offset_arr[blk_i]`` gather."""
+    w = (W - 1) // 2
+    return tuple(offset) == tuple(a - w for a in range(len(offset)))
+
+
+def _per_band_stream(
+    data: Array,
+    M_primary: int,
+    M_secondary: int,
+    W: int,
+    B_row: int,
+    B_col: int,
+    offset: tuple[int, ...],
+    primary_axis: int,
+    fill_value: Array,
+    L: tuple[int, ...],
+) -> Array:
+    """``lax.fori_loop`` streaming densify for a SINGLE band (no n_meta).
+
+    ``data`` is ``(M_primary, W, B_row, B_col, *L)``; returns
+    ``(M_row*B_row, M_col*B_col, *L)`` writing the W in-band sub-blocks per
+    primary slot via ``dynamic_update_slice`` — never materializes the
+    ``(M_primary, M_secondary)`` square. n_meta-free by construction: the
+    caller (``_densify_band``) maps this over batches and stitches, so the
+    CR-1 batch-drop bug cannot recur here.
+    """
+    M_row, M_col = (
+        (M_primary, M_secondary) if primary_axis == 0 else (M_secondary, M_primary)
+    )
+    out = jnp.full((M_row * B_row, M_col * B_col, *L), fill_value, dtype=data.dtype)
+    zero_idx = (jnp.int32(0),) * len(L)
+    off_arr = jnp.asarray(offset, dtype=jnp.int32)
+    row_primary = primary_axis == 0
+
+    def body(k, acc):
+        base = off_arr[k]
+        for b in range(W):
+            sec = base + b
+            if row_primary:
+                in_range = jnp.logical_and(sec >= 0, sec < M_col)
+                row_start = jnp.int32(k * B_row)
+                col_start = jnp.int32(sec * B_col)
+            else:
+                in_range = jnp.logical_and(sec >= 0, sec < M_row)
+                row_start = jnp.int32(sec * B_row)
+                col_start = jnp.int32(k * B_col)
+            block = data[k, b]
+            existing = lax.dynamic_slice(
+                acc, (row_start, col_start) + zero_idx, (B_row, B_col, *L)
+            )
+            replacement = jnp.where(in_range, block, existing)
+            acc = lax.dynamic_update_slice(
+                acc, replacement, (row_start, col_start) + zero_idx
+            )
+        return acc
+
+    return lax.fori_loop(0, M_primary, body, out)
+
+
+def _densify_band(
+    data: Array,
+    M_primary: int,
+    M_secondary: int,
+    W: int,
+    B_row: int,
+    B_col: int,
+    offset: tuple[int, ...],
+    primary_axis: int,
+    n_meta: int,
+    fill_value: Array,
+    L: tuple[int, ...],
+) -> Array:
+    """Consolidated, CR-fixed band densify. Single source of truth shared by
+    ``BlockBanded.to_dense`` (legacy) and ``BandedIndex.densify_axis`` (Phase 8).
+
+    ``data`` : ``(n_meta * M_primary, W, B_row, B_col, *L)`` — leading axis is
+    the flat ``n_meta`` batch × per-batch primary meta. ``offset`` is the
+    per-primary secondary offset (length ``M_primary``); ``()`` is treated as
+    the centered band.
+
+    Returns the dense ``(n_meta*M_row*B_row, n_meta*M_col*B_col, *L)``.
+
+    Fixes folded in from the code review:
+      * **CR-1**: ``n_meta>1`` is ALWAYS handled by per-batch densify +
+        ``_stitch_meta`` (never the n_meta-blind fallback that dropped
+        batches).
+      * **CR-2**: the ``_BLOCK_BANDED_BROADCAST_LIMIT`` guard is applied
+        per-batch; a single oversized batch streams via ``_per_band_stream``,
+        and when the *total* (n_meta × per-batch) exceeds the limit but each
+        batch fits, batches run sequentially via ``lax.map`` instead of a
+        simultaneous ``vmap``.
+      * **CR-3**: a centered ``offset`` takes the gather-free arithmetic
+        branch in ``_to_dense_banded``.
+      * **CR-4**: the out-of-band fill mask is skipped when ``fill_value`` is
+        a static zero.
+    """
+    L_pad = (None,) * len(L)
+    centered = (not offset) or _centered_offset(offset, W)
+    if centered:
+        offset_tuple, centered_w = None, (W - 1) // 2
+        off_for_stream = tuple(a - centered_w for a in range(M_primary))
+    else:
+        offset_tuple, centered_w = tuple(offset), None
+        off_for_stream = tuple(offset)
+
+    per_batch_size = math.prod((M_primary, M_secondary, W, B_row, B_col, *L))
+
+    def _one_batch(data_batch: Array) -> Array:
+        if per_batch_size > _BLOCK_BANDED_BROADCAST_LIMIT:
+            return _per_band_stream(
+                data_batch, M_primary, M_secondary, W, B_row, B_col,
+                off_for_stream, primary_axis, fill_value, L,
+            )
+        if primary_axis == 0:
+            return _to_dense_banded(
+                data_batch, M_primary, M_secondary, W, B_row, B_col,
+                offset_tuple, centered_w, fill_value, L, L_pad,
+            )
+        # Col-primary: swap sub-block axes, densify row-primary, transpose back.
+        data_t = data_batch.swapaxes(2, 3)
+        dense_T = _to_dense_banded(
+            data_t, M_primary, M_secondary, W, B_col, B_row,
+            offset_tuple, centered_w, fill_value, L, L_pad,
+        )
+        return dense_T.swapaxes(0, 1)
+
+    if n_meta == 1:
+        return _one_batch(data)
+
+    # n_meta > 1: per-batch densify, then stitch onto the n_meta meta-diagonal.
+    data_b = data.reshape(n_meta, M_primary, W, B_row, B_col, *L)
+    if per_batch_size * n_meta > _BLOCK_BANDED_BROADCAST_LIMIT:
+        per_batch_dense = jax.lax.map(_one_batch, data_b)  # sequential, bounded HBM
+    else:
+        per_batch_dense = jax.vmap(_one_batch)(data_b)
+    return _stitch_meta(per_batch_dense, fill_value)
 
 
 # ----------------------------------------------------------------------------
@@ -705,58 +865,24 @@ class BlockBanded(NamedTuple):
         onto an ``n_meta × n_meta`` meta-block-diagonal via
         :func:`_stitch_meta` (same broadcast+where pattern, no gather).
         """
+        # Delegate to the consolidated, CR-fixed orchestrator (single source of
+        # truth shared with ``BandedIndex.densify_axis``). ``offset=()`` is the
+        # centered sentinel; ``_densify_band`` handles n_meta / broadcast-limit /
+        # centered-gather-free / static-zero-fill uniformly.
         _, W, B_row, B_col, *L = self.data.shape
-        M_per_primary = self._M_primary  # per-batch
-        M_per_secondary = self._M_secondary  # per-batch
-        L_pad = (None,) * len(L)
-
-        # Two offset modes: centered (no gather) vs explicit (one unavoidable gather).
-        if self.offset:
-            offset_tuple = self.offset
-            centered_w = None
-            off_for_fallback = self.offset
-        else:
-            offset_tuple = None
-            centered_w = (W - 1) // 2
-            off_for_fallback = tuple(a - centered_w for a in range(M_per_primary))
-
-        if (
-            math.prod(
-                (M_per_primary, M_per_secondary, W, B_row, B_col, *L)
-            ) * self.n_meta
-            > _BLOCK_BANDED_BROADCAST_LIMIT
-        ):
-            return self._to_dense_per_band(
-                M_per_primary, M_per_secondary, W, B_row, B_col, off_for_fallback, L
-            )
-
-        def _one_batch_dense(data_batch: Array) -> Array:
-            """Per-batch banded densify: ``data_batch`` shape
-            ``(M_per_primary, W, B_row, B_col, *L)`` → per-batch dense
-            ``(M_per_primary * B_row, M_per_secondary * B_col, *L)`` for
-            row-primary; transposed for col-primary."""
-            if self.primary_axis == 0:
-                return _to_dense_banded(
-                    data_batch, M_per_primary, M_per_secondary, W, B_row, B_col,
-                    offset_tuple, centered_w, self.fill_value, L, L_pad,
-                )
-            data_t = data_batch.swapaxes(2, 3)
-            dense_T = _to_dense_banded(
-                data_t, M_per_primary, M_per_secondary, W, B_col, B_row,
-                offset_tuple, centered_w, self.fill_value, L, L_pad,
-            )
-            return dense_T.swapaxes(0, 1)
-
-        if self.n_meta == 1:
-            return _one_batch_dense(self.data)
-
-        # n_meta > 1: reshape, vmap, stitch.
-        data_b = self.data.reshape(
-            self.n_meta, M_per_primary, W, B_row, B_col, *L
+        return _densify_band(
+            self.data,
+            self._M_primary,
+            self._M_secondary,
+            W,
+            B_row,
+            B_col,
+            tuple(self.offset),
+            self.primary_axis,
+            self.n_meta,
+            self.fill_value,
+            tuple(L),
         )
-        per_batch_dense = jax.vmap(_one_batch_dense)(data_b)
-        # per_batch_dense shape: (n_meta, M_per_row * B_row, M_per_col * B_col, *L)
-        return _stitch_meta(per_batch_dense, self.fill_value)
 
     def _to_dense_per_band(
         self,
