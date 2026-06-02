@@ -289,6 +289,123 @@ class IntersectionBlocks(NamedTuple):
         return _stitch_meta(per_meta, self.op(self.fill_lhs, self.fill_rhs))
 
 
+# ----------------------------------------------------------------------------
+#  2b.  DivisorRemainder — unified primitive (subsumes UnionBlocks /
+#       IntersectionBlocks with an explicit semantic + ``include_remainder`` flag)
+# ----------------------------------------------------------------------------
+class DivisorRemainder(NamedTuple):
+    """Unified compressed-storage primitive for elementwise op outputs.
+
+    Subsumes :class:`UnionBlocks` (``semantic='union'``) and
+    :class:`IntersectionBlocks` (``semantic='intersection'``) under one type
+    with explicit semantic + a static ``include_remainder`` flag.
+
+    Layout
+    ------
+    ``divisor`` : ``(M, n_d, B_d_h, B_d_w, *L)``
+        Per-meta-block content for the "primary" side. Naming mirrors the
+        algebraic intuition: this is the "intersection-of-supports" content
+        the op consumes at every positioned cell.
+    ``remainder`` : ``(M, n_r, B_r_h, B_r_w, *L) | None``
+        Per-meta-block content for the "secondary" side. ``None`` when
+        ``include_remainder=False`` — the densify path then folds in
+        ``fill_remainder`` as a scalar overlay, no buffer materialized.
+    ``fill_divisor`` / ``fill_remainder`` : scalars used outside each side's
+        meta-block-diagonal.
+    ``semantic`` : ``'union'`` | ``'intersection'`` | ``'custom'``
+        Controls densification:
+          * ``'union'``: ``out = op(divisor_grid, remainder_grid)`` (or
+            ``op(divisor_grid, fill_remainder)`` when ``include_remainder=False``).
+          * ``'intersection'``: at positions where both sides have stored
+            data, ``op(divisor, remainder)``; at positions where only one
+            side has data, ``op(value, other_fill)``; elsewhere
+            ``op(fill_divisor, fill_remainder)``. ``op`` is typically
+            ``jnp.multiply`` with zero fills.
+          * ``'custom'``: callers operate on the two parts independently
+            (rare; the SparseTensor wrapper exposes ``divisor`` /
+            ``remainder`` via ``compressed_val`` for them to inspect).
+    ``include_remainder`` : ``bool`` (static field, JIT-constant)
+        When ``False``: ``remainder`` is ``None``, saves HBM AND trace-time
+        work. Set by emission probes when one side is provably-zero or
+        equal to fill.
+    ``op`` : the binary op (default ``jnp.add`` matching the legacy
+        ``UnionBlocks`` default).
+
+    Backward-compat
+    ---------------
+    The classic dual-buffer ``UnionBlocks(lhs, rhs, fill_lhs, fill_rhs, op)``
+    and ``IntersectionBlocks(...)`` classes are kept (separate NamedTuples
+    at the top of this module) so existing isinstance checks and
+    field accesses continue to work. ``DivisorRemainder`` is used by new
+    emission paths going forward; the old classes will be deleted in a
+    cleanup pass after all call sites migrate.
+
+    Constraints (same as :class:`UnionBlocks`, mutatis mutandis):
+        ``n_d * B_d_h == n_r * B_r_h == LCM_h``
+        ``n_d * B_d_w == n_r * B_r_w == LCM_w``
+    """
+
+    divisor: Array
+    remainder: Array | None
+    fill_divisor: Array
+    fill_remainder: Array
+    semantic: str = "union"
+    include_remainder: bool = True
+    op: Callable = jnp.add
+
+    @property
+    def lcm_h(self) -> int:
+        _, n_d, B_d_h, *_ = self.divisor.shape
+        return n_d * B_d_h
+
+    @property
+    def lcm_w(self) -> int:
+        _, n_d, _, B_d_w, *_ = self.divisor.shape
+        return n_d * B_d_w
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        M = self.divisor.shape[0]
+        L = self.divisor.shape[4:]
+        return (M * self.lcm_h, M * self.lcm_w, *L)
+
+    @property
+    def meta_block_shape(self) -> tuple[int, int, int]:
+        """``(M, LCM_h, LCM_w)`` — the natural meta-block-diagonal layout."""
+        return (self.divisor.shape[0], self.lcm_h, self.lcm_w)
+
+    def to_meta_blocks(self) -> Array:
+        """``(M, LCM_h, LCM_w, *L)`` per-meta-block contributions, materialized
+        through one fused broadcast+select+sum chain — no scatter, no gather.
+
+        When ``include_remainder=False`` the rhs grid is *not* allocated —
+        instead the densify path folds ``fill_remainder`` in as a scalar.
+        For ``op=add`` and ``fill_remainder=0`` this is the identity; for
+        ``op=multiply`` and ``fill_remainder=0`` it collapses the result to
+        zero (which the caller has verified is the desired structural
+        identity at emission time).
+        """
+        div_meta = _block_diag_per_meta(self.divisor, self.fill_divisor)
+        if self.include_remainder and self.remainder is not None:
+            rem_meta = _block_diag_per_meta(self.remainder, self.fill_remainder)
+            return self.op(div_meta, rem_meta)
+        # remainder omitted: treat as the constant ``fill_remainder`` grid.
+        return self.op(div_meta, self.fill_remainder)
+
+    def to_dense(self) -> Array:
+        """Materialize the fully-dense ``(M*LCM_h, M*LCM_w, *L)`` form.
+
+        For ``semantic='union'`` / ``'intersection'`` the densify chain is
+        identical to the legacy ``UnionBlocks`` / ``IntersectionBlocks``:
+        both compute ``to_meta_blocks()`` + ``_stitch_meta`` with
+        ``op(fill_divisor, fill_remainder)`` outside. Only the binary
+        ``op`` differs (``add`` vs ``multiply`` for the canonical cases).
+        """
+        per_meta = self.to_meta_blocks()
+        outside_fill = self.op(self.fill_divisor, self.fill_remainder)
+        return _stitch_meta(per_meta, outside_fill)
+
+
 def _to_dense_banded(
     data: Array,
     M_primary: int,
@@ -672,4 +789,32 @@ def _block_banded_unflatten(aux, children):
 
 jax.tree_util.register_pytree_node(
     BlockBanded, _block_banded_flatten, _block_banded_unflatten
+)
+
+
+def _divisor_remainder_flatten(dr):
+    """Flatten ``DivisorRemainder`` for pytree traversal. ``divisor`` and
+    ``remainder`` (may be ``None``) are array children; ``fill_*`` are
+    array children too. ``semantic`` / ``include_remainder`` / ``op`` go
+    into aux_data — JIT treats them as compile-time constants."""
+    return (
+        (dr.divisor, dr.remainder, dr.fill_divisor, dr.fill_remainder),
+        (dr.semantic, dr.include_remainder, dr.op),
+    )
+
+
+def _divisor_remainder_unflatten(aux, children):
+    return DivisorRemainder(
+        divisor=children[0],
+        remainder=children[1],
+        fill_divisor=children[2],
+        fill_remainder=children[3],
+        semantic=aux[0],
+        include_remainder=aux[1],
+        op=aux[2],
+    )
+
+
+jax.tree_util.register_pytree_node(
+    DivisorRemainder, _divisor_remainder_flatten, _divisor_remainder_unflatten
 )
