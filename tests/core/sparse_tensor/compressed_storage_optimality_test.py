@@ -317,7 +317,8 @@ class TestBlockBandedOptimality(unittest.TestCase):
 
     def _expected_bandwidth(self, M_new, B_new, B_x_h, B_x_w, B_y_h, B_y_w):
         """Compute the theoretical bandwidth ``w`` from input geometry.
-        Mirrors the calculation in ``ops.matmul._try_compressed_block_banded``."""
+        Mirrors the structural-overlap calculation in
+        ``ops.matmul._row_band_spans``."""
         w = 0
         for a in range(M_new):
             x_lo = ((a * B_new) // B_x_h) * B_x_w

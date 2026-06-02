@@ -970,17 +970,6 @@ def _build_output_tensor(ctx, rhs_dims, res):
             check_consistency=False,
             zero_fill=True,
         )
-    # Lazy compressed form (legacy, dead — replaced by the banded-emission
-    # branch above. Deleted in the next commit once we confirm parity.)
-    cv_st = _try_compressed_block_banded(
-        ctx,
-        final_out,
-        final_primal,
-        values,
-        final_mult,
-    )
-    if cv_st is not None:
-        return cv_st
     out_dtype = values.dtype if values is not None else jnp.asarray(final_mult).dtype
     # transforms intentionally not propagated through matmul; callers in
     # core.py unload pre/post transforms before the matmul and reattach
@@ -992,44 +981,6 @@ def _build_output_tensor(ctx, rhs_dims, res):
         scalar_mult=jnp.asarray(final_mult).astype(out_dtype),
         zero_fill=True,
     )
-
-
-def _block_banded_geometry(
-    M_eager: int,
-    B_eager: int,
-    B_x_h: int,
-    B_x_w: int,
-    B_y_h: int,
-    B_y_w: int,
-) -> tuple[int, int, int] | None:
-    """Compute the BlockBanded repacking geometry for an output that's
-    written in eager ``(M_eager, B_eager, B_eager)`` form. Returns
-    ``(M_new, B_new, w_band)`` or ``None`` if no granularity gain is
-    possible. ``B_new`` is the natural square sub-block size that contains
-    each output cell (``max(B_x_h, B_y_w)``); ``M_new = M_eager *
-    (B_eager / B_new)``; ``w_band`` is the half-bandwidth (max ``|a-b|``
-    among sub-block index pairs whose contraction ranges overlap).
-    """
-    B_new = builtins.max(B_x_h, B_y_w)
-    if B_eager % B_new != 0 or B_new == B_eager:
-        return None  # Either can't repack or no granularity gain.
-    M_new = M_eager * (B_eager // B_new)
-    # Sub-block (a, b) is non-zero iff x's contraction range from rows
-    # [a·B_new, a·B_new+B_new) overlaps y's contraction range from cols
-    # [b·B_new, b·B_new+B_new). Enumerate one period; track max |a-b|.
-    w_band = 0
-    for a in range(M_new):
-        x_lo = ((a * B_new) // B_x_h) * B_x_w
-        x_hi = (((a * B_new + B_new - 1) // B_x_h) + 1) * B_x_w
-        for b in range(M_new):
-            y_lo = ((b * B_new) // B_y_h) * B_y_w
-            y_hi = (((b * B_new + B_new - 1) // B_y_h) + 1) * B_y_w
-            if x_lo < y_hi and y_lo < x_hi:
-                w_band = builtins.max(w_band, abs(b - a))
-    W = 2 * w_band + 1
-    if M_new * W * B_new * B_new >= M_eager * B_eager * B_eager:
-        return None  # Eager is already as tight or tighter.
-    return M_new, B_new, w_band
 
 
 class BandedLayout(NamedTuple):
@@ -1277,112 +1228,6 @@ def _pack_dense_to_banded(values: Array, layout: BandedLayout) -> Array:
     mask = target[:, :, None] == jnp.arange(N_s, dtype=jnp.int32)[None, None, :]
     mask = mask[..., None, None]  # (M_p, W, N_s, 1, 1)
     return jnp.where(mask, grid_b, 0).sum(axis=2)  # (M_p, W, B_row, B_col)
-
-
-def _gather_banded_data(
-    values: Array, M_eager: int, B_eager: int, M_new: int, B_new: int, w_band: int
-) -> Array:
-    """Extract in-band ``(B_new, B_new)`` sub-blocks from the eager
-    ``(M_eager, B_eager, B_eager)`` val into ``(M_new, W, B_new, B_new)``
-    data — one fused gather XLA folds with the matmul output write.
-
-    Output sub-block (a, w_idx) sits at column ``b = a + (w_idx - w_band)``
-    in the banded layout. Out-of-band positions are zeroed via
-    ``jnp.where``; only sub-blocks that share an eager meta-block are
-    physically present (the eager output is meta-block-diagonal).
-    """
-    K = B_eager // B_new
-    W = 2 * w_band + 1
-    v5 = values.reshape(M_eager, K, B_new, K, B_new)
-    a_idx = np.arange(M_new)[:, None]  # (M_new, 1)
-    w_idx_arr = np.arange(W)[None, :]  # (1, W)
-    b_idx = a_idx + (w_idx_arr - w_band)  # (M_new, W)
-    in_band = (b_idx >= 0) & (b_idx < M_new)
-    eager_meta = a_idx // K  # (M_new, 1)
-    sub_a = a_idx % K  # (M_new, 1)
-    sub_b = np.where(in_band, b_idx % K, 0)  # (M_new, W) — clipped
-    same_meta = (b_idx // K) == eager_meta
-    keep = in_band & same_meta
-    em = jnp.broadcast_to(jnp.asarray(eager_meta), (M_new, W))
-    sa = jnp.broadcast_to(jnp.asarray(sub_a), (M_new, W))
-    sb = jnp.asarray(sub_b)
-    # ``v5[em, sa, :, sb, :]`` returns ``Array`` for our index shape, but
-    # the type stub annotates a wider ``Array | tuple[Array, ...]``. Cast
-    # at the boundary so downstream consumers see a single tensor.
-    from typing import cast
-
-    data = cast(Array, v5[em, sa, :, sb, :])  # (M_new, W, B_new, B_new)
-    return jnp.where(
-        jnp.asarray(keep)[..., None, None], data, jnp.zeros((), dtype=data.dtype)
-    )
-
-
-def _try_compressed_block_banded(ctx, final_out, final_primal, values, final_mult):
-    """Repack a meta-block-diagonal-square matmul output ``(M, B_eager,
-    B_eager)`` into a tighter ``BlockBanded(M_new, w, B_new, B_new)`` form
-    when the input geometry produces a narrow band. For nearly-coprime
-    block ratios (e.g. 5/11) ``w = 1`` (2-3 cells visible per row) and
-    BlockBanded is strictly tighter; for divisor / equal blocks the eager
-    form is already optimal and we fall through.
-
-    Conditions: 2-D single-sparse-pair on both inputs, square output
-    (``o.block_size == p.block_size``, ``o.size == p.size``), eager val
-    in canonical ``(M, B, B)`` shape, and the geometry must yield
-    ``M_new·W·B_new² < M_eager·B_eager²``.
-    """
-    if values is None:
-        return None
-    if len(final_out) != 1 or len(final_primal) != 1:
-        return None
-    o, p = final_out[0], final_primal[0]
-    if not o.is_sparse or not p.is_sparse:
-        return None
-    if o.block_size != p.block_size or o.size != p.size:
-        return None  # Not meta-block-diagonal-square.
-    if o.block_size is None:  # narrow Optional for the type checker
-        return None
-    M_eager, B_eager = o.size, o.block_size
-    if values.shape != (M_eager, B_eager, B_eager):
-        return None  # Output wasn't written in (M, B, B) form.
-    lhs, rhs = ctx.lhs, ctx.rhs
-    if len(lhs.dims) != 2 or len(rhs.dims) != 2:
-        return None
-    if not all(d.is_sparse for d in (*lhs.dims, *rhs.dims)):
-        return None
-    geom = _block_banded_geometry(
-        M_eager,
-        B_eager,
-        B_x_h=lhs.out_dims[0].block_size or 1,
-        B_x_w=lhs.primal_dims[0].block_size or 1,
-        B_y_h=rhs.out_dims[0].block_size or 1,
-        B_y_w=rhs.primal_dims[0].block_size or 1,
-    )
-    if geom is None:
-        return None
-    M_new, B_new, w_band = geom
-    data = _gather_banded_data(values, M_eager, B_eager, M_new, B_new, w_band)
-
-    from graphax.sparse.tensor import SparseTensor
-
-    from .block_storage import BlockBanded
-
-    bb = BlockBanded(data=data, fill_value=jnp.zeros((), dtype=values.dtype))
-    # ``BlockBanded(w>0)`` can't be expressed as a single sparse pair, so the
-    # SparseTensor wraps it behind two full-size ``DenseIndex``s — same dim
-    # structure ``from_compressed`` uses for the BlockBanded fallback path.
-    full = M_new * B_new
-    # transforms intentionally not propagated through matmul; callers in
-    # core.py unload pre/post transforms before the matmul and reattach
-    # fresh ones to the result.
-    return SparseTensor(
-        (DenseIndex(o.id, full, axis=0),),
-        (DenseIndex(p.id, full, axis=1),),
-        val=None,
-        compressed_val=bb,
-        scalar_mult=jnp.asarray(final_mult).astype(values.dtype),
-        check_consistency=False,
-        zero_fill=True,
-    )
 
 
 # --- Late-densification escape hatch for non-zero fill_value --------------
