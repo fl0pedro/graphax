@@ -595,5 +595,94 @@ class TestEndToEndPeakMemoryBound(unittest.TestCase):
             f"matmul peak {mon.peak} exceeds {bound}")
 
 
+class TestMultiAxisContractMatmul(unittest.TestCase):
+    """K>1 contracting axes with K'>1 misalignments.
+
+    Phase 7.3 verification: graphax's ``matmul`` natively supports multi-
+    axis contraction (``_build_matmul_topology`` pairs the last
+    ``min(len(lhs.primal), len(rhs.out))`` dims as contract pairs). When
+    multiple contract pairs are misaligned, the OUTPUT carries a band
+    structure along the corresponding output axis pairs — same logic as
+    K=1 but factorized along multiple independent axes.
+
+    Currently the probe ``_should_emit_block_banded`` gates on
+    ``len(pairs) == 1`` so K>1 cases fall through to the dense
+    ``val=values`` path: **output is correct, but no compression is
+    applied**. Multi-axis BlockBanded compression is a future extension
+    (the data layout needs ``(M_p1, W1, B_row1, M_p2, W2, B_row2, B_col1,
+    B_col2, *L)`` or similar to encode bands along multiple axes).
+
+    These tests lock in the *correctness* of K>1 multi-misalignment
+    matmul output. When multi-axis compression lands, the storage
+    assertion below should flip to assert compression instead.
+    """
+
+    def test_k2_misaligned_contract_matches_einsum(self):
+        """4-D matmul contracting on 2 axes, both misaligned (5/11 and
+        2/3). Output must equal a hand-rolled einsum reference."""
+        a = SparseTensor(
+            (
+                SparseIndex(0, 11, axis=0, other_id=2, block_size=5, block_axis=2),
+                SparseIndex(1, 3,  axis=1, other_id=3, block_size=4, block_axis=4),
+            ),
+            (
+                SparseIndex(2, 11, axis=0, other_id=0, block_size=5, block_axis=3),
+                SparseIndex(3, 3,  axis=1, other_id=1, block_size=2, block_axis=5),
+            ),
+            _n((11, 3, 5, 5, 4, 2), 1),
+        )
+        b = SparseTensor(
+            (
+                SparseIndex(0, 5, axis=0, other_id=2, block_size=11, block_axis=2),
+                SparseIndex(1, 2, axis=1, other_id=3, block_size=3,  block_axis=4),
+            ),
+            (
+                SparseIndex(2, 5, axis=0, other_id=0, block_size=7, block_axis=3),
+                SparseIndex(3, 2, axis=1, other_id=1, block_size=9, block_axis=5),
+            ),
+            _n((5, 2, 11, 7, 3, 9), 2),
+        )
+        ref = jnp.einsum("ijkl,klmn->ijmn", a.dense(), b.dense())
+        res = sparse_matmul(a, b)
+        self.assertTrue(jnp.allclose(res.dense(), ref, atol=1e-4))
+
+    def test_k2_misaligned_currently_stores_dense(self):
+        """Documenting the current behavior: K>1 misalignment falls
+        through to the dense ``val=values`` path (no BlockBanded
+        compression yet). When multi-axis BlockBanded compression lands,
+        flip this assertion to ``compressed_val is not None`` and add
+        the storage-bound check."""
+        a = SparseTensor(
+            (
+                SparseIndex(0, 11, axis=0, other_id=2, block_size=5, block_axis=2),
+                SparseIndex(1, 3,  axis=1, other_id=3, block_size=4, block_axis=4),
+            ),
+            (
+                SparseIndex(2, 11, axis=0, other_id=0, block_size=5, block_axis=3),
+                SparseIndex(3, 3,  axis=1, other_id=1, block_size=2, block_axis=5),
+            ),
+            _n((11, 3, 5, 5, 4, 2), 1),
+        )
+        b = SparseTensor(
+            (
+                SparseIndex(0, 5, axis=0, other_id=2, block_size=11, block_axis=2),
+                SparseIndex(1, 2, axis=1, other_id=3, block_size=3,  block_axis=4),
+            ),
+            (
+                SparseIndex(2, 5, axis=0, other_id=0, block_size=7, block_axis=3),
+                SparseIndex(3, 2, axis=1, other_id=1, block_size=9, block_axis=5),
+            ),
+            _n((5, 2, 11, 7, 3, 9), 2),
+        )
+        res = sparse_matmul(a, b)
+        self.assertIsNone(
+            res.compressed_val,
+            "K>1 multi-misalignment compression not implemented yet — "
+            "if this fires, the storage bound check below needs to be "
+            "added (and this assertion flipped).",
+        )
+        self.assertIsNotNone(res.val)
+
+
 if __name__ == "__main__":
     unittest.main()
