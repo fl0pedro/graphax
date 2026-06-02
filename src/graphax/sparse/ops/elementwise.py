@@ -455,6 +455,147 @@ def _try_compressed_union(lhs, rhs, op, is_intersection):
     )
 
 
+# --- Phase 6b: DivisorRemainder emission (probe + helper) -----------------
+# Inhabits the *general* dispatcher branch (path string stays "general").
+# Mirrors the gating of ``_try_compressed_union`` so the new emission
+# subsumes the dispatcher fast path; the ``include_remainder`` static flag
+# is set conservatively (always True) — structural-identity detection
+# (e.g., dropping a zero side) lands in a later refinement.
+def _should_emit_divisor_remainder(lhs, rhs, op, is_intersection):
+    """Static probe: should this elementwise op emit a compressed
+    ``DivisorRemainder`` rather than eagerly building the meta-block-
+    diagonal val? Returns a dict of geometry / IDs on success, ``None``
+    otherwise.
+
+    Gates mirror ``_try_compressed_union`` (so behavior matches for the
+    union case the dispatcher already handles). The ``is_intersection``
+    arm is gated off in 6b.2 — enabled in 6b.3 when the dispatcher
+    branch is deleted.
+    """
+    # Phase 6b.2 gate: intersection arm dormant. Phase 6b.3 drops this gate.
+    if is_intersection:
+        return None
+    if op not in _ZERO_PRESERVING_OPS:
+        return None
+    if len(lhs.dims) != 2 or len(rhs.dims) != 2:
+        return None
+    if lhs.val is None or rhs.val is None:
+        return None
+    if not (lhs.out_dims and lhs.primal_dims and rhs.out_dims and rhs.primal_dims):
+        return None
+    ao, ai = lhs.out_dims[0], lhs.primal_dims[0]
+    bo, bi = rhs.out_dims[0], rhs.primal_dims[0]
+    if not all(d.is_sparse for d in (ao, ai, bo, bi)):
+        return None
+    if ao.other_id != ai.id or ai.other_id != ao.id:
+        return None
+    if bo.other_id != bi.id or bi.other_id != bo.id:
+        return None
+    if any(d.axis is None for d in (ao, ai, bo, bi)):
+        return None
+    if any(
+        d.block_axis is None
+        for d in (ao, ai, bo, bi)
+        if d.block_size is not None and d.block_size > 1
+    ):
+        return None
+    a_b_h, a_b_w = ao.block_size or 1, ai.block_size or 1
+    b_b_h, b_b_w = bo.block_size or 1, bi.block_size or 1
+    a_n, b_n = ao.size, bo.size
+    if a_n * a_b_h != b_n * b_b_h or a_n * a_b_w != b_n * b_b_w:
+        return None
+    lcm_h = math.lcm(a_b_h, b_b_h)
+    lcm_w = math.lcm(a_b_w, b_b_w)
+    if (a_n * a_b_h) % lcm_h or (a_n * a_b_w) % lcm_w:
+        return None
+    M = (a_n * a_b_h) // lcm_h
+    n_lhs, n_rhs = a_n // M, b_n // M
+    union_size = n_lhs * a_b_h * a_b_w + n_rhs * b_b_h * b_b_w
+    meta_size = lcm_h * lcm_w
+    if union_size >= meta_size:
+        return None
+    return {
+        "M": M,
+        "n_lhs": n_lhs,
+        "n_rhs": n_rhs,
+        "a_b_h": a_b_h,
+        "a_b_w": a_b_w,
+        "b_b_h": b_b_h,
+        "b_b_w": b_b_w,
+        "lcm_h": lcm_h,
+        "lcm_w": lcm_w,
+        "semantic": "intersection" if is_intersection else "union",
+        "include_remainder": True,
+        "out_id": lhs.out_dims[0].id,
+        "primal_id": lhs.primal_dims[0].id,
+    }
+
+
+def _emit_divisor_remainder(lhs, rhs, op, geom):
+    """Construct the ``SparseTensor(compressed_val=DivisorRemainder)`` from
+    operand vals + the geometry dict returned by
+    :func:`_should_emit_divisor_remainder`. Mirrors the assembly inside
+    ``_try_compressed_union`` (matmul.py:417-455) but emits the new
+    unified primitive."""
+    M = geom["M"]
+    n_lhs, n_rhs = geom["n_lhs"], geom["n_rhs"]
+    a_b_h, a_b_w = geom["a_b_h"], geom["a_b_w"]
+    b_b_h, b_b_w = geom["b_b_h"], geom["b_b_w"]
+    lcm_h, lcm_w = geom["lcm_h"], geom["lcm_w"]
+
+    bool_op = lhs.dtype == jnp.bool_
+    if bool_op:
+        lhs_v = lhs.val & lhs.scalar_mult.astype(jnp.bool_)
+        rhs_v = rhs.val & rhs.scalar_mult.astype(jnp.bool_)
+    else:
+        lhs_v = lhs.val * lhs.scalar_mult
+        rhs_v = rhs.val * rhs.scalar_mult
+    fill_l = _scaled_fill(lhs)
+    fill_r = _scaled_fill(rhs)
+
+    lhs_blocks = lhs_v.reshape(M, n_lhs, a_b_h, a_b_w)
+    rhs_blocks = rhs_v.reshape(M, n_rhs, b_b_h, b_b_w)
+
+    from .block_storage import DivisorRemainder
+
+    dr = DivisorRemainder(
+        divisor=lhs_blocks,
+        remainder=rhs_blocks if geom["include_remainder"] else None,
+        fill_divisor=fill_l,
+        fill_remainder=fill_r,
+        semantic=geom["semantic"],
+        include_remainder=geom["include_remainder"],
+        op=op,
+    )
+    new_fill = op(fill_l, fill_r)
+    s_mult = jnp.array(True) if bool_op else jnp.array(1.0, dtype=lhs.val.dtype)
+    zf = (
+        getattr(lhs, "_zero_fill", False) and getattr(rhs, "_zero_fill", False)
+    ) or None
+    out_id, primal_id = geom["out_id"], geom["primal_id"]
+
+    from graphax.sparse.tensor import SparseTensor
+
+    return SparseTensor(
+        (
+            SparseIndex(
+                out_id, M, axis=0, other_id=primal_id, block_size=lcm_h, block_axis=1
+            ),
+        ),
+        (
+            SparseIndex(
+                primal_id, M, axis=0, other_id=out_id, block_size=lcm_w, block_axis=2
+            ),
+        ),
+        val=None,
+        compressed_val=dr,
+        scalar_mult=s_mult,
+        fill_value=new_fill,
+        check_consistency=False,
+        zero_fill=zf,
+    )
+
+
 # --- Path tracing (test-only) ---------------------------------------------
 # Re-exports from ``_path_tracking``. See that module for the full design;
 # tests opt in via the ``track_paths()`` context manager or ``TRACK_PATHS=1``
@@ -507,6 +648,17 @@ def elementwise(
             return compressed, n
         return compressed
     _record_path("general")
+    # Phase 6b: DivisorRemainder emission. The gate is dormant in 6b.2 (mirrors
+    # the dispatcher-stage ``_try_compressed_union``, so this branch never
+    # fires when that dispatcher catches first). 6b.3 deletes the dispatcher
+    # and broadens the probe to intersection ops — this becomes the live
+    # compression path.
+    _dr_geom = _should_emit_divisor_remainder(lhs, rhs, op, is_intersection)
+    if _dr_geom is not None:
+        out = _emit_divisor_remainder(lhs, rhs, op, _dr_geom)
+        if count:
+            return out, n
+        return out
     sp, dp = _map_topology(lhs, rhs)
     metrics = [_pair_metric(p) for p in sp]
     vl, al, ul = _value_axes_info(lhs, sp, dp, True)
