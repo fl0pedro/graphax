@@ -1,14 +1,16 @@
-"""Optimality proofs for the lazy compressed-storage forms.
+"""Optimality proofs for the compressed-storage Index forms.
 
-The three pytrees in ``ops.block_storage`` —
+The two compressed ``Index`` types in ``ops.indexes`` —
 
-  * ``UnionBlocks``        (additive elementwise on misaligned block diagonals),
-  * ``IntersectionBlocks`` (multiplicative elementwise, intersection-sparse),
-  * ``BlockBanded``        (matmul output that lives on a band of meta-blocks),
+  * ``SetIndex``    (set-theoretic elementwise output — additive *union* or
+                     multiplicative *intersection* on misaligned block diagonals),
+  * ``BandedIndex`` (matmul output that lives on a band of meta-blocks),
 
-— exist purely to keep the *physical* val storage tighter than the LCM-grid
-expansion would force. ``block_storage_test.py`` already verifies *correctness*
-(round-trip dense() matches the LCM-grid form). This file proves *optimality*:
+— exist purely to keep the *physical* ``val`` storage tighter than the LCM-grid
+expansion would force. ``compressed_index_test.py`` verifies *correctness*
+(``densify_axis`` matches an independent numpy oracle). This file proves
+*optimality*, driving the real ``elementwise`` / ``matmul`` emitters and
+measuring the emitted ``val`` buffer:
 
   1. **Storage is strictly less** than the LCM-grid alternative for every
      case where the compression is supposed to fire.
@@ -38,8 +40,7 @@ import jax.numpy as jnp
 import jax.random as jr
 
 from graphax.sparse.tensor import SparseTensor
-from graphax.sparse.indexes import DiagonalIndex, DenseIndex
-from graphax.sparse.ops.block_storage import UnionBlocks, IntersectionBlocks, BlockBanded
+from graphax.sparse.indexes import DiagonalIndex, DenseIndex, SetIndex, BandedIndex
 from graphax.sparse.ops.elementwise import elementwise
 from graphax.sparse.ops.matmul import matmul as sparse_matmul
 from graphax.sparse.ops._path_tracking import track_paths
@@ -76,34 +77,49 @@ def _entry_op_count(fn, *args):
 
 
 # ============================================================================
-# UnionBlocks — additive elementwise on misaligned block diagonals
+# SetIndex (union) — additive elementwise on misaligned block diagonals
 # ============================================================================
+def _misaligned_square_pair(B_a, B_b, M=1, key=1):
+    """Two square block-diagonal ``SparseTensor`` operands with coprime block
+    sizes ``B_a`` / ``B_b`` and the SAME logical shape ``(M·LCM, M·LCM)``:
+    ``a`` is ``M·(LCM/B_a)`` blocks of ``B_a``, ``b`` is ``M·(LCM/B_b)`` blocks
+    of ``B_b``. ``a + b`` / ``a * b`` then hit the misaligned SetIndex path."""
+    lcm = math.lcm(B_a, B_b)
+    n_a, n_b = lcm // B_a, lcm // B_b
+    a = SparseTensor(
+        (DiagonalIndex(0, M * n_a, axis=0, other_id=1, block_size=B_a, block_axis=1),),
+        (DiagonalIndex(1, M * n_a, axis=0, other_id=0, block_size=B_a, block_axis=2),),
+        _n((M * n_a, B_a, B_a), key),
+    )
+    b = SparseTensor(
+        (DiagonalIndex(0, M * n_b, axis=0, other_id=1, block_size=B_b, block_axis=1),),
+        (DiagonalIndex(1, M * n_b, axis=0, other_id=0, block_size=B_b, block_axis=2),),
+        _n((M * n_b, B_b, B_b), key + 1),
+    )
+    return a, b
+
+
 class TestUnionBlocksOptimality(unittest.TestCase):
-    """Strict storage / composition / end-to-end-memory bounds."""
+    """Strict storage / composition / end-to-end-memory bounds — measured on
+    the real ``SetIndex`` buffer emitted by ``elementwise(.., add)``."""
 
-    def _storage_size(self, ub):
-        """Total elements stored physically (sum of both buffers, ignoring
-        scalar fill values which are ``Array(())`` size-1)."""
-        return int(ub.lhs.size + ub.rhs.size)
-
-    def _lcm_grid_size(self, ub):
-        """Elements that the *eager* LCM-grid alternative would need to store —
-        ``M × LCM_h × LCM_w``."""
-        M, _, _, _, *_ = ub.lhs.shape
-        return int(M * ub.lcm_h * ub.lcm_w)
+    def _eager_grid_size(self, B_a, B_b, M=1):
+        """Elements the *eager* LCM-grid alternative would store: the
+        meta-block-diagonal form keeps ``M`` blocks each ``LCM_h × LCM_w``
+        (linear in ``M`` — the M meta-blocks sit on the diagonal, the
+        off-diagonal zeros aren't stored)."""
+        lcm = math.lcm(B_a, B_b)
+        return int(M * lcm * lcm)
 
     def test_coprime_511_canonical_compression(self):
         """5/11 case: the user's canonical example. Theoretical compression
         factor: ``LCM_grid / (n_lhs·B_lhs² + n_rhs·B_rhs²) =
         55² / (5·11² + 11·5²) = 3025 / (605 + 275) = 3.44×``."""
-        M = 1
-        ub = UnionBlocks(
-            lhs=_n((M, 5, 11, 11), 1),
-            rhs=_n((M, 11, 5, 5), 2),
-            fill_lhs=jnp.array(0.0), fill_rhs=jnp.array(0.0),
-        )
-        compressed = self._storage_size(ub)
-        eager = self._lcm_grid_size(ub)
+        a, b = _misaligned_square_pair(5, 11, M=1)
+        res = elementwise(a, b, jnp.add)
+        self.assertTrue(all(isinstance(d, SetIndex) for d in res.dims))
+        compressed = int(res.val.size)
+        eager = self._eager_grid_size(5, 11)  # 3025
         ratio = eager / compressed
         # Closed-form expectation: 3025 / 880 = 3.4375.
         self.assertAlmostEqual(ratio, 3025 / 880, places=3)
@@ -112,42 +128,34 @@ class TestUnionBlocksOptimality(unittest.TestCase):
 
     def test_storage_strict_inequality_across_coprime_pairs(self):
         """For *every* coprime ``(B_a, B_b)`` pair with ``B_a ≠ B_b``, the
-        UnionBlocks storage must be strictly less than the LCM-grid form."""
+        emitted ``SetIndex`` buffer must be strictly less than the LCM-grid."""
         for B_a, B_b in [(2, 3), (3, 5), (5, 7), (7, 11), (11, 13)]:
             with self.subTest(B_a=B_a, B_b=B_b):
-                lcm = math.lcm(B_a, B_b)
-                n_a = lcm // B_a
-                n_b = lcm // B_b
-                ub = UnionBlocks(
-                    lhs=_n((1, n_a, B_a, B_a), 1),
-                    rhs=_n((1, n_b, B_b, B_b), 2),
-                    fill_lhs=jnp.array(0.0), fill_rhs=jnp.array(0.0),
-                )
-                compressed = self._storage_size(ub)
-                eager = self._lcm_grid_size(ub)
+                a, b = _misaligned_square_pair(B_a, B_b, M=1)
+                res = elementwise(a, b, jnp.add)
+                compressed = int(res.val.size)
+                eager = self._eager_grid_size(B_a, B_b)
                 self.assertLess(
                     compressed, eager,
-                    f"({B_a},{B_b}): {compressed} bytes ≥ eager {eager}")
+                    f"({B_a},{B_b}): {compressed} ≥ eager {eager}")
 
     def test_meta_block_repetition_M_scales_linearly(self):
-        """When ``M`` (meta-block count) scales, both storage and LCM-grid
-        scale identically (linearly in ``M``), so the *ratio* stays
-        constant — verifies the compression is geometric, not accidental."""
+        """When ``M`` (meta-block count) scales, both the emitted buffer and the
+        LCM-grid scale linearly in ``M``, so the *ratio* stays constant —
+        verifies the compression is geometric, not accidental."""
         ratios = []
         for M in [1, 2, 4, 8]:
-            ub = UnionBlocks(
-                lhs=_n((M, 3, 5, 5), 1), rhs=_n((M, 5, 3, 3), 2),
-                fill_lhs=jnp.array(0.0), fill_rhs=jnp.array(0.0),
-            )
-            ratios.append(self._lcm_grid_size(ub) / self._storage_size(ub))
+            a, b = _misaligned_square_pair(5, 3, M=M)
+            res = elementwise(a, b, jnp.add)
+            ratios.append(self._eager_grid_size(5, 3, M) / int(res.val.size))
         # All four ratios should be identical (within floating-point).
         self.assertTrue(all(abs(r - ratios[0]) < 1e-9 for r in ratios),
                         f"ratios should be M-independent, got {ratios}")
 
     def test_dispatcher_emits_compressed_form(self):
-        """``a + b`` on misaligned block diagonals (with op = add) emits
-        ``compressed_val=UnionBlocks`` directly — verifies the fast path
-        actually fires rather than silently bailing to LCM expansion."""
+        """``a + b`` on misaligned block diagonals (with op = add) emits a
+        ``SetIndex`` (semantic 'union') pair directly — verifies the compressed
+        path actually fires rather than silently bailing to LCM expansion."""
         a = _block_diag(M=1, B=5, key=1)  # logical 5×5
         b = _block_diag(M=1, B=11, key=2)
         # Make logical sizes match: M_a*B_a == M_b*B_b. Use 11 outer blocks
@@ -239,70 +247,46 @@ class TestUnionBlocksOptimality(unittest.TestCase):
 
 
 # ============================================================================
-# IntersectionBlocks — multiplicative output is sparse on the intersection
+# SetIndex (intersection) — multiplicative output is sparse on the intersection
 # ============================================================================
 class TestIntersectionBlocksOptimality(unittest.TestCase):
-    """Same dual-buffer storage as Union, but the ``op`` is intersection-like
-    (``mul`` typically). Verifies the same storage bound applies and that
-    the dense materialization is non-zero only on the geometric intersection."""
+    """Same emitted ``SetIndex`` buffer as the union case, but the ``op`` is
+    intersection-like (``mul``). Verifies the same storage bound applies and
+    that the dense materialization is non-zero only on the geometric
+    intersection."""
 
     def test_storage_strict_inequality_across_coprime_pairs(self):
-        """The dual-buffer storage is strictly less than the LCM-grid form
-        for every coprime pair. (Mathematically the same bound as Union;
-        IntersectionBlocks just uses a different op.)"""
+        """The emitted ``SetIndex`` buffer is strictly less than the LCM-grid
+        for every coprime pair. (Same bound as union; only the op differs.)"""
         for B_a, B_b in [(2, 3), (3, 5), (5, 7), (7, 11)]:
             with self.subTest(B_a=B_a, B_b=B_b):
+                a, b = _misaligned_square_pair(B_a, B_b, M=1)
+                res = elementwise(a, b, jnp.multiply, is_intersection=True)
+                compressed = int(res.val.size)
                 lcm = math.lcm(B_a, B_b)
-                n_a = lcm // B_a
-                n_b = lcm // B_b
-                ib = IntersectionBlocks(
-                    lhs=_n((1, n_a, B_a, B_a), 1),
-                    rhs=_n((1, n_b, B_b, B_b), 2),
-                    fill_lhs=jnp.array(0.0), fill_rhs=jnp.array(0.0),
-                )
-                compressed = int(ib.lhs.size + ib.rhs.size)
-                eager = ib.shape[0] * ib.shape[1]  # M·LCM_h × M·LCM_w
+                eager = lcm * lcm  # M·LCM_h × M·LCM_w, M=1
                 self.assertLess(compressed, eager)
 
     def test_dense_is_intersection_sparse(self):
         """For ``op = jnp.multiply`` and zero fills, the dense form is non-zero
         *only* at positions where both lhs and rhs blocks have data — the
-        geometric intersection. The number of non-zeros equals
-        ``M × Σ_{(i,j) overlap} cell_count``."""
-        ib = IntersectionBlocks(
-            lhs=_n((1, 3, 5, 5), 1),
-            rhs=_n((1, 5, 3, 3), 2),
-            fill_lhs=jnp.array(0.0), fill_rhs=jnp.array(0.0),
-            op=jnp.multiply,
-        )
-        dense = ib.to_dense()
-        # Total cells = 15×15 = 225. Intersection cells = where both
-        # diagonals are non-zero. With B_a=5 and B_b=3, the intersection
-        # of diagonal-of-5 with diagonal-of-3 in a 15×15 grid is the
-        # main diagonal of size 15 (since gcd(5,3)=1, only the (0,0) cell
-        # of each meta-block is in the intersection, repeated by sub-blocks).
-        # Count via the dense.
+        geometric intersection — so most LCM-grid cells stay zero."""
+        a, b = _misaligned_square_pair(5, 3, M=1)
+        res = elementwise(a, b, jnp.multiply, is_intersection=True)
+        dense = res.dense()
         nonzero = int(jnp.sum(dense != 0))
-        # All cells should be non-zero only at intersection positions —
-        # and there's at most 15 positions on the main diagonal × ... .
-        # The intersection layout is a "checkerboard" on the LCM grid.
-        # Lower bound: at least M·max(B_a,B_b) cells (the M big-block diagonal).
         self.assertGreater(nonzero, 0)
         self.assertLess(nonzero, dense.size,
                         "intersection should leave most cells zero")
 
     def test_no_scatter_under_jit(self):
-        ib = IntersectionBlocks(
-            lhs=_n((2, 3, 5, 5), 1), rhs=_n((2, 5, 3, 3), 2),
-            fill_lhs=jnp.array(0.0), fill_rhs=jnp.array(0.0),
-            op=jnp.multiply,
-        )
+        a, b = _misaligned_square_pair(5, 3, M=2)
 
         @jax.jit
-        def to_dense(ib):
-            return ib.to_dense()
+        def mul_to_dense(a, b):
+            return elementwise(a, b, jnp.multiply, is_intersection=True).dense()
 
-        text = to_dense.lower(ib).compile().as_text()
+        text = mul_to_dense.lower(a, b).compile().as_text()
         self.assertEqual(text.lower().count("scatter("), 0)
 
     def test_elementwise_mul_emits_set_index(self):
@@ -800,10 +784,10 @@ class TestMultiAxisElementwise(unittest.TestCase):
             _n((5, 3, 7, 7, 4, 4), 2),
         )
         res = a + b
-        self.assertIsNone(
-            res.compressed_val,
+        self.assertFalse(
+            any(isinstance(d, SetIndex) for d in res.dims),
             "K>1 multi-axis elementwise compression not implemented yet — "
-            "flip this assertion when multi-axis DivisorRemainder lands.",
+            "flip this assertion when multi-axis SetIndex lands.",
         )
         self.assertIsNotNone(res.val)
 

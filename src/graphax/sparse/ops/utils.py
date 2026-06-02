@@ -22,11 +22,6 @@ if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
 
 
-# Sentinel for ``_copy(compressed_val=...)`` — distinguishes "carry over the
-# source's compressed_val" (default) from "explicitly clear it" (None).
-_UNSET = object()
-
-
 # Lazily resolved on first ``_is_sparse`` call to dodge a circular import
 # (``graphax.sparse.tensor`` imports from this module). After resolution every
 # subsequent ``_is_sparse`` is a single ``isinstance`` instead of a string
@@ -53,58 +48,14 @@ def _is_sparse(obj) -> bool:
 
 # --- Shared primitives (elementwise + matmul) ----------------------------
 def _resolve_val(val):
-    """Materialize the dense form of ``val`` if it's one of the compressed-storage
-    pytrees (``UnionBlocks`` / ``IntersectionBlocks`` / ``BlockBanded``).
-
-    These types expose a ``to_dense()`` method that produces a gather-free
-    broadcast+select+sum chain — XLA fuses it forward into a downstream
-    consumer's operand-fetch (SMEM, no HBM materialization). For plain
-    ``Array`` (or ``None``) ``val`` this is a no-op.
-    """
+    """Materialize the dense form of ``val`` if it exposes a ``to_dense()``
+    method (a structured-storage pytree). For a plain ``Array`` (or ``None``)
+    this is a no-op — the common case now that compressed structure lives in
+    the dim ``Index`` types rather than in ``val``."""
     if val is None or isinstance(val, jax.Array):
         return val
     to_dense = getattr(val, "to_dense", None)
     return to_dense() if callable(to_dense) else val
-
-
-def _materialize_compressed(tensor):
-    """Materialize ``tensor.compressed_val`` to the form the dim structure expects.
-
-    When the compressed pytree exposes a ``meta_block_shape`` (Union /
-    Intersection / BlockBanded(w=0)) and the host ``SparseTensor``'s dim
-    structure is a meta-block-diagonal sparse pair, we go through
-    ``to_meta_blocks()`` — shape ``(M, H_meta, W_meta, *L)``, M× less HBM
-    bandwidth than the full dense form, and the resulting ``val`` lines up
-    exactly with the sparse-pair layout so every downstream op stays on the
-    block-diagonal fast path.
-
-    Otherwise we fall back to ``to_dense()`` (the SparseTensor's dim structure
-    is a pair of full-size ``DenseIndex``s, e.g. for ``BlockBanded(w>0)``).
-    """
-    cv = tensor.compressed_val
-    if cv is None:
-        return tensor.val
-    meta = getattr(cv, "meta_block_shape", None)
-    if meta is not None and _has_meta_block_diag_dims(tensor, meta):
-        return cv.to_meta_blocks()
-    return cv.to_dense()
-
-
-def _has_meta_block_diag_dims(tensor, meta_block_shape) -> bool:
-    """``True`` iff the host SparseTensor's first out_dim/primal_dim form a
-    meta-block-diagonal sparse pair sized to host ``compressed_val.to_meta_blocks()``."""
-    # Assumes meta-block-diagonal storage lives on out_dims[0] / primal_dims[0];
-    # callers must enforce.
-    M, H_meta, W_meta = meta_block_shape
-    if not tensor.out_dims or not tensor.primal_dims:
-        return False
-    o, p = tensor.out_dims[0], tensor.primal_dims[0]
-    return (
-        o.is_sparse and p.is_sparse
-        and o.size == M and p.size == M
-        and o.block_size == H_meta and p.block_size == W_meta
-        and o.other_id == p.id and p.other_id == o.id
-    )
 
 
 def _compressed_dims(tensor) -> list:
@@ -351,26 +302,13 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
 # --- Construction / mutation --------------------------------------------
 def _copy(st: SparseTensor, val: Array | None = None, scalar_mult: Array | None = None,
           fill_value: Array | None = None, out_dims: Sequence[Index] | None = None,
-          primal_dims: Sequence[Index] | None = None, deep: bool = False,
-          compressed_val: Any = _UNSET):
+          primal_dims: Sequence[Index] | None = None, deep: bool = False):
     from graphax.sparse.tensor import SparseTensor
     s = scalar_mult if scalar_mult is not None else st.scalar_mult
     f = fill_value if fill_value is not None else st.fill_value
     od = out_dims if out_dims is not None else st.out_dims
     pd = primal_dims if primal_dims is not None else st.primal_dims
-    # ``compressed_val=_UNSET`` (default): carry over the source's
-    # compressed_val. An explicit value (incl. ``None``) replaces it — used
-    # by callers swapping compressed storage (e.g. UnionBlocks →
-    # IntersectionBlocks) without manually constructing ``SparseTensor(...)``.
-    # When a fresh dense ``val`` is supplied we default to clearing
-    # compressed_val (the constructor rejects both at once).
-    if val is not None:
-        v = val
-        cv = None if compressed_val is _UNSET else compressed_val
-    else:
-        v = st.val
-        cv = (getattr(st, "compressed_val", None) if compressed_val is _UNSET
-              else compressed_val)
+    v = val if val is not None else st.val
     if deep:
         v = copy.deepcopy(v) if v is not None else None
         s = copy.deepcopy(s); od = copy.deepcopy(od); pd = copy.deepcopy(pd)
@@ -384,7 +322,7 @@ def _copy(st: SparseTensor, val: Array | None = None, scalar_mult: Array | None 
         pre_transforms=st.pre_transforms,
         post_transforms=st.post_transforms,
         check_consistency=False,
-        zero_fill=zf, compressed_val=cv,
+        zero_fill=zf,
     )
 
 

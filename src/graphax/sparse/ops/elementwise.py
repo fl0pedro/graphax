@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-from .utils import _arr2st, _is_sparse, _val_or_one, _prepare_physical_array, _materialize_compressed, _is_zero_fill
+from .utils import _arr2st, _is_sparse, _val_or_one, _prepare_physical_array, _is_zero_fill
 from .layout import generate_block_permutation
 from graphax.sparse.indexes import DiagonalIndex, DenseIndex
 
@@ -75,17 +75,11 @@ def _normalize_inputs(lhs, rhs):
         inputs[i] = _arr2st(obj, out_ndim=len(other.out_dims) if _is_sparse(other) else None,
                             dtype=target_dtype)
     lhs, rhs = inputs
-    # Materialize compressed storage on input. ``_materialize_compressed`` picks
-    # ``to_meta_blocks()`` over ``to_dense()`` when the host's dim structure is
-    # already meta-block-diagonal — keeps storage at ``M·H·W`` rather than the
-    # ``M²·H·W`` of the full dense form, and keeps every downstream op on the
-    # block-diagonal fast path. XLA fuses either expression into the consumer.
-    from .utils import _copy, _materialize_for_op
-    if getattr(lhs, "compressed_val", None) is not None:
-        lhs = _copy(lhs, val=_materialize_compressed(lhs))
-    if getattr(rhs, "compressed_val", None) is not None:
-        rhs = _copy(rhs, val=_materialize_compressed(rhs))
-    # Phase 8: pre-densify compressed Index dims (no-op when there are none).
+    # Phase 8: pre-densify any compressed Index dims (BandedIndex / SetIndex)
+    # to DiagonalIndex / DenseIndex — elementwise consumes only those. XLA
+    # fuses the densify into the consumer (SMEM, not HBM). No-op when the
+    # operand carries no compressed dims.
+    from .utils import _materialize_for_op
     lhs = _materialize_for_op(lhs)
     rhs = _materialize_for_op(rhs)
     # Static shape comparison: ``SparseTensor.shape`` returns Python ints
@@ -503,13 +497,13 @@ def elementwise(
     """Sparse elementwise op dispatcher.
 
     Single ``general`` path that handles every case: misaligned 2-D
-    block-diagonal union AND intersection emissions land as
-    ``compressed_val=DivisorRemainder`` early in the path; aligned blocks,
-    non-zero fills, broadcast cases, and non-zero-preserving ops fall
-    through the full promote-to-unified pipeline. The ``compressed_union``
-    dispatcher branch (Phase 6b.3) was folded into this general path; its
-    path label is gone. The ``divisor_fast`` dispatcher branch
-    (Phase 6a) was deleted as HLO-redundant.
+    block-diagonal union AND intersection emissions land as a ``SetIndex``
+    pair (the combined per-side block buffer in ``val``) early in the path;
+    aligned blocks, non-zero fills, broadcast cases, and non-zero-preserving
+    ops fall through the full promote-to-unified pipeline. The
+    ``compressed_union`` dispatcher branch (Phase 6b.3) was folded into this
+    general path; its path label is gone. The ``divisor_fast`` dispatcher
+    branch (Phase 6a) was deleted as HLO-redundant.
 
     With ``count=True`` returns ``(result, n_ops)`` — the number of element
     positions where ``op`` actually fires, computed from the *static*

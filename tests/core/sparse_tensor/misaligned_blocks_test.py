@@ -19,12 +19,10 @@ Sparsity assertions
 -------------------
 Beyond correctness, every union / intersection test also pins down the *structure*
 of the output: the elementwise output of two block-diagonal sources with LCM-block
-size ``L`` over an ``M``-meta-block grid must be a meta-block-diagonal
-``SparseTensor`` (one ``DiagonalIndex`` pair of size ``M`` with ``block_size = L``,
-val of shape ``(M, L_h, L_w, *L)``) — *not* a fully dense ``(M*L_h, M*L_w)`` buffer.
-That's the structure ``SparseTensor.from_compressed(UnionBlocks(...))`` produces, and
-the structure that lets every downstream sparse op stay on the block-diagonal fast
-path instead of touching M²-many zero meta-blocks.
+size ``L`` over an ``M``-meta-block grid must compress to a ``SetIndex`` pair (the
+combined per-side block buffer in ``val``) — *not* a fully dense ``(M*L_h, M*L_w)``
+buffer. That compressed structure is what lets every downstream sparse op stay on
+the block-diagonal fast path instead of touching M²-many zero meta-blocks.
 
 Reference for every test: densify both operands and compute the dense expected value via
 ``jnp.matmul`` / the elementwise op. We assert agreement in both no-JIT and JIT modes.
@@ -40,7 +38,6 @@ from graphax.sparse.tensor import SparseTensor
 from graphax.sparse.indexes import DenseIndex, DiagonalIndex
 from graphax.sparse.ops.matmul import matmul
 from graphax.sparse.ops.elementwise import elementwise
-from graphax.sparse.ops.block_storage import UnionBlocks, IntersectionBlocks
 
 
 def _n(shape, key_idx, dtype=jnp.float32):
@@ -427,95 +424,6 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
                     f"matmul mismatch (jit={use_jit}): max diff "
                     f"{float(jnp.max(jnp.abs(got.dense() - expected)))}",
                 )
-
-
-# ============================================================================
-# Round-trip via the structured pytrees: ``UnionBlocks`` / ``IntersectionBlocks``
-# ============================================================================
-class TestStructuredRoundTrip(unittest.TestCase):
-    """A misaligned ``elementwise(a, b, op)`` should produce *the same* dense form
-    as wrapping its inputs in the matching structured pytree and going through
-    ``SparseTensor.from_compressed``. Two paths to the same tensor:
-
-      1. Sparse: ``SparseTensor`` with sparse-pair dims + ``elementwise(...)``.
-      2. Compressed: build the structured pytree (``UnionBlocks`` /
-         ``IntersectionBlocks``), wrap with ``from_compressed`` — this yields a
-         meta-block-diagonal ``SparseTensor`` with ``val`` of shape
-         ``(M, LCM_h, LCM_w)`` and ``M·LCM_h·LCM_w`` floats of storage,
-         instead of materializing the M× larger fully-dense form.
-
-    The two paths must agree element-wise *and* on the storage footprint."""
-
-    def _build_blocks(self, N, B_o, B_i, M_lcm, key_idx):
-        """Reshape a flat ``(N, B_o, B_i)`` block list into the per-meta-block
-        ``(M, n, B_o, B_i)`` layout that ``UnionBlocks`` / ``IntersectionBlocks``
-        expect: ``M = total / LCM`` meta-blocks, each carrying ``n = N / M``
-        of the original blocks on its own block-diagonal."""
-        blocks = jr.normal(jr.PRNGKey(key_idx), (N, B_o, B_i), dtype=jnp.float32)
-        n_per_meta = N // M_lcm
-        return blocks.reshape(M_lcm, n_per_meta, B_o, B_i)
-
-    def test_union_coprime_2x3_roundtrip(self):
-        # logical 12x12: lhs N=6, B=2 ; rhs N=4, B=3 ; LCM=6 ; M=2
-        N_a, B_a, N_b, B_b = 6, 2, 4, 3
-        M, lcm = 2, 6
-
-        lhs_blocks = self._build_blocks(N_a, B_a, B_a, M, 1)   # (2, 3, 2, 2)
-        rhs_blocks = self._build_blocks(N_b, B_b, B_b, M, 2)   # (2, 2, 3, 3)
-        ub = UnionBlocks(lhs=lhs_blocks, rhs=rhs_blocks,
-                         fill_lhs=jnp.array(0.0, jnp.float32),
-                         fill_rhs=jnp.array(0.0, jnp.float32),
-                         op=jnp.add)
-        # The compressed form's meta-block-diagonal storage:
-        st_compressed = SparseTensor.from_compressed(ub)
-        self.assertEqual(st_compressed.shape, (12, 12))
-        self.assertEqual(st_compressed.val.shape, (M, lcm, lcm))
-        self.assertEqual(st_compressed.val.size, M * lcm * lcm)
-        self.assertTrue(st_compressed.out_dims[0].is_sparse)  # meta-block-diagonal pair
-        self.assertEqual(st_compressed.out_dims[0].block_size, lcm)
-        # Bit-exact dense form against the union pytree's own to_dense.
-        self.assertTrue(jnp.allclose(st_compressed.dense(), ub.to_dense(), atol=1e-5))
-
-    def test_intersection_divisor_2x4_roundtrip(self):
-        # logical 16x16: lhs N=8, B=2 ; rhs N=4, B=4 ; LCM=4 ; M=4
-        N_a, B_a, N_b, B_b = 8, 2, 4, 4
-        M, lcm = 4, 4
-
-        lhs_blocks = self._build_blocks(N_a, B_a, B_a, M, 1)   # (4, 2, 2, 2)
-        rhs_blocks = self._build_blocks(N_b, B_b, B_b, M, 2)   # (4, 1, 4, 4)
-        ib = IntersectionBlocks(lhs=lhs_blocks, rhs=rhs_blocks,
-                                fill_lhs=jnp.array(0.0, jnp.float32),
-                                fill_rhs=jnp.array(0.0, jnp.float32),
-                                op=jnp.multiply)
-        st_compressed = SparseTensor.from_compressed(ib)
-        self.assertEqual(st_compressed.shape, (16, 16))
-        self.assertEqual(st_compressed.val.shape, (M, lcm, lcm))
-        self.assertTrue(jnp.allclose(st_compressed.dense(), ib.to_dense(), atol=1e-5))
-
-    def test_compression_factor(self):
-        """For ``M`` meta-blocks, ``from_compressed(meta_block_diagonal)`` saves M× of
-        storage vs ``compressed_val.to_dense()``: ``M·H·W`` floats vs ``(M·H)·(M·W)
-        = M²·H·W``. This is exactly the compression that lets misaligned outputs
-        scale to large meta-counts."""
-        for M, n_lhs, B_lhs, n_rhs, B_rhs in [
-            (2, 11, 5, 5, 11),  # the user's canonical mismatched-block example
-            (4, 3, 2, 2, 3),    # tighter coprime 2/3 with M=4
-            (8, 6, 4, 4, 6),    # shared-factor 4/6 with M=8
-        ]:
-            with self.subTest(M=M, n_lhs=n_lhs, B_lhs=B_lhs, n_rhs=n_rhs, B_rhs=B_rhs):
-                lhs = jr.normal(jr.PRNGKey(M),
-                                (M, n_lhs, B_lhs, B_lhs), jnp.float32)
-                rhs = jr.normal(jr.PRNGKey(M + 1),
-                                (M, n_rhs, B_rhs, B_rhs), jnp.float32)
-                ub = UnionBlocks(lhs=lhs, rhs=rhs,
-                                 fill_lhs=jnp.array(0.0, jnp.float32),
-                                 fill_rhs=jnp.array(0.0, jnp.float32),
-                                 op=jnp.add)
-                st = SparseTensor.from_compressed(ub)
-                stored = st.val.size
-                fully_dense = (M * n_lhs * B_lhs) * (M * n_lhs * B_lhs)
-                self.assertEqual(stored * M, fully_dense,
-                                 f"M={M}: meta-block-diag must give M× compression")
 
 
 if __name__ == "__main__":

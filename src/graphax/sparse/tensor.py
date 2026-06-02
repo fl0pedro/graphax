@@ -227,25 +227,13 @@ class SparseTensor(SparseMathMixin):
         post_transforms: Sequence[Callable] | None = None,
         check_consistency=True,
         zero_fill: bool | None = None,  # this depends on fill_value... should just be
-        compressed_val=None,  # TODO migrate this into val, and we check it automatically via type
         **kwargs,
     ):
         if val is not None and not hasattr(val, "dtype"):
             val = jnp.asarray(val)
 
         if dtype is None:
-            if val is not None:
-                dtype = val.dtype
-            elif compressed_val is not None:
-                for attr in ("data", "lhs", "main"):
-                    buf = getattr(compressed_val, attr, None)
-                    if buf is not None:
-                        dtype = buf.dtype
-                        break
-                if dtype is None:
-                    dtype = jnp.dtype("float32")
-            else:
-                dtype = jnp.dtype("float32")
+            dtype = val.dtype if val is not None else jnp.dtype("float32")
 
         if scalar_mult is None:
             scalar_mult = jnp.array(1, dtype=dtype)
@@ -256,9 +244,6 @@ class SparseTensor(SparseMathMixin):
         if post_transforms is None:
             post_transforms = ()
 
-        if compressed_val is not None and val is not None:  # yeah this is dumb :p
-            raise ValueError("set exactly one of ``val`` and ``compressed_val``")
-
         if val is not None and val.dtype != dtype:
             val = val.astype(dtype)
 
@@ -268,7 +253,6 @@ class SparseTensor(SparseMathMixin):
         self.out_dims = tuple(out_dims)
         self.primal_dims = tuple(primal_dims)
         self.val = val
-        self.compressed_val = compressed_val
         self.scalar_mult = scalar_mult
         self.fill_value = fill_value
         self.pre_transforms = tuple(pre_transforms)
@@ -292,7 +276,7 @@ class SparseTensor(SparseMathMixin):
             _assert_sparse_tensor_consistency(self)
 
     def tree_flatten(self):
-        children = (self.val, self.scalar_mult, self.fill_value, self.compressed_val)
+        children = (self.val, self.scalar_mult, self.fill_value)
         dynamic_kwargs = tuple(
             (k, getattr(self, k)) for k in getattr(self, "_dynamic_keys", ())
         )
@@ -308,7 +292,7 @@ class SparseTensor(SparseMathMixin):
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        val, scalar_mult, fill_value, compressed_val = children
+        val, scalar_mult, fill_value = children
         (
             out_dims,
             primal_dims,
@@ -323,7 +307,6 @@ class SparseTensor(SparseMathMixin):
         st.out_dims = out_dims
         st.primal_dims = primal_dims
         st.val = val
-        st.compressed_val = compressed_val
         st.scalar_mult = scalar_mult
         st.fill_value = fill_value
         st.pre_transforms = pre_transforms
@@ -335,91 +318,6 @@ class SparseTensor(SparseMathMixin):
             setattr(st, k, v)
 
         return st
-
-    @classmethod
-    def from_compressed(
-        cls, compressed_val, *, fill_value=None, dim_ids: tuple[int, int] = (0, 1)
-    ) -> SparseTensor:
-        """Wrap a structured pytree (``UnionBlocks`` / ``IntersectionBlocks`` /
-        ``BlockBanded``) into a 2-D ``SparseTensor``.
-
-        When the structured type exposes a ``meta_block_shape`` (i.e. the
-        compressed form is meta-block-diagonal — UnionBlocks, IntersectionBlocks,
-        and BlockBanded with ``w=0``), we wrap it as a *meta-block-diagonal
-        ``SparseTensor``*: a sparse pair of size ``M`` with ``block_size``
-        equal to the per-meta-block dims, ``val`` of shape ``(M, H_meta,
-        W_meta, *L)``. This is M× less storage than ``compressed_val.to_dense``,
-        and every downstream op (matmul / elementwise / transpose) hits the
-        existing block-diagonal fast paths instead of materializing the
-        ``M*M_block``-many zero meta-blocks.
-
-        For ``BlockBanded`` with ``w > 0`` (genuine band structure that
-        SparseTensor can't represent natively), we fall back to the
-        ``compressed_val=...`` storage that materializes via ``to_dense`` —
-        same dense form, just no sparse compression.
-        """
-        for attr in ("data", "lhs", "main"):
-            buf = getattr(compressed_val, attr, None)
-            if buf is not None:
-                dtype = buf.dtype
-                break
-        else:
-            dtype = jnp.float32
-        fv = fill_value if fill_value is not None else jnp.array(0, dtype=dtype)
-
-        meta = getattr(compressed_val, "meta_block_shape", None)
-        out_id, primal_id = dim_ids
-        if sorted(dim_ids) != [0, 1]:
-            raise ValueError(
-                f"from_compressed: dim_ids must be a permutation of (0, 1) to "
-                f"keep produced IDs contiguous; got {dim_ids!r}"
-            )
-
-        if meta is not None:
-            M, H_meta, W_meta = meta
-            val = compressed_val.to_meta_blocks()  # (M, H_meta, W_meta, *L)
-            leftover_dims = tuple(
-                DenseIndex(2 + i, s, axis=3 + i) for i, s in enumerate(val.shape[3:])
-            )
-            n_left = len(leftover_dims) // 2
-            return cls(
-                (
-                    DiagonalIndex(
-                        out_id,
-                        M,
-                        axis=0,
-                        other_id=primal_id,
-                        block_size=H_meta,
-                        block_axis=1,
-                    ),
-                )
-                + leftover_dims[:n_left],
-                (
-                    DiagonalIndex(
-                        primal_id,
-                        M,
-                        axis=0,
-                        other_id=out_id,
-                        block_size=W_meta,
-                        block_axis=2,
-                    ),
-                )
-                + leftover_dims[n_left:],
-                val=val,
-                fill_value=fv,
-                check_consistency=False,
-            )
-
-        H, W, *L = compressed_val.shape
-        leftover_dims = tuple(DenseIndex(2 + i, s, axis=2 + i) for i, s in enumerate(L))
-        return cls(
-            (DenseIndex(out_id, H, axis=0),) + leftover_dims[: len(L) // 2],
-            (DenseIndex(primal_id, W, axis=1),) + leftover_dims[len(L) // 2 :],
-            val=None,
-            compressed_val=compressed_val,
-            fill_value=fv,
-            check_consistency=False,
-        )
 
     def __repr__(self) -> str:
         def _repr_tuple(t: tuple) -> str:
@@ -553,13 +451,9 @@ class SparseTensor(SparseMathMixin):
     def _target_arr(self) -> Array:
         if self.val is not None:
             return self.val
-        if self.compressed_val is not None:
-            return self.compressed_val.to_dense()
         return self.scalar_mult
 
     def eff_val(self) -> Array | None:  # put this somewhere else?
-        if self.compressed_val is not None:
-            return self.compressed_val.to_dense()
         return self.val
 
     def block_until_ready(self) -> SparseTensor:
@@ -570,11 +464,6 @@ class SparseTensor(SparseMathMixin):
     def dtype(self) -> DTypeLike:
         if self.val is not None:
             return self.val.dtype
-        if self.compressed_val is not None:
-            for attr in ("data", "lhs", "main"):
-                buf = getattr(self.compressed_val, attr, None)
-                if buf is not None:
-                    return buf.dtype
         return self.scalar_mult.dtype
 
     def copy(
@@ -830,8 +719,6 @@ class SparseTensor(SparseMathMixin):
 
     def delete(self):
         # TODO this does not free buffers...
-        if self.compressed_val is not None:
-            raise NotImplementedError()
         arr = self._target_arr
         if hasattr(arr, "delete"):
             arr.delete()

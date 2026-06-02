@@ -35,26 +35,21 @@ def dense(
 
     Pipeline (each step is one helper below):
 
-      1. ``compressed_val`` short-circuit — if the tensor carries a
-         ``UnionBlocks`` / ``BlockBanded`` storage and ``axes`` only target
-         positions outside the compressed pair, return early; otherwise
-         expand the compressed buffer via ``_materialize_compressed`` and
-         fall through to the regular path.
-      2. ``_get_implicit_indices`` — find dims whose ``axis`` (or ``block_axis``
+      1. ``_get_implicit_indices`` — find dims whose ``axis`` (or ``block_axis``
          for sparse) is ``None``, i.e. the val doesn't yet carry that axis.
          Under ``hard=False`` these are excluded from the materialization set;
          under ``hard=True`` they're forced in.
-      3. ``_broadcast_and_append_dimensions`` — grow ``val`` so every requested
+      2. ``_broadcast_and_append_dimensions`` — grow ``val`` so every requested
          (and implicit, when ``hard``) axis has a physical slot. Reuses any
          orphan val axes via ``_collect_free_val_axes`` before appending new ones.
-      4. ``_collect_scatter_indices`` — for each requested dim, also pull in
+      3. ``_collect_scatter_indices`` — for each requested dim, also pull in
          its sparse-pair sibling (the diagonal needs both ends).
-      5. ``_apply_dense_scattering`` → ``_prepare_values_for_scattering`` →
+      4. ``_apply_dense_scattering`` → ``_prepare_values_for_scattering`` →
          ``_densify_diagonal_scatter`` — for each sparse pair to materialize,
          emit one ``(N, N, …) where eye_mask`` broadcast/select; loop the pairs
          independently (linearizing them would corrupt block-axis layouts and
          waste memory in the trailing axes).
-      6. Wrap the resulting array + relabeled dims into a fresh ``SparseTensor``.
+      5. Wrap the resulting array + relabeled dims into a fresh ``SparseTensor``.
 
     Worked example — a single sparse pair with ``N=2`` blocks of size ``B=3``::
 
@@ -75,40 +70,6 @@ def dense(
     ``axes`` selects which logical dim positions to densify (``None`` = all).
     ``hard=True`` also materializes dims whose val axis is implicit (``None``).
     """
-    # Compressed-storage path: materialize only as much as the requested ``axes``
-    # demand.
-    #   * No axes asked / axes covering every meta-block-diagonal pair → expand
-    #     fully (``to_dense()`` for banded, ``to_meta_blocks()`` then standard
-    #     densify for the meta-block-diag case — same end result either way).
-    #   * Axes only target *outside* the meta-block-diagonal pair → leave
-    #     ``compressed_val`` untouched and densify only the requested outer axes.
-    #     The pair stays compressed (M× tighter HBM footprint).
-    # ``_materialize_compressed`` picks the structure-preserving form when it's
-    # available (``to_meta_blocks``); both expressions are fused broadcast/select
-    # chains XLA folds into the consumer.
-    cv = getattr(tensor, "compressed_val", None)
-    if cv is not None:
-        from .utils import _copy, _has_meta_block_diag_dims, _materialize_compressed
-
-        meta = getattr(cv, "meta_block_shape", None)
-        is_meta_diag = meta is not None and _has_meta_block_diag_dims(tensor, meta)
-        # The compressed pair occupies the FIRST two axes (out_dim / primal_dim
-        # built by elementwise's compressed fast path or ``from_compressed``).
-        compressed_axes = {0, 1} if is_meta_diag else set(range(tensor.ndim))
-        requested = set(range(tensor.ndim)) if axes is None else set(axes)
-        if compressed_axes & requested:
-            # Materialize the compressed pair. Meta-block-diag → expand to
-            # ``(M, H, W)`` so the rest of the function emits a regular block-
-            # diagonal densify; banded → full ``to_dense``.
-            tensor = _copy(tensor, val=_materialize_compressed(tensor))
-        else:
-            # Requested axes don't touch the compressed pair → keep
-            # ``compressed_val`` as-is and short-circuit. NOTE: the returned
-            # tensor still has ``val is None`` (compressed-only); downstream
-            # callers must tolerate that (e.g. via ``_resolve_val``) rather
-            # than blindly multiplying ``tensor.val`` by ``scalar_mult``.
-            return tensor
-
     logical_indices = set(range(tensor.ndim)) if axes is None else set(axes)
     id_to_idx = {dim.id: i for i, dim in enumerate(tensor.dims)}
     implicit = _get_implicit_indices(tensor, logical_indices, hard)

@@ -37,7 +37,6 @@ from .utils import (
     _copy,
     _is_sparse,
     _is_zero_fill,
-    _materialize_compressed,
     _prepare_physical_array,
     _val_or_one,
 )
@@ -1648,18 +1647,14 @@ def __getattr__(name: str):
 
 # --- Main dispatcher ------------------------------------------------------
 def _normalize_inputs(lhs, rhs):
-    """Convert array operands to ``SparseTensor`` and materialize any
-    ``compressed_val`` storage. Pure shape / structure prep — no actual
-    matmul work happens here. Materializing compressed storage is fused
-    into the consuming kernel by XLA (SMEM, not HBM)."""
+    """Convert array operands to ``SparseTensor`` and pre-densify any
+    compressed Index dims. Pure shape / structure prep — no actual matmul
+    work happens here. Materializing compressed storage is fused into the
+    consuming kernel by XLA (SMEM, not HBM)."""
     if not _is_sparse(lhs):
         lhs = _arr2st(lhs, out_ndim=lhs.ndim - len(rhs.out_dims))
     if not _is_sparse(rhs):
         rhs = _arr2st(rhs, out_ndim=len(lhs.primal_dims))
-    if getattr(lhs, "compressed_val", None) is not None:
-        lhs = _copy(lhs, val=_materialize_compressed(lhs))
-    if getattr(rhs, "compressed_val", None) is not None:
-        rhs = _copy(rhs, val=_materialize_compressed(rhs))
     # Phase 8: pre-densify any compressed Index dims (BandedIndex / SetIndex)
     # to DiagonalIndex / DenseIndex — the tiled matmul consumes only those.
     # No-op when the operand has no compressed dims.
