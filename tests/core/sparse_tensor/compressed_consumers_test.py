@@ -65,6 +65,22 @@ def _k2_banded_output():
     return matmul(a, b)
 
 
+def _k2_set_output(is_intersection=False):
+    """A K=2 misaligned elementwise output → 4 SetIndex dims (compressed)."""
+    a = SparseTensor(
+        (DiagonalIndex(0, 7, 0, 2, 5, 2), DiagonalIndex(1, 4, 1, 3, 3, 4)),
+        (DiagonalIndex(2, 7, 0, 0, 5, 3), DiagonalIndex(3, 4, 1, 1, 3, 5)),
+        _n((7, 4, 5, 5, 3, 3), 1),
+    )
+    b = SparseTensor(
+        (DiagonalIndex(0, 5, 0, 2, 7, 2), DiagonalIndex(1, 3, 1, 3, 4, 4)),
+        (DiagonalIndex(2, 5, 0, 0, 7, 3), DiagonalIndex(3, 3, 1, 1, 4, 5)),
+        _n((5, 3, 7, 7, 4, 4), 2),
+    )
+    op = jnp.multiply if is_intersection else jnp.add
+    return elementwise(a, b, op, is_intersection=is_intersection)
+
+
 class TestCompressedReductions(unittest.TestCase):
     def _check(self, t):
         self.assertTrue(any(d.is_compressed for d in t.dims))
@@ -88,6 +104,12 @@ class TestCompressedReductions(unittest.TestCase):
 
     def test_k2_banded_reductions(self):
         self._check(_k2_banded_output())
+
+    def test_k2_set_union_reductions(self):
+        self._check(_k2_set_output(is_intersection=False))
+
+    def test_k2_set_intersection_reductions(self):
+        self._check(_k2_set_output(is_intersection=True))
 
     def test_max_is_actually_wrong_without_densify(self):
         # Guard against regressing to the raw-buffer reduction: the dense max of

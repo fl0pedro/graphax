@@ -646,22 +646,16 @@ class TestMultiAxisContractMatmul(unittest.TestCase):
 class TestMultiAxisElementwise(unittest.TestCase):
     """K>2 elementwise on operands with multiple misaligned sparse pairs.
 
-    Phase 7.4 verification: graphax's elementwise supports arbitrarily
-    many sparse pairs per operand. When ``K > 2`` of those pairs are
-    misaligned, the OUTPUT carries independent block-diagonal compression
-    structure along each pair's axes — same logic as K=1 (single sparse
-    pair) but factorized along K independent axis groups.
+    When ``K ≥ 2`` of the sparse pairs are misaligned, the OUTPUT carries
+    independent block-diagonal compression structure along each pair's axes —
+    same logic as K=1 (single sparse pair) but factorized along K independent
+    axis groups.
 
-    Currently the probe ``_should_emit_divisor_remainder`` gates on
-    ``len(lhs.dims) != 2`` so K>1 cases fall through to the general
-    expansion path: **output is correct, but no DivisorRemainder
-    compression is applied**. Multi-axis DivisorRemainder compression is
-    a Phase 7.5 extension (storage needs per-axis ``(M, n, B_h, B_w)``
-    buffers, densify chains ``_block_diag_per_meta`` along each axis).
-
-    These tests lock in the *correctness* of K>2 multi-misalignment
-    elementwise output. When multi-axis compression lands, the storage
-    assertion below should flip to assert compression.
+    Phase 9: ``_should_emit_multi_set`` emits a multi-axis ``SetIndex`` output
+    (the two operands' compact block buffers packed as W=1 multi-banded
+    buffers); densify reuses ``_densify_multi_banded`` per side then applies the
+    op. These tests check both *correctness* of the round-trip and that the
+    compressed buffer is strictly smaller than the dense output.
     """
 
     def test_k2_misaligned_add_matches_dense(self):
@@ -756,11 +750,10 @@ class TestMultiAxisElementwise(unittest.TestCase):
         res = a3 + b3
         self.assertTrue(jnp.allclose(res.dense(), ref, atol=1e-4))
 
-    def test_k2_misaligned_currently_stores_dense(self):
-        """Documents the current limitation: K>1 elementwise misalignment
-        falls through to the general path's dense ``val=values`` storage
-        (no DivisorRemainder compression yet). Phase 7.5 will flip this
-        assertion when multi-axis DivisorRemainder lands."""
+    def test_k2_misaligned_emits_set_index(self):
+        """Phase 9: K=2 misaligned elementwise emits a multi-axis ``SetIndex``
+        (2K dims) whose combined dual buffer is strictly smaller than the dense
+        output, and ``.dense()`` round-trips."""
         a = SparseTensor(
             (
                 DiagonalIndex(0, 7, axis=0, other_id=2, block_size=5, block_axis=2),
@@ -784,12 +777,12 @@ class TestMultiAxisElementwise(unittest.TestCase):
             _n((5, 3, 7, 7, 4, 4), 2),
         )
         res = a + b
-        self.assertFalse(
-            any(isinstance(d, SetIndex) for d in res.dims),
-            "K>1 multi-axis elementwise compression not implemented yet — "
-            "flip this assertion when multi-axis SetIndex lands.",
-        )
+        self.assertEqual(len(res.dims), 4)
+        self.assertTrue(all(isinstance(d, SetIndex) for d in res.dims))
         self.assertIsNotNone(res.val)
+        # Combined dual buffer strictly smaller than the dense (35*12)² output.
+        self.assertLess(int(res.val.size), 420 * 420)
+        self.assertTrue(jnp.allclose(res.dense(), a.dense() + b.dense(), atol=1e-4))
 
 
 if __name__ == "__main__":

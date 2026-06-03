@@ -480,6 +480,141 @@ def _emit_divisor_remainder(lhs, rhs, op, geom):
     )
 
 
+# --- Phase 9: K≥2 multi-axis SetIndex emission ----------------------------
+# A misaligned elementwise op on two operands that are each block-diagonal
+# along K≥2 sparse pairs compresses to a SetIndex pair *per axis* (2K SetIndex
+# dims) with the two operands' compact block buffers stored as W=1 multi-banded
+# buffers. Densify reuses ``_densify_multi_banded`` (band_width=1 ⇒ block-
+# diagonal) per side then applies the op — see ``utils._densify_compressed_dims``.
+def _should_emit_multi_set(lhs, rhs, op, is_intersection):
+    """Static probe for the K≥2 generalization of
+    :func:`_should_emit_divisor_remainder`. Returns per-axis geometry on
+    success (storing the compact dual buffers beats the dense LCM grid), else
+    ``None``. Same zero-fill / zero-preserving gating as the K=1 probe."""
+    if op not in _ZERO_PRESERVING_OPS:
+        return None
+    if not (_is_zero_fill(lhs) and _is_zero_fill(rhs)):
+        return None
+    if lhs.val is None or rhs.val is None:
+        return None
+    K = len(lhs.out_dims)
+    if K < 2:
+        return None
+    if (len(lhs.primal_dims) != K or len(rhs.out_dims) != K
+            or len(rhs.primal_dims) != K
+            or len(lhs.dims) != 2 * K or len(rhs.dims) != 2 * K):
+        return None
+
+    pairs = []
+    lhs_buf_size = rhs_buf_size = 1
+    dense_h = dense_w = 1
+    for i in range(K):
+        ao, ai = lhs.out_dims[i], lhs.primal_dims[i]
+        bo, bi = rhs.out_dims[i], rhs.primal_dims[i]
+        if not all(d.is_sparse for d in (ao, ai, bo, bi)):
+            return None
+        if ao.other_id != ai.id or ai.other_id != ao.id:
+            return None
+        if bo.other_id != bi.id or bi.other_id != bo.id:
+            return None
+        if any(d.axis is None for d in (ao, ai, bo, bi)):
+            return None
+        a_b_h, a_b_w = ao.block_size or 1, ai.block_size or 1
+        b_b_h, b_b_w = bo.block_size or 1, bi.block_size or 1
+        if any(d.block_axis is None for d in (ao, ai, bo, bi)
+               if (d.block_size or 1) > 1):
+            return None
+        a_n, b_n = ao.size, bo.size
+        if a_n * a_b_h != b_n * b_b_h or a_n * a_b_w != b_n * b_b_w:
+            return None
+        lcm_h, lcm_w = math.lcm(a_b_h, b_b_h), math.lcm(a_b_w, b_b_w)
+        if (a_n * a_b_h) % lcm_h or (a_n * a_b_w) % lcm_w:
+            return None
+        M = (a_n * a_b_h) // lcm_h
+        pairs.append({
+            "a_n": a_n, "a_b_h": a_b_h, "a_b_w": a_b_w,
+            "b_n": b_n, "b_b_h": b_b_h, "b_b_w": b_b_w,
+            "lcm_h": lcm_h, "lcm_w": lcm_w, "M": M,
+            "a_axis": ao.axis, "a_bh_axis": ao.block_axis, "a_bw_axis": ai.block_axis,
+            "b_axis": bo.axis, "b_bh_axis": bo.block_axis, "b_bw_axis": bi.block_axis,
+            "out_id": ao.id, "primal_id": ai.id,
+        })
+        lhs_buf_size *= a_n * a_b_h * a_b_w
+        rhs_buf_size *= b_n * b_b_h * b_b_w
+        dense_h *= a_n * a_b_h
+        dense_w *= a_n * a_b_w
+    # Only compress when the combined dual buffer beats the full dense tensor.
+    if lhs_buf_size + rhs_buf_size >= dense_h * dense_w:
+        return None
+    return {
+        "K": K, "pairs": pairs,
+        "semantic": "intersection" if is_intersection else "union",
+    }
+
+
+def _emit_multi_set(lhs, rhs, op, geom):
+    """Build the K≥2 multi-axis ``SetIndex`` output: each operand's block
+    structure is packed into a W=1 multi-banded buffer; the two buffers are
+    concatenated into a single 1-D ``val`` and described by 2K ``SetIndex``
+    dims. Densify reuses ``_densify_multi_banded`` per side then applies op."""
+    from graphax.sparse.indexes import SetIndex
+    from graphax.sparse.tensor import SparseTensor
+
+    K = geom["K"]
+    pairs = geom["pairs"]
+    bool_op = lhs.dtype == jnp.bool_
+    if bool_op:
+        lhs_v = lhs.val & lhs.scalar_mult.astype(jnp.bool_)
+        rhs_v = rhs.val & rhs.scalar_mult.astype(jnp.bool_)
+    else:
+        lhs_v = lhs.val * lhs.scalar_mult
+        rhs_v = rhs.val * rhs.scalar_mult
+
+    def _pack(v, axis_key, bh_key, bw_key, n_key, bh_szkey, bw_szkey):
+        # Permute operand val to (M_0..M_{K-1}, Bh_0..Bh_{K-1}, Bw_0..Bw_{K-1}),
+        # then reshape to the W=1 multi-banded layout (M_0,1,M_1,1,...,Bh*,Bw*).
+        perm = ([p[axis_key] for p in pairs]
+                + [p[bh_key] for p in pairs]
+                + [p[bw_key] for p in pairs])
+        t = v.transpose(perm)
+        band_shape = []
+        for p in pairs:
+            band_shape += [p[n_key], 1]
+        band_shape += [p[bh_szkey] for p in pairs] + [p[bw_szkey] for p in pairs]
+        return t.reshape(band_shape)
+
+    lhs_band = _pack(lhs_v, "a_axis", "a_bh_axis", "a_bw_axis", "a_n", "a_b_h", "a_b_w")
+    rhs_band = _pack(rhs_v, "b_axis", "b_bh_axis", "b_bw_axis", "b_n", "b_b_h", "b_b_w")
+    combined = jnp.concatenate([lhs_band.reshape(-1), rhs_band.reshape(-1)])
+
+    new_fill = jnp.array(False) if bool_op else jnp.array(0.0, dtype=lhs.val.dtype)
+    s_mult = jnp.array(True) if bool_op else jnp.array(1.0, dtype=lhs.val.dtype)
+    zf = (getattr(lhs, "_zero_fill", False)
+          and getattr(rhs, "_zero_fill", False)) or None
+    lhs_shape, rhs_shape = lhs_band.shape, rhs_band.shape
+    sem = geom["semantic"]
+
+    out_dims, primal_dims = [], []
+    for i, p in enumerate(pairs):
+        out_dims.append(SetIndex(
+            id=p["out_id"], size=p["M"], axis=i, other_id=p["primal_id"],
+            block_size=p["lcm_h"], block_axis=2 * K + i, semantic=sem,
+            lhs_shape=lhs_shape, rhs_shape=rhs_shape, include_remainder=True,
+            n_meta=1, op=op,
+        ))
+        primal_dims.append(SetIndex(
+            id=p["primal_id"], size=p["M"], axis=K + i, other_id=p["out_id"],
+            block_size=p["lcm_w"], block_axis=3 * K + i, semantic=sem,
+            lhs_shape=lhs_shape, rhs_shape=rhs_shape, include_remainder=True,
+            n_meta=1, op=op,
+        ))
+    return SparseTensor(
+        tuple(out_dims), tuple(primal_dims), combined,
+        scalar_mult=s_mult, fill_value=new_fill,
+        check_consistency=False, zero_fill=zf,
+    )
+
+
 # --- Path tracing (test-only) ---------------------------------------------
 # Re-exports from ``_path_tracking``. See that module for the full design;
 # tests opt in via the ``track_paths()`` context manager or ``TRACK_PATHS=1``
@@ -532,6 +667,15 @@ def elementwise(
     _dr_geom = _should_emit_divisor_remainder(lhs, rhs, op, is_intersection)
     if _dr_geom is not None:
         out = _emit_divisor_remainder(lhs, rhs, op, _dr_geom)
+        if count:
+            return out, n
+        return out
+    # Phase 9: K≥2 generalization — misaligned elementwise on operands with
+    # multiple sparse pairs compresses to a multi-axis SetIndex (dual block
+    # buffers), densified by reusing the W=1 multi-banded kernel per side.
+    _ms_geom = _should_emit_multi_set(lhs, rhs, op, is_intersection)
+    if _ms_geom is not None:
+        out = _emit_multi_set(lhs, rhs, op, _ms_geom)
         if count:
             return out, n
         return out

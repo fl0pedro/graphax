@@ -141,8 +141,48 @@ def _densify_compressed_dims(tensor, compact: bool = False):
             zero_fill=getattr(tensor, "_zero_fill", None),
         )
 
-    # --- K≥2 banded (multi-axis interleaved Array val) ---
+    # --- K≥2 SetIndex (multi-axis dual block-diagonal buffers) ---
     K = len(tensor.out_dims)
+    if (set_dims and len(set_dims) == 2 * K and K >= 2
+            and isinstance(tensor.val, jax.Array)
+            and all(isinstance(d, SetIndex) for d in tensor.out_dims)
+            and all(isinstance(d, SetIndex) for d in tensor.primal_dims)):
+        from graphax.sparse.ops.block_storage import (
+            _densify_multi_banded, BandAxisSpec,
+        )
+
+        sx = tensor.out_dims[0]
+        lhs_blocks, rhs_blocks = sx._split(tensor.val)  # W=1 multi-banded buffers
+        # Each per-side block-diagonal is a W=1 multi-banded buffer; densify it
+        # via the shared band kernel, then combine the two sides with the op.
+        def _specs(shape):
+            return tuple(
+                BandAxisSpec(band_width=1, block_row=shape[2 * K + i],
+                             block_col=shape[3 * K + i], n_secondary=shape[2 * i])
+                for i in range(K)
+            )
+        fill_lhs, fill_rhs = (fill if isinstance(fill, tuple) else (fill, fill))
+        lhs_dense = _densify_multi_banded(lhs_blocks, _specs(sx.lhs_shape), fill_lhs)
+        if rhs_blocks is not None:
+            rhs_dense = _densify_multi_banded(rhs_blocks, _specs(sx.rhs_shape), fill_rhs)
+            dense = sx._op()(lhs_dense, rhs_dense)
+        else:
+            dense = sx._op()(lhs_dense, fill_rhs)
+        new_out = tuple(
+            DenseIndex(tensor.out_dims[i].id, dense.shape[i], i) for i in range(K)
+        )
+        new_primal = tuple(
+            DenseIndex(tensor.primal_dims[i].id, dense.shape[K + i], K + i)
+            for i in range(K)
+        )
+        return SparseTensor(
+            new_out, new_primal, dense,
+            scalar_mult=tensor.scalar_mult, fill_value=tensor.fill_value,
+            check_consistency=False,
+            zero_fill=getattr(tensor, "_zero_fill", None),
+        )
+
+    # --- K≥2 banded (multi-axis interleaved Array val) ---
     if (banded and len(banded) == 2 * K and isinstance(tensor.val, jax.Array)
             and all(isinstance(d, BandedIndex) for d in tensor.out_dims)
             and all(isinstance(d, BandedIndex) for d in tensor.primal_dims)):
