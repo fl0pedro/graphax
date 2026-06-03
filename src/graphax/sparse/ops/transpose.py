@@ -7,25 +7,79 @@ required to straddle the out/primal split — if a permutation would land both
 ends on the same side, that pair is densified first.
 
 Compressed dims (``BandedIndex`` / ``SetIndex``) describe band / set-theoretic
-structure whose physical layout is NOT a plain ``axis``-indexed view, so the
-relabel-only transpose below would corrupt them. They are pre-densified to their
-``DiagonalIndex`` / ``DenseIndex`` equivalents (``compact=True`` keeps the
-``M×`` meta-block-diagonal form wherever the structure reduces to a diagonal —
-every ``SetIndex`` and any width-1 band — and only fully materializes a genuine
-band) before the view transpose runs.
+structure whose physical layout is NOT a plain ``axis``-indexed view, but the
+out↔primal swap (a 2-D ``.T``) maps cleanly onto the compressed buffer — see
+:func:`_try_compressed_transpose` — so it is done as a view that *preserves
+compression*. Any other permutation of a compressed tensor (a K≥2 multi-axis
+band, or a partial reorder) falls back to pre-densifying the compressed dims to
+their ``DiagonalIndex`` / ``DenseIndex`` equivalents (``compact=True`` keeps the
+``M×`` meta-block-diagonal form wherever the structure reduces to a diagonal)
+before the relabel-only transpose runs.
 """
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Sequence
 from dataclasses import replace
 
+import jax.numpy as jnp
+
 from .dense import dense
 from .utils import _copy, _compressed_dims, _densify_compressed_dims
 
-from graphax.sparse.indexes import DiagonalIndex
+from graphax.sparse.indexes import DiagonalIndex, BandedIndex, SetIndex
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
+
+
+def _try_compressed_transpose(tensor, full_perm, new_out_axes):
+    """View-transpose a pure 2-D compressed pair (one out + one primal
+    ``BandedIndex`` / ``SetIndex``) under the out↔primal swap, preserving
+    compression. Returns the transposed ``SparseTensor``, or ``None`` to tell
+    the caller to fall back to densify (K≥2 multi-axis bands, or any
+    permutation that isn't the plain 2-D swap).
+
+    ``BandedIndex``: ``densify(val.swapaxes(2,3), col-primary) ==
+    densify(val, row-primary).swapaxes(0,1) == Dᵀ`` — so swap each leaf block's
+    ``(B_row, B_col)`` axes and flip the band direction; the offset is reused
+    unchanged. ``SetIndex``: the set op (add/mul) is elementwise so
+    ``op(BD(lhs), BD(rhs))ᵀ == op(BD(lhsᵀ), BD(rhsᵀ))`` — transpose each per-side
+    block buffer's ``(B_h, B_w)`` axes and swap the ``lhs``/``rhs`` shapes h↔w.
+    In both, the out↔primal dims swap (carrying their block sizes / band params)."""
+    if len(tensor.out_dims) != 1 or len(tensor.primal_dims) != 1:
+        return None
+    # The only meaningful 2-D transpose is the out↔primal swap: perm (1, 0) with
+    # a single out axis afterwards.
+    if tuple(full_perm) != (1, 0) or len(new_out_axes) != 1:
+        return None
+    o, p = tensor.out_dims[0], tensor.primal_dims[0]
+
+    if isinstance(o, BandedIndex) and isinstance(p, BandedIndex):
+        new_val = tensor.val.swapaxes(2, 3)  # swap leaf (B_row, B_col)
+        new_out = (replace(p, id=0, axis=0, other_id=1, block_axis=1,
+                           primary=not p.primary),)
+        new_primal = (replace(o, id=1, axis=1, other_id=0, block_axis=3,
+                              primary=not o.primary),)
+        return _copy(tensor, val=new_val, out_dims=new_out, primal_dims=new_primal)
+
+    if isinstance(o, SetIndex) and isinstance(p, SetIndex):
+        lhs, rhs = o._split(tensor.val)
+        lhs_t = lhs.swapaxes(2, 3)
+        lhs_shape_t = lhs.shape[:2] + (lhs.shape[3], lhs.shape[2]) + lhs.shape[4:]
+        if rhs is not None:
+            rhs_t = rhs.swapaxes(2, 3)
+            rhs_shape_t = rhs.shape[:2] + (rhs.shape[3], rhs.shape[2]) + rhs.shape[4:]
+            new_val = jnp.concatenate([lhs_t.reshape(-1), rhs_t.reshape(-1)])
+        else:
+            rhs_shape_t = o.rhs_shape
+            new_val = lhs_t.reshape(-1)
+        new_out = (replace(p, id=0, axis=0, other_id=1, block_axis=1,
+                           lhs_shape=lhs_shape_t, rhs_shape=rhs_shape_t),)
+        new_primal = (replace(o, id=1, axis=1, other_id=0, block_axis=2,
+                              lhs_shape=lhs_shape_t, rhs_shape=rhs_shape_t),)
+        return _copy(tensor, val=new_val, out_dims=new_out, primal_dims=new_primal)
+
+    return None
 
 
 def _get_full_permutation(num_out, num_primal, out_axes=None, primal_axes=None):
@@ -72,11 +126,15 @@ def transpose(tensor: SparseTensor, out_axes: Sequence[int] | None = None,
             and len(new_out_axes) == len(tensor.out_dims)):
         return tensor
 
-    # Compressed dims can't be transposed as a relabel-only view — materialize
-    # them to their Diagonal / Dense equivalents first (compact form preserves
-    # the meta-block-diagonal compression wherever the structure reduces to a
-    # diagonal). The resulting Diagonal / Dense dims transpose correctly below.
+    # Compressed dims: the 2-D out↔primal swap maps onto the compressed buffer
+    # directly (preserving compression); take that view when it applies.
+    # Otherwise materialize the compressed dims to their Diagonal / Dense
+    # equivalents (compact form keeps the meta-block-diagonal compression where
+    # the structure reduces to a diagonal) and transpose via the relabel below.
     if _compressed_dims(tensor):
+        viewed = _try_compressed_transpose(tensor, full_perm, new_out_axes)
+        if viewed is not None:
+            return viewed
         tensor = _densify_compressed_dims(tensor, compact=True)
 
     tensor = _ensure_valid_sparsity(tensor, new_out_axes, new_primal_axes)

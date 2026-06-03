@@ -34,12 +34,15 @@ def _banded_tensor(M, W, B, n_meta=1, n_secondary=None, key=7):
     centered band buffer ``(n_meta*M, W, B, B)``."""
     n_sec = n_secondary if n_secondary is not None else M
     data = _n((n_meta * M, W, B, B), key)
+    # Both sides share the band orientation flag (producer convention: a band is
+    # row- or col-primary as a whole), out axis=0/block_axis=1, primal
+    # axis=1/block_axis=3 — matching matmul's BandedIndex emission.
     out = (BandedIndex(id=0, size=n_meta * M, axis=0, other_id=1,
                        block_size=B, block_axis=1, band_width=W, offset=(),
                        primary=True, n_secondary=n_sec, n_meta=n_meta),)
-    primal = (BandedIndex(id=1, size=n_meta * n_sec, axis=0, other_id=0,
-                          block_size=B, block_axis=2, band_width=W, offset=(),
-                          primary=False, n_secondary=n_sec, n_meta=n_meta),)
+    primal = (BandedIndex(id=1, size=n_meta * n_sec, axis=1, other_id=0,
+                          block_size=B, block_axis=3, band_width=W, offset=(),
+                          primary=True, n_secondary=n_sec, n_meta=n_meta),)
     return SparseTensor(out, primal, data, check_consistency=False)
 
 
@@ -80,14 +83,29 @@ class TestBandedIndexTranspose(unittest.TestCase):
         t = _banded_tensor(M=3, W=3, B=4)
         self.assertTrue(jnp.allclose(t.T.T.dense(), t.dense(), atol=1e-4))
 
-    def test_width1_band_transpose_keeps_diagonal_compression(self):
-        # A width-1 band reduces to a meta-block-diagonal → transpose keeps it
-        # compressed (DiagonalIndex), not fully dense.
-        t = _banded_tensor(M=4, W=1, B=3)
-        tt = t.T
-        self.assertTrue(jnp.allclose(tt.dense(), t.dense().T, atol=1e-4))
-        self.assertTrue(all(d.is_sparse for d in tt.dims))  # diagonal pair
-        self.assertLess(int(tt.val.size), tt.dense().size)
+    def test_transpose_preserves_banded_compression(self):
+        # The 2-D out↔primal swap is a view on the band buffer: the transposed
+        # tensor stays a BandedIndex pair (not densified) — same compact storage.
+        for W in (1, 3):
+            with self.subTest(W=W):
+                t = _banded_tensor(M=4, W=W, B=3)
+                tt = t.T
+                self.assertTrue(jnp.allclose(tt.dense(), t.dense().T, atol=1e-4))
+                self.assertTrue(all(isinstance(d, BandedIndex) for d in tt.dims))
+                self.assertEqual(int(tt.val.size), int(t.val.size))  # view, no growth
+                self.assertLess(int(tt.val.size), tt.dense().size)
+
+    def test_nonsquare_band_transpose(self):
+        # B_row != B_col and M_row != M_col: the swap must still match dense.T.
+        data = _n((5, 3, 3, 2), 4)  # M=5, W=3, B_row=3, B_col=2
+        out = (BandedIndex(id=0, size=5, axis=0, other_id=1, block_size=3,
+                           block_axis=1, band_width=3, offset=(), primary=True,
+                           n_secondary=4, n_meta=1),)
+        primal = (BandedIndex(id=1, size=4, axis=1, other_id=0, block_size=2,
+                              block_axis=3, band_width=3, offset=(), primary=True,
+                              n_secondary=4, n_meta=1),)
+        t = SparseTensor(out, primal, data, check_consistency=False)
+        self.assertTrue(jnp.allclose(t.T.dense(), t.dense().T, atol=1e-4))
 
 
 class TestSetIndexTranspose(unittest.TestCase):
@@ -100,13 +118,14 @@ class TestSetIndexTranspose(unittest.TestCase):
         t = _set_tensor(M=2, B_a=3, B_b=5, semantic="intersection")
         self.assertTrue(jnp.allclose(t.T.dense(), t.dense().T, atol=1e-4))
 
-    def test_transpose_preserves_meta_block_diagonal_compression(self):
-        # SetIndex always reduces to a meta-block-diagonal; M>1 ⇒ the
-        # transposed tensor keeps the M× compression (val < dense).
+    def test_transpose_preserves_setindex_compression(self):
+        # The out↔primal swap transposes each per-side block buffer in place:
+        # the transposed tensor stays a SetIndex pair (not densified), same val.
         t = _set_tensor(M=4, B_a=2, B_b=3, semantic="union")
         tt = t.T
         self.assertTrue(jnp.allclose(tt.dense(), t.dense().T, atol=1e-4))
-        self.assertTrue(all(d.is_sparse for d in tt.dims))  # DiagonalIndex pair
+        self.assertTrue(all(isinstance(d, SetIndex) for d in tt.dims))
+        self.assertEqual(int(tt.val.size), int(t.val.size))  # view, no growth
         self.assertLess(int(tt.val.size), tt.dense().size)
 
     def test_transpose_is_scatter_free_under_jit(self):
