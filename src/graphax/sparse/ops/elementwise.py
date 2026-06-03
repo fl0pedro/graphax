@@ -507,7 +507,7 @@ def _should_emit_multi_set(lhs, rhs, op, is_intersection):
 
     pairs = []
     lhs_buf_size = rhs_buf_size = 1
-    dense_h = dense_w = 1
+    meta_size = 1  # compact meta-block-diagonal size = prod(M_i·lcm_h_i·lcm_w_i)
     for i in range(K):
         ao, ai = lhs.out_dims[i], lhs.primal_dims[i]
         bo, bi = rhs.out_dims[i], rhs.primal_dims[i]
@@ -541,10 +541,26 @@ def _should_emit_multi_set(lhs, rhs, op, is_intersection):
         })
         lhs_buf_size *= a_n * a_b_h * a_b_w
         rhs_buf_size *= b_n * b_b_h * b_b_w
-        dense_h *= a_n * a_b_h
-        dense_w *= a_n * a_b_w
-    # Only compress when the combined dual buffer beats the full dense tensor.
-    if lhs_buf_size + rhs_buf_size >= dense_h * dense_w:
+        meta_size *= M * lcm_h * lcm_w
+    # The packer reshapes the operand val purely from its M / block axes, so the
+    # val must have no leftover (L) axes the perm wouldn't cover.
+    a_phys = K + sum(p["a_bh_axis"] is not None for p in pairs) \
+        + sum(p["a_bw_axis"] is not None for p in pairs)
+    b_phys = K + sum(p["b_bh_axis"] is not None for p in pairs) \
+        + sum(p["b_bw_axis"] is not None for p in pairs)
+    if lhs.val.ndim != a_phys or rhs.val.ndim != b_phys:
+        return None
+    # Restrict to a single meta-block per axis (M_i == 1). For M_i > 1 the
+    # general path already emits a *compact* meta-block-diagonal that ops consume
+    # directly; a SetIndex there would have to fully materialize (prod(M_i)×) at
+    # every op boundary — the K≥2 densify has no compact meta form yet — so it
+    # would be a boundary pessimization. The pure-win case (M_i == 1, where
+    # compact ≡ full) is what we compress.
+    if any(p["M"] != 1 for p in pairs):
+        return None
+    # Only compress when the dual buffer beats the *compact* meta-block-diagonal
+    # the general path would otherwise emit (NOT the prod(M_i)×-larger full dense).
+    if lhs_buf_size + rhs_buf_size >= meta_size:
         return None
     return {
         "K": K, "pairs": pairs,
@@ -571,11 +587,13 @@ def _emit_multi_set(lhs, rhs, op, geom):
         rhs_v = rhs.val * rhs.scalar_mult
 
     def _pack(v, axis_key, bh_key, bw_key, n_key, bh_szkey, bw_szkey):
-        # Permute operand val to (M_0..M_{K-1}, Bh_0..Bh_{K-1}, Bw_0..Bw_{K-1}),
+        # Permute operand val to (M_0..M_{K-1}, [existing Bh], [existing Bw]),
         # then reshape to the W=1 multi-banded layout (M_0,1,M_1,1,...,Bh*,Bw*).
+        # A trivial (block_size==1) pair has no physical block axis, so it is
+        # skipped in the perm and re-inserted as a size-1 dim by the reshape.
         perm = ([p[axis_key] for p in pairs]
-                + [p[bh_key] for p in pairs]
-                + [p[bw_key] for p in pairs])
+                + [p[bh_key] for p in pairs if p[bh_key] is not None]
+                + [p[bw_key] for p in pairs if p[bw_key] is not None])
         t = v.transpose(perm)
         band_shape = []
         for p in pairs:

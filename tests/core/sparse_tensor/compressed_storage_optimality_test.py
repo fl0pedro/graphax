@@ -784,6 +784,41 @@ class TestMultiAxisElementwise(unittest.TestCase):
         self.assertLess(int(res.val.size), 420 * 420)
         self.assertTrue(jnp.allclose(res.dense(), a.dense() + b.dense(), atol=1e-4))
 
+    def test_trivial_block_pair_does_not_crash(self):
+        """A K=2 pair with block_size==1 (no physical block axis, M=1) must pack
+        without a None in the transpose perm (regression: was a TypeError)."""
+        a = SparseTensor(
+            (DiagonalIndex(0, 7, 0, 2, 5, 2), DiagonalIndex(1, 1, 1, 3, 1, None)),
+            (DiagonalIndex(2, 7, 0, 0, 5, 3), DiagonalIndex(3, 1, 1, 1, 1, None)),
+            _n((7, 1, 5, 5), 1),
+        )
+        b = SparseTensor(
+            (DiagonalIndex(0, 5, 0, 2, 7, 2), DiagonalIndex(1, 1, 1, 3, 1, None)),
+            (DiagonalIndex(2, 5, 0, 0, 7, 3), DiagonalIndex(3, 1, 1, 1, 1, None)),
+            _n((5, 1, 7, 7), 2),
+        )
+        res = a + b
+        self.assertTrue(all(isinstance(d, SetIndex) for d in res.dims))
+        self.assertTrue(jnp.allclose(res.dense(), a.dense() + b.dense(), atol=1e-4))
+
+    def test_meta_count_gt_one_falls_through_to_general(self):
+        """M_i>1 per axis is NOT emitted as a SetIndex (it would inflate
+        prod(M_i)× at every op boundary); the general path emits the compact,
+        boundary-cheap meta-block-diagonal instead. Output stays correct."""
+        a = SparseTensor(
+            (DiagonalIndex(0, 14, 0, 2, 5, 2), DiagonalIndex(1, 8, 1, 3, 3, 4)),
+            (DiagonalIndex(2, 14, 0, 0, 5, 3), DiagonalIndex(3, 8, 1, 1, 3, 5)),
+            _n((14, 8, 5, 5, 3, 3), 1),
+        )
+        b = SparseTensor(
+            (DiagonalIndex(0, 10, 0, 2, 7, 2), DiagonalIndex(1, 6, 1, 3, 4, 4)),
+            (DiagonalIndex(2, 10, 0, 0, 7, 3), DiagonalIndex(3, 6, 1, 1, 4, 5)),
+            _n((10, 6, 7, 7, 4, 4), 2),
+        )
+        res = a + b
+        self.assertFalse(any(isinstance(d, SetIndex) for d in res.dims))
+        self.assertTrue(jnp.allclose(res.dense(), a.dense() + b.dense(), atol=1e-4))
+
 
 if __name__ == "__main__":
     unittest.main()
