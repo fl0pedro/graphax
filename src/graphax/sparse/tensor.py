@@ -169,6 +169,12 @@ class SparseMathMixin:
         return self.copy()
 
     def __abs__(self):
+        # Non-linear in val → must materialize compressed storage first
+        # (abs(a+b) != abs(a)+abs(b); a set buffer stores the pre-combination
+        # per-side blocks). __neg__ / __pos__ are linear and stay lazy.
+        t = self._materialize_compressed()
+        if t is not self:
+            return abs(t)
         return self.copy(
             val=jnp.abs(self.val) if self.val is not None else None,
             scalar_mult=jnp.abs(self.scalar_mult),
@@ -176,11 +182,17 @@ class SparseMathMixin:
         )
 
     def __invert__(self):
+        t = self._materialize_compressed()
+        if t is not self:
+            return ~t
         return self.copy(
             val=jax.lax.bitwise_not(self.val) if self.val is not None else None
         )
 
     def __round__(self, ndigits=None):
+        t = self._materialize_compressed()
+        if t is not self:
+            return round(t, ndigits)
         return self.copy(
             val=jnp.round(self.val, ndigits) if self.val is not None else None,
             scalar_mult=jnp.round(self.scalar_mult, ndigits),
@@ -474,20 +486,43 @@ class SparseTensor(SparseMathMixin):
     ):
         return _copy(self, val, scalar_mult, fill_value)
 
+    def _materialize_compressed(self) -> SparseTensor:
+        """Return an equivalent tensor with no compressed (``BandedIndex`` /
+        ``SetIndex``) dims — they are densified to their compact
+        ``DiagonalIndex`` / ``DenseIndex`` form so ``val`` again holds *exactly*
+        the non-fill values with ``size - val.size`` implicit fill cells. Any
+        value-semantic reduction / non-linear unary op below must route through
+        this first: a raw band / set buffer carries out-of-band padding slots
+        (banded) or pre-combination per-side blocks (set) whose element multiset
+        does NOT match the dense form, so reducing it directly is wrong. No-op
+        (returns ``self``) when the tensor has no compressed dims."""
+        from graphax.sparse.ops.utils import _compressed_dims, _materialize_for_op
+
+        return _materialize_for_op(self) if _compressed_dims(self) else self
+
     # Low priority TODO: axis, and other args
     def all(self) -> Array:
+        t = self._materialize_compressed()
+        if t is not self:
+            return t.all()
         val_part = (
             jnp.all(self.val * self.scalar_mult) if self.val is not None else True
         )
         return jnp.logical_and(val_part, self.fill_value * self.scalar_mult != 0)
 
     def any(self) -> Array:
+        t = self._materialize_compressed()
+        if t is not self:
+            return t.any()
         val_part = (
             jnp.any(self.val * self.scalar_mult) if self.val is not None else False
         )
         return jnp.logical_or(val_part, self.fill_value * self.scalar_mult != 0)
 
     def sum(self) -> Array:
+        t = self._materialize_compressed()
+        if t is not self:
+            return t.sum()
         if self.val is None:
             return self.fill_value * self.scalar_mult * self.size
         return jnp.sum(self.val * self.scalar_mult) + (
@@ -495,6 +530,9 @@ class SparseTensor(SparseMathMixin):
         ) * (self.size - self.val.size)
 
     def prod(self) -> Array:
+        t = self._materialize_compressed()
+        if t is not self:
+            return t.prod()
         if self.val is None:
             return (self.fill_value * self.scalar_mult) ** self.size
         return jnp.prod(self.val * self.scalar_mult) * (
@@ -502,11 +540,17 @@ class SparseTensor(SparseMathMixin):
         ) ** (self.size - self.val.size)
 
     def max(self) -> Array:
+        t = self._materialize_compressed()
+        if t is not self:
+            return t.max()
         if self.val is None:
             return self.fill_value * self.scalar_mult
         return jnp.maximum(jnp.max(self.val), self.fill_value) * self.scalar_mult
 
     def min(self) -> Array:
+        t = self._materialize_compressed()
+        if t is not self:
+            return t.min()
         if self.val is None:
             return self.fill_value * self.scalar_mult
         return jnp.minimum(jnp.min(self.val), self.fill_value) * self.scalar_mult

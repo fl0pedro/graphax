@@ -31,6 +31,7 @@ materialization into a downstream consumer's operand fetch (SMEM, not HBM).
 
 from __future__ import annotations
 
+import itertools
 import math
 from typing import NamedTuple
 
@@ -386,57 +387,70 @@ def _densify_multi_banded(
                 "K=1 patterns; add when needed."
             )
 
-    # Step 1: insert M_s_i singleton axes after each (M_p_i, W_i) pair.
-    indexer = []
-    for _ in range(K):
-        indexer.append(slice(None))  # M_p_i
-        indexer.append(None)          # M_s_i (inserted)
-        indexer.append(slice(None))  # W_i
-    indexer += [slice(None)] * (2 * K + len(L))  # B_row, B_col, L axes
-    data_e = data[tuple(indexer)]
-    expanded = []
-    for i in range(K):
-        expanded += [M_p[i], M_s[i], W[i]]
-    expanded += B_row
-    expanded += B_col
-    expanded += list(L)
-    data_b = jnp.broadcast_to(data_e, tuple(expanded))
+    # Steps 1-4 as a reusable core: broadcast each block over the secondary
+    # axes, select the in-band slot per axis, sum out the W axes, then permute /
+    # reshape to the dense layout — returns 0 outside the band (the fill mask is
+    # Step 5, applied once at the end). ``w_list`` / ``off_list`` are passed in
+    # so the streaming fallback can re-run it per single-W slot.
+    def _place(data_arr, w_list, off_list):
+        indexer = []
+        for _ in range(K):
+            indexer += [slice(None), None, slice(None)]  # M_p_i, M_s_i(new), W_i
+        indexer += [slice(None)] * (2 * K + len(L))      # B_row, B_col, L axes
+        data_e = data_arr[tuple(indexer)]
+        expanded = []
+        for i in range(K):
+            expanded += [M_p[i], M_s[i], w_list[i]]
+        expanded += B_row + B_col + list(L)
+        data_b = jnp.broadcast_to(data_e, tuple(expanded))
+        combined_mask = None
+        for i in range(K):
+            off_arr = jnp.asarray(off_list[i], dtype=jnp.int32)
+            bj = jnp.arange(M_s[i], dtype=jnp.int32)
+            target_w = bj[None, :] - off_arr[:, None]  # (M_p_i, M_s_i)
+            sel = target_w[:, :, None] == jnp.arange(w_list[i], dtype=jnp.int32)[None, None, :]
+            sel_shape = [1] * len(expanded)
+            sel_shape[3 * i] = M_p[i]
+            sel_shape[3 * i + 1] = M_s[i]
+            sel_shape[3 * i + 2] = w_list[i]
+            sel_r = sel.reshape(*sel_shape)
+            combined_mask = sel_r if combined_mask is None else (combined_mask & sel_r)
+        w_axes = tuple(3 * i + 2 for i in range(K))
+        placed = jnp.where(combined_mask, data_b, 0).sum(axis=w_axes)
+        perm = []
+        for i in range(K):
+            perm += [2 * i, 2 * K + i]          # M_p_i, B_row_i
+        for i in range(K):
+            perm += [2 * i + 1, 3 * K + i]      # M_s_i, B_col_i
+        perm += list(range(4 * K, 4 * K + len(L)))
+        placed = placed.transpose(perm)
+        fshape = (
+            [M_p[i] * B_row[i] for i in range(K)]
+            + [M_s[i] * B_col[i] for i in range(K)]
+            + list(L)
+        )
+        return placed.reshape(*fshape)
 
-    # Step 2: per-axis one-hot band masks, combined via AND.
-    combined_mask = None
-    for i in range(K):
-        off_arr = jnp.asarray(offsets[i], dtype=jnp.int32)
-        bj = jnp.arange(M_s[i], dtype=jnp.int32)
-        target_w = bj[None, :] - off_arr[:, None]  # (M_p_i, M_s_i)
-        sel = target_w[:, :, None] == jnp.arange(W[i], dtype=jnp.int32)[None, None, :]
-        sel_shape = [1] * len(expanded)
-        sel_shape[3 * i] = M_p[i]
-        sel_shape[3 * i + 1] = M_s[i]
-        sel_shape[3 * i + 2] = W[i]
-        sel_r = sel.reshape(*sel_shape)
-        combined_mask = sel_r if combined_mask is None else (combined_mask & sel_r)
-
-    # Step 3: where + sum over all W_i axes in one fused reduction.
-    W_axes = tuple(3 * i + 2 for i in range(K))
-    out = jnp.where(combined_mask, data_b, 0).sum(axis=W_axes)
-
-    # Step 4: permute + reshape to dense layout.
-    perm = []
-    for i in range(K):
-        perm.append(2 * i)         # M_p_i
-        perm.append(2 * K + i)     # B_row_i
-    for i in range(K):
-        perm.append(2 * i + 1)     # M_s_i
-        perm.append(3 * K + i)     # B_col_i
-    perm += list(range(4 * K, 4 * K + len(L)))
-    out = out.transpose(perm)
-    final_shape = []
-    for i in range(K):
-        final_shape.append(M_p[i] * B_row[i])
-    for i in range(K):
-        final_shape.append(M_s[i] * B_col[i])
-    final_shape += list(L)
-    out = out.reshape(*final_shape)
+    # CR-2: the full broadcast inflates the dense output by prod(W_i) (the W
+    # axes are summed out). Guard it like the single-axis path; above the limit,
+    # stream over the (small, static) W-combinations so each placement is only
+    # output-sized — bounded HBM, no prod(W_i) intermediate.
+    expanded_size = (
+        math.prod(M_p[i] * M_s[i] * W[i] for i in range(K))
+        * math.prod(B_row) * math.prod(B_col) * math.prod(L)
+    )
+    if expanded_size > _BLOCK_BANDED_BROADCAST_LIMIT:
+        out = None
+        for wc in itertools.product(*[range(W[i]) for i in range(K)]):
+            sl = [slice(None)] * data.ndim
+            for i in range(K):
+                sl[2 * i + 1] = slice(wc[i], wc[i] + 1)  # keep W axis size-1
+            data_wc = data[tuple(sl)]
+            off_wc = [tuple(o + wc[i] for o in offsets[i]) for i in range(K)]
+            piece = _place(data_wc, [1] * K, off_wc)
+            out = piece if out is None else (out + piece)
+    else:
+        out = _place(data, W, offsets)
 
     # Step 5: AND per-axis in-band masks, swap fill_value for out-of-band cells.
     # For a centered band the per-primary col offset is ``blk_r - w0`` (pure

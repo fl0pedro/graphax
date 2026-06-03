@@ -23,6 +23,7 @@ from .primitives import (
 )
 from .sparse.ops import add_w_counts
 from .sparse.ops.matmul import matmul as sparse_matmul
+from .sparse.ops.utils import _compressed_dims, _materialize_for_op
 from .sparse.tensor import _assert_sparse_tensor_consistency
 from .sparse.micro_actions import Compress, Diag, apply_compress, apply_diag
 from .sparse.utils import zeros_like
@@ -382,6 +383,15 @@ def _eliminate_vertex(
 
                 if len(pre_val.pre_transforms) > 0:
                     edge_outval = append_pre_transforms(pre_val, edge_outval)
+
+                # A misaligned-contract matmul can emit a compressed output
+                # (BandedIndex / SetIndex). The consistency check and the
+                # Diag / Compress micro-actions below consume only plain
+                # {Dense, Diagonal} dims, so densify the compressed pair to
+                # its compact equivalent here (keeps the M× meta-block-diagonal
+                # form where the structure reduces to a diagonal).
+                if _compressed_dims(edge_outval):
+                    edge_outval = _materialize_for_op(edge_outval)
 
                 _assert_sparse_tensor_consistency(edge_outval)
                 # If there is already an edge between the two vertices, add the new
