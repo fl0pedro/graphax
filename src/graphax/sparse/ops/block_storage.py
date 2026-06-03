@@ -369,19 +369,38 @@ def _densify_multi_banded(
         for i, ax in enumerate(axes)
     ]
     W = [ax.band_width for ax in axes]
-    B_row = [ax.block_row for ax in axes]
-    B_col = [ax.block_col for ax in axes]
     L = data.shape[4 * K :]
 
     if K == 1:
         # Single band — defer to the (n_meta-aware, guarded) single-axis kernel.
         ax = axes[0]
         return _densify_band(
-            data, M_p[0], M_s[0], W[0], B_row[0], B_col[0],
+            data, M_p[0], M_s[0], W[0], ax.block_row, ax.block_col,
             tuple(ax.offset), ax.primary_axis, ax.n_meta, fill_value, tuple(L),
         )
 
-    # K≥2 offset bookkeeping (only needed past the K=1 early return).
+    for ax in axes:
+        if ax.n_meta != 1:
+            raise NotImplementedError(
+                "multi-axis banded densify K>1 supports n_meta=1 per axis; "
+                "multi-batch follows the K=1 pattern, add when needed."
+            )
+
+    # Per-axis col-primary (the transpose of a row-primary band, ``primary_axis
+    # == 1``): un-swap the leaf ``(B_row, B_col)`` so the kernel densifies the
+    # original block orientation row-primary, then transpose the output's
+    # ``(row_i, col_i)`` axes at the end — the K-axis generalization of
+    # ``_densify_band``'s col-primary path. ``B_row`` / ``B_col`` are read from
+    # the un-swapped buffer so the kernel layout is uniform.
+    col = [ax.primary_axis == 1 for ax in axes]
+    data_k = data
+    for i in range(K):
+        if col[i]:
+            data_k = data_k.swapaxes(2 * K + i, 3 * K + i)
+    B_row = [data_k.shape[2 * K + i] for i in range(K)]
+    B_col = [data_k.shape[3 * K + i] for i in range(K)]
+
+    # Offset bookkeeping (only needed past the K=1 early return).
     offsets = []
     centered = []  # per-axis: True ⇒ in-band test is pure arithmetic (no gather)
     for i, ax in enumerate(axes):
@@ -393,14 +412,6 @@ def _densify_multi_banded(
             offsets.append(tuple(a - w for a in range(M_p[i])))
             centered.append(True)  # () sentinel ⇒ centered band
     w0 = [(ax.band_width - 1) // 2 for ax in axes]
-
-    for ax in axes:
-        if ax.n_meta != 1 or ax.primary_axis != 0:
-            raise NotImplementedError(
-                "multi-axis banded densify K>1 supports n_meta=1 + row-primary "
-                "per axis. Multi-batch and col-primary per-axis follow the "
-                "K=1 patterns; add when needed."
-            )
 
     # Steps 1-4 as a reusable core: broadcast each block over the secondary
     # axes, select the in-band slot per axis, sum out the W axes, then permute /
@@ -454,15 +465,15 @@ def _densify_multi_banded(
     if expanded_size > _BLOCK_BANDED_BROADCAST_LIMIT:
         out = None
         for wc in itertools.product(*[range(W[i]) for i in range(K)]):
-            sl = [slice(None)] * data.ndim
+            sl = [slice(None)] * data_k.ndim
             for i in range(K):
                 sl[2 * i + 1] = slice(wc[i], wc[i] + 1)  # keep W axis size-1
-            data_wc = data[tuple(sl)]
+            data_wc = data_k[tuple(sl)]
             off_wc = [tuple(o + wc[i] for o in offsets[i]) for i in range(K)]
             piece = _place(data_wc, [1] * K, off_wc)
             out = piece if out is None else (out + piece)
     else:
-        out = _place(data, W, offsets)
+        out = _place(data_k, W, offsets)
 
     # Step 5: AND per-axis in-band masks, swap fill_value for out-of-band cells.
     # For a centered band the per-primary col offset is ``blk_r - w0`` (pure
@@ -490,7 +501,14 @@ def _densify_multi_banded(
     if L:
         L_pad = (None,) * len(L)
         full_mask = full_mask[(..., *L_pad)]
-    return jnp.where(full_mask, out, fill_value)
+    out = jnp.where(full_mask, out, fill_value)
+
+    # Col-primary axes: transpose the output's (row_i, col_i) axes — the band
+    # was densified in its un-swapped row-primary orientation above.
+    for i in range(K):
+        if col[i]:
+            out = out.swapaxes(i, K + i)
+    return out
 
 
 # ----------------------------------------------------------------------------

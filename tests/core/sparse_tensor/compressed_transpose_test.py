@@ -4,11 +4,12 @@ gather-free K-axis densify.
 Two properties:
 
   1. ``transpose()`` of a tensor carrying compressed ``BandedIndex`` / ``SetIndex``
-     dims must equal the transpose of the dense form. The compressed dims are
-     pre-densified to their ``DiagonalIndex`` / ``DenseIndex`` equivalents (the
-     relabel-only view transpose can't permute the band/set physical layout),
-     and the ``M×`` meta-block-diagonal compression is kept wherever the
-     structure reduces to a diagonal (every ``SetIndex``; any width-1 band).
+     dims must equal the transpose of the dense form, AND keep the tensor
+     compressed (the swap is a view on the compressed buffer — leaf-block
+     transpose + band-direction flip / set h↔w swap, see
+     ``_try_compressed_transpose``). This holds for the 2-D pair and for K≥2
+     all-banded tensors under any band-preserving permutation; other
+     permutations fall back to a compact densify.
 
   2. The K-axis ``_densify_multi_banded`` kernel is gather-free for centered
      bands (CR-3 parity with the single-axis path).
@@ -182,6 +183,64 @@ class TestMultiBandedGatherFree(unittest.TestCase):
         got_c = _densify_multi_banded(data, specs_c, jnp.float32(0))
         got_e = _densify_multi_banded(data, specs_e, jnp.float32(0))
         self.assertTrue(jnp.allclose(got_c, got_e, atol=1e-5))
+
+
+class TestMultiBandedTranspose(unittest.TestCase):
+    """K≥2 multi-axis banded transpose is a compression-preserving view."""
+
+    def _k2_banded(self):
+        from graphax.sparse.ops.matmul import matmul
+        a = SparseTensor(
+            (DiagonalIndex(0, 11, 0, 2, 5, 2), DiagonalIndex(1, 3, 1, 3, 4, 4)),
+            (DiagonalIndex(2, 11, 0, 0, 5, 3), DiagonalIndex(3, 3, 1, 1, 2, 5)),
+            _n((11, 3, 5, 5, 4, 2), 1),
+        )
+        b = SparseTensor(
+            (DiagonalIndex(0, 5, 0, 2, 11, 2), DiagonalIndex(1, 2, 1, 3, 3, 4)),
+            (DiagonalIndex(2, 5, 0, 0, 7, 3), DiagonalIndex(3, 2, 1, 1, 9, 5)),
+            _n((5, 2, 11, 7, 3, 9), 2),
+        )
+        res = matmul(a, b)
+        assert all(isinstance(d, BandedIndex) for d in res.dims)
+        return res
+
+    def test_full_reverse_T_preserves_compression(self):
+        from graphax.sparse.ops.transpose import transpose
+        res = self._k2_banded()
+        D = res.dense()
+        t = res.T
+        self.assertTrue(jnp.allclose(t.dense(), jnp.transpose(D), atol=1e-4))
+        self.assertTrue(all(isinstance(d, BandedIndex) for d in t.dims))
+        self.assertEqual(int(t.val.size), int(res.val.size))  # view, no growth
+        self.assertLess(int(t.val.size), D.size)
+
+    def test_double_transpose_is_identity(self):
+        res = self._k2_banded()
+        self.assertTrue(jnp.allclose(res.T.T.dense(), res.dense(), atol=1e-4))
+
+    def test_band_preserving_permutations(self):
+        from graphax.sparse.ops.transpose import transpose
+        res = self._k2_banded()
+        D = res.dense()
+        # (out↔primal keep order), (swap pair order both groups), (full reverse)
+        for oa, pa, perm in [([2, 3], [0, 1], (2, 3, 0, 1)),
+                             ([1, 0], [3, 2], (1, 0, 3, 2)),
+                             ([3, 2], [1, 0], (3, 2, 1, 0))]:
+            with self.subTest(perm=perm):
+                t = transpose(res, oa, pa)
+                self.assertTrue(jnp.allclose(t.dense(), jnp.transpose(D, perm), atol=1e-4))
+                self.assertTrue(all(isinstance(d, BandedIndex) for d in t.dims))
+
+    def test_transpose_scatter_free_under_jit(self):
+        res = self._k2_banded()
+
+        @jax.jit
+        def f(v):
+            st = SparseTensor(res.out_dims, res.primal_dims, v, check_consistency=False)
+            return st.T.dense()
+
+        text = f.lower(res.val).compile().as_text().lower()
+        self.assertEqual(text.count("scatter("), 0)
 
 
 if __name__ == "__main__":

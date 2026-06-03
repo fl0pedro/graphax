@@ -32,24 +32,80 @@ if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
 
 
+def _multi_banded_transpose(tensor, full_perm, new_out_axes):
+    """View-transpose a K≥2 all-``BandedIndex`` tensor under any band-preserving
+    permutation, keeping it compressed. Returns the transposed tensor, or
+    ``None`` (fall back to densify) when the permutation splits a band pair
+    across slots or doesn't straddle the out/primal boundary.
+
+    The K val pairs (each ``M_p_i, W_i, B_row_i, B_col_i`` in the interleaved
+    band buffer) are permuted to their new slots; a pair whose row/col roles
+    flip gets its leaf ``(B_row, B_col)`` axes swapped and ``primary`` flipped —
+    the K-axis generalization of the 2-D band swap, materialized by the
+    col-primary path in ``_densify_multi_banded``."""
+    K = len(tensor.out_dims)
+    if len(tensor.primal_dims) != K or len(new_out_axes) != K:
+        return None
+    # inverse perm: new logical position of each old logical dim. Pair i's row
+    # is old logical i (out[i]); its col is old logical K+i (primal[i]).
+    inv = [0] * (2 * K)
+    for q, old in enumerate(full_perm):
+        inv[old] = q
+    slot_src = [None] * K  # new slot s ← (old pair i, flipped?)
+    for i in range(K):
+        rp, cp = inv[i], inv[K + i]
+        if rp % K != cp % K or (rp < K) == (cp < K):
+            return None  # pair split across slots, or both ends same side
+        s = rp % K
+        if slot_src[s] is not None:
+            return None
+        slot_src[s] = (i, rp >= K)  # flipped iff the original row landed in primal
+
+    nd = tensor.val.ndim
+    perm_val = list(range(nd))
+    out_old, primal_old = tensor.out_dims, tensor.primal_dims
+    new_out, new_primal = [], []
+    for s in range(K):
+        i, flipped = slot_src[s]
+        perm_val[2 * s] = 2 * i          # M_p
+        perm_val[2 * s + 1] = 2 * i + 1  # W
+        perm_val[2 * K + s] = (3 * K + i) if flipped else (2 * K + i)  # B_row (swap if flipped)
+        perm_val[3 * K + s] = (2 * K + i) if flipped else (3 * K + i)  # B_col
+        row_src, col_src = (primal_old[i], out_old[i]) if flipped else (out_old[i], primal_old[i])
+        new_out.append(replace(row_src, id=s, axis=s, other_id=K + s,
+                               block_axis=2 * K + s,
+                               primary=(not row_src.primary) if flipped else row_src.primary))
+        new_primal.append(replace(col_src, id=K + s, axis=K + s, other_id=s,
+                                  block_axis=3 * K + s,
+                                  primary=(not col_src.primary) if flipped else col_src.primary))
+    new_val = tensor.val.transpose(perm_val)
+    return _copy(tensor, val=new_val, out_dims=tuple(new_out), primal_dims=tuple(new_primal))
+
+
 def _try_compressed_transpose(tensor, full_perm, new_out_axes):
-    """View-transpose a pure 2-D compressed pair (one out + one primal
-    ``BandedIndex`` / ``SetIndex``) under the out↔primal swap, preserving
-    compression. Returns the transposed ``SparseTensor``, or ``None`` to tell
-    the caller to fall back to densify (K≥2 multi-axis bands, or any
-    permutation that isn't the plain 2-D swap).
+    """View-transpose a compressed tensor (``BandedIndex`` / ``SetIndex``)
+    preserving compression. Returns the transposed ``SparseTensor``, or ``None``
+    to tell the caller to fall back to densify (a permutation that isn't a clean
+    band-preserving / out↔primal swap).
 
     ``BandedIndex``: ``densify(val.swapaxes(2,3), col-primary) ==
     densify(val, row-primary).swapaxes(0,1) == Dᵀ`` — so swap each leaf block's
     ``(B_row, B_col)`` axes and flip the band direction; the offset is reused
-    unchanged. ``SetIndex``: the set op (add/mul) is elementwise so
-    ``op(BD(lhs), BD(rhs))ᵀ == op(BD(lhsᵀ), BD(rhsᵀ))`` — transpose each per-side
-    block buffer's ``(B_h, B_w)`` axes and swap the ``lhs``/``rhs`` shapes h↔w.
-    In both, the out↔primal dims swap (carrying their block sizes / band params)."""
-    if len(tensor.out_dims) != 1 or len(tensor.primal_dims) != 1:
+    unchanged (handled for any K by :func:`_multi_banded_transpose` + the
+    col-primary path in ``_densify_multi_banded``). ``SetIndex``: the set op
+    (add/mul) is elementwise so ``op(BD(lhs), BD(rhs))ᵀ == op(BD(lhsᵀ),
+    BD(rhsᵀ))`` — transpose each per-side block buffer's ``(B_h, B_w)`` axes and
+    swap the ``lhs``/``rhs`` shapes h↔w. In both, the out↔primal dims swap."""
+    out_d, primal_d = tensor.out_dims, tensor.primal_dims
+
+    # K≥2 all-banded: general band-preserving permutation.
+    if (len(out_d) >= 2 and len(out_d) == len(primal_d)
+            and all(isinstance(d, BandedIndex) for d in (*out_d, *primal_d))):
+        return _multi_banded_transpose(tensor, full_perm, new_out_axes)
+
+    # 2-D pure pair (K=1) under the out↔primal swap.
+    if len(out_d) != 1 or len(primal_d) != 1:
         return None
-    # The only meaningful 2-D transpose is the out↔primal swap: perm (1, 0) with
-    # a single out axis afterwards.
     if tuple(full_perm) != (1, 0) or len(new_out_axes) != 1:
         return None
     o, p = tensor.out_dims[0], tensor.primal_dims[0]
