@@ -30,6 +30,7 @@ from jax import Array
 
 from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
 
+from .block_storage import _band_axis_select
 from .dense import dense_for_matmul
 from .layout import generate_block_permutation, generate_grouped_permutation
 from .utils import (
@@ -1010,6 +1011,11 @@ def _build_output_tensor(ctx, rhs_dims, res):
         M_row = layout.m_primary if is_row_primary else layout.n_secondary
         M_col = layout.n_secondary if is_row_primary else layout.m_primary
         # ``size`` is the META count (logical_size = size*block_size).
+        # ``axis`` / ``block_axis`` are NOMINAL for a BandedIndex — densify
+        # reconstructs the layout from ``val.shape`` + the band params, never
+        # from these fields — but we keep them distinct per side and matching
+        # the K>=2 convention (out: axis=i, block_axis=K+i; primal: axis=K+i,
+        # block_axis=3K+i, here K=1) so no consumer conflates the two sides.
         out_ix = BandedIndex(
             id=out_id, size=layout.n_meta * M_row,
             axis=0, other_id=primal_id, block_size=layout.block_row, block_axis=1,
@@ -1019,7 +1025,7 @@ def _build_output_tensor(ctx, rhs_dims, res):
         )
         primal_ix = BandedIndex(
             id=primal_id, size=layout.n_meta * M_col,
-            axis=1, other_id=out_id, block_size=layout.block_col, block_axis=1,
+            axis=1, other_id=out_id, block_size=layout.block_col, block_axis=3,
             band_width=layout.band_width, offset=layout.offset,
             primary=is_row_primary, n_secondary=layout.n_secondary,
             n_meta=layout.n_meta,
@@ -1475,13 +1481,11 @@ def _pack_dense_to_multi_axis_banded(
     grid_b = jnp.broadcast_to(grid_b, tuple(expanded))
 
     # Step 4: build per-axis selection masks ``w_idx == b - offset[a]``
-    # and AND them.
+    # and AND them. Shares ``_band_axis_select`` with the inverse densify kernel
+    # so pack / densify stay provably in-band-consistent.
     combined_mask = None
     for i in range(K):
-        off_arr = jnp.asarray(offsets[i], dtype=jnp.int32)
-        bj = jnp.arange(M_s[i], dtype=jnp.int32)
-        target_w = bj[None, :] - off_arr[:, None]
-        sel = target_w[:, :, None] == jnp.arange(W[i], dtype=jnp.int32)[None, None, :]
+        sel = _band_axis_select(M_s[i], W[i], offsets[i])  # (M_p_i, M_s_i, W_i)
         sel_shape = [1] * len(expanded)
         sel_shape[3 * i] = M_p[i]
         sel_shape[3 * i + 1] = M_s[i]

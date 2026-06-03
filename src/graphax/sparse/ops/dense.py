@@ -191,10 +191,8 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
             ]
             return dense_pair.transpose(target_axes)
 
-    from .utils import _resolve_val
-
     densified = dense(tensor, hard=True)
-    val = _resolve_val(densified.val)
+    val = densified.val
     if val is None:
         return jnp.broadcast_to(
             densified.fill_value * tensor.scalar_mult, densified.shape

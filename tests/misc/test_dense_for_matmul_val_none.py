@@ -4,14 +4,10 @@ For tensors that don't hit the fully-dense or single-pair fast paths,
 ``dense_for_matmul`` calls ``dense(tensor, hard=True)`` and multiplies the
 result's ``.val`` by ``scalar_mult``. The original line ``dense(...).val *
 scalar_mult`` raised ``TypeError`` when the densified tensor's ``val`` was
-``None`` — which can happen on the early-return path through ``dense()`` (a
-compressed-only tensor whose requested axes don't touch the compressed
-pair leaves ``val=None`` intact) or whenever the densified ``val`` is one of
-the compressed-storage pytrees rather than a plain ``Array``.
+``None`` (pure-structure tensors).
 
-The fix routes the densified ``.val`` through ``_resolve_val`` (which expands
-compressed pytrees and returns ``None`` unchanged) and broadcasts the
-``fill_value`` when the resolved ``val`` is genuinely ``None``.
+The fix broadcasts the ``fill_value`` when the densified ``val`` is ``None``
+instead of multiplying ``None`` by ``scalar_mult``.
 """
 import importlib
 
@@ -79,53 +75,9 @@ def test_fallback_does_not_crash_with_none_densified_val(monkeypatch):
     assert np.allclose(arr, 21.0)
 
 
-def test_fallback_works_with_compressed_pytree_val(monkeypatch):
-    """When ``dense(t, hard=True).val`` is a compressed-storage pytree (has
-    a ``.to_dense()`` method but isn't a JAX array), the old fallback would
-    try ``pytree * scalar_mult`` which is ill-typed. The fix routes through
-    ``_resolve_val`` which materializes the pytree first.
-    """
-    out_a = DiagonalIndex(id=0, size=3, axis=0, other_id=2)
-    out_b = DiagonalIndex(id=1, size=2, axis=1, other_id=3)
-    primal_a = DiagonalIndex(id=2, size=3, axis=0, other_id=0)
-    primal_b = DiagonalIndex(id=3, size=2, axis=1, other_id=1)
-    val = jnp.ones((3, 2), dtype=jnp.float32)
-    st = SparseTensor(
-        out_dims=(out_a, out_b),
-        primal_dims=(primal_a, primal_b),
-        val=val,
-        scalar_mult=jnp.array(2.0),
-    )
-
-    sentinel_dense = jnp.full((3, 2, 3, 2), 5.0, dtype=jnp.float32)
-
-    class FakeCompressed:
-        """Stand-in for ``UnionBlocks``-style storage: opaque, has ``to_dense``."""
-
-        def to_dense(self):
-            return sentinel_dense
-
-    real_dense = dense_mod.dense
-
-    def fake_dense(tensor, axes=None, hard=False):
-        densified = real_dense(tensor, axes=axes, hard=hard)
-        from graphax.sparse.tensor import SparseTensor as _ST
-        # Stuff the FakeCompressed into the .val slot — bypassing the
-        # constructor's validation by post-assigning. This mimics how a
-        # future densifier could leave ``val`` as a not-yet-materialized
-        # pytree.
-        st_out = _ST(
-            densified.out_dims, densified.primal_dims, None,
-            scalar_mult=densified.scalar_mult,
-            fill_value=densified.fill_value,
-            check_consistency=False,
-        )
-        object.__setattr__(st_out, "val", FakeCompressed())
-        return st_out
-
-    monkeypatch.setattr(dense_mod, "dense", fake_dense)
-
-    result = dense_for_matmul(st)
-    # Expected: sentinel_dense * scalar_mult = 5 * 2 = 10 everywhere.
-    assert result.shape == (3, 2, 3, 2)
-    np.testing.assert_allclose(np.asarray(result), 10.0)
+# NOTE: the former ``test_fallback_works_with_compressed_pytree_val`` was
+# deleted in the Phase-8 follow-up. It exercised ``_resolve_val`` materializing
+# a non-Array ``.to_dense()`` pytree left in ``val`` — but post-Phase-8 ``val``
+# is always a plain Array (compressed structure lives in the dim ``Index``
+# types), ``dense()`` never returns a pytree val, and ``_resolve_val`` is gone.
+# The remaining ``val is None`` fallback (above) is the live behavior.

@@ -47,15 +47,6 @@ def _is_sparse(obj) -> bool:
 
 
 # --- Shared primitives (elementwise + matmul) ----------------------------
-def _resolve_val(val):
-    """Materialize the dense form of ``val`` if it exposes a ``to_dense()``
-    method (a structured-storage pytree). For a plain ``Array`` (or ``None``)
-    this is a no-op — the common case now that compressed structure lives in
-    the dim ``Index`` types rather than in ``val``."""
-    if val is None or isinstance(val, jax.Array):
-        return val
-    to_dense = getattr(val, "to_dense", None)
-    return to_dense() if callable(to_dense) else val
 
 
 def _compressed_dims(tensor) -> list:
@@ -97,9 +88,15 @@ def _densify_compressed_dims(tensor, compact: bool = False):
     banded = [d for d in comp if isinstance(d, BandedIndex)]
     fill = tensor.fill_value
 
+    # Only a *pure* compressed pair (the whole tensor is one out + one primal
+    # compressed dim) is handled — the branches below index ``dims[0]`` directly.
+    # A compressed pair coexisting with extra Dense/Diagonal dims would mislabel
+    # those, so it falls through to the explicit ``NotImplementedError``.
+    pure_pair = len(tensor.out_dims) == 1 and len(tensor.primal_dims) == 1
+
     # --- K=1 SetIndex pair (combined 1-D Array val) ---
     set_dims = [d for d in comp if isinstance(d, SetIndex)]
-    if len(comp) == 2 and len(set_dims) == 2 and isinstance(tensor.val, jax.Array):
+    if pure_pair and len(set_dims) == 2 and isinstance(tensor.val, jax.Array):
         sx = tensor.out_dims[0]
         o, p = tensor.out_dims[0], tensor.primal_dims[0]
         if compact:  # SetIndex always reduces to a meta-block-diagonal
@@ -122,7 +119,7 @@ def _densify_compressed_dims(tensor, compact: bool = False):
         )
 
     # --- K=1 banded pair (Array val) ---
-    if len(comp) == 2 and len(banded) == 2 and isinstance(tensor.val, jax.Array):
+    if pure_pair and len(banded) == 2 and isinstance(tensor.val, jax.Array):
         primary = next((d for d in banded if d.primary), banded[0])
         o, p = tensor.out_dims[0], tensor.primal_dims[0]
         if compact and primary.reduces_to_diagonal():
@@ -181,8 +178,11 @@ def _densify_compressed_dims(tensor, compact: bool = False):
 
     raise NotImplementedError(
         f"densify of compressed dims: unhandled shape — {len(comp)} compressed "
-        f"dims, val type {type(tensor.val).__name__} (SetIndex dual-buffer is "
-        "Phase 8.F)."
+        f"dims across {len(tensor.out_dims)} out / {len(tensor.primal_dims)} "
+        f"primal dims, val type {type(tensor.val).__name__}. Handled: a pure "
+        "K=1 SetIndex / banded pair, or an all-BandedIndex K≥2 tensor. A "
+        "compressed pair coexisting with Dense/Diagonal dims is not yet "
+        "supported (no producer emits it today)."
     )
 
 
@@ -198,12 +198,11 @@ def _materialize_for_op(tensor):
 
 
 def _val_or_one(tensor: SparseTensor) -> Array:
-    """A tensor's stored value, or a scalar 1 in its dtype if the tensor carries pure structure.
-
-    If the tensor's ``val`` is one of the compressed-storage pytrees, the
-    dense form is materialized as a fused JAX expression — XLA folds the
-    densification into the consuming kernel."""
-    val = _resolve_val(tensor.val)
+    """A tensor's stored ``val``, or a scalar 1 in its dtype if the tensor
+    carries pure structure (``val is None``). ``val`` is always a plain
+    ``Array`` post-Phase-8 (compressed structure lives in the dim ``Index``
+    types, not in ``val``)."""
+    val = tensor.val
     return val if val is not None else jnp.array(1.0, dtype=tensor.dtype)
 
 

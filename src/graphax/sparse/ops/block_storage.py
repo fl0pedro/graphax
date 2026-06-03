@@ -329,6 +329,18 @@ def _densify_band(
     return _stitch_meta(per_batch_dense, fill_value)
 
 
+def _band_axis_select(M_s: int, W: int, offset: tuple[int, ...]) -> Array:
+    """Per-axis one-hot band selector ``(M_p, M_s, W)`` bool: slot ``w`` of
+    primary ``a`` is the secondary block ``b = offset[a] + w``. ``M_p`` is
+    ``len(offset)``. Shared by the pack (dense→band) and densify (band→dense)
+    K-axis kernels so the two stay provably inverse — they must agree exactly on
+    which ``(a, b, w)`` cells are in-band."""
+    off_arr = jnp.asarray(offset, dtype=jnp.int32)
+    bj = jnp.arange(M_s, dtype=jnp.int32)
+    target_w = bj[None, :] - off_arr[:, None]  # (M_p, M_s)
+    return target_w[:, :, None] == jnp.arange(W, dtype=jnp.int32)[None, None, :]
+
+
 def _densify_multi_banded(
     data: Array,
     axes: "tuple[BandAxisSpec, ...]",
@@ -359,6 +371,17 @@ def _densify_multi_banded(
     W = [ax.band_width for ax in axes]
     B_row = [ax.block_row for ax in axes]
     B_col = [ax.block_col for ax in axes]
+    L = data.shape[4 * K :]
+
+    if K == 1:
+        # Single band — defer to the (n_meta-aware, guarded) single-axis kernel.
+        ax = axes[0]
+        return _densify_band(
+            data, M_p[0], M_s[0], W[0], B_row[0], B_col[0],
+            tuple(ax.offset), ax.primary_axis, ax.n_meta, fill_value, tuple(L),
+        )
+
+    # K≥2 offset bookkeeping (only needed past the K=1 early return).
     offsets = []
     centered = []  # per-axis: True ⇒ in-band test is pure arithmetic (no gather)
     for i, ax in enumerate(axes):
@@ -370,14 +393,6 @@ def _densify_multi_banded(
             offsets.append(tuple(a - w for a in range(M_p[i])))
             centered.append(True)  # () sentinel ⇒ centered band
     w0 = [(ax.band_width - 1) // 2 for ax in axes]
-    L = data.shape[4 * K :]
-
-    if K == 1:
-        ax = axes[0]
-        return _densify_band(
-            data, M_p[0], M_s[0], W[0], B_row[0], B_col[0],
-            tuple(ax.offset), ax.primary_axis, ax.n_meta, fill_value, tuple(L),
-        )
 
     for ax in axes:
         if ax.n_meta != 1 or ax.primary_axis != 0:
@@ -405,10 +420,7 @@ def _densify_multi_banded(
         data_b = jnp.broadcast_to(data_e, tuple(expanded))
         combined_mask = None
         for i in range(K):
-            off_arr = jnp.asarray(off_list[i], dtype=jnp.int32)
-            bj = jnp.arange(M_s[i], dtype=jnp.int32)
-            target_w = bj[None, :] - off_arr[:, None]  # (M_p_i, M_s_i)
-            sel = target_w[:, :, None] == jnp.arange(w_list[i], dtype=jnp.int32)[None, None, :]
+            sel = _band_axis_select(M_s[i], w_list[i], off_list[i])  # (M_p_i, M_s_i, W_i)
             sel_shape = [1] * len(expanded)
             sel_shape[3 * i] = M_p[i]
             sel_shape[3 * i + 1] = M_s[i]
