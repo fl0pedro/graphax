@@ -359,12 +359,16 @@ def _densify_multi_banded(
     B_row = [ax.block_row for ax in axes]
     B_col = [ax.block_col for ax in axes]
     offsets = []
+    centered = []  # per-axis: True ⇒ in-band test is pure arithmetic (no gather)
     for i, ax in enumerate(axes):
+        w = (ax.band_width - 1) // 2
         if ax.offset:
             offsets.append(ax.offset)
+            centered.append(_centered_offset(tuple(ax.offset), ax.band_width))
         else:
-            w = (ax.band_width - 1) // 2
             offsets.append(tuple(a - w for a in range(M_p[i])))
+            centered.append(True)  # () sentinel ⇒ centered band
+    w0 = [(ax.band_width - 1) // 2 for ax in axes]
     L = data.shape[4 * K :]
 
     if K == 1:
@@ -435,12 +439,19 @@ def _densify_multi_banded(
     out = out.reshape(*final_shape)
 
     # Step 5: AND per-axis in-band masks, swap fill_value for out-of-band cells.
+    # For a centered band the per-primary col offset is ``blk_r - w0`` (pure
+    # arithmetic) — avoids the ``off_arr[blk_r]`` gather (CR-3, mirroring the
+    # single-axis ``_to_dense_banded``); only an explicit non-centered offset
+    # falls back to the gather.
     per_axis_in_band = []
     for i in range(K):
         blk_r = jnp.arange(M_p[i] * B_row[i]) // B_row[i]
         blk_c = jnp.arange(M_s[i] * B_col[i]) // B_col[i]
-        off_arr = jnp.asarray(offsets[i], dtype=jnp.int32)
-        co = off_arr[blk_r]
+        if centered[i]:
+            co = blk_r - w0[i]
+        else:
+            off_arr = jnp.asarray(offsets[i], dtype=jnp.int32)
+            co = off_arr[blk_r]
         diff = blk_c[None, :] - co[:, None]
         per_axis_in_band.append((diff >= 0) & (diff < W[i]))
     full_mask = None
