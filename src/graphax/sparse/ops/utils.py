@@ -58,6 +58,31 @@ def _compressed_dims(tensor) -> list:
             if getattr(d, "is_compressed", False)]
 
 
+def _rewrap(tensor, out_dims, primal_dims, val):
+    """Re-emit ``tensor`` with new dims/val, carrying scalar_mult / fill_value /
+    zero_fill (the shared tail of every densify branch)."""
+    from graphax.sparse.tensor import SparseTensor
+
+    return SparseTensor(
+        out_dims, primal_dims, val,
+        scalar_mult=tensor.scalar_mult, fill_value=tensor.fill_value,
+        check_consistency=False, zero_fill=getattr(tensor, "_zero_fill", None),
+    )
+
+
+def _dense_pair_result(tensor, dense, K):
+    """Wrap a fully-materialized ``dense`` array as a K-pair ``DenseIndex``
+    tensor (out axes 0..K-1, primal axes K..2K-1), reusing the source dim ids."""
+    from graphax.sparse.indexes import DenseIndex
+
+    out = tuple(DenseIndex(tensor.out_dims[i].id, dense.shape[i], i) for i in range(K))
+    primal = tuple(
+        DenseIndex(tensor.primal_dims[i].id, dense.shape[K + i], K + i)
+        for i in range(K)
+    )
+    return _rewrap(tensor, out, primal, dense)
+
+
 def _densify_compressed_dims(tensor, compact: bool = False):
     """Replace a tensor's compressed Index dims (``BandedIndex`` / ``SetIndex``)
     with their densified ``DenseIndex`` / ``DiagonalIndex`` equivalents, writing
@@ -82,8 +107,7 @@ def _densify_compressed_dims(tensor, compact: bool = False):
     if not comp:
         return tensor
 
-    from graphax.sparse.tensor import SparseTensor
-    from graphax.sparse.indexes import BandedIndex, SetIndex, DenseIndex, DiagonalIndex
+    from graphax.sparse.indexes import BandedIndex, SetIndex, DiagonalIndex
 
     banded = [d for d in comp if isinstance(d, BandedIndex)]
     fill = tensor.fill_value
@@ -102,21 +126,10 @@ def _densify_compressed_dims(tensor, compact: bool = False):
         if compact:  # SetIndex always reduces to a meta-block-diagonal
             meta = sx.to_meta_blocks(tensor.val, fill)  # (M, LCM_h, LCM_w, *L)
             M, H, W = meta.shape[0], meta.shape[1], meta.shape[2]
-            new_out = (DiagonalIndex(o.id, M, 0, p.id, H, 1),)
-            new_primal = (DiagonalIndex(p.id, M, 0, o.id, W, 2),)
-            new_val = meta
-        else:
-            dense = sx.densify_axis(tensor.val, fill)  # (M*LCM_h, M*LCM_w, *L)
-            rows, cols = dense.shape[0], dense.shape[1]
-            new_out = (DenseIndex(o.id, rows, 0),)
-            new_primal = (DenseIndex(p.id, cols, 1),)
-            new_val = dense
-        return SparseTensor(
-            new_out, new_primal, new_val,
-            scalar_mult=tensor.scalar_mult, fill_value=tensor.fill_value,
-            check_consistency=False,
-            zero_fill=getattr(tensor, "_zero_fill", None),
-        )
+            return _rewrap(tensor, (DiagonalIndex(o.id, M, 0, p.id, H, 1),),
+                           (DiagonalIndex(p.id, M, 0, o.id, W, 2),), meta)
+        dense = sx.densify_axis(tensor.val, fill)  # (M*LCM_h, M*LCM_w, *L)
+        return _dense_pair_result(tensor, dense, 1)
 
     # --- K=1 banded pair (Array val) ---
     if pure_pair and len(banded) == 2 and isinstance(tensor.val, jax.Array):
@@ -125,21 +138,10 @@ def _densify_compressed_dims(tensor, compact: bool = False):
         if compact and primary.reduces_to_diagonal():
             meta = primary.to_meta_blocks(tensor.val)  # (n_meta*M, B_row, B_col, *L)
             M, B_row, B_col = meta.shape[0], meta.shape[1], meta.shape[2]
-            new_out = (DiagonalIndex(o.id, M, 0, p.id, B_row, 1),)
-            new_primal = (DiagonalIndex(p.id, M, 0, o.id, B_col, 2),)
-            new_val = meta
-        else:
-            dense = primary.densify_axis(tensor.val, fill)  # (rows, cols, *L)
-            rows, cols = dense.shape[0], dense.shape[1]
-            new_out = (DenseIndex(o.id, rows, 0),)
-            new_primal = (DenseIndex(p.id, cols, 1),)
-            new_val = dense
-        return SparseTensor(
-            new_out, new_primal, new_val,
-            scalar_mult=tensor.scalar_mult, fill_value=tensor.fill_value,
-            check_consistency=False,
-            zero_fill=getattr(tensor, "_zero_fill", None),
-        )
+            return _rewrap(tensor, (DiagonalIndex(o.id, M, 0, p.id, B_row, 1),),
+                           (DiagonalIndex(p.id, M, 0, o.id, B_col, 2),), meta)
+        dense = primary.densify_axis(tensor.val, fill)  # (rows, cols, *L)
+        return _dense_pair_result(tensor, dense, 1)
 
     # --- K≥2 SetIndex (multi-axis dual block-diagonal buffers) ---
     K = len(tensor.out_dims)
@@ -168,19 +170,7 @@ def _densify_compressed_dims(tensor, compact: bool = False):
             dense = sx._op()(lhs_dense, rhs_dense)
         else:
             dense = sx._op()(lhs_dense, fill_rhs)
-        new_out = tuple(
-            DenseIndex(tensor.out_dims[i].id, dense.shape[i], i) for i in range(K)
-        )
-        new_primal = tuple(
-            DenseIndex(tensor.primal_dims[i].id, dense.shape[K + i], K + i)
-            for i in range(K)
-        )
-        return SparseTensor(
-            new_out, new_primal, dense,
-            scalar_mult=tensor.scalar_mult, fill_value=tensor.fill_value,
-            check_consistency=False,
-            zero_fill=getattr(tensor, "_zero_fill", None),
-        )
+        return _dense_pair_result(tensor, dense, K)
 
     # --- K≥2 banded (multi-axis interleaved Array val) ---
     if (banded and len(banded) == 2 * K and isinstance(tensor.val, jax.Array)
@@ -202,19 +192,7 @@ def _densify_compressed_dims(tensor, compact: bool = False):
         dense = _densify_multi_banded(
             tensor.val, specs, fill,
         )  # (rows_0..rows_{K-1}, cols_0..cols_{K-1}, *L)
-        new_out = tuple(
-            DenseIndex(tensor.out_dims[i].id, dense.shape[i], i) for i in range(K)
-        )
-        new_primal = tuple(
-            DenseIndex(tensor.primal_dims[i].id, dense.shape[K + i], K + i)
-            for i in range(K)
-        )
-        return SparseTensor(
-            new_out, new_primal, dense,
-            scalar_mult=tensor.scalar_mult, fill_value=tensor.fill_value,
-            check_consistency=False,
-            zero_fill=getattr(tensor, "_zero_fill", None),
-        )
+        return _dense_pair_result(tensor, dense, K)
 
     raise NotImplementedError(
         f"densify of compressed dims: unhandled shape — {len(comp)} compressed "

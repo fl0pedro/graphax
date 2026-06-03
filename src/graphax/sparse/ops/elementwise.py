@@ -531,12 +531,15 @@ def _should_emit_multi_set(lhs, rhs, op, is_intersection):
         if (a_n * a_b_h) % lcm_h or (a_n * a_b_w) % lcm_w:
             return None
         M = (a_n * a_b_h) // lcm_h
+        # Symmetric per-side geometry: pair["a"]/pair["b"] each carry the
+        # operand's M axis, block axes (None when block_size==1), and sizes,
+        # so the packer indexes p[side][...] uniformly.
         pairs.append({
-            "a_n": a_n, "a_b_h": a_b_h, "a_b_w": a_b_w,
-            "b_n": b_n, "b_b_h": b_b_h, "b_b_w": b_b_w,
+            "a": {"axis": ao.axis, "bh_axis": ao.block_axis, "bw_axis": ai.block_axis,
+                  "n": a_n, "b_h": a_b_h, "b_w": a_b_w},
+            "b": {"axis": bo.axis, "bh_axis": bo.block_axis, "bw_axis": bi.block_axis,
+                  "n": b_n, "b_h": b_b_h, "b_w": b_b_w},
             "lcm_h": lcm_h, "lcm_w": lcm_w, "M": M,
-            "a_axis": ao.axis, "a_bh_axis": ao.block_axis, "a_bw_axis": ai.block_axis,
-            "b_axis": bo.axis, "b_bh_axis": bo.block_axis, "b_bw_axis": bi.block_axis,
             "out_id": ao.id, "primal_id": ai.id,
         })
         lhs_buf_size *= a_n * a_b_h * a_b_w
@@ -544,11 +547,10 @@ def _should_emit_multi_set(lhs, rhs, op, is_intersection):
         meta_size *= M * lcm_h * lcm_w
     # The packer reshapes the operand val purely from its M / block axes, so the
     # val must have no leftover (L) axes the perm wouldn't cover.
-    a_phys = K + sum(p["a_bh_axis"] is not None for p in pairs) \
-        + sum(p["a_bw_axis"] is not None for p in pairs)
-    b_phys = K + sum(p["b_bh_axis"] is not None for p in pairs) \
-        + sum(p["b_bw_axis"] is not None for p in pairs)
-    if lhs.val.ndim != a_phys or rhs.val.ndim != b_phys:
+    def _phys(side):
+        return K + sum(p[side]["bh_axis"] is not None for p in pairs) \
+            + sum(p[side]["bw_axis"] is not None for p in pairs)
+    if lhs.val.ndim != _phys("a") or rhs.val.ndim != _phys("b"):
         return None
     # Restrict to a single meta-block per axis (M_i == 1). For M_i > 1 the
     # general path already emits a *compact* meta-block-diagonal that ops consume
@@ -586,23 +588,24 @@ def _emit_multi_set(lhs, rhs, op, geom):
         lhs_v = lhs.val * lhs.scalar_mult
         rhs_v = rhs.val * rhs.scalar_mult
 
-    def _pack(v, axis_key, bh_key, bw_key, n_key, bh_szkey, bw_szkey):
+    def _pack(v, side):
         # Permute operand val to (M_0..M_{K-1}, [existing Bh], [existing Bw]),
         # then reshape to the W=1 multi-banded layout (M_0,1,M_1,1,...,Bh*,Bw*).
         # A trivial (block_size==1) pair has no physical block axis, so it is
         # skipped in the perm and re-inserted as a size-1 dim by the reshape.
-        perm = ([p[axis_key] for p in pairs]
-                + [p[bh_key] for p in pairs if p[bh_key] is not None]
-                + [p[bw_key] for p in pairs if p[bw_key] is not None])
+        g = [p[side] for p in pairs]
+        perm = ([s["axis"] for s in g]
+                + [s["bh_axis"] for s in g if s["bh_axis"] is not None]
+                + [s["bw_axis"] for s in g if s["bw_axis"] is not None])
         t = v.transpose(perm)
         band_shape = []
-        for p in pairs:
-            band_shape += [p[n_key], 1]
-        band_shape += [p[bh_szkey] for p in pairs] + [p[bw_szkey] for p in pairs]
+        for s in g:
+            band_shape += [s["n"], 1]
+        band_shape += [s["b_h"] for s in g] + [s["b_w"] for s in g]
         return t.reshape(band_shape)
 
-    lhs_band = _pack(lhs_v, "a_axis", "a_bh_axis", "a_bw_axis", "a_n", "a_b_h", "a_b_w")
-    rhs_band = _pack(rhs_v, "b_axis", "b_bh_axis", "b_bw_axis", "b_n", "b_b_h", "b_b_w")
+    lhs_band = _pack(lhs_v, "a")
+    rhs_band = _pack(rhs_v, "b")
     combined = jnp.concatenate([lhs_band.reshape(-1), rhs_band.reshape(-1)])
 
     new_fill = jnp.array(False) if bool_op else jnp.array(0.0, dtype=lhs.val.dtype)

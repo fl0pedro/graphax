@@ -4,7 +4,7 @@ import math
 from abc import ABC
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from functools import partial
+from functools import partial, wraps
 from math import prod
 from typing import Any, Callable, Literal, override
 
@@ -51,6 +51,22 @@ def _compute_zero_fill_flag(fill_value) -> bool:
 
 
 Transform = Callable[["SparseTensor", "SparseTensor", Array], "SparseTensor"]
+
+
+def _on_materialized(method):
+    """Decorator for value-semantic methods (reductions + non-linear unary ops)
+    that must NOT read a raw compressed ``val``: when the tensor has compressed
+    (``BandedIndex`` / ``SetIndex``) dims, run ``method`` on the materialized
+    ``{Diagonal, Dense}`` equivalent instead. No-op for non-compressed tensors.
+    A band buffer carries out-of-band padding and a set buffer the
+    pre-combination per-side blocks, so reducing either directly is wrong."""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        t = self._materialize_compressed()
+        if t is not self:
+            return getattr(t, method.__name__)(*args, **kwargs)
+        return method(self, *args, **kwargs)
+    return wrapper
 
 
 class SparseMathMixin:
@@ -168,31 +184,25 @@ class SparseMathMixin:
     def __pos__(self):
         return self.copy()
 
+    # Non-linear in val → @_on_materialized densifies compressed storage first
+    # (abs(a+b) != abs(a)+abs(b); a set buffer stores the pre-combination
+    # per-side blocks). __neg__ / __pos__ are linear and stay lazy.
+    @_on_materialized
     def __abs__(self):
-        # Non-linear in val → must materialize compressed storage first
-        # (abs(a+b) != abs(a)+abs(b); a set buffer stores the pre-combination
-        # per-side blocks). __neg__ / __pos__ are linear and stay lazy.
-        t = self._materialize_compressed()
-        if t is not self:
-            return abs(t)
         return self.copy(
             val=jnp.abs(self.val) if self.val is not None else None,
             scalar_mult=jnp.abs(self.scalar_mult),
             fill_value=jnp.abs(self.fill_value),
         )
 
+    @_on_materialized
     def __invert__(self):
-        t = self._materialize_compressed()
-        if t is not self:
-            return ~t
         return self.copy(
             val=jax.lax.bitwise_not(self.val) if self.val is not None else None
         )
 
+    @_on_materialized
     def __round__(self, ndigits=None):
-        t = self._materialize_compressed()
-        if t is not self:
-            return round(t, ndigits)
         return self.copy(
             val=jnp.round(self.val, ndigits) if self.val is not None else None,
             scalar_mult=jnp.round(self.scalar_mult, ndigits),
@@ -501,56 +511,44 @@ class SparseTensor(SparseMathMixin):
         return _materialize_for_op(self) if _compressed_dims(self) else self
 
     # Low priority TODO: axis, and other args
+    @_on_materialized
     def all(self) -> Array:
-        t = self._materialize_compressed()
-        if t is not self:
-            return t.all()
         val_part = (
             jnp.all(self.val * self.scalar_mult) if self.val is not None else True
         )
         return jnp.logical_and(val_part, self.fill_value * self.scalar_mult != 0)
 
+    @_on_materialized
     def any(self) -> Array:
-        t = self._materialize_compressed()
-        if t is not self:
-            return t.any()
         val_part = (
             jnp.any(self.val * self.scalar_mult) if self.val is not None else False
         )
         return jnp.logical_or(val_part, self.fill_value * self.scalar_mult != 0)
 
+    @_on_materialized
     def sum(self) -> Array:
-        t = self._materialize_compressed()
-        if t is not self:
-            return t.sum()
         if self.val is None:
             return self.fill_value * self.scalar_mult * self.size
         return jnp.sum(self.val * self.scalar_mult) + (
             self.fill_value * self.scalar_mult
         ) * (self.size - self.val.size)
 
+    @_on_materialized
     def prod(self) -> Array:
-        t = self._materialize_compressed()
-        if t is not self:
-            return t.prod()
         if self.val is None:
             return (self.fill_value * self.scalar_mult) ** self.size
         return jnp.prod(self.val * self.scalar_mult) * (
             self.fill_value * self.scalar_mult
         ) ** (self.size - self.val.size)
 
+    @_on_materialized
     def max(self) -> Array:
-        t = self._materialize_compressed()
-        if t is not self:
-            return t.max()
         if self.val is None:
             return self.fill_value * self.scalar_mult
         return jnp.maximum(jnp.max(self.val), self.fill_value) * self.scalar_mult
 
+    @_on_materialized
     def min(self) -> Array:
-        t = self._materialize_compressed()
-        if t is not self:
-            return t.min()
         if self.val is None:
             return self.fill_value * self.scalar_mult
         return jnp.minimum(jnp.min(self.val), self.fill_value) * self.scalar_mult

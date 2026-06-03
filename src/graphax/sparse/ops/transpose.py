@@ -98,25 +98,18 @@ def _try_compressed_transpose(tensor, full_perm, new_out_axes):
     swap the ``lhs``/``rhs`` shapes h↔w. In both, the out↔primal dims swap."""
     out_d, primal_d = tensor.out_dims, tensor.primal_dims
 
-    # K≥2 all-banded: general band-preserving permutation.
-    if (len(out_d) >= 2 and len(out_d) == len(primal_d)
+    # All-banded (any K, including the 2-D pair): general band-preserving
+    # permutation. The K=1 swap is just the degenerate case of this routine.
+    if (len(out_d) >= 1 and len(out_d) == len(primal_d)
             and all(isinstance(d, BandedIndex) for d in (*out_d, *primal_d))):
         return _multi_banded_transpose(tensor, full_perm, new_out_axes)
 
-    # 2-D pure pair (K=1) under the out↔primal swap.
+    # 2-D SetIndex pair under the out↔primal swap (sets stay K=1).
     if len(out_d) != 1 or len(primal_d) != 1:
         return None
     if tuple(full_perm) != (1, 0) or len(new_out_axes) != 1:
         return None
     o, p = tensor.out_dims[0], tensor.primal_dims[0]
-
-    if isinstance(o, BandedIndex) and isinstance(p, BandedIndex):
-        new_val = tensor.val.swapaxes(2, 3)  # swap leaf (B_row, B_col)
-        new_out = (replace(p, id=0, axis=0, other_id=1, block_axis=1,
-                           primary=not p.primary),)
-        new_primal = (replace(o, id=1, axis=1, other_id=0, block_axis=3,
-                              primary=not o.primary),)
-        return _copy(tensor, val=new_val, out_dims=new_out, primal_dims=new_primal)
 
     if isinstance(o, SetIndex) and isinstance(p, SetIndex):
         lhs, rhs = o._split(tensor.val)
