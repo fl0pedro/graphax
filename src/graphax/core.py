@@ -265,20 +265,42 @@ def _is_scalar_st(t) -> bool:
 
 
 def _acts_as_identity(t) -> bool:
-    """Whether a structural (``val is None``) edge Jacobian acts as the
-    multiplicative identity in ``post @ pre`` — i.e. composing with it is a
-    pure pass-through.
+    """Whether a structural (``val is None``) edge Jacobian is the PURE-DIAGONAL
+    IDENTITY — up to its ``scalar_mult`` — so that ``t @ pre`` is a pass-through
+    returning ``pre`` scaled by ``t.scalar_mult`` (the caller folds the
+    ``scalar_mult`` in).
 
-    A ``val is None`` tensor is the identity only when it is SHAPE-PRESERVING:
-    its out logical shape equals its primal logical shape. A broadcast /
-    reduction structural Jacobian (``val is None`` but e.g. out ``(4, 4)`` vs
-    primal ``(1, 4)`` — the duplicate ``broadcast_in_dim`` pattern) is NOT the
-    identity; passing it through unchanged drops the broadcast axis and yields
-    a wrong-shaped edge, so it must go through the real contraction instead."""
-    return (
-        tuple(d.logical_size for d in t.out_dims)
-        == tuple(d.logical_size for d in t.primal_dims)
-    )
+    Grounded in the representation's semantics of ``val is None`` / ``axis is
+    None`` (not a shape heuristic):
+      * a DENSE dim (``other_id is None``) is a BROADCAST over that axis — NOT
+        the identity;
+      * a DIAGONAL pair (``other_id`` set, linking out↔primal of equal size)
+        with ``block_size in {None, 1}`` is a PURE DIAGONAL = identity;
+        ``block_size > 1`` is a block-local reduction — NOT the identity;
+      * a non-zero ``fill_value`` (anything but the statically-zero ``None``)
+        paints the off-structure cells, so it is not a pure identity;
+      * a 0-rank scalar (no dims) is the identity up to ``scalar_mult``.
+
+    ``scalar_mult`` is deliberately NOT inspected here — it can't be proven
+    ``== 1`` inside ``jit`` (it is a tracer) — so the test is purely structural
+    and the caller multiplies it into the passed-through value, which is correct
+    for any ``scalar_mult``."""
+    if t.fill_value is not None:
+        return False
+    if not t.out_dims and not t.primal_dims:
+        return True  # scalar: identity up to scalar_mult
+    if len(t.out_dims) != len(t.primal_dims):
+        return False
+    primal_by_id = {d.id: d for d in t.primal_dims}
+    for d in t.out_dims:
+        if d.other_id is None:  # dense dim => broadcast, not identity
+            return False
+        p = primal_by_id.get(d.other_id)
+        if p is None or p.other_id != d.id or p.logical_size != d.logical_size:
+            return False
+        if (d.block_size or 1) != 1 or (p.block_size or 1) != 1:
+            return False  # block_size > 1 => block-local reduction, not identity
+    return True
 
 
 def _eliminate_vertex(
@@ -408,9 +430,22 @@ def _eliminate_vertex(
                             edge_outval = _post_val @ _pre_val
 
                 elif pre_val.val is not None:
-                    edge_outval = _pre_val
+                    # post is a pure-diagonal identity up to its scalar_mult:
+                    # pass pre through, FOLDING post's scalar_mult (a scalar /
+                    # scaled-identity edge multiplies by it; dropping it was the
+                    # ``sum(z*sum(z))`` bug — 10·pre became pre).
+                    edge_outval = _pre_val.copy(
+                        scalar_mult=_pre_val.scalar_mult * _post_val.scalar_mult
+                    )
+                    if count_ops:
+                        muls += 1
                 else:
-                    edge_outval = _post_val
+                    # pre is the identity (up to scalar_mult): pass post through.
+                    edge_outval = _post_val.copy(
+                        scalar_mult=_post_val.scalar_mult * _pre_val.scalar_mult
+                    )
+                    if count_ops:
+                        muls += 1
                 # Offload the remain Jacobian transforms to the output tensor
                 if len(post_val.post_transforms) > 0:
                     edge_outval = prepend_post_transforms(post_val, edge_outval)
