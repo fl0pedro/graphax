@@ -21,6 +21,7 @@ from graphax.sparse.ops.elementwise import elementwise
 from graphax.sparse.ops.matmul import matmul
 from graphax.sparse.ops.transpose import transpose
 from graphax.sparse.ops.utils import (
+    _KEEP_ZF as _KEEP_ZF,
     _arr2st,
     _assert_sparse_tensor_consistency,
     _copy,
@@ -176,9 +177,12 @@ class SparseMathMixin:
         return elementwise(self, other, jax.lax.ge)
 
     def __neg__(self):
+        # Zero-preserving on the fill (-0 == 0) → carry the zero-fill flag so a
+        # negation inside jit doesn't force the next matmul onto the slow path.
         return self.copy(
             scalar_mult=-self.scalar_mult,
             fill_value=-self.fill_value,
+            zero_fill=self._zero_fill,
         )
 
     def __pos__(self):
@@ -193,6 +197,7 @@ class SparseMathMixin:
             val=jnp.abs(self.val) if self.val is not None else None,
             scalar_mult=jnp.abs(self.scalar_mult),
             fill_value=jnp.abs(self.fill_value),
+            zero_fill=self._zero_fill,
         )
 
     @_on_materialized
@@ -207,6 +212,7 @@ class SparseMathMixin:
             val=jnp.round(self.val, ndigits) if self.val is not None else None,
             scalar_mult=jnp.round(self.scalar_mult, ndigits),
             fill_value=jnp.round(self.fill_value, ndigits),
+            zero_fill=self._zero_fill,  # round(0)==0, zero-preserving
         )
 
 
@@ -269,6 +275,10 @@ class SparseTensor(SparseMathMixin):
         if val is not None and val.dtype != dtype:
             val = val.astype(dtype)
 
+        # A defaulted fill is concretely zero — record that directly so the
+        # zero-fill fast path survives construction INSIDE jit, where
+        # ``_compute_zero_fill_flag`` can't prove a traced ``jnp.array(0)`` zero.
+        default_fill = fill_value is None
         if fill_value is None:
             fill_value = jnp.array(0, dtype=dtype)
 
@@ -280,7 +290,9 @@ class SparseTensor(SparseMathMixin):
         self.pre_transforms = tuple(pre_transforms)
         self.post_transforms = tuple(post_transforms)
         self._zero_fill = (
-            zero_fill if zero_fill is not None else _compute_zero_fill_flag(fill_value)
+            zero_fill if zero_fill is not None
+            else True if default_fill
+            else _compute_zero_fill_flag(fill_value)
         )
 
         self._dynamic_keys = tuple(kwargs.keys())
@@ -493,8 +505,9 @@ class SparseTensor(SparseMathMixin):
         val: Array | None = None,
         scalar_mult: Array | None = None,
         fill_value: Array | None = None,
+        zero_fill=_KEEP_ZF,
     ):
-        return _copy(self, val, scalar_mult, fill_value)
+        return _copy(self, val, scalar_mult, fill_value, zero_fill=zero_fill)
 
     def _materialize_compressed(self) -> SparseTensor:
         """Return an equivalent tensor with no compressed (``BandedIndex`` /
@@ -511,47 +524,62 @@ class SparseTensor(SparseMathMixin):
         return _materialize_for_op(self) if _compressed_dims(self) else self
 
     # Low priority TODO: axis, and other args
+    @property
+    def _n_fill_cells(self) -> int:
+        """Number of implicit fill cells = logical size minus stored values.
+        ``0`` ⇒ ``val`` covers every cell, so ``fill_value`` must NOT enter a
+        reduction (a dense tensor has no off-diagonal fill positions)."""
+        return self.size - (0 if self.val is None else self.val.size)
+
     @_on_materialized
     def all(self) -> Array:
         val_part = (
             jnp.all(self.val * self.scalar_mult) if self.val is not None else True
         )
-        return jnp.logical_and(val_part, self.fill_value * self.scalar_mult != 0)
+        if self._n_fill_cells > 0:  # fill cells exist → they must be truthy too
+            return jnp.logical_and(val_part, self.fill_value * self.scalar_mult != 0)
+        return jnp.asarray(val_part)
 
     @_on_materialized
     def any(self) -> Array:
         val_part = (
             jnp.any(self.val * self.scalar_mult) if self.val is not None else False
         )
-        return jnp.logical_or(val_part, self.fill_value * self.scalar_mult != 0)
+        if self._n_fill_cells > 0:
+            return jnp.logical_or(val_part, self.fill_value * self.scalar_mult != 0)
+        return jnp.asarray(val_part)
 
     @_on_materialized
     def sum(self) -> Array:
-        if self.val is None:
-            return self.fill_value * self.scalar_mult * self.size
-        return jnp.sum(self.val * self.scalar_mult) + (
-            self.fill_value * self.scalar_mult
-        ) * (self.size - self.val.size)
+        # The fill term vanishes when _n_fill_cells == 0, so no guard needed.
+        val_part = 0.0 if self.val is None else jnp.sum(self.val * self.scalar_mult)
+        return val_part + (self.fill_value * self.scalar_mult) * self._n_fill_cells
 
     @_on_materialized
     def prod(self) -> Array:
-        if self.val is None:
-            return (self.fill_value * self.scalar_mult) ** self.size
-        return jnp.prod(self.val * self.scalar_mult) * (
-            self.fill_value * self.scalar_mult
-        ) ** (self.size - self.val.size)
+        # fill ** 0 == 1 when _n_fill_cells == 0, so no guard needed.
+        val_part = 1.0 if self.val is None else jnp.prod(self.val * self.scalar_mult)
+        return val_part * (self.fill_value * self.scalar_mult) ** self._n_fill_cells
 
     @_on_materialized
     def max(self) -> Array:
+        # Scale BEFORE the extremum (a negative scalar_mult reverses order), and
+        # only fold fill when implicit fill cells exist.
         if self.val is None:
             return self.fill_value * self.scalar_mult
-        return jnp.maximum(jnp.max(self.val), self.fill_value) * self.scalar_mult
+        m = jnp.max(self.val * self.scalar_mult)
+        if self._n_fill_cells > 0:
+            m = jnp.maximum(m, self.fill_value * self.scalar_mult)
+        return m
 
     @_on_materialized
     def min(self) -> Array:
         if self.val is None:
             return self.fill_value * self.scalar_mult
-        return jnp.minimum(jnp.min(self.val), self.fill_value) * self.scalar_mult
+        m = jnp.min(self.val * self.scalar_mult)
+        if self._n_fill_cells > 0:
+            m = jnp.minimum(m, self.fill_value * self.scalar_mult)
+        return m
 
     def mean(self) -> Array:
         return self.sum() / self.size
@@ -609,11 +637,15 @@ class SparseTensor(SparseMathMixin):
     def __deepcopy__(self, memo=None):
         return self.copy()
 
+    # astype / conj / real / imag are zero-preserving on the fill
+    # (cast(0)=conj(0)=real(0)=imag(0)=0), so carry the source's zero-fill flag
+    # through — otherwise a cast/conj inside jit would drop fast-path eligibility.
     def astype(self, dtype: DTypeLike, **kwargs) -> SparseTensor:
         return self.copy(
             val=self.val.astype(dtype, **kwargs) if self.val is not None else None,
             scalar_mult=self.scalar_mult.astype(dtype, **kwargs),
             fill_value=self.fill_value.astype(dtype, **kwargs),
+            zero_fill=self._zero_fill,
         )
 
     def conj(self) -> SparseTensor:
@@ -621,6 +653,7 @@ class SparseTensor(SparseMathMixin):
             val=jnp.conj(self.val) if self.val is not None else None,
             scalar_mult=jnp.conj(self.scalar_mult),
             fill_value=jnp.conj(self.fill_value),
+            zero_fill=self._zero_fill,
         )
 
     def conjugate(self) -> SparseTensor:
@@ -632,6 +665,7 @@ class SparseTensor(SparseMathMixin):
             val=jnp.real(self.val) if self.val is not None else None,
             scalar_mult=jnp.real(self.scalar_mult),
             fill_value=jnp.real(self.fill_value),
+            zero_fill=self._zero_fill,
         )
 
     @property
@@ -640,6 +674,7 @@ class SparseTensor(SparseMathMixin):
             val=jnp.imag(self.val) if self.val is not None else None,
             scalar_mult=jnp.imag(self.scalar_mult),
             fill_value=jnp.imag(self.fill_value),
+            zero_fill=self._zero_fill,
         )
 
     def item(self):
@@ -1040,4 +1075,7 @@ def _apply_block_diagonal(
 
 
 def sparse_tensor_zeros_like(st: SparseTensor) -> SparseTensor:
-    return _copy(st, jnp.zeros_like(st.val), jnp.array(1.0), jnp.array(0.0))
+    # Definitionally zero-fill → keep the fast-path flag (the explicit 0.0 fill
+    # would otherwise re-probe to False inside jit).
+    return _copy(st, jnp.zeros_like(st.val), jnp.array(1.0), jnp.array(0.0),
+                 zero_fill=True)

@@ -46,6 +46,11 @@ def _is_sparse(obj) -> bool:
     return False
 
 
+# Sentinel for ``_copy(zero_fill=...)``: ``_KEEP_ZF`` ⇒ derive the flag the
+# default way; any other value (incl. None / True / False) is used verbatim.
+_KEEP_ZF = object()
+
+
 # --- Shared primitives (elementwise + matmul) ----------------------------
 
 
@@ -319,7 +324,8 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
 # --- Construction / mutation --------------------------------------------
 def _copy(st: SparseTensor, val: Array | None = None, scalar_mult: Array | None = None,
           fill_value: Array | None = None, out_dims: Sequence[Index] | None = None,
-          primal_dims: Sequence[Index] | None = None, deep: bool = False):
+          primal_dims: Sequence[Index] | None = None, deep: bool = False,
+          zero_fill=_KEEP_ZF):
     from graphax.sparse.tensor import SparseTensor
     s = scalar_mult if scalar_mult is not None else st.scalar_mult
     f = fill_value if fill_value is not None else st.fill_value
@@ -329,10 +335,15 @@ def _copy(st: SparseTensor, val: Array | None = None, scalar_mult: Array | None 
     if deep:
         v = copy.deepcopy(v) if v is not None else None
         s = copy.deepcopy(s); od = copy.deepcopy(od); pd = copy.deepcopy(pd)
-    # Preserve the source's zero-fill flag whenever ``fill_value`` is unchanged
-    # — otherwise inside jit a fresh tracer would force the constructor to
-    # conservatively report ``False`` and we'd lose the fast-path eligibility.
-    zf = getattr(st, "_zero_fill", None) if fill_value is None else None
+    # Zero-fill flag: an explicit ``zero_fill`` wins (a zero-preserving op like
+    # neg/astype/conj passes the source flag); else preserve when ``fill_value``
+    # is unchanged, otherwise re-probe. Preserving matters inside jit, where a
+    # fresh traced fill would force the ctor to conservatively report ``False``
+    # and lose fast-path eligibility.
+    if zero_fill is not _KEEP_ZF:
+        zf = zero_fill
+    else:
+        zf = getattr(st, "_zero_fill", None) if fill_value is None else None
     return SparseTensor(
         od, pd, v,
         scalar_mult=s, fill_value=f,

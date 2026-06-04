@@ -424,7 +424,7 @@ def _eliminate_vertex(
                         ]:  # Do we need the [::-1] here?
                             _edge = transform.apply_inverse(_edge)
 
-                    _assert_sparse_tensor_consistency(edge_outval)
+                    _assert_sparse_tensor_consistency(_edge)
 
                     # Check if the computed edge Jacobian shapes actually match
                     # what we expect
