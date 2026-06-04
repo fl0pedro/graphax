@@ -63,19 +63,29 @@ def _compressed_dims(tensor) -> list:
             if getattr(d, "is_compressed", False)]
 
 
-def _rewrap(tensor, out_dims, primal_dims, val):
+_KEEP_FILL = object()
+
+
+def _rewrap(tensor, out_dims, primal_dims, val, fill_value=_KEEP_FILL):
     """Re-emit ``tensor`` with new dims/val, carrying scalar_mult / fill_value /
-    zero_fill (the shared tail of every densify branch)."""
+    zero_fill (the shared tail of every densify branch).
+
+    ``fill_value`` defaults to the source's, but SetIndex densify branches
+    override it with the COMBINED ``op(fill_lhs, fill_rhs)``: the source carries
+    a per-side fill (scalar or tuple), whereas the densified result's implicit
+    cells hold the op-combined fill that ``densify_axis`` / ``to_meta_blocks``
+    already stitch into the data (L3)."""
     from graphax.sparse.tensor import SparseTensor
 
+    fv = tensor.fill_value if fill_value is _KEEP_FILL else fill_value
     return SparseTensor(
         out_dims, primal_dims, val,
-        scalar_mult=tensor.scalar_mult, fill_value=tensor.fill_value,
+        scalar_mult=tensor.scalar_mult, fill_value=fv,
         check_consistency=False, zero_fill=getattr(tensor, "_zero_fill", None),
     )
 
 
-def _dense_pair_result(tensor, dense, K):
+def _dense_pair_result(tensor, dense, K, fill_value=_KEEP_FILL):
     """Wrap a fully-materialized ``dense`` array as a K-pair ``DenseIndex``
     tensor (out axes 0..K-1, primal axes K..2K-1), reusing the source dim ids."""
     from graphax.sparse.indexes import DenseIndex
@@ -85,7 +95,7 @@ def _dense_pair_result(tensor, dense, K):
         DenseIndex(tensor.primal_dims[i].id, dense.shape[K + i], K + i)
         for i in range(K)
     )
-    return _rewrap(tensor, out, primal, dense)
+    return _rewrap(tensor, out, primal, dense, fill_value=fill_value)
 
 
 def _densify_compressed_dims(tensor, compact: bool = False):
@@ -128,13 +138,19 @@ def _densify_compressed_dims(tensor, compact: bool = False):
     if pure_pair and len(set_dims) == 2 and isinstance(tensor.val, jax.Array):
         sx = tensor.out_dims[0]
         o, p = tensor.out_dims[0], tensor.primal_dims[0]
+        # The densified data's implicit cells hold op(fill_lhs, fill_rhs); the
+        # result tensor's fill must match that combined value, not the raw
+        # per-side fill (L3).
+        fl, fr = (fill if isinstance(fill, tuple) else (fill, fill))
+        set_fill = sx._op()(fl, fr)
         if compact:  # SetIndex always reduces to a meta-block-diagonal
             meta = sx.to_meta_blocks(tensor.val, fill)  # (M, LCM_h, LCM_w, *L)
             M, H, W = meta.shape[0], meta.shape[1], meta.shape[2]
             return _rewrap(tensor, (DiagonalIndex(o.id, M, 0, p.id, H, 1),),
-                           (DiagonalIndex(p.id, M, 0, o.id, W, 2),), meta)
+                           (DiagonalIndex(p.id, M, 0, o.id, W, 2),), meta,
+                           fill_value=set_fill)
         dense = sx.densify_axis(tensor.val, fill)  # (M*LCM_h, M*LCM_w, *L)
-        return _dense_pair_result(tensor, dense, 1)
+        return _dense_pair_result(tensor, dense, 1, fill_value=set_fill)
 
     # --- K=1 banded pair (Array val) ---
     if pure_pair and len(banded) == 2 and isinstance(tensor.val, jax.Array):
@@ -175,7 +191,9 @@ def _densify_compressed_dims(tensor, compact: bool = False):
             dense = sx._op()(lhs_dense, rhs_dense)
         else:
             dense = sx._op()(lhs_dense, fill_rhs)
-        return _dense_pair_result(tensor, dense, K)
+        # Result fill is the op-combined per-side fill (L3), matching the data.
+        return _dense_pair_result(tensor, dense, K,
+                                  fill_value=sx._op()(fill_lhs, fill_rhs))
 
     # --- K≥2 banded (multi-axis interleaved Array val) ---
     if (banded and len(banded) == 2 * K and isinstance(tensor.val, jax.Array)

@@ -103,8 +103,19 @@ class BandedIndex(Index):
 
         ``size`` is the meta count (``n_meta * M_primary``); the per-batch
         primary count is ``size // n_meta``, which must equal ``n_secondary``
-        for the band to be square-diagonal."""
+        for the band to be square-diagonal.
+
+        Only the PRIMARY side can self-determine this: on a col-primary
+        (``primary=False``) index ``size // n_meta`` is the *secondary* meta
+        count, so the ``!= n_secondary`` test would be vacuously satisfied
+        (``n_secondary != n_secondary``) and wrongly report a non-square band as
+        diagonal. The true row count lives on the partner, which a pure method
+        can't see, so a non-primary index conservatively reports ``False``
+        (densify fully) — never wrong, just less compact. In practice the only
+        caller picks the primary side, so this is a latent-safety guard."""
         if self.band_width != 1:
+            return False
+        if not self.primary:
             return False
         m_primary = self.size // self.n_meta
         if self.n_secondary >= 0 and self.n_secondary != m_primary:
@@ -217,6 +228,11 @@ class SetIndex(Index):
         if rhs_blocks is not None:
             rhs_meta = _block_diag_per_meta(rhs_blocks, fill_rhs)
             return op(lhs_meta, rhs_meta)
+        # include_remainder=False ⟹ the rhs buffer is omitted because the rhs
+        # has NO explicit blocks: it is ``fill_rhs`` everywhere. So the exact
+        # densify is ``op(lhs_meta, fill_rhs)`` — for an intersection (multiply)
+        # with ``fill_rhs == 0`` this correctly yields 0 (``x ∩ ∅ = ∅``); it is
+        # not a data-zeroing bug but the right answer for an empty rhs.
         return op(lhs_meta, fill_rhs)
 
     def densify_axis(self, val, fill):
