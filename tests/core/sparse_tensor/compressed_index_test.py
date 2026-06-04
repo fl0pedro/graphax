@@ -148,6 +148,49 @@ class TestBandedIndexDensify(unittest.TestCase):
         self.assertTrue(jnp.allclose(got, ref, atol=1e-5))
 
 
+class TestBandedIndexDtype(unittest.TestCase):
+    """B4: the one-hot ``where(..., 0).sum`` densify must not corrupt the
+    dtype. A bool band densifies to bool (not int32), consistently across the
+    broadcast fast path and the streaming fallback."""
+
+    def _bool_band(self):
+        M, W, B = 4, 3, 2
+        data = (_n((M, W, B, B), 7) > 0)  # bool
+        bx = BandedIndex(
+            id=0, size=M * B, axis=0, other_id=1, block_size=B, block_axis=1,
+            band_width=W, offset=(), primary=True, n_secondary=M, n_meta=1,
+        )
+        return bx, data
+
+    def test_bool_band_stays_bool_fast_path(self):
+        bx, data = self._bool_band()
+        out = bx.densify_axis(data, jnp.array(False))
+        self.assertEqual(out.dtype, jnp.bool_)
+        # In-band cells equal the packed bool; out-of-band equal the bool fill.
+        ref = _dense_band_ref(data.astype(jnp.float32), fill=0.0) > 0
+        self.assertTrue(jnp.array_equal(out, ref))
+
+    def test_bool_band_stays_bool_streaming(self):
+        bx, data = self._bool_band()
+        fast = bx.densify_axis(data, jnp.array(False))
+        orig = bs._BLOCK_BANDED_BROADCAST_LIMIT
+        try:
+            bs._BLOCK_BANDED_BROADCAST_LIMIT = 1
+            streamed = bx.densify_axis(data, jnp.array(False))
+        finally:
+            bs._BLOCK_BANDED_BROADCAST_LIMIT = orig
+        self.assertEqual(streamed.dtype, jnp.bool_)
+        self.assertTrue(jnp.array_equal(streamed, fast))
+
+    def test_bool_band_nonzero_fill(self):
+        bx, data = self._bool_band()
+        out = bx.densify_axis(data, jnp.array(True))
+        self.assertEqual(out.dtype, jnp.bool_)
+        ref = _dense_band_ref(data.astype(jnp.float32), fill=2.0)
+        # fill cells (==2.0) → True; in-band keep the packed bool.
+        self.assertTrue(jnp.array_equal(out, (ref > 0)))
+
+
 class TestBandedIndexNMetaRegression(unittest.TestCase):
     """CR-1: the large-band streaming fallback must NOT drop n_meta batches."""
 

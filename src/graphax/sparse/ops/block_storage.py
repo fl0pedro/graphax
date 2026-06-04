@@ -171,8 +171,11 @@ def _to_dense_banded(
     # zero), so when ``fill_value`` is a static zero (CR-4 — the matmul path
     # always builds ``fill=0``) this mask is a no-op; skip it to avoid a second
     # dense-sized boolean + where over the whole output.
+    # The one-hot ``where(..., 0).sum`` above promotes the dtype (a bool band
+    # becomes int32); cast back to the input dtype so densify is dtype-stable
+    # (B4 — and consistent with the streaming fallback).
     if skip_fill_mask or _is_static_zero(fill_value):
-        return out_meta
+        return out_meta.astype(data.dtype)
     blk_i = jnp.arange(M_primary * B_p) // B_p
     blk_j = jnp.arange(M_secondary * B_s) // B_s
     if centered_w is not None:
@@ -185,7 +188,7 @@ def _to_dense_banded(
     in_band = (diff >= 0) & (diff < W)
     if L:
         in_band = in_band[(..., *L_pad)]
-    return jnp.where(in_band, out_meta, fill_value)
+    return jnp.where(in_band, out_meta, fill_value).astype(data.dtype)
 
 
 def _centered_offset(offset: tuple[int, ...], W: int) -> bool:
@@ -286,6 +289,19 @@ def _densify_band(
         branch in ``_to_dense_banded``.
       * **CR-4**: the out-of-band fill mask is skipped when ``fill_value`` is
         a static zero.
+
+    Padding contract (B5): ``W`` is the *max* per-primary span, so a row whose
+    true band is narrower than ``W`` has padding slots ``w in [span_p, W)`` in
+    ``data[p]``. Those slots map to in-matrix secondary blocks ``offset[p]+w``
+    that lie OUTSIDE the row's true band, so this kernel *places* them — it has
+    no per-row width to mask them against. The invariant that keeps this
+    correct is that **padding slots hold ``fill_value``**. The only producer
+    (``_pack_dense_to_banded``) guarantees this structurally: the dense matmul
+    output at an out-of-band ``(p, offset[p]+w)`` block is exactly zero (the
+    contraction couples no indices there) and matmul fill is zero, so padding ==
+    fill. A hand-built ``BandedIndex`` with non-uniform spans MUST therefore
+    zero its padding slots; representing non-uniform bands exactly (per-row
+    widths) is a deliberate non-goal of the rectangular ``(M_p, W, …)`` layout.
     """
     L_pad = (None,) * len(L)
     centered = (not offset) or _centered_offset(offset, W)
@@ -508,7 +524,10 @@ def _densify_multi_banded(
     for i in range(K):
         if col[i]:
             out = out.swapaxes(i, K + i)
-    return out
+    # The one-hot ``where(..., 0).sum`` (and the streaming ``out + piece``
+    # accumulator) promote the dtype; cast back so a bool band stays bool (B4,
+    # matching the single-axis ``_to_dense_banded`` and ``_per_band_stream``).
+    return out.astype(data_k.dtype)
 
 
 # ----------------------------------------------------------------------------

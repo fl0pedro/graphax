@@ -185,7 +185,15 @@ def _align_value(value, tensor, sp, dp, axes, broadcast_unused, is_left):
     return jnp.broadcast_to(value, tuple(target_shape) + tuple(broadcast_unused))
 
 
-def _promote_to_unified(value: Array, metrics, is_left: bool) -> Array:
+def _promote_to_unified(value: Array, metrics, is_left: bool, fill: Array) -> Array:
+    # ``fill`` is the operand's POST-scaled fill (``_scaled_fill``): ``value``
+    # arrives already scaled by ``scalar_mult`` (``_align_value``), so the
+    # off-diagonal LCM-grid cells — positions where this operand has no block,
+    # i.e. its implicit fill — must hold the scaled fill, not a literal 0 (B3).
+    # For the common zero-fill operand this is 0 (unchanged); for a non-zero
+    # fill it makes ``op(promote(lhs), promote(rhs))`` produce the correct
+    # ``op(fill_lhs, fill_rhs)`` off the diagonal.
+    fill = jnp.asarray(fill, value.dtype)
     in_shape, exp_shape, out_shape = [], [], []
     needs_expansion = False
     for m in metrics:
@@ -244,7 +252,7 @@ def _promote_to_unified(value: Array, metrics, is_left: bool) -> Array:
             v = value.reshape(M, exp, 1, b1, b2, *rem)
             mask_shape = [1, exp, exp, 1, 1] + [1] * len(rem)
             eye = jnp.eye(exp, dtype=jnp.bool_).reshape(mask_shape)
-            v = jnp.where(eye, v, jnp.array(0, dtype=value.dtype))
+            v = jnp.where(eye, v, fill)
             return v.transpose([0, 1, 3, 2, 4] + list(range(5, 5 + len(rem)))) \
                     .reshape(M, cb1, cb2, *rem)
 
@@ -269,7 +277,7 @@ def _promote_to_unified(value: Array, metrics, is_left: bool) -> Array:
                 em = jnp.logical_and(eye_h, eye_w)
                 mask = em if mask is None else mask & em
         if mask is not None:
-            value = jnp.where(mask, value, jnp.array(0, dtype=value.dtype))
+            value = jnp.where(mask, value, fill)
     perm = generate_block_permutation(len(metrics), 5, [0, 1, 3, 2, 4])
     perm.extend(range(5 * len(metrics), len(exp_shape)))
     if perm != list(range(len(perm))):
@@ -707,7 +715,8 @@ def elementwise(
     bus = list(jnp.broadcast_shapes(tuple(ul), tuple(ur)))
     vl = _align_value(vl, lhs, sp, dp, al, bus, True)
     vr = _align_value(vr, rhs, sp, dp, ar, bus, False)
-    res = op(_promote_to_unified(vl, metrics, True), _promote_to_unified(vr, metrics, False))
+    res = op(_promote_to_unified(vl, metrics, True, _scaled_fill(lhs)),
+             _promote_to_unified(vr, metrics, False, _scaled_fill(rhs)))
     res, out_meta = _demote_intersection(res, metrics, is_intersection)
     out = _reconstruct_result(res, lhs, sp, dp, out_meta, op, rhs)
     if count:
