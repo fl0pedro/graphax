@@ -1,15 +1,20 @@
-"""Feature pin: `sparsity_map` plumbs through `jacve` and `apply_dynamic_sparsity`.
+"""Feature pin: per-vertex Jacobian ``transforms`` plumb through ``jacve``.
 
-`sparsity_map` is `Sequence[(vertex_id, ((idx1, idx2[, factor]), ...))]`. For
-each elimination step on `vertex_id`, the listed dimension pairs of the
-composed edge are forced sparse via `apply_dynamic_sparsity`. The pin checks:
+``transforms`` is the successor to the old ``sparsity_map`` (which fed the
+removed ``apply_dynamic_sparsity``). It is
+``Sequence[(vertex_id, Sequence[Diag | Compress | Callable])]``: for each
+elimination step on ``vertex_id`` the listed transforms are applied IN ORDER to
+the composed edge Jacobian. A ``Diag(i, j, factor)`` block-diagonalises the
+logical-index pair ``(i, j)`` with block count ``factor``; a transform that
+doesn't fit the edge geometry is skipped (best-effort). This file pins the
+plumbing:
 
-1. `sparsity_map=None` (default) is a no-op — same Jacobian as without.
-2. `sparsity_map=()` (empty tuple) is also a no-op.
-3. The parameter is accepted on `jacve` and threaded through without crashing.
+1. ``transforms=None`` (default) is a no-op — same Jacobian as without.
+2. ``transforms=()`` (empty) is also a no-op.
+3. The parameter is accepted on ``jacve``.
 
-Verifying that `apply_dynamic_sparsity` produces *correct* sparser Jacobians
-is the responsibility of the sparse_tensor tests; here we're just pinning the
+Verifying that the transforms produce *correct* sparser Jacobians is the
+responsibility of the sparse_tensor / micro_action tests; here we only pin the
 plumbing.
 """
 
@@ -23,25 +28,25 @@ def _f(x, y):
     return jnp.sin(x * y).sum()
 
 
-def test_sparsity_map_none_is_noop():
+def test_transforms_none_is_noop():
     x = jnp.array([1.0, 2.0, 3.0])
     y = jnp.array([4.0, 5.0, 6.0])
     plain = jax.jit(jacve(_f, order="rev", argnums=(0, 1)))(x, y)
-    none = jax.jit(jacve(_f, order="rev", argnums=(0, 1), sparsity_map=None))(x, y)
+    none = jax.jit(jacve(_f, order="rev", argnums=(0, 1), transforms=None))(x, y)
     assert bool(tree_allclose(plain, none))
 
 
-def test_sparsity_map_empty_is_noop():
+def test_transforms_empty_is_noop():
     x = jnp.array([1.0, 2.0, 3.0])
     y = jnp.array([4.0, 5.0, 6.0])
     plain = jax.jit(jacve(_f, order="rev", argnums=(0, 1)))(x, y)
-    empty = jax.jit(jacve(_f, order="rev", argnums=(0, 1), sparsity_map=()))(x, y)
+    empty = jax.jit(jacve(_f, order="rev", argnums=(0, 1), transforms=()))(x, y)
     assert bool(tree_allclose(plain, empty))
 
 
-def test_sparsity_map_accepted_in_jacve_signature():
+def test_transforms_accepted_in_jacve_signature():
     """If someone reverts the signature change, this test fails immediately."""
     import inspect
 
     sig = inspect.signature(jacve)
-    assert "sparsity_map" in sig.parameters
+    assert "transforms" in sig.parameters

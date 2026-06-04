@@ -2,7 +2,7 @@
 
 `extract_jaxpr` JIT-traces the entire vertex elimination process and wraps
 the resulting jaxpr as a `VEJaxpr` for downstream consumers (e.g. alphagrad).
-The topology cache memoizes by (jaxpr, argnums, order, sparsity_map,
+The topology cache memoizes by (jaxpr, argnums, order, transforms,
 sparse_representation), so repeated calls with the same plan return the
 same cached object.
 """
@@ -68,8 +68,9 @@ def test_topology_cache_distinguishes_orders():
     assert ve_rev is not ve_fwd
 
 
-def test_extract_jaxpr_supports_sparsity_map():
-    """sparsity_map plumbed into the cache key (no rules == empty tuple)."""
+def test_extract_jaxpr_supports_transforms():
+    """per-vertex `transforms` plumbed into the cache key (no rules == empty
+    tuple). Successor to the removed `sparsity_map` parameter."""
     _topology_cache.clear()
     closed, args = _make_closed_jaxpr()
     base = dict(
@@ -79,5 +80,5 @@ def test_extract_jaxpr_supports_sparsity_map():
         args=args,
         consts=closed.literals,
     )
-    ve = extract_jaxpr(closed.jaxpr, **base, sparsity_map=())
+    ve = extract_jaxpr(closed.jaxpr, **base, transforms=())
     assert isinstance(ve, VEJaxpr)

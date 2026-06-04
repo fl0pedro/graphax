@@ -286,8 +286,12 @@ def _resolve_contract_pair(lp, ro, lhs_out_map, rhs_primal_map):
         rhs_ids.append(rp.id)
     return (
         Pair(
+            # logical_element_count = elements per contraction unit: the block
+            # size, or the dim size when the dim carries no block (block_size is
+            # present-but-None for dense/scalar contracting dims, so a getattr
+            # default never fires — use ``or`` to fall through), or 1.
             "contract",
-            getattr(lp, "block_size", getattr(lp, "size", 1)),
+            (getattr(lp, "block_size", None) or getattr(lp, "size", None) or 1),
             *_full_pair_data(lo, lp, ro, rp, swap_rhs=True),
         ),
         lhs_ids,
