@@ -703,7 +703,26 @@ def elementwise(
         if count:
             return out, n
         return out
-    sp, dp = _map_topology(lhs, rhs)
+    try:
+        sp, dp = _map_topology(lhs, rhs)
+    except ValueError as e:
+        if "Topology mismatch" not in str(e):
+            raise
+        # The two operands are logically the same shape but carry incompatible
+        # sparse encodings — e.g. two logically-equal broadcast Jacobians where
+        # one path produced an extra diagonal pair (the duplicate
+        # broadcast_in_dim pattern). There is no aligned sparse form to combine
+        # them in, so densify both to a common dense representation and combine
+        # there (the architectural boundary fallback). Correct, just not
+        # compressed for this op.
+        from .dense import dense as _dense
+        out = elementwise(
+            _dense(lhs, hard=True), _dense(rhs, hard=True), op,
+            is_intersection=is_intersection,
+        )
+        if count:
+            return out, n
+        return out
     metrics = [_pair_metric(p) for p in sp]
     vl, al, ul = _value_axes_info(lhs, sp, dp, True)
     vr, ar, ur = _value_axes_info(rhs, sp, dp, False)

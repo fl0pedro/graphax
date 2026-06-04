@@ -264,6 +264,23 @@ def _is_scalar_st(t) -> bool:
     return not t.out_dims and not t.primal_dims
 
 
+def _acts_as_identity(t) -> bool:
+    """Whether a structural (``val is None``) edge Jacobian acts as the
+    multiplicative identity in ``post @ pre`` — i.e. composing with it is a
+    pure pass-through.
+
+    A ``val is None`` tensor is the identity only when it is SHAPE-PRESERVING:
+    its out logical shape equals its primal logical shape. A broadcast /
+    reduction structural Jacobian (``val is None`` but e.g. out ``(4, 4)`` vs
+    primal ``(1, 4)`` — the duplicate ``broadcast_in_dim`` pattern) is NOT the
+    identity; passing it through unchanged drops the broadcast axis and yields
+    a wrong-shaped edge, so it must go through the real contraction instead."""
+    return (
+        tuple(d.logical_size for d in t.out_dims)
+        == tuple(d.logical_size for d in t.primal_dims)
+    )
+
+
 def _eliminate_vertex(
     vertex: int,
     jaxpr: core.Jaxpr,
@@ -351,8 +368,18 @@ def _eliminate_vertex(
                 else:
                     _pre_val = pre_val.copy()
 
-                # Multiply the two values of the edges if applicable
-                if pre_val.val is not None and post_val.val is not None:
+                # Multiply the two values of the edges if applicable. The real
+                # contraction runs whenever both edges carry values OR a
+                # ``val is None`` operand is a non-identity structural Jacobian
+                # (a broadcast / reduction — see ``_acts_as_identity``); the
+                # pass-through shortcuts below are only valid when the val-less
+                # operand truly acts as the identity.
+                _need_contract = (
+                    (pre_val.val is not None and post_val.val is not None)
+                    or (post_val.val is None and not _acts_as_identity(_post_val))
+                    or (pre_val.val is None and not _acts_as_identity(_pre_val))
+                )
+                if _need_contract:
                     if count_ops:
                         edge_outval, (_a, _m, _f) = sparse_matmul(
                             _post_val, _pre_val, count=True
