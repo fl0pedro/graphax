@@ -320,29 +320,36 @@ def _eliminate_vertex(
             _post_raw = _force(graph[central_var][out_edge])
             if _post_raw is None:
                 continue  # no Jacobian for this out-edge; skip
-            post_val = _post_raw.copy()
+            # ``_post_raw`` / ``_pre_raw`` come straight from the memoized
+            # ``_force`` cache; ``post_val`` / ``pre_val`` only READ them (their
+            # transform lists + ``.val``) and are never used after the working
+            # values are built, so they can alias the cache directly — the
+            # private working copies below absorb every in-place mutation
+            # (a defensive ``.copy()`` of these read-only bases was pure
+            # per-edge overhead on the O(E²) AD hot path).
+            post_val = _post_raw
             for in_edge in transpose_graph[central_var].keys():
                 _pre_raw = _force(transpose_graph[central_var][in_edge])
                 if _pre_raw is None:
                     continue  # no Jacobian (e.g. stop_gradient blocks grad); skip
-                pre_val = _pre_raw.copy()
+                pre_val = _pre_raw
 
                 # TODO implement a process that discards unnecessary edges from the computation
 
                 # Handle stuff like reshape, squeeze etc.
-                # Apply Jacobian transforms where applicable
-                _pre_val = pre_val.copy()
-                _post_val = post_val.copy()
-
-                # print(f"{in_edge}-->{central_var}-->{out_edge}")
-                # print("post:", _post_val)
-                # print("pre:", _pre_val)
-
+                # Apply Jacobian transforms where applicable. ``unload_*``
+                # already returns a fresh tensor, so only copy in the no-
+                # transform branch — copying *then* overwriting with the unload
+                # result (the old code) wasted a full tensor copy per edge.
                 if len(pre_val.post_transforms) > 0 and post_val.val is not None:
                     _post_val = unload_post_transforms(post_val, pre_val)
+                else:
+                    _post_val = post_val.copy()
 
                 if len(post_val.pre_transforms) > 0 and pre_val.val is not None:
                     _pre_val = unload_pre_transforms(post_val, pre_val)
+                else:
+                    _pre_val = pre_val.copy()
 
                 # Multiply the two values of the edges if applicable
                 if pre_val.val is not None and post_val.val is not None:
