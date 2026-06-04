@@ -21,7 +21,7 @@ from graphax.sparse.ops.elementwise import elementwise
 from graphax.sparse.ops.matmul import matmul
 from graphax.sparse.ops.transpose import transpose
 from graphax.sparse.ops.utils import (
-    _KEEP_ZF as _KEEP_ZF,
+    _KEEP as _KEEP_ZF,
     _arr2st,
     _assert_sparse_tensor_consistency,
     _copy,
@@ -531,55 +531,58 @@ class SparseTensor(SparseMathMixin):
         reduction (a dense tensor has no off-diagonal fill positions)."""
         return self.size - (0 if self.val is None else self.val.size)
 
-    @_on_materialized
-    def all(self) -> Array:
+    def _bool_reduce(self, reduce_fn, fold_fn, empty) -> Array:
+        """Shared skeleton for all()/any(): reduce the scaled stored values
+        (``empty`` when pure-structure), then fold the implicit fill's
+        truthiness in only when fill cells exist."""
         val_part = (
-            jnp.all(self.val * self.scalar_mult) if self.val is not None else True
+            reduce_fn(self.val * self.scalar_mult) if self.val is not None else empty
         )
-        if self._n_fill_cells > 0:  # fill cells exist → they must be truthy too
-            return jnp.logical_and(val_part, self.fill_value * self.scalar_mult != 0)
+        if self._n_fill_cells > 0:  # fill cells exist → fold their truthiness
+            return fold_fn(val_part, self.fill_value * self.scalar_mult != 0)
         return jnp.asarray(val_part)
 
     @_on_materialized
+    def all(self) -> Array:
+        return self._bool_reduce(jnp.all, jnp.logical_and, True)
+
+    @_on_materialized
     def any(self) -> Array:
-        val_part = (
-            jnp.any(self.val * self.scalar_mult) if self.val is not None else False
-        )
-        if self._n_fill_cells > 0:
-            return jnp.logical_or(val_part, self.fill_value * self.scalar_mult != 0)
-        return jnp.asarray(val_part)
+        return self._bool_reduce(jnp.any, jnp.logical_or, False)
 
     @_on_materialized
     def sum(self) -> Array:
         # The fill term vanishes when _n_fill_cells == 0, so no guard needed.
-        val_part = 0.0 if self.val is None else jnp.sum(self.val * self.scalar_mult)
+        # Seed with a weak Python ``0`` (not ``0.0``) so an integer tensor's
+        # reduction stays integer rather than promoting to float.
+        val_part = 0 if self.val is None else jnp.sum(self.val * self.scalar_mult)
         return val_part + (self.fill_value * self.scalar_mult) * self._n_fill_cells
 
     @_on_materialized
     def prod(self) -> Array:
-        # fill ** 0 == 1 when _n_fill_cells == 0, so no guard needed.
-        val_part = 1.0 if self.val is None else jnp.prod(self.val * self.scalar_mult)
+        # fill ** 0 == 1 when _n_fill_cells == 0, so no guard needed. Weak ``1``
+        # (not ``1.0``) keeps an integer tensor's product integer.
+        val_part = 1 if self.val is None else jnp.prod(self.val * self.scalar_mult)
         return val_part * (self.fill_value * self.scalar_mult) ** self._n_fill_cells
+
+    def _extremum(self, reduce_fn, fold_fn) -> Array:
+        """Shared skeleton for max()/min(): scale BEFORE the extremum (a negative
+        scalar_mult reverses order), fold the scaled fill only when implicit fill
+        cells exist. Pure-structure tensors are just the scaled fill."""
+        if self.val is None:
+            return self.fill_value * self.scalar_mult
+        m = reduce_fn(self.val * self.scalar_mult)
+        if self._n_fill_cells > 0:
+            m = fold_fn(m, self.fill_value * self.scalar_mult)
+        return m
 
     @_on_materialized
     def max(self) -> Array:
-        # Scale BEFORE the extremum (a negative scalar_mult reverses order), and
-        # only fold fill when implicit fill cells exist.
-        if self.val is None:
-            return self.fill_value * self.scalar_mult
-        m = jnp.max(self.val * self.scalar_mult)
-        if self._n_fill_cells > 0:
-            m = jnp.maximum(m, self.fill_value * self.scalar_mult)
-        return m
+        return self._extremum(jnp.max, jnp.maximum)
 
     @_on_materialized
     def min(self) -> Array:
-        if self.val is None:
-            return self.fill_value * self.scalar_mult
-        m = jnp.min(self.val * self.scalar_mult)
-        if self._n_fill_cells > 0:
-            m = jnp.minimum(m, self.fill_value * self.scalar_mult)
-        return m
+        return self._extremum(jnp.min, jnp.minimum)
 
     def mean(self) -> Array:
         return self.sum() / self.size

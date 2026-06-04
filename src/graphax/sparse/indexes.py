@@ -3,6 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+def _split_fill(fill):
+    """Per-side ``(fill_lhs, fill_rhs)`` for a ``SetIndex`` fill, which may be a
+    single shared value or an explicit ``(lhs, rhs)`` tuple."""
+    return fill if isinstance(fill, tuple) else (fill, fill)
+
+
 @dataclass(frozen=True)
 class Index:
     """Unified dim descriptor.
@@ -202,6 +208,14 @@ class SetIndex(Index):
 
         return _jnp.multiply if self.semantic == "intersection" else _jnp.add
 
+    def combined_fill(self, fill):
+        """The op-combined implicit-cell fill ``op(fill_lhs, fill_rhs)`` that
+        densify stitches off the meta-diagonal — i.e. the ``fill_value`` of the
+        materialized result tensor. The single source of truth for "what fill
+        does densifying this SetIndex produce" (used by both the densify kernels
+        here and the op-boundary re-wrap in ``ops/utils``)."""
+        return self._op()(*_split_fill(fill))
+
     def _split(self, val):
         """Split the concatenated 1-D ``val`` back into ``(lhs_blocks,
         rhs_blocks)`` (rhs ``None`` when ``include_remainder`` is False)."""
@@ -222,7 +236,7 @@ class SetIndex(Index):
         from graphax.sparse.ops.block_storage import _block_diag_per_meta
 
         lhs_blocks, rhs_blocks = self._split(val)
-        fill_lhs, fill_rhs = (fill if isinstance(fill, tuple) else (fill, fill))
+        fill_lhs, fill_rhs = _split_fill(fill)
         op = self._op()
         lhs_meta = _block_diag_per_meta(lhs_blocks, fill_lhs)
         if rhs_blocks is not None:
@@ -241,9 +255,8 @@ class SetIndex(Index):
         (gather-free; mirrors the legacy ``DivisorRemainder.to_dense``)."""
         from graphax.sparse.ops.block_storage import _stitch_meta
 
-        fill_lhs, fill_rhs = (fill if isinstance(fill, tuple) else (fill, fill))
         per_meta = self.to_meta_blocks(val, fill)
-        return _stitch_meta(per_meta, self._op()(fill_lhs, fill_rhs))
+        return _stitch_meta(per_meta, self.combined_fill(fill))
 
 
 def DenseIndex(id: int, size: int, axis: int | None) -> Index:

@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-from graphax.sparse.indexes import Index, DenseIndex, DiagonalIndex
+from graphax.sparse.indexes import Index, DenseIndex, DiagonalIndex, _split_fill
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
@@ -46,9 +46,11 @@ def _is_sparse(obj) -> bool:
     return False
 
 
-# Sentinel for ``_copy(zero_fill=...)``: ``_KEEP_ZF`` ⇒ derive the flag the
-# default way; any other value (incl. None / True / False) is used verbatim.
-_KEEP_ZF = object()
+# Shared "keep the default" sentinel for optional override kwargs: passed
+# verbatim ⇒ derive the value the default way; any other value (incl.
+# None / True / False) is used as the explicit override. Used by both
+# ``_copy(zero_fill=...)`` and ``_rewrap/_dense_pair_result(fill_value=...)``.
+_KEEP = object()
 
 
 # --- Shared primitives (elementwise + matmul) ----------------------------
@@ -63,10 +65,7 @@ def _compressed_dims(tensor) -> list:
             if getattr(d, "is_compressed", False)]
 
 
-_KEEP_FILL = object()
-
-
-def _rewrap(tensor, out_dims, primal_dims, val, fill_value=_KEEP_FILL):
+def _rewrap(tensor, out_dims, primal_dims, val, fill_value=_KEEP):
     """Re-emit ``tensor`` with new dims/val, carrying scalar_mult / fill_value /
     zero_fill (the shared tail of every densify branch).
 
@@ -77,7 +76,7 @@ def _rewrap(tensor, out_dims, primal_dims, val, fill_value=_KEEP_FILL):
     already stitch into the data (L3)."""
     from graphax.sparse.tensor import SparseTensor
 
-    fv = tensor.fill_value if fill_value is _KEEP_FILL else fill_value
+    fv = tensor.fill_value if fill_value is _KEEP else fill_value
     return SparseTensor(
         out_dims, primal_dims, val,
         scalar_mult=tensor.scalar_mult, fill_value=fv,
@@ -85,7 +84,7 @@ def _rewrap(tensor, out_dims, primal_dims, val, fill_value=_KEEP_FILL):
     )
 
 
-def _dense_pair_result(tensor, dense, K, fill_value=_KEEP_FILL):
+def _dense_pair_result(tensor, dense, K, fill_value=_KEEP):
     """Wrap a fully-materialized ``dense`` array as a K-pair ``DenseIndex``
     tensor (out axes 0..K-1, primal axes K..2K-1), reusing the source dim ids."""
     from graphax.sparse.indexes import DenseIndex
@@ -141,8 +140,7 @@ def _densify_compressed_dims(tensor, compact: bool = False):
         # The densified data's implicit cells hold op(fill_lhs, fill_rhs); the
         # result tensor's fill must match that combined value, not the raw
         # per-side fill (L3).
-        fl, fr = (fill if isinstance(fill, tuple) else (fill, fill))
-        set_fill = sx._op()(fl, fr)
+        set_fill = sx.combined_fill(fill)
         if compact:  # SetIndex always reduces to a meta-block-diagonal
             meta = sx.to_meta_blocks(tensor.val, fill)  # (M, LCM_h, LCM_w, *L)
             M, H, W = meta.shape[0], meta.shape[1], meta.shape[2]
@@ -184,7 +182,7 @@ def _densify_compressed_dims(tensor, compact: bool = False):
                              block_col=shape[3 * K + i], n_secondary=shape[2 * i])
                 for i in range(K)
             )
-        fill_lhs, fill_rhs = (fill if isinstance(fill, tuple) else (fill, fill))
+        fill_lhs, fill_rhs = _split_fill(fill)
         lhs_dense = _densify_multi_banded(lhs_blocks, _specs(sx.lhs_shape), fill_lhs)
         if rhs_blocks is not None:
             rhs_dense = _densify_multi_banded(rhs_blocks, _specs(sx.rhs_shape), fill_rhs)
@@ -192,8 +190,7 @@ def _densify_compressed_dims(tensor, compact: bool = False):
         else:
             dense = sx._op()(lhs_dense, fill_rhs)
         # Result fill is the op-combined per-side fill (L3), matching the data.
-        return _dense_pair_result(tensor, dense, K,
-                                  fill_value=sx._op()(fill_lhs, fill_rhs))
+        return _dense_pair_result(tensor, dense, K, fill_value=sx.combined_fill(fill))
 
     # --- K≥2 banded (multi-axis interleaved Array val) ---
     if (banded and len(banded) == 2 * K and isinstance(tensor.val, jax.Array)
@@ -343,7 +340,7 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
 def _copy(st: SparseTensor, val: Array | None = None, scalar_mult: Array | None = None,
           fill_value: Array | None = None, out_dims: Sequence[Index] | None = None,
           primal_dims: Sequence[Index] | None = None, deep: bool = False,
-          zero_fill=_KEEP_ZF):
+          zero_fill=_KEEP):
     from graphax.sparse.tensor import SparseTensor
     s = scalar_mult if scalar_mult is not None else st.scalar_mult
     f = fill_value if fill_value is not None else st.fill_value
@@ -358,7 +355,7 @@ def _copy(st: SparseTensor, val: Array | None = None, scalar_mult: Array | None 
     # is unchanged, otherwise re-probe. Preserving matters inside jit, where a
     # fresh traced fill would force the ctor to conservatively report ``False``
     # and lose fast-path eligibility.
-    if zero_fill is not _KEEP_ZF:
+    if zero_fill is not _KEEP:
         zf = zero_fill
     else:
         zf = getattr(st, "_zero_fill", None) if fill_value is None else None

@@ -192,8 +192,8 @@ def _promote_to_unified(value: Array, metrics, is_left: bool, fill: Array) -> Ar
     # i.e. its implicit fill — must hold the scaled fill, not a literal 0 (B3).
     # For the common zero-fill operand this is 0 (unchanged); for a non-zero
     # fill it makes ``op(promote(lhs), promote(rhs))`` produce the correct
-    # ``op(fill_lhs, fill_rhs)`` off the diagonal.
-    fill = jnp.asarray(fill, value.dtype)
+    # ``op(fill_lhs, fill_rhs)`` off the diagonal. The cast is deferred to the
+    # ``needs_expansion`` branches below — it is dead work when no axis expands.
     in_shape, exp_shape, out_shape = [], [], []
     needs_expansion = False
     for m in metrics:
@@ -221,6 +221,8 @@ def _promote_to_unified(value: Array, metrics, is_left: bool, fill: Array) -> Ar
     in_shape += rem; exp_shape += rem; out_shape += rem
     if value.shape != tuple(in_shape):
         value = value.reshape(in_shape)
+    if needs_expansion:  # only the expansion branches read ``fill`` (B3)
+        fill = jnp.asarray(fill, value.dtype)
 
     # Single-pair expansion fast path: scatter the ``exp`` source sub-blocks
     # directly into a zero-initialized ``(M, LCM_h, LCM_w)`` buffer instead of

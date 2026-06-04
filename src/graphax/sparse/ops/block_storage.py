@@ -91,6 +91,15 @@ def _stitch_meta(per_meta: Array, fill: Array) -> Array:
     return jnp.where(mask, gathered, fill)
 
 
+def _stable_dtype(out: Array, dtype) -> Array:
+    """Cast ``out`` back to a band's input ``dtype`` so the one-hot
+    ``where(..., 0).sum`` densify stays dtype-stable (a bool band must not
+    become int32 — B4). The cast is statically a no-op for the common float32
+    matmul path (``out.dtype == dtype``), so skip it then to avoid an identity
+    ``convert`` in the lowered HLO on the densify hot path."""
+    return out if out.dtype == dtype else out.astype(dtype)
+
+
 def _is_static_zero(x) -> bool:
     """True iff ``x`` is a compile-time-constant zero (Python scalar or a
     concrete, non-traced array equal to 0). Used to skip redundant
@@ -171,11 +180,8 @@ def _to_dense_banded(
     # zero), so when ``fill_value`` is a static zero (CR-4 — the matmul path
     # always builds ``fill=0``) this mask is a no-op; skip it to avoid a second
     # dense-sized boolean + where over the whole output.
-    # The one-hot ``where(..., 0).sum`` above promotes the dtype (a bool band
-    # becomes int32); cast back to the input dtype so densify is dtype-stable
-    # (B4 — and consistent with the streaming fallback).
     if skip_fill_mask or _is_static_zero(fill_value):
-        return out_meta.astype(data.dtype)
+        return _stable_dtype(out_meta, data.dtype)  # B4: see _stable_dtype
     blk_i = jnp.arange(M_primary * B_p) // B_p
     blk_j = jnp.arange(M_secondary * B_s) // B_s
     if centered_w is not None:
@@ -188,7 +194,7 @@ def _to_dense_banded(
     in_band = (diff >= 0) & (diff < W)
     if L:
         in_band = in_band[(..., *L_pad)]
-    return jnp.where(in_band, out_meta, fill_value).astype(data.dtype)
+    return _stable_dtype(jnp.where(in_band, out_meta, fill_value), data.dtype)
 
 
 def _centered_offset(offset: tuple[int, ...], W: int) -> bool:
@@ -524,10 +530,7 @@ def _densify_multi_banded(
     for i in range(K):
         if col[i]:
             out = out.swapaxes(i, K + i)
-    # The one-hot ``where(..., 0).sum`` (and the streaming ``out + piece``
-    # accumulator) promote the dtype; cast back so a bool band stays bool (B4,
-    # matching the single-axis ``_to_dense_banded`` and ``_per_band_stream``).
-    return out.astype(data_k.dtype)
+    return _stable_dtype(out, data_k.dtype)  # B4: see _stable_dtype
 
 
 # ----------------------------------------------------------------------------
