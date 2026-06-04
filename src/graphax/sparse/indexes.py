@@ -213,7 +213,13 @@ class SetIndex(Index):
         densify stitches off the meta-diagonal — i.e. the ``fill_value`` of the
         materialized result tensor. The single source of truth for "what fill
         does densifying this SetIndex produce" (used by both the densify kernels
-        here and the op-boundary re-wrap in ``ops/utils``)."""
+        here and the op-boundary re-wrap in ``ops/utils``).
+
+        A ``None`` (statically-zero) fill stays ``None``: densifying a zero-fill
+        SetIndex yields a zero-fill result, so the marker propagates and callers
+        need no separate None guard."""
+        if fill is None:
+            return None
         return self._op()(*_split_fill(fill))
 
     def _split(self, val):

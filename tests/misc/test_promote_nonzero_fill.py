@@ -48,3 +48,16 @@ def test_promote_nonzero_fill_multiply_matches_dense():
     got = np.asarray((a * b).dense())
     ref = np.asarray(a.dense()) * np.asarray(b.dense())
     np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-6)
+
+
+def test_intersection_path_nonzero_fill_matches_dense():
+    # The is_intersection=True path (mul_w_counts / `&`) SUMS over the LCM
+    # expansion axis; that compaction is only valid for zero fill. With a
+    # non-zero fill the demote must fall back to union-style reconstruction,
+    # else the B3 off-diagonal fill is summed in spuriously.
+    from graphax.sparse.ops.elementwise import mul_w_counts
+    a = _blockdiag(3, 2, 5, fill=0.5)
+    b = _blockdiag(2, 3, 6, fill=0.7)  # lcm(2,3)=6, dex=3 — the summed case
+    got = np.asarray(mul_w_counts(a, b)[0].dense())
+    ref = np.asarray(a.dense()) * np.asarray(b.dense())
+    np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-6)

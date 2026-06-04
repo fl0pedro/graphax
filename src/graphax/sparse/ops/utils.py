@@ -145,8 +145,8 @@ def _densify_compressed_dims(tensor, compact: bool = False):
         o, p = tensor.out_dims[0], tensor.primal_dims[0]
         # The densified data's implicit cells hold op(fill_lhs, fill_rhs); the
         # result tensor's fill must match that combined value, not the raw
-        # per-side fill (L3). A None (statically-zero) fill stays None.
-        set_fill = None if raw_fill is None else sx.combined_fill(raw_fill)
+        # per-side fill (L3). combined_fill keeps a None (statically-zero) None.
+        set_fill = sx.combined_fill(raw_fill)
         if compact:  # SetIndex always reduces to a meta-block-diagonal
             meta = sx.to_meta_blocks(tensor.val, fill)  # (M, LCM_h, LCM_w, *L)
             M, H, W = meta.shape[0], meta.shape[1], meta.shape[2]
@@ -196,9 +196,8 @@ def _densify_compressed_dims(tensor, compact: bool = False):
         else:
             dense = sx._op()(lhs_dense, fill_rhs)
         # Result fill is the op-combined per-side fill (L3), matching the data;
-        # a None (statically-zero) fill stays None.
-        set_fill = None if raw_fill is None else sx.combined_fill(raw_fill)
-        return _dense_pair_result(tensor, dense, K, fill_value=set_fill)
+        # combined_fill keeps a None (statically-zero) fill None.
+        return _dense_pair_result(tensor, dense, K, fill_value=sx.combined_fill(raw_fill))
 
     # --- K≥2 banded (multi-axis interleaved Array val) ---
     if (banded and len(banded) == 2 * K and isinstance(tensor.val, jax.Array)

@@ -712,7 +712,16 @@ def elementwise(
     vr = _align_value(vr, rhs, sp, dp, ar, bus, False)
     res = op(_promote_to_unified(vl, metrics, True, _scaled_fill(lhs)),
              _promote_to_unified(vr, metrics, False, _scaled_fill(rhs)))
-    res, out_meta = _demote_intersection(res, metrics, is_intersection)
+    # The intersection demote SUMS over the LCM-expansion axis, which is only
+    # valid when the off-intersection sub-blocks are zero — i.e. zero fill (for
+    # a multiplicative op, fill·data vanishes only when a fill is 0). With a
+    # non-zero fill the B3 off-diagonal fill written by _promote_to_unified
+    # would be summed in spuriously, so fall back to the union-style
+    # reconstruction (no sum), which yields the correct full elementwise result.
+    eff_intersection = (
+        is_intersection and _is_zero_fill(lhs) and _is_zero_fill(rhs)
+    )
+    res, out_meta = _demote_intersection(res, metrics, eff_intersection)
     out = _reconstruct_result(res, lhs, sp, dp, out_meta, op, rhs)
     if count:
         return out, n
