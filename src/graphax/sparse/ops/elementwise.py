@@ -26,10 +26,10 @@ if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
 
 
-# Ops where ``op(0, 0) == 0`` — used to propagate the static ``_zero_fill``
-# flag through elementwise-of-zero-fills. Hardcoded because jit-time numerical
-# probing always promotes operands to tracers, even concrete numpy zeros, so
-# we can't introspect ``op`` numerically inside the trace.
+# Ops where ``op(0, 0) == 0`` — used to keep the statically-zero ``fill_value``
+# marker (``None``) on an elementwise-of-zero-fills result. Hardcoded because
+# jit-time numerical probing always promotes operands to tracers, even concrete
+# numpy zeros, so we can't introspect ``op`` numerically inside the trace.
 _ZERO_PRESERVING_OPS = frozenset((
     jnp.add, jnp.subtract, jnp.multiply, jnp.maximum, jnp.minimum,
     jnp.logical_or, jnp.logical_and, jnp.logical_xor,
@@ -51,13 +51,14 @@ _ADDITIVE_IDENTITY_OPS = frozenset((
 
 
 def _scaled_fill(tensor) -> Array:
-    """Post-scaled fill_value: ``fill * scalar_mult`` (or ``& mask`` for bool).
+    """Post-scaled fill as a concrete array: ``fill * scalar_mult`` (or ``& mask``
+    for bool), with a ``None`` (statically-zero) fill read as 0 via ``_eff_fill``.
     Canonical form used to compose output fills consistently — every fast path
     must produce a fill that matches the post-scaled meaning of the input
     operands so downstream consumers see one definition."""
     if tensor.dtype == jnp.bool_:
-        return tensor.fill_value & tensor.scalar_mult.astype(jnp.bool_)
-    return tensor.fill_value * tensor.scalar_mult
+        return tensor._eff_fill & tensor.scalar_mult.astype(jnp.bool_)
+    return tensor._eff_fill * tensor.scalar_mult
 
 
 def _normalize_inputs(lhs, rhs):
@@ -335,26 +336,22 @@ def _reconstruct_result(value, lhs, sp, dp, output_meta, op, rhs):
         idx = tuple(0 if ax in info["squeeze"] else slice(None) for ax in range(value.ndim))
         value = value[idx]
     s_mult = jnp.array(True) if value.dtype == jnp.bool_ else jnp.array(1.0, dtype=value.dtype)
-    new_fill = op(_scaled_fill(lhs), _scaled_fill(rhs))
-    # Propagate the static zero-fill flag when both inputs have zero fill and
-    # ``op(0, 0) == 0`` — otherwise downstream matmuls drop to the densify
-    # fallback. We can't probe ``op`` numerically inside jit (any jax-side
-    # call produces a tracer regardless of operand concreteness), so we lean
-    # on a hard-coded set of zero-preserving ops covering the canonical
-    # elementwise primitives. Anything else: leave ``zf=None`` (constructor
-    # auto-detects, conservatively reporting ``False`` for tracer fills).
-    zf = None
-    lhs_zf = getattr(lhs, "_zero_fill", False)
-    rhs_zf = getattr(rhs, "_zero_fill", False)
-    if lhs_zf and rhs_zf and op in _ZERO_PRESERVING_OPS:
-        zf = True
+    # Result fill: ``None`` (statically zero) when both inputs are statically
+    # zero AND ``op(0, 0) == 0`` — so the output keeps fast-path eligibility.
+    # We can't probe ``op`` numerically inside jit (any jax call yields a tracer
+    # regardless of operand concreteness), so we lean on a hard-coded set of
+    # zero-preserving ops covering the canonical elementwise primitives.
+    # Otherwise compute the concrete combined fill (densify path downstream).
+    if lhs.fill_value is None and rhs.fill_value is None and op in _ZERO_PRESERVING_OPS:
+        new_fill = None
+    else:
+        new_fill = op(_scaled_fill(lhs), _scaled_fill(rhs))
     return SparseTensor(
         tuple(rec[d.id] for d in lhs.out_dims),
         tuple(rec[d.id] for d in lhs.primal_dims),
         value, scalar_mult=s_mult,
         fill_value=new_fill,
         check_consistency=False,
-        zero_fill=zf,
     )
 
 
@@ -466,11 +463,9 @@ def _emit_divisor_remainder(lhs, rhs, op, geom):
     rhs_shape = (M, n_rhs, b_b_h, b_b_w)
     combined = jnp.concatenate([lhs_v.reshape(-1), rhs_v.reshape(-1)])
 
-    new_fill = jnp.array(False) if bool_op else jnp.array(0.0, dtype=lhs.val.dtype)
     s_mult = jnp.array(True) if bool_op else jnp.array(1.0, dtype=lhs.val.dtype)
-    zf = (
-        getattr(lhs, "_zero_fill", False) and getattr(rhs, "_zero_fill", False)
-    ) or None
+    # Emitted only when both operands are statically zero-fill (gated upstream),
+    # so the output is statically zero-fill too: fill_value=None.
     out_id, primal_id = geom["out_id"], geom["primal_id"]
 
     out_ix = SetIndex(
@@ -485,8 +480,8 @@ def _emit_divisor_remainder(lhs, rhs, op, geom):
     )
     return SparseTensor(
         (out_ix,), (primal_ix,), combined,
-        scalar_mult=s_mult, fill_value=new_fill,
-        check_consistency=False, zero_fill=zf,
+        scalar_mult=s_mult, fill_value=None,
+        check_consistency=False,
     )
 
 
@@ -618,10 +613,8 @@ def _emit_multi_set(lhs, rhs, op, geom):
     rhs_band = _pack(rhs_v, "b")
     combined = jnp.concatenate([lhs_band.reshape(-1), rhs_band.reshape(-1)])
 
-    new_fill = jnp.array(False) if bool_op else jnp.array(0.0, dtype=lhs.val.dtype)
     s_mult = jnp.array(True) if bool_op else jnp.array(1.0, dtype=lhs.val.dtype)
-    zf = (getattr(lhs, "_zero_fill", False)
-          and getattr(rhs, "_zero_fill", False)) or None
+    # Gated on both operands statically zero-fill → output is too (fill_value=None).
     lhs_shape, rhs_shape = lhs_band.shape, rhs_band.shape
     sem = geom["semantic"]
 
@@ -641,8 +634,8 @@ def _emit_multi_set(lhs, rhs, op, geom):
         ))
     return SparseTensor(
         tuple(out_dims), tuple(primal_dims), combined,
-        scalar_mult=s_mult, fill_value=new_fill,
-        check_consistency=False, zero_fill=zf,
+        scalar_mult=s_mult, fill_value=None,
+        check_consistency=False,
     )
 
 

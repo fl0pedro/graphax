@@ -151,13 +151,13 @@ class TestZeroFillFlagSurvivesJit(unittest.TestCase):
     fell back to ``False``, and the matmul rerouted through the
     densify-then-dot_general fallback even for the canonical zero-fill case.
 
-    The fix caches the flag at SparseTensor construction (when fill_value is
-    still concrete) and propagates it through the pytree's static aux_data
-    so it survives jit. These tests pin that behavior:
+    The static-zero marker is now ``fill_value is None``: None lives in the
+    pytree treedef (static aux), so the distinction survives jit for free.
+    These tests pin that behavior:
 
-    1. The flag is statically ``True`` for default-construction zero fills.
-    2. The flag round-trips through ``jit(identity)`` (i.e. ``tree_unflatten``
-       restores it from aux_data).
+    1. ``fill_value is None`` for default-construction zero fills.
+    2. The None marker round-trips through ``jit(identity)`` (``tree_unflatten``
+       restores it from the treedef).
     3. A jit'd ``matmul`` of two zero-fill operands compiles to small HLO
        (proxy for "stayed on the tiled path, didn't materialize a dense
        intermediate") — the densify fallback would balloon the HLO with a
@@ -174,23 +174,24 @@ class TestZeroFillFlagSurvivesJit(unittest.TestCase):
         )
 
     def test_default_fill_is_static_zero(self):
-        """Default ``fill_value=None`` ⇒ ``jnp.array(0)`` ⇒ flag must be True."""
+        """Default fill ⇒ ``fill_value is None`` (the statically-zero marker)."""
         t = self._zero_fill_tensor((4, 6), 1)
-        self.assertTrue(t._zero_fill,
-                        "default-constructed SparseTensor must have _zero_fill=True")
+        self.assertIsNone(t.fill_value,
+                          "default-constructed SparseTensor must have fill_value=None")
 
     def test_explicit_nonzero_fill_is_static_false(self):
-        """Concretely non-zero fill ⇒ flag must be False (forces densify path)."""
+        """Concretely non-zero fill ⇒ not None (forces densify path)."""
         t = self._zero_fill_tensor((4, 6), 1,
                                    fill_value=jnp.array(0.5, dtype=jnp.float32))
-        self.assertFalse(t._zero_fill)
+        self.assertIsNotNone(t.fill_value)
 
     def test_flag_survives_jit_identity(self):
-        """``tree_unflatten`` after a jit must restore ``_zero_fill``. If aux_data
-        loses it, downstream ops downgrade silently to the densify path."""
+        """``tree_unflatten`` after a jit must restore the ``None`` fill marker
+        from the treedef. If it were lost, downstream ops downgrade silently to
+        the densify path."""
         t = self._zero_fill_tensor((4, 6), 1)
         t2 = jax.jit(lambda x: x)(t)
-        self.assertTrue(t2._zero_fill)
+        self.assertIsNone(t2.fill_value)
 
     def test_jitted_matmul_uses_tiled_path(self):
         """If the densify fallback fires, HLO carries a full ``dot`` over

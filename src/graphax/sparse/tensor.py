@@ -21,7 +21,7 @@ from graphax.sparse.ops.elementwise import elementwise
 from graphax.sparse.ops.matmul import matmul
 from graphax.sparse.ops.transpose import transpose
 from graphax.sparse.ops.utils import (
-    _KEEP as _KEEP_ZF,
+    _KEEP,
     _arr2st,
     _assert_sparse_tensor_consistency,
     _copy,
@@ -30,25 +30,13 @@ from graphax.sparse.ops.utils import (
 )
 
 
-def _compute_zero_fill_flag(fill_value) -> bool:
-    """Static probe: ``True`` iff ``fill_value`` is concretely known to be zero.
-
-    Called once at ``SparseTensor`` construction (where ``fill_value`` is still
-    a concrete jax/numpy/python scalar in the common case) so the flag can ride
-    along in the pytree's static aux_data, surviving jit tracing. If the value
-    is already a tracer (rare — happens only when the tensor is built inside
-    a traced function), we fall back to ``False`` (the densify path is correct
-    in all cases; we just lose the fast-path opportunity)."""
-    try:
-        return bool(np.all(np.asarray(fill_value) == 0))
-    except (
-        TypeError,
-        ValueError,
-        AttributeError,
-        jax.errors.TracerArrayConversionError,
-    ):
-        # Tracer or non-array; conservatively report non-zero.
-        return False
+def _map_fill(fill, fn):
+    """Apply a zero-preserving unary ``fn`` to a tensor's ``fill_value``,
+    propagating the ``None`` sentinel. ``fill_value is None`` means the fill is
+    statically zero (the fast-path marker); since ``fn`` preserves zero (neg /
+    abs / round / astype / conj / real / imag all map 0 → 0), ``None`` stays
+    ``None`` rather than materializing a concrete zero and losing the marker."""
+    return None if fill is None else fn(fill)
 
 
 Transform = Callable[["SparseTensor", "SparseTensor", Array], "SparseTensor"]
@@ -177,12 +165,12 @@ class SparseMathMixin:
         return elementwise(self, other, jax.lax.ge)
 
     def __neg__(self):
-        # Zero-preserving on the fill (-0 == 0) → carry the zero-fill flag so a
-        # negation inside jit doesn't force the next matmul onto the slow path.
+        # Zero-preserving on the fill (-0 == 0): ``_map_fill`` keeps a None fill
+        # None so a negation inside jit doesn't force the next matmul off the
+        # fast path.
         return self.copy(
             scalar_mult=-self.scalar_mult,
-            fill_value=-self.fill_value,
-            zero_fill=self._zero_fill,
+            fill_value=_map_fill(self.fill_value, lambda f: -f),
         )
 
     def __pos__(self):
@@ -196,8 +184,7 @@ class SparseMathMixin:
         return self.copy(
             val=jnp.abs(self.val) if self.val is not None else None,
             scalar_mult=jnp.abs(self.scalar_mult),
-            fill_value=jnp.abs(self.fill_value),
-            zero_fill=self._zero_fill,
+            fill_value=_map_fill(self.fill_value, jnp.abs),
         )
 
     @_on_materialized
@@ -211,8 +198,7 @@ class SparseMathMixin:
         return self.copy(
             val=jnp.round(self.val, ndigits) if self.val is not None else None,
             scalar_mult=jnp.round(self.scalar_mult, ndigits),
-            fill_value=jnp.round(self.fill_value, ndigits),
-            zero_fill=self._zero_fill,  # round(0)==0, zero-preserving
+            fill_value=_map_fill(self.fill_value, lambda f: jnp.round(f, ndigits)),
         )
 
 
@@ -238,7 +224,7 @@ class SparseTensor(SparseMathMixin):
     primal_dims: tuple[Index, ...]
     val: Array | None
     scalar_mult: Array
-    fill_value: Array
+    fill_value: Array | None  # None ⇒ statically-zero fill (fast-path marker)
     pre_transforms: tuple[Transform, ...]
     post_transforms: tuple[Transform, ...]
 
@@ -254,7 +240,6 @@ class SparseTensor(SparseMathMixin):
         pre_transforms: Sequence[Callable] | None = None,
         post_transforms: Sequence[Callable] | None = None,
         check_consistency=True,
-        zero_fill: bool | None = None,  # this depends on fill_value... should just be
         **kwargs,
     ):
         if val is not None and not hasattr(val, "dtype"):
@@ -275,13 +260,13 @@ class SparseTensor(SparseMathMixin):
         if val is not None and val.dtype != dtype:
             val = val.astype(dtype)
 
-        # A defaulted fill is concretely zero — record that directly so the
-        # zero-fill fast path survives construction INSIDE jit, where
-        # ``_compute_zero_fill_flag`` can't prove a traced ``jnp.array(0)`` zero.
-        default_fill = fill_value is None
-        if fill_value is None:
-            fill_value = jnp.array(0, dtype=dtype)
-
+        # ``fill_value is None`` is the canonical "statically-zero fill" marker:
+        # it lands in the pytree treedef (static aux), so it survives jit and
+        # lets matmul / elementwise branch onto the tiled fast path at trace
+        # time without re-probing a (possibly traced) value. A concrete array —
+        # even one that happens to equal 0 at runtime — is treated as "maybe
+        # non-zero" and takes the densify path. So a defaulted fill stays
+        # ``None`` rather than materializing a concrete ``jnp.array(0)``.
         self.out_dims = tuple(out_dims)
         self.primal_dims = tuple(primal_dims)
         self.val = val
@@ -289,11 +274,6 @@ class SparseTensor(SparseMathMixin):
         self.fill_value = fill_value
         self.pre_transforms = tuple(pre_transforms)
         self.post_transforms = tuple(post_transforms)
-        self._zero_fill = (
-            zero_fill if zero_fill is not None
-            else True if default_fill
-            else _compute_zero_fill_flag(fill_value)
-        )
 
         self._dynamic_keys = tuple(kwargs.keys())
         for k, v in kwargs.items():
@@ -320,12 +300,14 @@ class SparseTensor(SparseMathMixin):
             self.pre_transforms,
             self.post_transforms,
             dynamic_kwargs,
-            self._zero_fill,
         )
         return (children, aux_data)
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
+        # ``fill_value`` is a child: when it is None (statically-zero fill) the
+        # None lives in the treedef, so the static fast-path distinction is
+        # preserved across flatten/unflatten without a separate aux field.
         val, scalar_mult, fill_value = children
         (
             out_dims,
@@ -333,7 +315,6 @@ class SparseTensor(SparseMathMixin):
             pre_transforms,
             post_transforms,
             dynamic_kwargs,
-            zero_fill,
         ) = aux_data
         kwargs = dict(dynamic_kwargs)
 
@@ -345,7 +326,6 @@ class SparseTensor(SparseMathMixin):
         st.fill_value = fill_value
         st.pre_transforms = pre_transforms
         st.post_transforms = post_transforms
-        st._zero_fill = zero_fill
         st._dynamic_keys = tuple(kwargs.keys())
 
         for k, v in kwargs.items():
@@ -500,14 +480,21 @@ class SparseTensor(SparseMathMixin):
             return self.val.dtype
         return self.scalar_mult.dtype
 
+    @property
+    def _eff_fill(self) -> Array:
+        """The fill as a concrete array: ``fill_value`` itself, or a zero scalar
+        when ``fill_value is None`` (the statically-zero marker). Used wherever
+        the fill is consumed as a *value* (reductions, densify); the matmul /
+        elementwise fast-path dispatch instead tests ``fill_value is None``."""
+        return self.fill_value if self.fill_value is not None else jnp.zeros((), self.dtype)
+
     def copy(
         self,
         val: Array | None = None,
         scalar_mult: Array | None = None,
-        fill_value: Array | None = None,
-        zero_fill=_KEEP_ZF,
+        fill_value=_KEEP,
     ):
-        return _copy(self, val, scalar_mult, fill_value, zero_fill=zero_fill)
+        return _copy(self, val, scalar_mult, fill_value)
 
     def _materialize_compressed(self) -> SparseTensor:
         """Return an equivalent tensor with no compressed (``BandedIndex`` /
@@ -539,7 +526,7 @@ class SparseTensor(SparseMathMixin):
             reduce_fn(self.val * self.scalar_mult) if self.val is not None else empty
         )
         if self._n_fill_cells > 0:  # fill cells exist → fold their truthiness
-            return fold_fn(val_part, self.fill_value * self.scalar_mult != 0)
+            return fold_fn(val_part, self._eff_fill * self.scalar_mult != 0)
         return jnp.asarray(val_part)
 
     @_on_materialized
@@ -556,24 +543,24 @@ class SparseTensor(SparseMathMixin):
         # Seed with a weak Python ``0`` (not ``0.0``) so an integer tensor's
         # reduction stays integer rather than promoting to float.
         val_part = 0 if self.val is None else jnp.sum(self.val * self.scalar_mult)
-        return val_part + (self.fill_value * self.scalar_mult) * self._n_fill_cells
+        return val_part + (self._eff_fill * self.scalar_mult) * self._n_fill_cells
 
     @_on_materialized
     def prod(self) -> Array:
         # fill ** 0 == 1 when _n_fill_cells == 0, so no guard needed. Weak ``1``
         # (not ``1.0``) keeps an integer tensor's product integer.
         val_part = 1 if self.val is None else jnp.prod(self.val * self.scalar_mult)
-        return val_part * (self.fill_value * self.scalar_mult) ** self._n_fill_cells
+        return val_part * (self._eff_fill * self.scalar_mult) ** self._n_fill_cells
 
     def _extremum(self, reduce_fn, fold_fn) -> Array:
         """Shared skeleton for max()/min(): scale BEFORE the extremum (a negative
         scalar_mult reverses order), fold the scaled fill only when implicit fill
         cells exist. Pure-structure tensors are just the scaled fill."""
         if self.val is None:
-            return self.fill_value * self.scalar_mult
+            return self._eff_fill * self.scalar_mult
         m = reduce_fn(self.val * self.scalar_mult)
         if self._n_fill_cells > 0:
-            m = fold_fn(m, self.fill_value * self.scalar_mult)
+            m = fold_fn(m, self._eff_fill * self.scalar_mult)
         return m
 
     @_on_materialized
@@ -647,16 +634,14 @@ class SparseTensor(SparseMathMixin):
         return self.copy(
             val=self.val.astype(dtype, **kwargs) if self.val is not None else None,
             scalar_mult=self.scalar_mult.astype(dtype, **kwargs),
-            fill_value=self.fill_value.astype(dtype, **kwargs),
-            zero_fill=self._zero_fill,
+            fill_value=_map_fill(self.fill_value, lambda f: f.astype(dtype, **kwargs)),
         )
 
     def conj(self) -> SparseTensor:
         return self.copy(
             val=jnp.conj(self.val) if self.val is not None else None,
             scalar_mult=jnp.conj(self.scalar_mult),
-            fill_value=jnp.conj(self.fill_value),
-            zero_fill=self._zero_fill,
+            fill_value=_map_fill(self.fill_value, jnp.conj),
         )
 
     def conjugate(self) -> SparseTensor:
@@ -667,8 +652,7 @@ class SparseTensor(SparseMathMixin):
         return self.copy(
             val=jnp.real(self.val) if self.val is not None else None,
             scalar_mult=jnp.real(self.scalar_mult),
-            fill_value=jnp.real(self.fill_value),
-            zero_fill=self._zero_fill,
+            fill_value=_map_fill(self.fill_value, jnp.real),
         )
 
     @property
@@ -676,8 +660,7 @@ class SparseTensor(SparseMathMixin):
         return self.copy(
             val=jnp.imag(self.val) if self.val is not None else None,
             scalar_mult=jnp.imag(self.scalar_mult),
-            fill_value=jnp.imag(self.fill_value),
-            zero_fill=self._zero_fill,
+            fill_value=_map_fill(self.fill_value, jnp.imag),
         )
 
     def item(self):
@@ -1078,7 +1061,5 @@ def _apply_block_diagonal(
 
 
 def sparse_tensor_zeros_like(st: SparseTensor) -> SparseTensor:
-    # Definitionally zero-fill → keep the fast-path flag (the explicit 0.0 fill
-    # would otherwise re-probe to False inside jit).
-    return _copy(st, jnp.zeros_like(st.val), jnp.array(1.0), jnp.array(0.0),
-                 zero_fill=True)
+    # Definitionally zero-fill → fill_value=None keeps the fast-path marker.
+    return _copy(st, jnp.zeros_like(st.val), jnp.array(1.0), fill_value=None)

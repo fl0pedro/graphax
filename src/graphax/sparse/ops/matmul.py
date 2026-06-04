@@ -1001,8 +1001,8 @@ def _build_output_tensor(ctx, rhs_dims, res):
             return SparseTensor(
                 tuple(out_dims_new), tuple(primal_dims_new), band_data,
                 scalar_mult=jnp.asarray(final_mult).astype(values.dtype),
-                fill_value=jnp.zeros((), dtype=values.dtype),
-                check_consistency=False, zero_fill=True,
+                fill_value=None,  # tiled path assumes zero fill → statically zero
+                check_consistency=False,
             )
 
         # K=1 banded output: band buffer in val + a single BandedIndex pair.
@@ -1033,9 +1033,8 @@ def _build_output_tensor(ctx, rhs_dims, res):
         return SparseTensor(
             (out_ix,), (primal_ix,), band_data,
             scalar_mult=jnp.asarray(final_mult).astype(values.dtype),
-            fill_value=jnp.zeros((), dtype=values.dtype),
+            fill_value=None,  # tiled path assumes zero fill → statically zero
             check_consistency=False,
-            zero_fill=True,
         )
     out_dtype = values.dtype if values is not None else jnp.asarray(final_mult).dtype
     # transforms intentionally not propagated through matmul; callers in
@@ -1046,7 +1045,7 @@ def _build_output_tensor(ctx, rhs_dims, res):
         final_primal,
         values,
         scalar_mult=jnp.asarray(final_mult).astype(out_dtype),
-        zero_fill=True,
+        fill_value=None,  # tiled path assumes zero fill → statically zero
     )
 
 
@@ -1625,9 +1624,8 @@ def _matmul_via_densify(lhs, rhs):
         out_dims,
         primal_dims,
         result,
-        fill_value=jnp.array(0, dtype=result.dtype),
+        fill_value=None,  # densified output is fully dense → no fill cells
         check_consistency=False,
-        zero_fill=True,
     )
 
 
@@ -1751,8 +1749,8 @@ def matmul(lhs, rhs, count: bool = False):
     # for non-zero fills). Only safe when contracting dim sizes pair up
     # positionally — graphax's AD pipeline can produce permuted dim orders
     # that need the tiled path's id-aware topology resolver. ``_is_zero_fill``
-    # checks the static ``_zero_fill`` flag (set at ``SparseTensor`` ctor time)
-    # so this stays jit-friendly.
+    # is the static ``fill_value is None`` test (None lives in the treedef) so
+    # this stays jit-friendly.
     has_nonzero_fill = not _is_zero_fill(lhs) or not _is_zero_fill(rhs)
     if has_nonzero_fill:
         if _densify_is_safe(lhs, rhs):
@@ -1762,7 +1760,7 @@ def matmul(lhs, rhs, count: bool = False):
                 return out, _compute_matmul_count(lhs, rhs, out)
             return out
         # Tiled / aligned-pair / dot_general fast paths assume zero fill;
-        # falling through silently mislabels the result as ``zero_fill=True``.
+        # falling through silently mislabels the result as zero-fill.
         raise NotImplementedError(
             "matmul of operands with non-zero fill_value and incompatible "
             "logical sizes is not supported; reorder dim ids first"

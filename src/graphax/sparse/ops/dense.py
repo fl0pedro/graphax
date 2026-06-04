@@ -90,7 +90,7 @@ def dense(
     )
 
     values, result_dims = _apply_dense_scattering(
-        values, tensor.fill_value, updated_dims, actual_scatter, phys_to_scatter
+        values, tensor._eff_fill, updated_dims, actual_scatter, phys_to_scatter
     )
     from graphax.sparse.tensor import SparseTensor
 
@@ -99,9 +99,8 @@ def dense(
         tuple(result_dims[len(tensor.out_dims) :]),
         values,
         scalar_mult=tensor.scalar_mult,
-        fill_value=tensor.fill_value,
+        fill_value=tensor.fill_value,  # None (statically zero) preserved
         check_consistency=False,
-        zero_fill=getattr(tensor, "_zero_fill", None),
     )
 
 
@@ -115,7 +114,7 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
     if all(not d.is_sparse for d in tensor.dims):
         if tensor.val is None:
             return jnp.broadcast_to(
-                tensor.fill_value * tensor.scalar_mult, tensor.shape
+                tensor._eff_fill * tensor.scalar_mult, tensor.shape
             )
         v = tensor.val
         perm = [d.axis for d in tensor.dims if d.axis is not None]
@@ -179,7 +178,7 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
             mask = blk_o[:, None] == blk_i[None, :]
             mask_b = mask[(..., *((None,) * len(leftover_sizes)))]
             dense_pair = jnp.where(
-                mask_b, gathered, tensor.fill_value * tensor.scalar_mult
+                mask_b, gathered, tensor._eff_fill * tensor.scalar_mult
             )
             # Reorder dense_pair's axes to match tensor.dims order. ``target_axes[i]`` is
             # the dense_pair axis that should land at result position ``i``, so the
@@ -195,7 +194,7 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
     val = densified.val
     if val is None:
         return jnp.broadcast_to(
-            densified.fill_value * tensor.scalar_mult, densified.shape
+            densified._eff_fill * tensor.scalar_mult, densified.shape
         )
     return val * tensor.scalar_mult
 

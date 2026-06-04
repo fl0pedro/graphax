@@ -46,10 +46,11 @@ def _is_sparse(obj) -> bool:
     return False
 
 
-# Shared "keep the default" sentinel for optional override kwargs: passed
-# verbatim ⇒ derive the value the default way; any other value (incl.
-# None / True / False) is used as the explicit override. Used by both
-# ``_copy(zero_fill=...)`` and ``_rewrap/_dense_pair_result(fill_value=...)``.
+# Shared "keep the source's value" sentinel for the optional ``fill_value``
+# override on ``_copy`` / ``_rewrap`` / ``_dense_pair_result``: passed verbatim
+# ⇒ reuse the source's fill; any other value — INCLUDING ``None`` (the
+# statically-zero marker) — is used as the explicit override. (A plain ``None``
+# default would be ambiguous now that ``None`` is a meaningful fill.)
 _KEEP = object()
 
 
@@ -80,7 +81,7 @@ def _rewrap(tensor, out_dims, primal_dims, val, fill_value=_KEEP):
     return SparseTensor(
         out_dims, primal_dims, val,
         scalar_mult=tensor.scalar_mult, fill_value=fv,
-        check_consistency=False, zero_fill=getattr(tensor, "_zero_fill", None),
+        check_consistency=False,
     )
 
 
@@ -124,7 +125,12 @@ def _densify_compressed_dims(tensor, compact: bool = False):
     from graphax.sparse.indexes import BandedIndex, SetIndex, DiagonalIndex
 
     banded = [d for d in comp if isinstance(d, BandedIndex)]
-    fill = tensor.fill_value
+    # Kernels consume the fill as a concrete array (``_eff_fill`` → 0 when the
+    # fill is the statically-zero ``None`` marker); the RESULT tensor's fill,
+    # however, preserves ``None`` so the materialized tensor stays fast-path
+    # eligible. ``raw_fill`` carries that marker through.
+    raw_fill = tensor.fill_value
+    fill = tensor._eff_fill
 
     # Only a *pure* compressed pair (the whole tensor is one out + one primal
     # compressed dim) is handled — the branches below index ``dims[0]`` directly.
@@ -139,8 +145,8 @@ def _densify_compressed_dims(tensor, compact: bool = False):
         o, p = tensor.out_dims[0], tensor.primal_dims[0]
         # The densified data's implicit cells hold op(fill_lhs, fill_rhs); the
         # result tensor's fill must match that combined value, not the raw
-        # per-side fill (L3).
-        set_fill = sx.combined_fill(fill)
+        # per-side fill (L3). A None (statically-zero) fill stays None.
+        set_fill = None if raw_fill is None else sx.combined_fill(raw_fill)
         if compact:  # SetIndex always reduces to a meta-block-diagonal
             meta = sx.to_meta_blocks(tensor.val, fill)  # (M, LCM_h, LCM_w, *L)
             M, H, W = meta.shape[0], meta.shape[1], meta.shape[2]
@@ -189,8 +195,10 @@ def _densify_compressed_dims(tensor, compact: bool = False):
             dense = sx._op()(lhs_dense, rhs_dense)
         else:
             dense = sx._op()(lhs_dense, fill_rhs)
-        # Result fill is the op-combined per-side fill (L3), matching the data.
-        return _dense_pair_result(tensor, dense, K, fill_value=sx.combined_fill(fill))
+        # Result fill is the op-combined per-side fill (L3), matching the data;
+        # a None (statically-zero) fill stays None.
+        set_fill = None if raw_fill is None else sx.combined_fill(raw_fill)
+        return _dense_pair_result(tensor, dense, K, fill_value=set_fill)
 
     # --- K≥2 banded (multi-axis interleaved Array val) ---
     if (banded and len(banded) == 2 * K and isinstance(tensor.val, jax.Array)
@@ -272,36 +280,26 @@ def _prepare_physical_array(val: Array, axis_axes: Sequence[int | None]) -> Arra
 
 
 def _is_zero_fill(tensor: SparseTensor) -> bool:
-    """True iff ``tensor.fill_value`` is statically known to be zero.
+    """True iff ``tensor.fill_value`` is STATICALLY known to be zero, i.e.
+    ``fill_value is None`` — the canonical fast-path marker.
 
-    Reads the cached ``_zero_fill`` flag set at ``SparseTensor`` construction
-    time and propagated through the pytree's static aux_data. This flag is
-    available even inside ``jit`` (where the actual ``fill_value`` becomes a
-    tracer with no concrete value), letting matmul / elementwise statically
-    branch between the fast tiled path (``fill = 0``) and the densify fallback
-    (``fill ≠ 0``) without paying for a runtime check.
-
-    Falls back to inspecting ``fill_value`` directly when the flag is missing
-    (e.g. a tensor produced before the static-flag mechanism was added)."""
-    flag = getattr(tensor, "_zero_fill", None)
-    # Honour any explicit boolean — the cache exists precisely to avoid
-    # re-probing the (possibly traced) ``fill_value``. Only fall through
-    # when the flag is genuinely unset (``None``).
-    if flag is not None:
-        return bool(flag)
-    fv = tensor.fill_value
-    try:
-        return bool(np.all(np.asarray(fv) == 0))
-    except (TypeError, ValueError, AttributeError,
-            jax.errors.TracerArrayConversionError,
-            jax.errors.ConcretizationTypeError):
-        return False
+    ``None`` lives in the pytree treedef, so this is a compile-time test that
+    holds inside ``jit`` (where a concrete ``fill_value`` would be an opaque
+    tracer), letting matmul / elementwise branch between the tiled fast path
+    (``fill = 0``) and the densify fallback without a runtime check. A concrete
+    array — even one equal to 0 at runtime — is conservatively "maybe non-zero"
+    and takes the densify path."""
+    return tensor.fill_value is None
 
 
 # --- Consistency checks --------------------------------------------------
 def _check_sparse_dim_pair(d, dim_map):
     other = dim_map.get(d.other_id)
-    return (other.is_sparse and other.other_id == d.id and d.size == other.size)
+    # ``other`` is None when ``other_id`` names no dim in this tensor (an
+    # unpaired sparse dim) — return False so the caller raises the intended
+    # ValueError rather than an AttributeError on ``None.is_sparse``.
+    return (other is not None and other.is_sparse
+            and other.other_id == d.id and d.size == other.size)
 
 
 def _check_block_axis(d, dim_map, block_axiss):
@@ -338,34 +336,26 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
 
 # --- Construction / mutation --------------------------------------------
 def _copy(st: SparseTensor, val: Array | None = None, scalar_mult: Array | None = None,
-          fill_value: Array | None = None, out_dims: Sequence[Index] | None = None,
-          primal_dims: Sequence[Index] | None = None, deep: bool = False,
-          zero_fill=_KEEP):
+          fill_value=_KEEP, out_dims: Sequence[Index] | None = None,
+          primal_dims: Sequence[Index] | None = None, deep: bool = False):
     from graphax.sparse.tensor import SparseTensor
     s = scalar_mult if scalar_mult is not None else st.scalar_mult
-    f = fill_value if fill_value is not None else st.fill_value
+    # ``fill_value`` carries the static-zero marker directly: ``_KEEP`` ⇒ reuse
+    # the source's (preserving a ``None`` fast-path marker through jit); an
+    # explicit value (incl. ``None``) overrides it.
+    f = st.fill_value if fill_value is _KEEP else fill_value
     od = out_dims if out_dims is not None else st.out_dims
     pd = primal_dims if primal_dims is not None else st.primal_dims
     v = val if val is not None else st.val
     if deep:
         v = copy.deepcopy(v) if v is not None else None
         s = copy.deepcopy(s); od = copy.deepcopy(od); pd = copy.deepcopy(pd)
-    # Zero-fill flag: an explicit ``zero_fill`` wins (a zero-preserving op like
-    # neg/astype/conj passes the source flag); else preserve when ``fill_value``
-    # is unchanged, otherwise re-probe. Preserving matters inside jit, where a
-    # fresh traced fill would force the ctor to conservatively report ``False``
-    # and lose fast-path eligibility.
-    if zero_fill is not _KEEP:
-        zf = zero_fill
-    else:
-        zf = getattr(st, "_zero_fill", None) if fill_value is None else None
     return SparseTensor(
         od, pd, v,
         scalar_mult=s, fill_value=f,
         pre_transforms=st.pre_transforms,
         post_transforms=st.post_transforms,
         check_consistency=False,
-        zero_fill=zf,
     )
 
 

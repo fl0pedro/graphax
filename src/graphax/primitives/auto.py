@@ -2657,7 +2657,9 @@ def convert_element_type_rule(primals, **params):
             new_primal_dims,
             new_pre_val,
             scalar_mult=lax.convert_element_type(pre.scalar_mult, new_dtype),
-            fill_value=lax.convert_element_type(pre.fill_value, new_dtype),
+            # None (statically-zero) fill stays None across a dtype convert.
+            fill_value=(None if pre.fill_value is None
+                        else lax.convert_element_type(pre.fill_value, new_dtype)),
         )
 
     def inverse_convert_element_type_transform(post):
@@ -2671,7 +2673,9 @@ def convert_element_type_rule(primals, **params):
             new_primal_dims,
             new_post_val,
             scalar_mult=lax.convert_element_type(post.scalar_mult, new_dtype),
-            fill_value=lax.convert_element_type(post.fill_value, new_dtype),
+            # None (statically-zero) fill stays None across a dtype convert.
+            fill_value=(None if post.fill_value is None
+                        else lax.convert_element_type(post.fill_value, new_dtype)),
         )
 
     transform = JacobianTransform(
