@@ -18,7 +18,10 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-from .utils import _arr2st, _is_sparse, _val_or_one, _prepare_physical_array, _is_zero_fill
+from .utils import (
+    _arr2st, _is_sparse, _val_or_one, _prepare_physical_array, _is_zero_fill,
+    _apply_scalar_mult, _scaled_fill,
+)
 from .layout import generate_block_permutation
 from graphax.sparse.indexes import DiagonalIndex, DenseIndex
 
@@ -50,28 +53,10 @@ _ADDITIVE_IDENTITY_OPS = frozenset((
 ))
 
 
-def _apply_scalar_mult(value: Array, tensor) -> Array:
-    """Scale ``value`` by ``tensor.scalar_mult`` — bitwise-and (with a bool-cast
-    mult) for bool tensors, multiply otherwise. The single definition of "apply
-    this operand's scalar_mult to a buffer"."""
-    if tensor.dtype == jnp.bool_:
-        return value & tensor.scalar_mult.astype(jnp.bool_)
-    return value * tensor.scalar_mult
-
-
 def _identity_scalar_mult(dtype) -> Array:
     """Identity ``scalar_mult`` for a freshly-built result buffer: ``True`` for
     bool, else ``1.0`` in the result dtype (the values already carry the scale)."""
     return jnp.array(True) if dtype == jnp.bool_ else jnp.array(1.0, dtype=dtype)
-
-
-def _scaled_fill(tensor) -> Array:
-    """Post-scaled fill as a concrete array: ``fill * scalar_mult`` (or ``& mask``
-    for bool), with a ``None`` (statically-zero) fill read as 0 via ``_eff_fill``.
-    Canonical form used to compose output fills consistently — every fast path
-    must produce a fill that matches the post-scaled meaning of the input
-    operands so downstream consumers see one definition."""
-    return _apply_scalar_mult(tensor._eff_fill, tensor)
 
 
 def _normalize_inputs(lhs, rhs):

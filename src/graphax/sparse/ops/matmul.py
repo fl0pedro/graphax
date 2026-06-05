@@ -39,6 +39,7 @@ from .utils import (
     _is_sparse,
     _is_zero_fill,
     _prepare_physical_array,
+    _scaled_fill,
     _val_or_one,
 )
 
@@ -1637,9 +1638,9 @@ def _matmul_via_densify(lhs, rhs):
             if ls == rs:
                 continue
             if ls == 1 and _is_implicit_block_dim(ld):
-                lhs_dense = _pad_axis_to(lhs_dense, la, rs, lhs._eff_fill * lhs.scalar_mult)
+                lhs_dense = _pad_axis_to(lhs_dense, la, rs, _scaled_fill(lhs))
             elif rs == 1 and _is_implicit_block_dim(rd):
-                rhs_dense = _pad_axis_to(rhs_dense, ra, ls, rhs._eff_fill * rhs.scalar_mult)
+                rhs_dense = _pad_axis_to(rhs_dense, ra, ls, _scaled_fill(rhs))
 
     result = jax.lax.dot_general(
         lhs_dense,

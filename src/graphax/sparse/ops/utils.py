@@ -55,6 +55,25 @@ _KEEP = object()
 
 
 # --- Shared primitives (elementwise + matmul) ----------------------------
+def _apply_scalar_mult(value: Array, tensor) -> Array:
+    """Scale ``value`` by ``tensor.scalar_mult`` — bitwise-and (with a bool-cast
+    mult) for bool tensors, multiply otherwise. The single definition of "apply
+    this operand's scalar_mult to a buffer", shared by elementwise + matmul."""
+    if tensor.dtype == jnp.bool_:
+        return value & tensor.scalar_mult.astype(jnp.bool_)
+    return value * tensor.scalar_mult
+
+
+def _scaled_fill(tensor) -> Array:
+    """Post-scaled fill as a concrete array: ``fill * scalar_mult`` (or ``& mask``
+    for bool), with a ``None`` (statically-zero) fill read as 0 via ``_eff_fill``.
+    Canonical form used to compose output fills consistently — every fast path
+    must produce a fill that matches the post-scaled meaning of the input
+    operands so downstream consumers see one definition."""
+    return _apply_scalar_mult(tensor._eff_fill, tensor)
+
+
+
 
 
 def _compressed_dims(tensor) -> list:

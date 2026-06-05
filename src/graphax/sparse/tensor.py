@@ -551,9 +551,9 @@ class SparseTensor(SparseMathMixin):
             identity if self.val is None else reduce_fn(self.val * self.scalar_mult)
         )
         scaled_fill = self._eff_fill * self.scalar_mult
-        if weighted:
-            return fold_fn(val_part, scaled_fill, self._n_fill_cells)
-        if self._n_fill_cells > 0:
+        # weighted (sum/prod) always folds (branchless, vanishes at identity when
+        # n_fill==0); all/any fold only when fill cells exist.
+        if weighted or self._n_fill_cells > 0:
             return fold_fn(val_part, scaled_fill, self._n_fill_cells)
         return jnp.asarray(val_part)
 
