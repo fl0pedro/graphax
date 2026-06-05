@@ -151,17 +151,19 @@ def _to_dense_banded(
         (M_primary, M_secondary, W, B_p, B_s, *L),
     )
 
-    # Step 2: build one-hot ``w_idx == b - offset[a]`` selector along W.
-    bj_idx = jnp.arange(M_secondary, dtype=jnp.int32)  # (M_secondary,)
-    if centered_w is not None:
-        bi_idx = jnp.arange(M_primary, dtype=jnp.int32)[:, None]
-        target_w = bj_idx[None, :] - bi_idx + centered_w  # arithmetic, no gather
-    else:
-        off_arr = jnp.asarray(offset_tuple, dtype=jnp.int32)  # (M_primary,)
-        target_w = bj_idx[None, :] - off_arr[:, None]
-    select_mask = (
-        target_w[:, :, None] == jnp.arange(W, dtype=jnp.int32)[None, None, :]
+    # Step 2: one-hot ``w_idx == b - offset[a]`` selector along W, via the shared
+    # ``_band_axis_select`` (keeps this K=1 path provably inverse to the K-axis
+    # pack/densify). The centered band's offset is a compile-time constant
+    # (``offset[a] = a - centered_w``, M_primary and centered_w are static ints),
+    # so the selector stays gather-free and XLA constant-folds it identically to
+    # the old ``arange`` arithmetic — same as the K-axis path that
+    # ``TestMultiBandedGatherFree`` pins.
+    offset = (
+        tuple(a - centered_w for a in range(M_primary))
+        if centered_w is not None
+        else offset_tuple
     )
+    select_mask = _band_axis_select(M_secondary, W, offset)  # (M_p, M_s, W)
     select_mask = select_mask[..., None, None]  # (M_primary, M_secondary, W, 1, 1)
     if L:
         select_mask = select_mask[(..., *L_pad)]

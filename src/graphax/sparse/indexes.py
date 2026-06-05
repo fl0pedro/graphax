@@ -65,7 +65,22 @@ class Index:
 
 
 @dataclass(frozen=True)
-class BandedIndex(Index):
+class CompressedIndex(Index):
+    """Base for the compressed Index types (:class:`BandedIndex` /
+    :class:`SetIndex`) — structure that matmul / elementwise cannot consume
+    directly and so is densified at the op boundary (Phase 8). The single thing
+    shared here is the ``is_compressed`` discriminator; each subclass provides
+    its own ``densify_axis`` / ``reduces_to_diagonal`` / ``to_meta_blocks`` (the
+    band-gather vs set-op kernels differ structurally). ``isinstance(d,
+    CompressedIndex)`` is the canonical structural test."""
+
+    @property
+    def is_compressed(self) -> bool:
+        return True
+
+
+@dataclass(frozen=True)
+class BandedIndex(CompressedIndex):
     """Banded compressed dim — one side of a band axis-pair.
 
     A banded output (from a misaligned-contract matmul) is non-zero only
@@ -95,10 +110,6 @@ class BandedIndex(Index):
     primary: bool = True
     n_secondary: int = -1
     n_meta: int = 1
-
-    @property
-    def is_compressed(self) -> bool:
-        return True
 
     def reduces_to_diagonal(self) -> bool:
         """``True`` iff this band is actually a pure meta-block-diagonal —
@@ -160,7 +171,7 @@ class BandedIndex(Index):
 
 
 @dataclass(frozen=True)
-class SetIndex(Index):
+class SetIndex(CompressedIndex):
     """Set-theoretic compressed dim for elementwise outputs — one side of a
     pair (linked by ``other_id``).
 
@@ -190,10 +201,6 @@ class SetIndex(Index):
     include_remainder: bool = True
     n_meta: int = 1
     op: object = None
-
-    @property
-    def is_compressed(self) -> bool:
-        return True
 
     def reduces_to_diagonal(self) -> bool:
         """A SetIndex output is always meta-block-diagonal (its content sits on

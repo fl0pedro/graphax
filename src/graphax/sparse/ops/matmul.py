@@ -1403,12 +1403,10 @@ def _pack_dense_to_banded(values: Array, layout: BandedLayout) -> Array:
         (N, M_p, W, N_s, B_row, B_col),
     )
 
-    # Step 4: one-hot mask along the secondary axis + sum collapse.
-    offset_arr = jnp.asarray(layout.offset, dtype=jnp.int32)  # (M_p,)
-    target = (
-        offset_arr[:, None] + jnp.arange(W, dtype=jnp.int32)[None, :]
-    )  # (M_p, W); target[p, w] = offset[p] + w
-    mask = target[:, :, None] == jnp.arange(N_s, dtype=jnp.int32)[None, None, :]
+    # Step 4: one-hot band mask + sum collapse. Shares ``_band_axis_select`` with
+    # the inverse densify kernel (provably inverse). The selector yields
+    # ``(M_p, N_s, W)``; transpose to this pack's ``(M_p, W, N_s)`` axis order.
+    mask = _band_axis_select(N_s, W, tuple(layout.offset)).transpose(0, 2, 1)
     mask = mask[None, ..., None, None]  # (1, M_p, W, N_s, 1, 1)
     out = jnp.where(mask, grid_b, 0).sum(axis=3)  # (N, M_p, W, B_row, B_col)
     # Flatten the leading ``(N, M_p)`` into ``(N * M_p)`` — the layout
