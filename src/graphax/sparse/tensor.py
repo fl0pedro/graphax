@@ -108,13 +108,17 @@ class SparseMathMixin:
     def __rmod__(self, other):
         return elementwise(other, self, jax.lax.rem)
 
+    # pow is union, NOT intersection: ``x ** 0 == 1`` keeps a position present
+    # even where the exponent is an implicit (fill) zero, so the output support
+    # must not be narrowed to the intersection of the operands' supports. (0 is
+    # absorbing only in the *base*, and only for positive exponents — a single
+    # is_intersection flag can't capture that, so the safe/correct choice is the
+    # broader union.) Both directions are explicit + consistent.
     def __pow__(self, other):
-        return elementwise(
-            self, other, jax.lax.pow, is_intersection=False
-        )  # seems wrong
+        return elementwise(self, other, jax.lax.pow, is_intersection=False)
 
     def __rpow__(self, other):
-        return elementwise(other, self, jax.lax.pow)
+        return elementwise(other, self, jax.lax.pow, is_intersection=False)
 
     def __and__(self, other):
         return elementwise(self, other, jax.lax.bitwise_and, is_intersection=True)
@@ -176,16 +180,25 @@ class SparseMathMixin:
     def __pos__(self):
         return self.copy()
 
+    def _map_unary(self, g):
+        """Apply a zero-preserving unary ``g`` to ``val`` / ``scalar_mult`` /
+        ``fill_value`` (``g(0) == 0`` for cast / conj / real / imag / abs / round),
+        keeping the ``None`` fill fast-path marker via ``_map_fill``. Callers wrap
+        with ``@_on_materialized`` when ``g`` is non-linear in ``val``. NOT for
+        ``__neg__`` (linear: scales scalar_mult only, leaves val lazy) or
+        ``__invert__`` (maps val only)."""
+        return self.copy(
+            val=g(self.val) if self.val is not None else None,
+            scalar_mult=g(self.scalar_mult),
+            fill_value=_map_fill(self.fill_value, g),
+        )
+
     # Non-linear in val → @_on_materialized densifies compressed storage first
     # (abs(a+b) != abs(a)+abs(b); a set buffer stores the pre-combination
     # per-side blocks). __neg__ / __pos__ are linear and stay lazy.
     @_on_materialized
     def __abs__(self):
-        return self.copy(
-            val=jnp.abs(self.val) if self.val is not None else None,
-            scalar_mult=jnp.abs(self.scalar_mult),
-            fill_value=_map_fill(self.fill_value, jnp.abs),
-        )
+        return self._map_unary(jnp.abs)
 
     @_on_materialized
     def __invert__(self):
@@ -195,11 +208,10 @@ class SparseMathMixin:
 
     @_on_materialized
     def __round__(self, ndigits=None):
-        return self.copy(
-            val=jnp.round(self.val, ndigits) if self.val is not None else None,
-            scalar_mult=jnp.round(self.scalar_mult, ndigits),
-            fill_value=_map_fill(self.fill_value, lambda f: jnp.round(f, ndigits)),
-        )
+        # round(x) with no arg → ndigits=None; numpy rounds to 0 decimals there
+        # (jnp.round rejects None), so normalise.
+        nd = 0 if ndigits is None else ndigits
+        return self._map_unary(lambda v: jnp.round(v, nd))
 
 
 @register_pytree_node_class
@@ -521,39 +533,45 @@ class SparseTensor(SparseMathMixin):
         reduction (a dense tensor has no off-diagonal fill positions)."""
         return self.size - (0 if self.val is None else self.val.size)
 
-    def _bool_reduce(self, reduce_fn, fold_fn, empty) -> Array:
-        """Shared skeleton for all()/any(): reduce the scaled stored values
-        (``empty`` when pure-structure), then fold the implicit fill's
-        truthiness in only when fill cells exist."""
+    def _reduce(self, reduce_fn, fold_fn, identity, *, weighted: bool = False) -> Array:
+        """Shared skeleton for all/any/sum/prod (NOT max/min — see ``_extremum``,
+        which can't seed an identity without introducing ``-inf``).
+
+        Reduce the scaled stored values (``identity`` = the reduce identity for a
+        pure-structure tensor; pass a *weak* Python ``0``/``1`` for sum/prod so an
+        integer tensor doesn't promote to float), then fold the scaled implicit
+        fill via ``fold_fn(reduced, scaled_fill, n_fill)``:
+
+        * ``weighted`` (sum/prod): the fold weights by the implicit-cell count
+          (``+ f*n`` / ``* f**n``) and is branchless — it vanishes at ``identity``
+          when ``n_fill == 0``.
+        * otherwise (all/any): an idempotent fold applied only when fill cells
+          exist; ``fold_fn`` maps the fill's truthiness itself."""
         val_part = (
-            reduce_fn(self.val * self.scalar_mult) if self.val is not None else empty
+            identity if self.val is None else reduce_fn(self.val * self.scalar_mult)
         )
-        if self._n_fill_cells > 0:  # fill cells exist → fold their truthiness
-            return fold_fn(val_part, self._eff_fill * self.scalar_mult != 0)
+        scaled_fill = self._eff_fill * self.scalar_mult
+        if weighted:
+            return fold_fn(val_part, scaled_fill, self._n_fill_cells)
+        if self._n_fill_cells > 0:
+            return fold_fn(val_part, scaled_fill, self._n_fill_cells)
         return jnp.asarray(val_part)
 
     @_on_materialized
     def all(self) -> Array:
-        return self._bool_reduce(jnp.all, jnp.logical_and, True)
+        return self._reduce(jnp.all, lambda v, f, n: jnp.logical_and(v, f != 0), True)
 
     @_on_materialized
     def any(self) -> Array:
-        return self._bool_reduce(jnp.any, jnp.logical_or, False)
+        return self._reduce(jnp.any, lambda v, f, n: jnp.logical_or(v, f != 0), False)
 
     @_on_materialized
     def sum(self) -> Array:
-        # The fill term vanishes when _n_fill_cells == 0, so no guard needed.
-        # Seed with a weak Python ``0`` (not ``0.0``) so an integer tensor's
-        # reduction stays integer rather than promoting to float.
-        val_part = 0 if self.val is None else jnp.sum(self.val * self.scalar_mult)
-        return val_part + (self._eff_fill * self.scalar_mult) * self._n_fill_cells
+        return self._reduce(jnp.sum, lambda v, f, n: v + f * n, 0, weighted=True)
 
     @_on_materialized
     def prod(self) -> Array:
-        # fill ** 0 == 1 when _n_fill_cells == 0, so no guard needed. Weak ``1``
-        # (not ``1.0``) keeps an integer tensor's product integer.
-        val_part = 1 if self.val is None else jnp.prod(self.val * self.scalar_mult)
-        return val_part * (self._eff_fill * self.scalar_mult) ** self._n_fill_cells
+        return self._reduce(jnp.prod, lambda v, f, n: v * f ** n, 1, weighted=True)
 
     def _extremum(self, reduce_fn, fold_fn) -> Array:
         """Shared skeleton for max()/min(): scale BEFORE the extremum (a negative
@@ -631,40 +649,25 @@ class SparseTensor(SparseMathMixin):
         return self.copy()
 
     # astype / conj / real / imag are zero-preserving on the fill
-    # (cast(0)=conj(0)=real(0)=imag(0)=0), so carry the source's zero-fill flag
-    # through — otherwise a cast/conj inside jit would drop fast-path eligibility.
+    # (cast(0)=conj(0)=real(0)=imag(0)=0), so ``_map_unary`` carries the source's
+    # zero-fill marker through — otherwise a cast/conj inside jit would drop
+    # fast-path eligibility.
     def astype(self, dtype: DTypeLike, **kwargs) -> SparseTensor:
-        return self.copy(
-            val=self.val.astype(dtype, **kwargs) if self.val is not None else None,
-            scalar_mult=self.scalar_mult.astype(dtype, **kwargs),
-            fill_value=_map_fill(self.fill_value, lambda f: f.astype(dtype, **kwargs)),
-        )
+        return self._map_unary(lambda v: v.astype(dtype, **kwargs))
 
     def conj(self) -> SparseTensor:
-        return self.copy(
-            val=jnp.conj(self.val) if self.val is not None else None,
-            scalar_mult=jnp.conj(self.scalar_mult),
-            fill_value=_map_fill(self.fill_value, jnp.conj),
-        )
+        return self._map_unary(jnp.conj)
 
     def conjugate(self) -> SparseTensor:
         return self.conj()
 
     @property
     def real(self) -> SparseTensor:
-        return self.copy(
-            val=jnp.real(self.val) if self.val is not None else None,
-            scalar_mult=jnp.real(self.scalar_mult),
-            fill_value=_map_fill(self.fill_value, jnp.real),
-        )
+        return self._map_unary(jnp.real)
 
     @property
     def imag(self) -> SparseTensor:
-        return self.copy(
-            val=jnp.imag(self.val) if self.val is not None else None,
-            scalar_mult=jnp.imag(self.scalar_mult),
-            fill_value=_map_fill(self.fill_value, jnp.imag),
-        )
+        return self._map_unary(jnp.imag)
 
     def item(self):
         if self.ndim == 0:
@@ -798,11 +801,10 @@ class SparseTensor(SparseMathMixin):
         return self.copy()
 
     def to_device(self, device):
-        return self.copy(
-            val=jax.device_put(self.val, device) if self.val is not None else None,
-            scalar_mult=jax.device_put(self.scalar_mult, device),
-            fill_value=jax.device_put(self.fill_value, device),
-        )
+        # device_put preserves values (incl. zero), so _map_unary keeps a None
+        # fill None — a statically-zero fill has no data to move, and the old
+        # ``jax.device_put(None, device)`` dropped that fast-path marker.
+        return self._map_unary(lambda v: jax.device_put(v, device))
 
     @property
     def aval(self):

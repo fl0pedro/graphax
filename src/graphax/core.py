@@ -260,6 +260,25 @@ def append_pre_transforms(pre, out):
     return out
 
 
+def _drain_transforms(tensor, post_first: bool = True):
+    """Fold a tensor's queued Jacobian transforms into its data: apply each
+    ``post_transform`` forward (``apply``) and each ``pre_transform`` in reverse
+    (``apply_inverse``). ``post_first`` (the edge-merge order) drains post then
+    pre; ``post_first=False`` (the final-output drain) drains pre then post.
+    Empty transform lists are no-ops."""
+    def _post(t):
+        for transform in t.post_transforms:
+            t = transform.apply(t)
+        return t
+
+    def _pre(t):
+        for transform in t.pre_transforms[::-1]:
+            t = transform.apply_inverse(t)
+        return t
+
+    return _pre(_post(tensor)) if post_first else _post(_pre(tensor))
+
+
 def _is_scalar_st(t) -> bool:
     return not t.out_dims and not t.primal_dims
 
@@ -469,30 +488,11 @@ def _eliminate_vertex(
                     _edge = _force(transpose_graph[out_edge][in_edge])
                     _assert_sparse_tensor_consistency(_edge)
 
-                    # Offload the remaining Jacobian transforms to the output tensor
-                    if len(edge_outval.post_transforms) > 0:
-                        for transform in edge_outval.post_transforms:
-                            edge_outval = transform.apply(edge_outval)
-
-                    if len(edge_outval.pre_transforms) > 0:
-                        for transform in edge_outval.pre_transforms[
-                            ::-1
-                        ]:  # Do we need the [::-1] here?
-                            edge_outval = transform.apply_inverse(edge_outval)
-
+                    # Offload the remaining Jacobian transforms to each tensor
+                    edge_outval = _drain_transforms(edge_outval)
                     _assert_sparse_tensor_consistency(edge_outval)
 
-                    # Offload the remain Jacobian transforms to the output tensor
-                    if len(_edge.post_transforms) > 0:
-                        for transform in _edge.post_transforms:
-                            _edge = transform.apply(_edge)
-
-                    if len(_edge.pre_transforms) > 0:
-                        for transform in _edge.pre_transforms[
-                            ::-1
-                        ]:  # Do we need the [::-1] here?
-                            _edge = transform.apply_inverse(_edge)
-
+                    _edge = _drain_transforms(_edge)
                     _assert_sparse_tensor_consistency(_edge)
 
                     # Check if the computed edge Jacobian shapes actually match
@@ -1222,13 +1222,7 @@ def vertex_elimination_jaxpr(
             tensor = _force(edge)
             if tensor is None:
                 continue  # null edge (e.g. stop_gradient); treat as zero
-            tensor = tensor.copy()
-            if len(tensor.pre_transforms) > 0:
-                for transform in tensor.pre_transforms[::-1]:
-                    tensor = transform.apply_inverse(tensor)
-            if len(tensor.post_transforms) > 0:
-                for transform in tensor.post_transforms:
-                    tensor = transform.apply(tensor)
+            tensor = _drain_transforms(tensor.copy(), post_first=False)
             m_inner[outvar] = tensor
             updated = True
         if updated:
@@ -1500,15 +1494,29 @@ def _accumulate_edge_triplet(
     if len(post_val.pre_transforms) > 0 and pre_val.val is not None:
         _pre_val = unload_pre_transforms(post_val, pre_val)
 
-    if pre_val.val is not None and post_val.val is not None:
+    # Mirror _eliminate_vertex: a val=None operand only acts as a pure-diagonal
+    # identity pass-through when _acts_as_identity holds (else it's a non-identity
+    # structural Jacobian — broadcast/reduction — that must be contracted), and
+    # the pass-through must FOLD the identity operand's scalar_mult (dropping it
+    # was the sum(z*sum(z)) bug — 10·pre became pre).
+    _need_contract = (
+        (pre_val.val is not None and post_val.val is not None)
+        or (post_val.val is None and not _acts_as_identity(_post_val))
+        or (pre_val.val is None and not _acts_as_identity(_pre_val))
+    )
+    if _need_contract:
         if _is_scalar_st(_post_val) and _is_scalar_st(_pre_val):
             edge_outval = _post_val * _pre_val
         else:
             edge_outval = _post_val @ _pre_val
     elif pre_val.val is not None:
-        edge_outval = _pre_val
+        edge_outval = _pre_val.copy(
+            scalar_mult=_pre_val.scalar_mult * _post_val.scalar_mult
+        )
     else:
-        edge_outval = _post_val
+        edge_outval = _post_val.copy(
+            scalar_mult=_post_val.scalar_mult * _pre_val.scalar_mult
+        )
 
     if len(post_val.post_transforms) > 0:
         edge_outval = prepend_post_transforms(post_val, edge_outval)
@@ -1519,18 +1527,8 @@ def _accumulate_edge_triplet(
     if existing is not None:
         _edge = _force(existing)
         if _edge is not None:
-            if len(edge_outval.post_transforms) > 0:
-                for transform in edge_outval.post_transforms:
-                    edge_outval = transform.apply(edge_outval)
-            if len(edge_outval.pre_transforms) > 0:
-                for transform in edge_outval.pre_transforms[::-1]:
-                    edge_outval = transform.apply_inverse(edge_outval)
-            if len(_edge.post_transforms) > 0:
-                for transform in _edge.post_transforms:
-                    _edge = transform.apply(_edge)
-            if len(_edge.pre_transforms) > 0:
-                for transform in _edge.pre_transforms[::-1]:
-                    _edge = transform.apply_inverse(_edge)
+            edge_outval = _drain_transforms(edge_outval)
+            _edge = _drain_transforms(_edge)
             edge_outval = edge_outval + _edge
 
     graph[v_i][v_k] = edge_outval

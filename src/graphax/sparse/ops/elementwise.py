@@ -50,15 +50,28 @@ _ADDITIVE_IDENTITY_OPS = frozenset((
 ))
 
 
+def _apply_scalar_mult(value: Array, tensor) -> Array:
+    """Scale ``value`` by ``tensor.scalar_mult`` — bitwise-and (with a bool-cast
+    mult) for bool tensors, multiply otherwise. The single definition of "apply
+    this operand's scalar_mult to a buffer"."""
+    if tensor.dtype == jnp.bool_:
+        return value & tensor.scalar_mult.astype(jnp.bool_)
+    return value * tensor.scalar_mult
+
+
+def _identity_scalar_mult(dtype) -> Array:
+    """Identity ``scalar_mult`` for a freshly-built result buffer: ``True`` for
+    bool, else ``1.0`` in the result dtype (the values already carry the scale)."""
+    return jnp.array(True) if dtype == jnp.bool_ else jnp.array(1.0, dtype=dtype)
+
+
 def _scaled_fill(tensor) -> Array:
     """Post-scaled fill as a concrete array: ``fill * scalar_mult`` (or ``& mask``
     for bool), with a ``None`` (statically-zero) fill read as 0 via ``_eff_fill``.
     Canonical form used to compose output fills consistently — every fast path
     must produce a fill that matches the post-scaled meaning of the input
     operands so downstream consumers see one definition."""
-    if tensor.dtype == jnp.bool_:
-        return tensor._eff_fill & tensor.scalar_mult.astype(jnp.bool_)
-    return tensor._eff_fill * tensor.scalar_mult
+    return _apply_scalar_mult(tensor._eff_fill, tensor)
 
 
 def _normalize_inputs(lhs, rhs):
@@ -173,10 +186,7 @@ def _value_axes_info(tensor, sp, dp, is_left):
 
 
 def _align_value(value, tensor, sp, dp, axes, broadcast_unused, is_left):
-    if tensor.dtype == jnp.bool_:
-        value = value & tensor.scalar_mult.astype(jnp.bool_)
-    else:
-        value = value * tensor.scalar_mult
+    value = _apply_scalar_mult(value, tensor)
     target_shape = [s for _, s in _ew_pair_axes(sp, dp, is_left)]
     value = _prepare_physical_array(value, axes)
     pad = len(broadcast_unused) - (value.ndim - len(axes))
@@ -335,7 +345,7 @@ def _reconstruct_result(value, lhs, sp, dp, output_meta, op, rhs):
     if info["squeeze"]:
         idx = tuple(0 if ax in info["squeeze"] else slice(None) for ax in range(value.ndim))
         value = value[idx]
-    s_mult = jnp.array(True) if value.dtype == jnp.bool_ else jnp.array(1.0, dtype=value.dtype)
+    s_mult = _identity_scalar_mult(value.dtype)
     # Result fill: ``None`` (statically zero) when both inputs are statically
     # zero AND ``op(0, 0) == 0`` — so the output keeps fast-path eligibility.
     # We can't probe ``op`` numerically inside jit (any jax call yields a tracer
@@ -451,19 +461,14 @@ def _emit_divisor_remainder(lhs, rhs, op, geom):
     b_b_h, b_b_w = geom["b_b_h"], geom["b_b_w"]
     lcm_h, lcm_w = geom["lcm_h"], geom["lcm_w"]
 
-    bool_op = lhs.dtype == jnp.bool_
-    if bool_op:
-        lhs_v = lhs.val & lhs.scalar_mult.astype(jnp.bool_)
-        rhs_v = rhs.val & rhs.scalar_mult.astype(jnp.bool_)
-    else:
-        lhs_v = lhs.val * lhs.scalar_mult
-        rhs_v = rhs.val * rhs.scalar_mult
+    lhs_v = _apply_scalar_mult(lhs.val, lhs)
+    rhs_v = _apply_scalar_mult(rhs.val, rhs)
 
     lhs_shape = (M, n_lhs, a_b_h, a_b_w)
     rhs_shape = (M, n_rhs, b_b_h, b_b_w)
     combined = jnp.concatenate([lhs_v.reshape(-1), rhs_v.reshape(-1)])
 
-    s_mult = jnp.array(True) if bool_op else jnp.array(1.0, dtype=lhs.val.dtype)
+    s_mult = _identity_scalar_mult(lhs.val.dtype)
     # Emitted only when both operands are statically zero-fill (gated upstream),
     # so the output is statically zero-fill too: fill_value=None.
     out_id, primal_id = geom["out_id"], geom["primal_id"]
@@ -585,13 +590,8 @@ def _emit_multi_set(lhs, rhs, op, geom):
 
     K = geom["K"]
     pairs = geom["pairs"]
-    bool_op = lhs.dtype == jnp.bool_
-    if bool_op:
-        lhs_v = lhs.val & lhs.scalar_mult.astype(jnp.bool_)
-        rhs_v = rhs.val & rhs.scalar_mult.astype(jnp.bool_)
-    else:
-        lhs_v = lhs.val * lhs.scalar_mult
-        rhs_v = rhs.val * rhs.scalar_mult
+    lhs_v = _apply_scalar_mult(lhs.val, lhs)
+    rhs_v = _apply_scalar_mult(rhs.val, rhs)
 
     def _pack(v, side):
         # Permute operand val to (M_0..M_{K-1}, [existing Bh], [existing Bw]),
@@ -613,7 +613,7 @@ def _emit_multi_set(lhs, rhs, op, geom):
     rhs_band = _pack(rhs_v, "b")
     combined = jnp.concatenate([lhs_band.reshape(-1), rhs_band.reshape(-1)])
 
-    s_mult = jnp.array(True) if bool_op else jnp.array(1.0, dtype=lhs.val.dtype)
+    s_mult = _identity_scalar_mult(lhs.val.dtype)
     # Gated on both operands statically zero-fill → output is too (fill_value=None).
     lhs_shape, rhs_shape = lhs_band.shape, rhs_band.shape
     sem = geom["semantic"]
