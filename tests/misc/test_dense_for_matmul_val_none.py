@@ -6,8 +6,13 @@ result's ``.val`` by ``scalar_mult``. The original line ``dense(...).val *
 scalar_mult`` raised ``TypeError`` when the densified tensor's ``val`` was
 ``None`` (pure-structure tensors).
 
-The fix broadcasts the ``fill_value`` when the densified ``val`` is ``None``
-instead of multiplying ``None`` by ``scalar_mult``.
+The fix broadcasts ``ones * scalar_mult`` when the densified ``val`` is
+``None`` instead of multiplying ``None`` by ``scalar_mult``. ``val=None`` means
+the structure is all-ones (× ``scalar_mult``); the densified tensor here is
+fully-dense (no sparse pairs left after ``hard=True``), so there are NO
+off-block-diagonal positions for ``fill_value`` to paint — every cell is
+``1 * scalar_mult``. (This matches the fully-dense fast path; the earlier
+``fill_value``-based fallback was the dense()/dense_for_matmul inconsistency.)
 """
 import importlib
 
@@ -29,7 +34,7 @@ def test_fallback_does_not_crash_with_none_densified_val(monkeypatch):
     We force the None case by monkeypatching ``dense`` to return a tensor
     with ``val=None`` — the original buggy ``dense(...).val * scalar_mult``
     line would raise ``TypeError`` on this; the fixed path returns the
-    fill * scalar broadcast instead.
+    ones * scalar broadcast instead (val=None ⇒ all-ones structure).
     """
     # Build a 3-dim tensor that defeats the fully-dense and single-pair
     # fast paths so the fallback runs.
@@ -67,12 +72,13 @@ def test_fallback_does_not_crash_with_none_densified_val(monkeypatch):
     # Should not raise — the bug was a TypeError from None * Array.
     result = dense_for_matmul(st)
 
-    # The fallback emits fill_value * scalar_mult broadcast to the densified
-    # logical shape. Logical shape = (3, 2, 3, 2).
+    # The fallback emits ones * scalar_mult broadcast to the densified logical
+    # shape (val=None ⇒ all-ones; the densified tensor is fully-dense, so no
+    # off-block-diagonal fill cells). Logical shape = (3, 2, 3, 2).
     assert result.shape == (3, 2, 3, 2)
     arr = np.asarray(result)
-    # Every cell should equal fill * scalar = 7 * 3 = 21.
-    assert np.allclose(arr, 21.0)
+    # Every cell should equal ones * scalar = 1 * 3 = 3.
+    assert np.allclose(arr, 3.0)
 
 
 # NOTE: the former ``test_fallback_works_with_compressed_pytree_val`` was

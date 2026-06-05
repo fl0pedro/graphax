@@ -113,8 +113,13 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
     # Fast path: fully-dense tensor — val IS the dense form (modulo permutation).
     if all(not d.is_sparse for d in tensor.dims):
         if tensor.val is None:
+            # val=None ⇒ the structure is all-ones (× scalar_mult) — same as
+            # dense(); fill_value paints only a sparse pair's off-diagonal, of
+            # which a fully-dense tensor has none. (Using _eff_fill here was the
+            # dense()/dense_for_matmul inconsistency: it materialised 0 instead
+            # of 1 for a fully-dense val=None operand.)
             return jnp.broadcast_to(
-                tensor._eff_fill * tensor.scalar_mult, tensor.shape
+                jnp.array(1.0, dtype=tensor.dtype) * tensor.scalar_mult, tensor.shape
             )
         v = tensor.val
         perm = [d.axis for d in tensor.dims if d.axis is not None]
@@ -193,8 +198,10 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
     densified = dense(tensor, hard=True)
     val = densified.val
     if val is None:
+        # Purely structural after hard densify ⇒ all-ones × scalar_mult (val=None
+        # semantics; see the fully-dense branch above).
         return jnp.broadcast_to(
-            densified._eff_fill * tensor.scalar_mult, densified.shape
+            jnp.array(1.0, dtype=tensor.dtype) * tensor.scalar_mult, densified.shape
         )
     return val * tensor.scalar_mult
 

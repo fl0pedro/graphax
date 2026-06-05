@@ -1505,6 +1505,59 @@ def _pack_dense_to_multi_axis_banded(
     return out
 
 
+# --- Metadata-stated single-block contraction -----------------------------
+# A contracting dim of size 1 whose ``val`` does NOT physically carry it
+# (``axis`` and ``block_axis`` both None) is a single structural block embedded
+# in a larger logical axis: the metadata says it occupies one block and the
+# rest of the partner's positions are off-structure. Contracting it against a
+# size-N partner therefore *zero-pads* (the lone block at index 0, ``fill_value``
+# at the remaining N-1 positions) — NOT a replicate-broadcast. (Concretely:
+# a val=None 1×1 operand is ones·scalar_mult on its single block, fill off it;
+# eye(N) @ [v, fill, …] selects column 0 → [v, fill, …], matching jax.jacfwd.)
+# A size-1 dim WITH a physical axis is a genuine size-1 mismatch — never padded.
+def _is_implicit_block_dim(d) -> bool:
+    return (
+        int(d.logical_size) == 1
+        and getattr(d, "axis", None) is None
+        and getattr(d, "block_axis", None) is None
+    )
+
+
+def _contract_pair_compatible(l, r) -> bool:
+    """A contracting pair ``dot_general`` can take after densify: equal sizes,
+    or a metadata-stated single-block embed (the size-1 side carries no physical
+    axis), which ``_matmul_via_densify`` zero-pads up to the partner size."""
+    if int(l.logical_size) == int(r.logical_size):
+        return True
+    small = l if int(l.logical_size) < int(r.logical_size) else r
+    return int(small.logical_size) == 1 and _is_implicit_block_dim(small)
+
+
+def _has_implicit_block_contraction(lhs, rhs) -> bool:
+    """True iff some contracting pair is a metadata-stated size-1↔size-N embed
+    — the only size mismatch we route to the densify path (which zero-pads it);
+    genuine mismatches keep falling through to the tiled path's strict error."""
+    if not (hasattr(lhs, "primal_dims") and hasattr(rhs, "out_dims")):
+        return False
+    n = min(len(lhs.primal_dims), len(rhs.out_dims))
+    if n == 0:
+        return False
+    return any(
+        int(l.logical_size) != int(r.logical_size) and _contract_pair_compatible(l, r)
+        for l, r in zip(lhs.primal_dims[-n:], rhs.out_dims[-n:])
+    )
+
+
+def _pad_axis_to(arr, axis: int, size: int, fill):
+    """Zero-pad (with ``fill``) ``arr`` along ``axis`` from its current size up
+    to ``size``. The existing block stays at index 0; off-block positions take
+    ``fill`` (the operand's off-structure value)."""
+    pad_shape = list(arr.shape)
+    pad_shape[axis] = size - arr.shape[axis]
+    pad = jnp.full(tuple(pad_shape), fill, dtype=arr.dtype)
+    return jnp.concatenate([arr, pad], axis=axis)
+
+
 # --- Late-densification escape hatch for non-zero fill_value --------------
 def _matmul_via_densify(lhs, rhs):
     """Late-densification matmul for SparseTensors with non-zero ``fill_value``.
@@ -1570,6 +1623,25 @@ def _matmul_via_densify(lhs, rhs):
         lhs_batch.append(i)
         rhs_batch.append(j)
         del rhs_id_to_axis[d.id]
+
+    # Metadata-stated single-block embed: a contracting dim whose val doesn't
+    # carry it (``axis`` None, size 1) is one structural block in a larger
+    # logical axis. ``dot_general`` needs the physical contracting shapes to
+    # line up, so zero-pad the size-1 axis up to its size-N partner here (block
+    # at index 0, ``fill_value`` elsewhere) — gated strictly on the metadata
+    # (``_is_implicit_block_dim``) so a genuine size-1 is never silently padded
+    # (it reaches dot_general mismatched and raises, as before).
+    if n_contract > 0:
+        lhs_pri = lhs.primal_dims[-n_contract:]
+        rhs_out = rhs.out_dims[-n_contract:]
+        for la, ra, ld, rd in zip(lhs_contract, rhs_contract, lhs_pri, rhs_out):
+            ls, rs = lhs_dense.shape[la], rhs_dense.shape[ra]
+            if ls == rs:
+                continue
+            if ls == 1 and _is_implicit_block_dim(ld):
+                lhs_dense = _pad_axis_to(lhs_dense, la, rs, lhs._eff_fill * lhs.scalar_mult)
+            elif rs == 1 and _is_implicit_block_dim(rd):
+                rhs_dense = _pad_axis_to(rhs_dense, ra, ls, rhs._eff_fill * rhs.scalar_mult)
 
     result = jax.lax.dot_general(
         lhs_dense,
@@ -1756,19 +1828,27 @@ def matmul(lhs, rhs, count: bool = False):
     # is the static ``fill_value is None`` test (None lives in the treedef) so
     # this stays jit-friendly.
     has_nonzero_fill = not _is_zero_fill(lhs) or not _is_zero_fill(rhs)
-    if has_nonzero_fill:
+    # The densify path also owns metadata-stated single-block contractions
+    # (size-1↔size-N where the size-1 side carries no physical axis): the tiled
+    # path's ``_resolve_contract_pair`` rejects the size mismatch, but the embed
+    # is well-defined and ``_matmul_via_densify`` zero-pads it.
+    need_block_embed = _has_implicit_block_contraction(lhs, rhs)
+    if has_nonzero_fill or need_block_embed:
         if _densify_is_safe(lhs, rhs):
             _record_path("densify")
             out = _matmul_via_densify(lhs, rhs)
             if count:
                 return out, _compute_matmul_count(lhs, rhs, out)
             return out
-        # Tiled / aligned-pair / dot_general fast paths assume zero fill;
-        # falling through silently mislabels the result as zero-fill.
-        raise NotImplementedError(
-            "matmul of operands with non-zero fill_value and incompatible "
-            "logical sizes is not supported; reorder dim ids first"
-        )
+        if has_nonzero_fill:
+            # Tiled / aligned-pair / dot_general fast paths assume zero fill;
+            # falling through silently mislabels the result as zero-fill.
+            raise NotImplementedError(
+                "matmul of operands with non-zero fill_value and incompatible "
+                "logical sizes is not supported; reorder dim ids first"
+            )
+        # Zero-fill broadcast that isn't densify-safe (a permuted dim order):
+        # fall through to the tiled path, which raises the strict size error.
     rhs_out_dims, rhs_primal_dims, rhs_id_offset = _align_tensor_ids(lhs, rhs)
     rhs_dims = rhs_out_dims + rhs_primal_dims
     pairs = _build_matmul_topology(lhs, rhs_out_dims, rhs_primal_dims, rhs_id_offset)
@@ -1794,8 +1874,10 @@ def _densify_is_safe(lhs, rhs) -> bool:
         return True
     lhs_pri = lhs.primal_dims[-n_contract:]
     rhs_out = rhs.out_dims[-n_contract:]
+    # Equal sizes pair directly; a metadata-stated broadcast (size-1 side with
+    # no physical axis) is expanded in ``_matmul_via_densify`` before dot_general.
     return all(
-        int(l.logical_size) == int(r.logical_size) for l, r in zip(lhs_pri, rhs_out)
+        _contract_pair_compatible(l, r) for l, r in zip(lhs_pri, rhs_out)
     )
 
 
@@ -1822,8 +1904,12 @@ def _matmul_contraction_depth(lhs, rhs) -> int:
         n_contract = min(len(lhs.primal_dims), len(rhs.out_dims))
         K = 1
         for i in range(n_contract):
-            d = lhs.primal_dims[-1 - i]
-            K *= int(d.logical_size)
+            # The contraction runs over the broadcast (max) size: a
+            # metadata-stated size-1 broadcast against a size-N partner
+            # reduces over N, not 1.
+            ls = int(lhs.primal_dims[-1 - i].logical_size)
+            rs = int(rhs.out_dims[-1 - i].logical_size)
+            K *= max(ls, rs)
         return K
     # Both inputs are plain arrays (the dense_dense path).
     if hasattr(lhs, "shape") and hasattr(rhs, "shape"):
