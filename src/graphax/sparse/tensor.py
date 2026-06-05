@@ -16,7 +16,7 @@ from jax.tree_util import register_pytree_node_class
 from jax.typing import DTypeLike
 
 from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
-from graphax.sparse.ops.dense import dense
+from graphax.sparse.ops.dense import dense  # noqa: F401  (re-exported: callers do `from graphax.sparse.tensor import dense`)
 from graphax.sparse.ops.elementwise import elementwise
 from graphax.sparse.ops.matmul import matmul
 from graphax.sparse.ops.transpose import transpose
@@ -450,12 +450,15 @@ class SparseTensor(SparseMathMixin):
         return prod(self.shape)
 
     def dense(self) -> Array:
-        # Compressed Index dims (BandedIndex / SetIndex) carry structure the
-        # scatter-based ``dense`` flow doesn't understand; densify them to
-        # plain DenseIndex / DiagonalIndex first (no-op when there are none).
+        # ``dense_for_matmul`` is the single Array-producing densifier (fusion
+        # fast paths, with a ``dense(hard=True)`` fallback for shapes they don't
+        # cover) — see the densification map in ``ops/dense.py``. It consumes
+        # only Dense/Diagonal, so first strip any compressed (BandedIndex /
+        # SetIndex) dims (no-op when there are none).
+        from graphax.sparse.ops.dense import dense_for_matmul
         from graphax.sparse.ops.utils import _compressed_dims, _densify_compressed_dims
         t = _densify_compressed_dims(self) if _compressed_dims(self) else self
-        return dense(t, hard=True).val * t.scalar_mult
+        return dense_for_matmul(t)
 
     @property
     def T(self) -> SparseTensor:

@@ -1,6 +1,6 @@
 """Bug: ``dense()`` collapsed multiple sparse pairs into one combined diagonal.
 
-``_densify_diagonal_scatter`` was called once on a tensor whose leading axes
+``_densify_diagonal_select`` was called once on a tensor whose leading axes
 had been linearised into a single ``B = prod(N_i)`` axis. After reshape back
 to ``(N1, N2, N1, N2, *trailing)`` the math coincidentally lined up for the
 no-block / no-extra-trailing case (because the combined diagonal in linearised
@@ -92,7 +92,7 @@ def test_per_pair_densifier_eye_mask_size_is_per_pair_not_product():
 
     If a future regression linearises pairs again, the eye-mask traced here
     would be ``(N1*N2, N1*N2)`` instead of two separate per-pair eye-masks.
-    We probe by counting calls to ``_densify_diagonal_scatter``."""
+    We probe by counting calls to ``_densify_diagonal_select``."""
     from unittest.mock import patch
     import importlib
 
@@ -112,13 +112,13 @@ def test_per_pair_densifier_eye_mask_size_is_per_pair_not_product():
     )
 
     leading_sizes: list[int] = []
-    real_densifier = dense_mod._densify_diagonal_scatter
+    real_densifier = dense_mod._densify_diagonal_select
 
     def spy(v, fv):
         leading_sizes.append(v.shape[0])
         return real_densifier(v, fv)
 
-    with patch.object(dense_mod, "_densify_diagonal_scatter", spy):
+    with patch.object(dense_mod, "_densify_diagonal_select", spy):
         dense(st, hard=True)
 
     # Two pairs → two separate calls, each with leading axis size N_i.

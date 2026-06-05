@@ -1,14 +1,62 @@
 """Densification of ``SparseTensor`` axes.
 
-* ``dense(tensor, axes=None, hard=False)`` — materialize sparse pairs into dense axes,
-  returning a new ``SparseTensor`` whose ``val`` carries the requested axes in dense form.
-  ``hard=True`` also materializes implicit pairs (``axis is None``).
+THE DENSIFICATION MAP
+=====================
+Densification is one *ladder* from most-compressed to fully-materialized::
 
-* ``dense_for_matmul(tensor) -> Array`` — a fusion-friendly densifier that returns a raw
-  ``Array`` ready to feed into ``jax.lax.dot_general``. For tensors with simple structure
-  (fully-dense, or a single sparse pair), it emits a single broadcast+select fusion that
-  XLA can fold into the consuming matmul kernel — keeping the expansion in SMEM rather
-  than spilling to L2 / HBM. Falls back to the scatter-based ``dense()`` otherwise.
+    compressed (BandedIndex / SetIndex)
+        │  _densify_compressed_dims / Index.densify_axis
+        ▼
+    diagonal (DiagonalIndex block-diagonal pairs)   ← matmul / elementwise consume here
+        │  dense() / _densify_diagonal_select
+        ▼
+    dense grid (plain DenseIndex, NxN with fill off-block-diagonal)
+
+Two questions pick the entry point: (1) *how far down the ladder*, and (2)
+*what you get back* — a ``SparseTensor`` (structure preserved, ``scalar_mult``
+deferred) or a raw ``Array`` (fully dense, ``scalar_mult`` folded in).
+
+Entry points (where they live -> what they return):
+
+* ``dense(tensor, axes=None, hard=False)``  [this module]  -> ``SparseTensor``
+    The workhorse (~97 call sites). Materializes sparse pairs into dense axes.
+    ``axes`` selects *which* logical dims (None = all); ``hard=True`` also
+    materializes *implicit* dims (``axis is None``, i.e. not yet carried by
+    ``val``). Does NOT understand BandedIndex/SetIndex — densify those first.
+
+* ``dense_for_matmul(tensor)``  [this module]  -> ``Array``
+    Fusion-friendly full densify for feeding ``jax.lax.dot_general``. Two fast
+    paths — fully-dense (``val`` IS the answer, modulo a permutation) and a
+    single sparse pair (one broadcast+select) — that XLA folds into the matmul
+    kernel (stays in SMEM, no HBM spill). Everything else falls back to
+    ``dense(tensor, hard=True)`` then ``* scalar_mult`` — i.e. it is exactly
+    ``SparseTensor.dense()`` minus the compressed-dim handling, plus fast paths.
+
+* ``SparseTensor.dense()``  [tensor.py]  -> ``Array``
+    The public "give me the dense array" method, used everywhere (``flat``,
+    ``__getitem__``, ``float()``, and as the test-suite's correctness oracle).
+    = ``_densify_compressed_dims`` (if any) -> ``dense(hard=True)`` -> ``* scalar_mult``.
+
+* ``_densify_compressed_dims(tensor, compact=False)``  [ops/utils.py]  -> ``SparseTensor``
+    Replaces BandedIndex/SetIndex dims with their expanded equivalents.
+    ``compact=True`` stops at the DiagonalIndex rung (M× less storage) when the
+    pair ``reduces_to_diagonal``; ``compact=False`` goes to the full dense grid.
+
+* ``_materialize_for_op(tensor)``  [ops/utils.py]  -> ``SparseTensor``
+    The matmul/elementwise boundary: strips compressed dims so those ops only
+    ever see Dense/Diagonal. == ``_densify_compressed_dims(compact=True)``.
+    Exposed as the ``SparseTensor._materialize_compressed()`` method (via the
+    ``@_on_materialized`` decorator) for reductions / non-linear unary ops,
+    which must run on the dense element multiset, not the raw band/set buffer.
+
+Internal kernels (not entry points): ``_apply_dense_scattering`` ->
+``_densify_diagonal_select`` (broadcast + ``jnp.where`` over an eye-mask — *no*
+``lax.scatter``, despite the surrounding "scatter" vocabulary, so XLA can fuse
+it); compressed expansion goes through ``Index.densify_axis`` -> the band
+kernels in ``ops/block_storage.py``.
+
+Architectural invariant: ops consume only {Dense, Diagonal}; {Banded, Set} are
+densified at every boundary except transpose-as-view.
 """
 
 from __future__ import annotations
@@ -45,7 +93,7 @@ def dense(
       3. ``_collect_scatter_indices`` — for each requested dim, also pull in
          its sparse-pair sibling (the diagonal needs both ends).
       4. ``_apply_dense_scattering`` → ``_prepare_values_for_scattering`` →
-         ``_densify_diagonal_scatter`` — for each sparse pair to materialize,
+         ``_densify_diagonal_select`` — for each sparse pair to materialize,
          emit one ``(N, N, …) where eye_mask`` broadcast/select; loop the pairs
          independently (linearizing them would corrupt block-axis layouts and
          waste memory in the trailing axes).
@@ -63,7 +111,7 @@ def dense(
 
     Internally: implicit=∅ (every dim already has an axis), so step 3 is a
     no-op. Step 4 expands the requested ``{0, 1}`` to itself (siblings already
-    in). Step 5 calls ``_densify_diagonal_scatter`` once on the leading axis,
+    in). Step 5 calls ``_densify_diagonal_select`` once on the leading axis,
     producing shape ``(2, 2, 3, 3)``; ``_apply_dense_scattering`` then
     transposes to ``(2, 3, 2, 3)`` and reshapes to ``(6, 6)``.
 
@@ -151,6 +199,11 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
         return v
 
     # Single-sparse-pair fast path: emit a where over a 1-fusion dense form.
+    # Requires every NON-pair (dense) dim to be physically present in ``val``
+    # (``axis is not None``): the layout step below maps each such dim to a
+    # leftover ``val`` axis, so an implicit (``axis is None``) dense dim has no
+    # axis to map and would break the layout. Those tensors fall through to the
+    # generic ``dense(hard=True)`` path below, which broadcasts implicit dims in.
     sparse_dims = [d for d in tensor.dims if d.is_sparse]
     if (
         tensor.val is not None
@@ -158,6 +211,7 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
         and sparse_dims[0].other_id == sparse_dims[1].id
         and sparse_dims[1].other_id == sparse_dims[0].id
         and sparse_dims[0].axis == sparse_dims[1].axis
+        and all(d.axis is not None for d in tensor.dims if not d.is_sparse)
     ):
         d_o, d_i = sparse_dims
         B_o, B_i = d_o.block_size or 1, d_i.block_size or 1
@@ -351,13 +405,13 @@ def _prepare_values_for_scattering(values, scatter_axes, fill_value):
     #   axes[num_scatter+i..]            = trailing axes (original order)
     for i in range(num_scatter):
         # The next pair to densify currently sits at axis ``i`` (its "out"
-        # slot). Move it to position 0 so ``_densify_diagonal_scatter`` can
+        # slot). Move it to position 0 so ``_densify_diagonal_select`` can
         # operate on the leading axis.
         if i != 0:
             perm = [i] + [a for a in range(values.ndim) if a != i]
             values = values.transpose(perm)
-        values = _densify_diagonal_scatter(values, fill_value)
-        # ``_densify_diagonal_scatter`` produced shape ``(N, N, *rest)``.
+        values = _densify_diagonal_select(values, fill_value)
+        # ``_densify_diagonal_select`` produced shape ``(N, N, *rest)``.
         # Place the new "out" copy at position ``i`` (its final slot) and
         # the new "primal" copy at position ``num_scatter + i`` (slot for
         # the i-th primal copy) without disturbing the relative order of
@@ -472,7 +526,7 @@ def _reconstruct_logical_dimensions(logical_dims, logical_to_physical):
     return res
 
 
-def _densify_diagonal_scatter(val: Array, fill_value: Array) -> Array:
+def _densify_diagonal_select(val: Array, fill_value: Array) -> Array:
     """Place ``val[i, ...]`` on the diagonal of a single sparse pair.
 
     Returns a ``(n_diag, n_diag, *trailing)`` grid where the leading axis of
