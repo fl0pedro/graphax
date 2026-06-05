@@ -527,59 +527,95 @@ class SparseTensor(SparseMathMixin):
 
     # Low priority TODO: axis, and other args
     @property
-    def _n_fill_cells(self) -> int:
-        """Number of implicit fill cells = logical size minus stored values.
-        ``0`` ⇒ ``val`` covers every cell, so ``fill_value`` must NOT enter a
-        reduction (a dense tensor has no off-diagonal fill positions)."""
-        return self.size - (0 if self.val is None else self.val.size)
+    def _structural_val_size(self) -> int:
+        """Number of on-structure (non-fill) cells — the size ``val`` carries, or
+        WOULD carry if materialized for a ``val is None`` tensor.
 
-    def _reduce(self, reduce_fn, fold_fn, identity, *, weighted: bool = False) -> Array:
+        For ``val`` present this is just ``val.size``. For ``val is None`` (the
+        structure is all-ones — same reading as ``dense()``), it is
+        ``size // ∏ N_pair``: each sparse pair's two sides both carry the shared
+        meta count ``N``, so the logical ``size`` holds ``N²`` per pair while the
+        stored diagonal holds only ``N`` — divide it back out once per pair. A
+        fully-dense ``val is None`` tensor has no pairs ⇒ every cell is structure
+        (all ones); a diagonal pair contributes its ``N·B_row·B_col`` blocks."""
+        if self.val is not None:
+            return self.val.size
+        n = self.size
+        seen = set()
+        for d in self.dims:
+            if d.is_sparse:
+                key = frozenset((d.id, d.other_id))
+                if key not in seen:
+                    seen.add(key)
+                    n //= d.size
+        return n
+
+    @property
+    def _n_fill_cells(self) -> int:
+        """Number of implicit fill cells = logical size minus on-structure cells.
+        ``0`` ⇒ ``val`` covers every cell, so ``fill_value`` must NOT enter a
+        reduction (a fully-dense tensor has no off-block-diagonal fill positions)."""
+        return self.size - self._structural_val_size
+
+    def _stored_val(self) -> Array:
+        """The on-structure values as a concrete array: ``val`` itself, or — for a
+        structural ``val is None`` tensor — ``ones`` of the would-be stored size
+        (``_structural_val_size``). ``val=None`` means the structure is all-ones
+        (matching ``dense()``), so reductions fold those ones in rather than
+        treating every cell as fill."""
+        if self.val is not None:
+            return self.val
+        return jnp.ones(self._structural_val_size, dtype=self.dtype)
+
+    def _reduce(self, reduce_fn, fold_fn, *, weighted: bool = False) -> Array:
         """Shared skeleton for all/any/sum/prod (NOT max/min — see ``_extremum``,
         which can't seed an identity without introducing ``-inf``).
 
-        Reduce the scaled stored values (``identity`` = the reduce identity for a
-        pure-structure tensor; pass a *weak* Python ``0``/``1`` for sum/prod so an
-        integer tensor doesn't promote to float), then fold the scaled implicit
-        fill via ``fold_fn(reduced, scaled_fill, n_fill)``:
+        Reduce the scaled on-structure values (``_stored_val()`` — ``val``, or
+        ``ones`` when ``val is None``; ``_stored_val`` uses the tensor's own dtype
+        so an integer tensor stays integer), then fold the scaled implicit fill
+        via ``fold_fn(reduced, scaled_fill, n_fill)``:
 
         * ``weighted`` (sum/prod): the fold weights by the implicit-cell count
-          (``+ f*n`` / ``* f**n``) and is branchless — it vanishes at ``identity``
-          when ``n_fill == 0``.
+          (``+ f*n`` / ``* f**n``) and is branchless — it vanishes when ``n_fill
+          == 0``.
         * otherwise (all/any): an idempotent fold applied only when fill cells
           exist; ``fold_fn`` maps the fill's truthiness itself."""
-        val_part = (
-            identity if self.val is None else reduce_fn(self.val * self.scalar_mult)
-        )
+        val_part = reduce_fn(self._stored_val() * self.scalar_mult)
         scaled_fill = self._eff_fill * self.scalar_mult
-        # weighted (sum/prod) always folds (branchless, vanishes at identity when
-        # n_fill==0); all/any fold only when fill cells exist.
+        # weighted (sum/prod) always folds (branchless, vanishes when n_fill==0);
+        # all/any fold only when fill cells exist.
         if weighted or self._n_fill_cells > 0:
             return fold_fn(val_part, scaled_fill, self._n_fill_cells)
         return jnp.asarray(val_part)
 
     @_on_materialized
     def all(self) -> Array:
-        return self._reduce(jnp.all, lambda v, f, n: jnp.logical_and(v, f != 0), True)
+        return self._reduce(jnp.all, lambda v, f, n: jnp.logical_and(v, f != 0))
 
     @_on_materialized
     def any(self) -> Array:
-        return self._reduce(jnp.any, lambda v, f, n: jnp.logical_or(v, f != 0), False)
+        return self._reduce(jnp.any, lambda v, f, n: jnp.logical_or(v, f != 0))
 
     @_on_materialized
     def sum(self) -> Array:
-        return self._reduce(jnp.sum, lambda v, f, n: v + f * n, 0, weighted=True)
+        return self._reduce(jnp.sum, lambda v, f, n: v + f * n, weighted=True)
 
     @_on_materialized
     def prod(self) -> Array:
-        return self._reduce(jnp.prod, lambda v, f, n: v * f ** n, 1, weighted=True)
+        return self._reduce(jnp.prod, lambda v, f, n: v * f ** n, weighted=True)
 
     def _extremum(self, reduce_fn, fold_fn) -> Array:
         """Shared skeleton for max()/min(): scale BEFORE the extremum (a negative
-        scalar_mult reverses order), fold the scaled fill only when implicit fill
-        cells exist. Pure-structure tensors are just the scaled fill."""
-        if self.val is None:
+        scalar_mult reverses order) over the on-structure values (``_stored_val``
+        — ``val``, or ``ones`` when ``val is None``), then fold the scaled fill
+        when implicit fill cells exist. A tensor with NO on-structure cells (an
+        empty / pure-fill tensor) has no extremum to take, so it IS the scaled
+        fill."""
+        val = self._stored_val()
+        if val.size == 0:
             return self._eff_fill * self.scalar_mult
-        m = reduce_fn(self.val * self.scalar_mult)
+        m = reduce_fn(val * self.scalar_mult)
         if self._n_fill_cells > 0:
             m = fold_fn(m, self._eff_fill * self.scalar_mult)
         return m
