@@ -8,7 +8,7 @@ from jax import Array
 
 from graphax.sparse.ops.matmul import matmul
 from graphax.sparse.tensor import (
-    SparseIndex,
+    DiagonalIndex,
     SparseTensor,
     _arr2st,
     matmul,

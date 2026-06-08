@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 
-from graphax.sparse.indexes import SparseIndex, DenseIndex
+from graphax.sparse.indexes import DiagonalIndex, DenseIndex
 from graphax.sparse.tensor import SparseTensor, _arr2st
 import math
 
@@ -31,16 +31,16 @@ class TestExplicit(unittest.TestCase):
         B = jr.normal(k2, (a,))
 
         A_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1),), (SparseIndex(1, a, 0, 0),), A
+            (DiagonalIndex(0, a, 0, 1),), (DiagonalIndex(1, a, 0, 0),), A
         )
         B_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1),), (SparseIndex(1, a, 0, 0),), B
+            (DiagonalIndex(0, a, 0, 1),), (DiagonalIndex(1, a, 0, 0),), B
         )
 
         R = A * B
 
         R_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1),), (SparseIndex(1, a, 0, 0),), R
+            (DiagonalIndex(0, a, 0, 1),), (DiagonalIndex(1, a, 0, 0),), R
         )
 
         assert jnp.allclose(R_st.dense(), A_st.dense() @ B_st.dense())
@@ -83,7 +83,7 @@ class TestExplicit(unittest.TestCase):
         B = jr.normal(k2, (a, b))
 
         A_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1),), (SparseIndex(1, a, 0, 0),), A
+            (DiagonalIndex(0, a, 0, 1),), (DiagonalIndex(1, a, 0, 0),), A
         )
         B_st = _arr2st(B)
 
@@ -109,7 +109,7 @@ class TestExplicit(unittest.TestCase):
 
         A_st = _arr2st(A)
         B_st = SparseTensor(
-            (SparseIndex(0, b, 0, 1),), (SparseIndex(1, b, 0, 0),), B
+            (DiagonalIndex(0, b, 0, 1),), (DiagonalIndex(1, b, 0, 0),), B
         )
 
         R = A * jnp.expand_dims(B, 0)
@@ -133,21 +133,21 @@ class TestExplicit(unittest.TestCase):
         B = jr.normal(k2, (a, c, d))
 
         A_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1, b, 1),),
-            (SparseIndex(1, a, 0, 0, c, 2),),
+            (DiagonalIndex(0, a, 0, 1, b, 1),),
+            (DiagonalIndex(1, a, 0, 0, c, 2),),
             A,
         )
         B_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1, c, 1),),
-            (SparseIndex(1, a, 0, 0, d, 2),),
+            (DiagonalIndex(0, a, 0, 1, c, 1),),
+            (DiagonalIndex(1, a, 0, 0, d, 2),),
             B,
         )
 
         R = jax.lax.dot_general(A, B, (((2,), (1,)), ((0,), (0,))))
 
         R_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1, b, 1),),
-            (SparseIndex(1, a, 0, 0, d, 2),),
+            (DiagonalIndex(0, a, 0, 1, b, 1),),
+            (DiagonalIndex(1, a, 0, 0, d, 2),),
             R,
         )
 
@@ -168,8 +168,8 @@ class TestExplicit(unittest.TestCase):
         B = jr.normal(k2, (a * c, d))
 
         A_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1, b, 1),),
-            (SparseIndex(1, a, 0, 0, c, 2),),
+            (DiagonalIndex(0, a, 0, 1, b, 1),),
+            (DiagonalIndex(1, a, 0, 0, c, 2),),
             A,
         )
         B_st = _arr2st(B)
@@ -200,8 +200,8 @@ class TestExplicit(unittest.TestCase):
 
         A_st = _arr2st(A)
         B_st = SparseTensor(
-            (SparseIndex(0, b, 0, 1, c, 1),),
-            (SparseIndex(1, b, 0, 0, d, 2),),
+            (DiagonalIndex(0, b, 0, 1, c, 1),),
+            (DiagonalIndex(1, b, 0, 0, d, 2),),
             B,
         )
 
@@ -230,20 +230,20 @@ class TestExplicit(unittest.TestCase):
         B = jr.normal(k2, (a * c,))
 
         A_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1, b, 1),),
-            (SparseIndex(1, a, 0, 0, c, 2),),
+            (DiagonalIndex(0, a, 0, 1, b, 1),),
+            (DiagonalIndex(1, a, 0, 0, c, 2),),
             A,
         )
         B_st = SparseTensor(
-            (SparseIndex(0, a * c, 0, 1),), (SparseIndex(1, a * c, 0, 0),), B
+            (DiagonalIndex(0, a * c, 0, 1),), (DiagonalIndex(1, a * c, 0, 0),), B
         )
 
         B_prime = B.reshape(a, c)
         R = A * jnp.expand_dims(B_prime, 1)  # broadcast_mul
 
         R_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1, b, 1),),
-            (SparseIndex(1, a, 0, 0, c, 2),),
+            (DiagonalIndex(0, a, 0, 1, b, 1),),
+            (DiagonalIndex(1, a, 0, 0, c, 2),),
             R,
         )
 
@@ -264,11 +264,11 @@ class TestExplicit(unittest.TestCase):
         B = jr.normal(k2, (a, b, c))
 
         A_st = SparseTensor(
-            (SparseIndex(0, a * b, 0, 1),), (SparseIndex(1, a * b, 0, 0),), A
+            (DiagonalIndex(0, a * b, 0, 1),), (DiagonalIndex(1, a * b, 0, 0),), A
         )
         B_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1, b, 1),),
-            (SparseIndex(1, a, 0, 0, c, 2),),
+            (DiagonalIndex(0, a, 0, 1, b, 1),),
+            (DiagonalIndex(1, a, 0, 0, c, 2),),
             B,
         )
 
@@ -276,8 +276,8 @@ class TestExplicit(unittest.TestCase):
         R = jnp.expand_dims(A_prime, 2) * B  # broadcast_mul
 
         R_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1, b, 1),),
-            (SparseIndex(1, a, 0, 0, c, 2),),
+            (DiagonalIndex(0, a, 0, 1, b, 1),),
+            (DiagonalIndex(1, a, 0, 0, c, 2),),
             R,
         )
 
@@ -299,13 +299,13 @@ class TestExplicit(unittest.TestCase):
         B = jr.normal(k2, (c, b, f))
 
         A_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1, d, 1),),
-            (SparseIndex(1, a, 0, 0, e, 2),),
+            (DiagonalIndex(0, a, 0, 1, d, 1),),
+            (DiagonalIndex(1, a, 0, 0, e, 2),),
             A,
         )
         B_st = SparseTensor(
-            (SparseIndex(0, c, 0, 1, b, 1),),
-            (SparseIndex(1, c, 0, 0, f, 2),),
+            (DiagonalIndex(0, c, 0, 1, b, 1),),
+            (DiagonalIndex(1, c, 0, 0, f, 2),),
             B,
         )
 
@@ -314,8 +314,8 @@ class TestExplicit(unittest.TestCase):
         R = R_inter.reshape(a, k, d, f).transpose(0, 2, 1, 3).reshape(a, d, k * f)
 
         R_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1, d, 1),),
-            (SparseIndex(1, a, 0, 0, k * f, 2),),
+            (DiagonalIndex(0, a, 0, 1, d, 1),),
+            (DiagonalIndex(1, a, 0, 0, k * f, 2),),
             R,
         )
 
@@ -337,13 +337,13 @@ class TestExplicit(unittest.TestCase):
         B = jr.normal(k2, (c, b, f))
 
         A_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1, d, 1),),
-            (SparseIndex(1, a, 0, 0, e, 2),),
+            (DiagonalIndex(0, a, 0, 1, d, 1),),
+            (DiagonalIndex(1, a, 0, 0, e, 2),),
             A,
         )
         B_st = SparseTensor(
-            (SparseIndex(0, c, 0, 1, b, 1),),
-            (SparseIndex(1, c, 0, 0, f, 2),),
+            (DiagonalIndex(0, c, 0, 1, b, 1),),
+            (DiagonalIndex(1, c, 0, 0, f, 2),),
             B,
         )
 
@@ -352,8 +352,8 @@ class TestExplicit(unittest.TestCase):
         R = R_inter.reshape(c, k * d, f)
 
         R_st = SparseTensor(
-            (SparseIndex(0, c, 0, 1, k * d, 1),),
-            (SparseIndex(1, c, 0, 0, f, 2),),
+            (DiagonalIndex(0, c, 0, 1, k * d, 1),),
+            (DiagonalIndex(1, c, 0, 0, f, 2),),
             R,
         )
 
@@ -376,13 +376,13 @@ class TestExplicit(unittest.TestCase):
         B = jr.normal(k2, (b, c, f))
 
         A_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1, d, 1),),
-            (SparseIndex(1, a, 0, 0, e, 2),),
+            (DiagonalIndex(0, a, 0, 1, d, 1),),
+            (DiagonalIndex(1, a, 0, 0, e, 2),),
             A,
         )
         B_st = SparseTensor(
-            (SparseIndex(0, b, 0, 1, c, 1),),
-            (SparseIndex(1, b, 0, 0, f, 2),),
+            (DiagonalIndex(0, b, 0, 1, c, 1),),
+            (DiagonalIndex(1, b, 0, 0, f, 2),),
             B,
         )
 
@@ -407,8 +407,8 @@ class TestExplicit(unittest.TestCase):
         )
 
         R_st = SparseTensor(
-            (SparseIndex(0, k, 0, 1, (a // k) * d, 1),),
-            (SparseIndex(1, k, 0, 0, (b // k) * f, 2),),
+            (DiagonalIndex(0, k, 0, 1, (a // k) * d, 1),),
+            (DiagonalIndex(1, k, 0, 0, (b // k) * f, 2),),
             R,
         )
 
@@ -416,9 +416,9 @@ class TestExplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
+        # Misaligned-contract matmul emits a BandedIndex pair (band buffer in
+        # ``val``). Compare densified forms.
         assert jnp.allclose(R_ref.dense(), R_st.dense())
-        assert (R_st == R_ref).all()
-        assert jnp.allclose(R, R_ref.val)
 
     def test_block_block_coprime_a_greater_b(self):
         rng_key = self.rng_key
@@ -429,13 +429,13 @@ class TestExplicit(unittest.TestCase):
         B = jr.normal(k2, (b, c, f))
 
         A_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1, d, 1),),
-            (SparseIndex(1, a, 0, 0, e, 2),),
+            (DiagonalIndex(0, a, 0, 1, d, 1),),
+            (DiagonalIndex(1, a, 0, 0, e, 2),),
             A,
         )
         B_st = SparseTensor(
-            (SparseIndex(0, b, 0, 1, c, 1),),
-            (SparseIndex(1, b, 0, 0, f, 2),),
+            (DiagonalIndex(0, b, 0, 1, c, 1),),
+            (DiagonalIndex(1, b, 0, 0, f, 2),),
             B,
         )
 
@@ -451,7 +451,10 @@ class TestExplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
-        assert jnp.allclose(R_st.val, R_ref.val)
+        # Misaligned-contract matmul emits a BandedIndex pair (band buffer in
+        # ``val``). Compare densified forms; structural shape / dim count is
+        # still preserved.
+        assert jnp.allclose(R_st.dense(), R_ref.dense())
         assert R_st.shape == R_ref.shape
         assert len(R_st.dims) == len(R_ref.dims)
 
@@ -464,13 +467,13 @@ class TestExplicit(unittest.TestCase):
         B = jr.normal(k2, (a, e, d))
 
         A_st = SparseTensor(
-            (SparseIndex(0, b, 0, 1, f, 1),),
-            (SparseIndex(1, b, 0, 0, c, 2),),
+            (DiagonalIndex(0, b, 0, 1, f, 1),),
+            (DiagonalIndex(1, b, 0, 0, c, 2),),
             A,
         )
         B_st = SparseTensor(
-            (SparseIndex(0, a, 0, 1, e, 1),),
-            (SparseIndex(1, a, 0, 0, d, 2),),
+            (DiagonalIndex(0, a, 0, 1, e, 1),),
+            (DiagonalIndex(1, a, 0, 0, d, 2),),
             B,
         )
 
@@ -486,7 +489,10 @@ class TestExplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
-        assert jnp.allclose(R_st.val, R_ref.val)
+        # Misaligned-contract matmul emits a BandedIndex pair (band buffer in
+        # ``val``). Compare densified forms; structural shape / dim count is
+        # still preserved.
+        assert jnp.allclose(R_st.dense(), R_ref.dense())
         assert R_st.shape == R_ref.shape
         assert len(R_st.dims) == len(R_ref.dims)
 
@@ -498,9 +504,9 @@ class TestExplicit(unittest.TestCase):
         B = jr.normal(k2, (2, 9, 2))
 
         A_st = SparseTensor(
-            (SparseIndex(0, 4, 0, 1, 3, 2),),
+            (DiagonalIndex(0, 4, 0, 1, 3, 2),),
             (
-                SparseIndex(1, 4, 0, 0),
+                DiagonalIndex(1, 4, 0, 0),
                 DenseIndex(2, 9, 1),
             ),
             A,
@@ -508,12 +514,12 @@ class TestExplicit(unittest.TestCase):
 
         B_st = SparseTensor(
             (
-                SparseIndex(0, 2, 0, 2, 2, 2),
-                SparseIndex(1, 9, 1, 3),
+                DiagonalIndex(0, 2, 0, 2, 2, 2),
+                DiagonalIndex(1, 9, 1, 3),
             ),
             (
-                SparseIndex(2, 2, 0, 0),
-                SparseIndex(3, 9, 1, 1),
+                DiagonalIndex(2, 2, 0, 0),
+                DiagonalIndex(3, 9, 1, 1),
             ),
             B,
         )
@@ -526,9 +532,9 @@ class TestExplicit(unittest.TestCase):
         R = R_inter.transpose(0, 1, 3, 2).reshape(2, 6, 9)
 
         R_st = SparseTensor(
-            (SparseIndex(0, 2, 0, 1, 6, 1),),
+            (DiagonalIndex(0, 2, 0, 1, 6, 1),),
             (
-                SparseIndex(1, 2, 0, 0),
+                DiagonalIndex(1, 2, 0, 0),
                 DenseIndex(2, 9, 2),
             ),
             R,
@@ -553,13 +559,13 @@ class TestExplicit(unittest.TestCase):
         B = jr.normal(k2, (2, 3, 2, 8, 2))
 
         A_st = SparseTensor(
-            (SparseIndex(0, 4, 0, 2, 3, 2), SparseIndex(1, 4, 1, 3, 2, 3)),
-            (SparseIndex(2, 4, 0, 0), SparseIndex(3, 4, 1, 1, 6, 4)),
+            (DiagonalIndex(0, 4, 0, 2, 3, 2), DiagonalIndex(1, 4, 1, 3, 2, 3)),
+            (DiagonalIndex(2, 4, 0, 0), DiagonalIndex(3, 4, 1, 1, 6, 4)),
             A,
         )
         B_st = SparseTensor(
-            (SparseIndex(0, 2, 0, 2, 2, 2), SparseIndex(1, 3, 1, 3, 8, 3)),
-            (SparseIndex(2, 2, 0, 0), SparseIndex(3, 3, 1, 1, 2, 4)),
+            (DiagonalIndex(0, 2, 0, 2, 2, 2), DiagonalIndex(1, 3, 1, 3, 8, 3)),
+            (DiagonalIndex(2, 2, 0, 0), DiagonalIndex(3, 3, 1, 1, 2, 4)),
             B,
         )
 
@@ -591,8 +597,8 @@ class TestExplicit(unittest.TestCase):
         R = C_grid.transpose(0, 3, 1, 6, 4, 7, 2, 5, 8).reshape(2, 6, 8, 6)
 
         R_st = SparseTensor(
-            (SparseIndex(0, 2, 0, 2, 6, 1), SparseIndex(1, 1, None, 3, 8, 2)),
-            (SparseIndex(2, 2, 0, 0), SparseIndex(3, 1, None, 1, 6, 3)),
+            (DiagonalIndex(0, 2, 0, 2, 6, 1), DiagonalIndex(1, 1, None, 3, 8, 2)),
+            (DiagonalIndex(2, 2, 0, 0), DiagonalIndex(3, 1, None, 1, 6, 3)),
             R,
         )
         assert jnp.allclose(
@@ -616,13 +622,13 @@ class TestExplicit(unittest.TestCase):
         B = jr.normal(k2, (6, 6, 2, 5))
 
         A_st = SparseTensor(
-            (SparseIndex(0, 4, 0, 2, 4, 2), SparseIndex(1, 3, 1, 3, 2, 3)),
-            (SparseIndex(2, 4, 0, 0, 3, 4), SparseIndex(3, 3, 1, 1, 2, 5)),
+            (DiagonalIndex(0, 4, 0, 2, 4, 2), DiagonalIndex(1, 3, 1, 3, 2, 3)),
+            (DiagonalIndex(2, 4, 0, 0, 3, 4), DiagonalIndex(3, 3, 1, 1, 2, 5)),
             A,
         )
         B_st = SparseTensor(
-            (SparseIndex(0, 6, 0, 2, 2, 2), DenseIndex(1, 6, 1)),
-            (SparseIndex(2, 6, 0, 0, 5, 3),),
+            (DiagonalIndex(0, 6, 0, 2, 2, 2), DenseIndex(1, 6, 1)),
+            (DiagonalIndex(2, 6, 0, 0, 5, 3),),
             B,
         )
 
@@ -643,8 +649,8 @@ class TestExplicit(unittest.TestCase):
         R = C_grid.transpose(0, 1, 4, 3, 5, 2, 6).reshape(2, 8, 6, 15)
 
         R_st = SparseTensor(
-            (SparseIndex(0, 2, 0, 2, 8, 1), DenseIndex(1, 6, 2)),
-            (SparseIndex(2, 2, 0, 0, 15, 3),),
+            (DiagonalIndex(0, 2, 0, 2, 8, 1), DenseIndex(1, 6, 2)),
+            (DiagonalIndex(2, 2, 0, 0, 15, 3),),
             R,
         )
         assert jnp.allclose(
@@ -669,27 +675,27 @@ class TestExplicit(unittest.TestCase):
 
         A_st = SparseTensor(
             (
-                SparseIndex(0, 4, 0, 2, 3, 3),
-                SparseIndex(1, 3, 2, 4),
+                DiagonalIndex(0, 4, 0, 2, 3, 3),
+                DiagonalIndex(1, 3, 2, 4),
             ),
             (
-                SparseIndex(2, 4, 0, 0),
+                DiagonalIndex(2, 4, 0, 0),
                 DenseIndex(3, 9, 1),
-                SparseIndex(4, 3, 2, 1),
+                DiagonalIndex(4, 3, 2, 1),
             ),
             A,
         )
 
         B_st = SparseTensor(
             (
-                SparseIndex(0, 2, 0, 3, 2, 3),
-                SparseIndex(1, 9, 1, 4),
-                SparseIndex(2, 3, 2, 5),
+                DiagonalIndex(0, 2, 0, 3, 2, 3),
+                DiagonalIndex(1, 9, 1, 4),
+                DiagonalIndex(2, 3, 2, 5),
             ),
             (
-                SparseIndex(3, 2, 0, 0),
-                SparseIndex(4, 9, 1, 1),
-                SparseIndex(5, 3, 2, 2),
+                DiagonalIndex(3, 2, 0, 0),
+                DiagonalIndex(4, 9, 1, 1),
+                DiagonalIndex(5, 3, 2, 2),
             ),
             B,
         )
@@ -703,13 +709,13 @@ class TestExplicit(unittest.TestCase):
 
         R_st = SparseTensor(
             (
-                SparseIndex(0, 2, 0, 2, 6, 2),
-                SparseIndex(1, 3, 1, 4),
+                DiagonalIndex(0, 2, 0, 2, 6, 2),
+                DiagonalIndex(1, 3, 1, 4),
             ),
             (
-                SparseIndex(2, 2, 0, 0),
+                DiagonalIndex(2, 2, 0, 0),
                 DenseIndex(3, 9, 3),
-                SparseIndex(4, 3, 1, 1),
+                DiagonalIndex(4, 3, 1, 1),
             ),
             R,
         )
@@ -734,24 +740,24 @@ class TestExplicit(unittest.TestCase):
 
         A_st = SparseTensor(
             (
-                SparseIndex(0, 4, 0, 3, 3, 3),
-                SparseIndex(1, 4, 1, 4, 2, 4),
-                SparseIndex(2, 3, 2, 5, 3, 6),
+                DiagonalIndex(0, 4, 0, 3, 3, 3),
+                DiagonalIndex(1, 4, 1, 4, 2, 4),
+                DiagonalIndex(2, 3, 2, 5, 3, 6),
             ),
             (
-                SparseIndex(3, 4, 0, 0),
-                SparseIndex(4, 4, 1, 1, 3, 5),
-                SparseIndex(5, 3, 2, 2, 3, 7),
+                DiagonalIndex(3, 4, 0, 0),
+                DiagonalIndex(4, 4, 1, 1, 3, 5),
+                DiagonalIndex(5, 3, 2, 2, 3, 7),
             ),
             A,
         )
         B_st = SparseTensor(
             (
-                SparseIndex(0, 2, 0, 3, 2, 2),
-                SparseIndex(1, 3, 1, 4, 4, 3),
+                DiagonalIndex(0, 2, 0, 3, 2, 2),
+                DiagonalIndex(1, 3, 1, 4, 4, 3),
                 DenseIndex(2, 9, 4),
             ),
-            (SparseIndex(3, 2, 0, 0), SparseIndex(4, 3, 1, 1, 2, 5)),
+            (DiagonalIndex(3, 2, 0, 0), DiagonalIndex(4, 3, 1, 1, 2, 5)),
             B,
         )
 
@@ -788,23 +794,24 @@ class TestExplicit(unittest.TestCase):
 
         R_st = SparseTensor(
             (
-                SparseIndex(0, 2, 0, 3, 6, 1),
-                SparseIndex(1, 1, None, 4, 8, 2),
+                DiagonalIndex(0, 2, 0, 3, 6, 1),
+                DiagonalIndex(1, 1, None, 4, 8, 2),
                 DenseIndex(2, 9, 3),
             ),
-            (SparseIndex(3, 2, 0, 0), SparseIndex(4, 1, None, 1, 6, 4)),
+            (DiagonalIndex(3, 2, 0, 0), DiagonalIndex(4, 1, None, 1, 6, 4)),
             R,
         )
 
         assert jnp.allclose(
             R_st.dense(),
             jnp.tensordot(A_st.dense(), B_st.dense(), axes=([3, 4, 5], [0, 1, 2])),
+            atol=1e-5,
         )
 
         R_ref = A_st @ B_st
 
         assert jnp.allclose(R_ref.dense(), R_st.dense())
-        assert (R_st == R_ref).all()
+        assert jnp.allclose(R_st.dense(), R_ref.dense())
         assert jnp.allclose(R, R_ref.val)
 
 

@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import jax.random as jr
 
 from graphax.sparse.tensor import SparseTensor
-from graphax.sparse.indexes import DenseIndex, SparseIndex
+from graphax.sparse.indexes import DenseIndex, DiagonalIndex
 from graphax.sparse.ops.matmul import matmul
 
 
@@ -71,8 +71,8 @@ class TestMatmulBatchedSparsePair(unittest.TestCase):
         N, A, K, B = 3, 2, 4, 5
         a = SparseTensor(
             (
-                SparseIndex(0, N, axis=0, other_id=1),
-                SparseIndex(1, N, axis=0, other_id=0),
+                DiagonalIndex(0, N, axis=0, other_id=1),
+                DiagonalIndex(1, N, axis=0, other_id=0),
                 DenseIndex(2, A, axis=1),
             ),
             (DenseIndex(3, K, axis=2),),
@@ -81,8 +81,8 @@ class TestMatmulBatchedSparsePair(unittest.TestCase):
         )
         b = SparseTensor(
             (
-                SparseIndex(0, N, axis=0, other_id=1),
-                SparseIndex(1, N, axis=0, other_id=0),
+                DiagonalIndex(0, N, axis=0, other_id=1),
+                DiagonalIndex(1, N, axis=0, other_id=0),
                 DenseIndex(2, K, axis=1),  # contracts with a.primal DenseDim(3)
             ),
             (DenseIndex(3, B, axis=2),),
@@ -101,9 +101,9 @@ class TestMatmulBatchedSparsePair(unittest.TestCase):
             f"batch_sparse mismatch: max diff "
             f"{float(jnp.max(jnp.abs(got.dense() - ref_dense)))}",
         )
-        # Sanity-check that the result actually carries a SparseIndex pair (the proof
+        # Sanity-check that the result actually carries a DiagonalIndex pair (the proof
         # that the `batch_sparse` arm built the output and not, say, a `spatial_*` arm).
-        sparse_dims_out = [d for d in got.dims if isinstance(d, SparseIndex)]
+        sparse_dims_out = [d for d in got.dims if d.is_sparse]
         self.assertEqual(len(sparse_dims_out), 2, "expected one sparse pair in output")
 
 
@@ -151,13 +151,13 @@ class TestZeroFillFlagSurvivesJit(unittest.TestCase):
     fell back to ``False``, and the matmul rerouted through the
     densify-then-dot_general fallback even for the canonical zero-fill case.
 
-    The fix caches the flag at SparseTensor construction (when fill_value is
-    still concrete) and propagates it through the pytree's static aux_data
-    so it survives jit. These tests pin that behavior:
+    The static-zero marker is now ``fill_value is None``: None lives in the
+    pytree treedef (static aux), so the distinction survives jit for free.
+    These tests pin that behavior:
 
-    1. The flag is statically ``True`` for default-construction zero fills.
-    2. The flag round-trips through ``jit(identity)`` (i.e. ``tree_unflatten``
-       restores it from aux_data).
+    1. ``fill_value is None`` for default-construction zero fills.
+    2. The None marker round-trips through ``jit(identity)`` (``tree_unflatten``
+       restores it from the treedef).
     3. A jit'd ``matmul`` of two zero-fill operands compiles to small HLO
        (proxy for "stayed on the tiled path, didn't materialize a dense
        intermediate") — the densify fallback would balloon the HLO with a
@@ -167,30 +167,31 @@ class TestZeroFillFlagSurvivesJit(unittest.TestCase):
     def _zero_fill_tensor(self, shape, key_idx, fill_value=None):
         return SparseTensor(
             (DenseIndex(0, shape[0], axis=0),
-             SparseIndex(1, shape[1], axis=1, other_id=2)),
-            (SparseIndex(2, shape[1], axis=1, other_id=1),),
+             DiagonalIndex(1, shape[1], axis=1, other_id=2)),
+            (DiagonalIndex(2, shape[1], axis=1, other_id=1),),
             _n(shape, key_idx),
             **({"fill_value": fill_value} if fill_value is not None else {}),
         )
 
     def test_default_fill_is_static_zero(self):
-        """Default ``fill_value=None`` ⇒ ``jnp.array(0)`` ⇒ flag must be True."""
+        """Default fill ⇒ ``fill_value is None`` (the statically-zero marker)."""
         t = self._zero_fill_tensor((4, 6), 1)
-        self.assertTrue(t._zero_fill,
-                        "default-constructed SparseTensor must have _zero_fill=True")
+        self.assertIsNone(t.fill_value,
+                          "default-constructed SparseTensor must have fill_value=None")
 
     def test_explicit_nonzero_fill_is_static_false(self):
-        """Concretely non-zero fill ⇒ flag must be False (forces densify path)."""
+        """Concretely non-zero fill ⇒ not None (forces densify path)."""
         t = self._zero_fill_tensor((4, 6), 1,
                                    fill_value=jnp.array(0.5, dtype=jnp.float32))
-        self.assertFalse(t._zero_fill)
+        self.assertIsNotNone(t.fill_value)
 
     def test_flag_survives_jit_identity(self):
-        """``tree_unflatten`` after a jit must restore ``_zero_fill``. If aux_data
-        loses it, downstream ops downgrade silently to the densify path."""
+        """``tree_unflatten`` after a jit must restore the ``None`` fill marker
+        from the treedef. If it were lost, downstream ops downgrade silently to
+        the densify path."""
         t = self._zero_fill_tensor((4, 6), 1)
         t2 = jax.jit(lambda x: x)(t)
-        self.assertTrue(t2._zero_fill)
+        self.assertIsNone(t2.fill_value)
 
     def test_jitted_matmul_uses_tiled_path(self):
         """If the densify fallback fires, HLO carries a full ``dot`` over
@@ -215,16 +216,16 @@ class TestZeroFillFlagSurvivesJit(unittest.TestCase):
 
 
 class TestCompressedValStorage(unittest.TestCase):
-    """SparseTensor can hold a structured pytree from ``ops.block_storage``
-    (UnionBlocks / IntersectionBlocks / BlockBanded) in ``compressed_val``
-    instead of a dense ``val``. Operations that need the dense form call
-    ``compressed_val.to_dense()`` — a gather-free broadcast+select(+sum)
-    chain that XLA folds into the consuming kernel (SMEM, no HBM).
+    """SparseTensor can carry a compressed ``BandedIndex`` pair (the band
+    buffer lives in ``val``; the band geometry lives in the dim ``Index``).
+    Ops that need the dense form pre-densify at the op boundary
+    (``_materialize_for_op``) — a gather-free broadcast+select(+sum) chain that
+    XLA folds into the consuming kernel (SMEM, no HBM).
 
     These tests pin three properties:
 
-    1. SparseTensor accepts compressed storage and round-trips through jit
-       without materializing in HBM.
+    1. SparseTensor accepts compressed-Index storage and round-trips through
+       jit without materializing the full dense form in HBM.
     2. ``tensor.dense()`` returns the same numbers as the equivalent
        dense-val tensor.
     3. ``matmul`` and ``elementwise`` materialize compressed inputs as a
@@ -232,30 +233,43 @@ class TestCompressedValStorage(unittest.TestCase):
     """
 
     def _bb_pair(self, M, B, w):
-        """Build a ``(SparseTensor with BlockBanded compressed_val,
-        equivalent dense SparseTensor)`` pair for testing."""
-        from graphax.sparse.ops.block_storage import BlockBanded
+        """Build a ``(SparseTensor with a BandedIndex pair, equivalent dense
+        SparseTensor)`` pair for testing. The band buffer ``(M, W, B, B)`` is
+        a centered band (``W = 2w+1``); the dense equivalent is its
+        materialization."""
+        from graphax.sparse.indexes import BandedIndex
 
         W = 2 * w + 1
         data = _n((M, W, B, B), 7)
-        bb = BlockBanded(data=data, fill_value=jnp.array(0.0, dtype=jnp.float32))
-        # User-facing API: ``SparseTensor.from_compressed`` wraps a structured
-        # pytree as a SparseTensor with ``compressed_val`` storage in one call.
-        compressed = SparseTensor.from_compressed(bb)
+        # ``size`` is the META count (n_meta * M_row), matching the matmul
+        # producer; ``logical_size = size * block_size = M * B`` is the dense dim.
+        out = (BandedIndex(id=0, size=M, axis=0, other_id=1,
+                           block_size=B, block_axis=1, band_width=W, offset=(),
+                           primary=True, n_secondary=M, n_meta=1),)
+        primal = (BandedIndex(id=1, size=M, axis=0, other_id=0,
+                              block_size=B, block_axis=2, band_width=W, offset=(),
+                              primary=False, n_secondary=M, n_meta=1),)
+        compressed = SparseTensor(
+            out, primal, data,
+            fill_value=jnp.array(0.0, dtype=jnp.float32),
+            check_consistency=False,
+        )
         plain = SparseTensor(
             (DenseIndex(0, M * B, axis=0),),
             (DenseIndex(1, M * B, axis=1),),
-            val=bb.to_dense(),
+            val=compressed.dense(),
             fill_value=jnp.array(0.0, dtype=jnp.float32),
         )
         return compressed, plain
 
     def test_construct_with_compressed_val_and_dense(self):
-        """``compressed_val`` storage round-trips to the same dense form as
-        the equivalent uncompressed ``SparseTensor``."""
+        """Compressed-Index storage round-trips to the same dense form as the
+        equivalent uncompressed ``SparseTensor``, and the dims report as
+        compressed."""
         c, p = self._bb_pair(M=3, B=4, w=1)
-        self.assertIsNone(c.val)
-        self.assertIsNotNone(c.compressed_val)
+        self.assertTrue(c.out_dims[0].is_compressed)
+        self.assertTrue(c.primal_dims[0].is_compressed)
+        self.assertEqual(c.shape, p.shape)
         self.assertTrue(jnp.allclose(c.dense(), p.dense(), atol=1e-5))
 
     def test_compressed_val_survives_jit(self):
@@ -264,14 +278,13 @@ class TestCompressedValStorage(unittest.TestCase):
         c, _ = self._bb_pair(M=3, B=4, w=1)
         out = jax.jit(lambda x: x)(c)
         self.assertIsInstance(out, SparseTensor)
-        self.assertIsNone(out.val)
-        self.assertIsNotNone(out.compressed_val)
+        self.assertTrue(out.out_dims[0].is_compressed)
 
     def test_matmul_consumes_compressed_input(self):
         """A jit'd matmul of (compressed, dense) gives the same result as
         (dense, dense). The compressed input is materialized inline via the
-        gather-free ``BlockBanded.to_dense`` expression — XLA folds it
-        forward into the matmul kernel."""
+        gather-free band densify — XLA folds it forward into the matmul
+        kernel."""
         c, p = self._bb_pair(M=3, B=4, w=1)
         # Build a dense rhs to multiply against.
         rhs = SparseTensor(
@@ -295,9 +308,10 @@ class TestCompressedValStorage(unittest.TestCase):
         from graphax.sparse.ops.elementwise import elementwise
 
         c, p = self._bb_pair(M=3, B=4, w=1)
-        # Same shape; build with regular val.
+        # Same shape; build with a regular dense val + DenseIndex dims.
         other = SparseTensor(
-            c.out_dims, c.primal_dims,
+            (DenseIndex(0, 3 * 4, axis=0),),
+            (DenseIndex(1, 3 * 4, axis=1),),
             val=_n((3 * 4, 3 * 4), 9),
             fill_value=jnp.array(0.0, dtype=jnp.float32),
         )

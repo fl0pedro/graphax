@@ -39,7 +39,7 @@ def test_extra_batch_axes_either_succeed_or_raise():
     out_dims = (DenseIndex(0, 5, 0),)
     primal_dims = (DenseIndex(1, 7, 1),)
     val = jnp.arange(5 * 7 * 3 * 2, dtype=jnp.float32).reshape((5, 7, 3, 2))
-    st = SparseTensor(out_dims, primal_dims, val, sort_val=False)
+    st = SparseTensor(out_dims, primal_dims, val)
     original_shape = st.val.shape
 
     try:
@@ -69,8 +69,7 @@ def test_axis_zero_only_dim_does_not_silently_duplicate():
     out_dims = (DenseIndex(0, 4, 0),)
     primal_dims: tuple = ()
     val = jnp.arange(4 * 5 * 6, dtype=jnp.float32).reshape((4, 5, 6))
-    st = SparseTensor(out_dims, primal_dims, val, sort_val=False,
-                      check_consistency=False)
+    st = SparseTensor(out_dims, primal_dims, val, check_consistency=False)
     original_shape = st.val.shape
 
     try:

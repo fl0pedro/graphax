@@ -1,7 +1,7 @@
 import unittest
 import jax.numpy as jnp
 import jax.random as jr
-from graphax.sparse.tensor import SparseTensor, DenseIndex, SparseIndex
+from graphax.sparse.tensor import SparseTensor, DenseIndex, DiagonalIndex
 from graphax.sparse.ops.matmul import matmul
 from graphax.sparse.ops.elementwise import elementwise
 
@@ -23,13 +23,13 @@ class TestBroadcastingFailures(unittest.TestCase):
     def test_elementwise_sparse_shape_mismatch(self):
         """Fails if matched sparse dimensions have different outer sizes."""
         a = SparseTensor(
-            (SparseIndex(0, 4, axis=0, other_id=1),),
-            (SparseIndex(1, 4, axis=0, other_id=0),),
+            (DiagonalIndex(0, 4, axis=0, other_id=1),),
+            (DiagonalIndex(1, 4, axis=0, other_id=0),),
             self._n((4,), 1),
         )
         b = SparseTensor(
-            (SparseIndex(0, 5, axis=0, other_id=1),),
-            (SparseIndex(1, 5, axis=0, other_id=0),),
+            (DiagonalIndex(0, 5, axis=0, other_id=1),),
+            (DiagonalIndex(1, 5, axis=0, other_id=0),),
             self._n((5,), 2),
         )
         with self.assertRaises((ValueError, AssertionError, TypeError)):
@@ -39,12 +39,12 @@ class TestBroadcastingFailures(unittest.TestCase):
         """Fails if matched sparse dimensions compute to different total logical sizes."""
         a = SparseTensor(
             (
-                SparseIndex(
+                DiagonalIndex(
                     0, 4, axis=0, other_id=1, block_size=2, block_axis=1
                 ),
             ),
             (
-                SparseIndex(
+                DiagonalIndex(
                     1, 4, axis=0, other_id=0, block_size=2, block_axis=2
                 ),
             ),
@@ -52,12 +52,12 @@ class TestBroadcastingFailures(unittest.TestCase):
         )  # Logical Size: 8
         b = SparseTensor(
             (
-                SparseIndex(
+                DiagonalIndex(
                     0, 4, axis=0, other_id=1, block_size=3, block_axis=1
                 ),
             ),
             (
-                SparseIndex(
+                DiagonalIndex(
                     1, 4, axis=0, other_id=0, block_size=3, block_axis=2
                 ),
             ),
@@ -82,13 +82,13 @@ class TestBroadcastingFailures(unittest.TestCase):
     def test_matmul_batch_sparse_mismatch(self):
         """Fails if implicit sparse batch dimensions have different sizes."""
         a = SparseTensor(
-            (SparseIndex(0, 4, axis=0, other_id=1), DenseIndex(2, 5, 1)),
-            (SparseIndex(1, 4, axis=0, other_id=0),),
+            (DiagonalIndex(0, 4, axis=0, other_id=1), DenseIndex(2, 5, 1)),
+            (DiagonalIndex(1, 4, axis=0, other_id=0),),
             self._n((4, 5), 1),
         )
         b = SparseTensor(
-            (SparseIndex(0, 3, axis=0, other_id=1), DenseIndex(2, 5, 1)),
-            (SparseIndex(1, 3, axis=0, other_id=0),),
+            (DiagonalIndex(0, 3, axis=0, other_id=1), DenseIndex(2, 5, 1)),
+            (DiagonalIndex(1, 3, axis=0, other_id=0),),
             self._n((3, 5), 2),
         )
         with self.assertRaises((ValueError, AssertionError, TypeError)):
@@ -104,8 +104,8 @@ class TestBroadcastingFailures(unittest.TestCase):
     def test_matmul_contraction_sparse_dense_mismatch(self):
         """Fails if sparse LHS contracts against differently sized dense RHS."""
         a = SparseTensor(
-            (SparseIndex(0, 4, axis=0, other_id=1),),
-            (SparseIndex(1, 4, axis=0, other_id=0),),
+            (DiagonalIndex(0, 4, axis=0, other_id=1),),
+            (DiagonalIndex(1, 4, axis=0, other_id=0),),
             self._n((4,), 1),
         )  # Logical contraction size: 4
         b = SparseTensor(
@@ -120,8 +120,8 @@ class TestBroadcastingFailures(unittest.TestCase):
             (), (DenseIndex(0, 4, 0),), self._n((4,), 1)
         )  # Logical contraction size: 4
         b = SparseTensor(
-            (SparseIndex(0, 5, axis=0, other_id=1),),
-            (SparseIndex(1, 5, axis=0, other_id=0),),
+            (DiagonalIndex(0, 5, axis=0, other_id=1),),
+            (DiagonalIndex(1, 5, axis=0, other_id=0),),
             self._n((5,), 2),
         )  # Logical contraction size: 5
         with self.assertRaises((ValueError, AssertionError, TypeError)):
@@ -130,13 +130,13 @@ class TestBroadcastingFailures(unittest.TestCase):
     def test_matmul_contraction_sparse_sparse_outer_mismatch(self):
         """Fails if LHS/RHS sparse contractions have different outer sizes."""
         a = SparseTensor(
-            (SparseIndex(0, 4, axis=0, other_id=1),),
-            (SparseIndex(1, 4, axis=0, other_id=0),),
+            (DiagonalIndex(0, 4, axis=0, other_id=1),),
+            (DiagonalIndex(1, 4, axis=0, other_id=0),),
             self._n((4,), 1),
         )
         b = SparseTensor(
-            (SparseIndex(0, 5, axis=0, other_id=1),),
-            (SparseIndex(1, 5, axis=0, other_id=0),),
+            (DiagonalIndex(0, 5, axis=0, other_id=1),),
+            (DiagonalIndex(1, 5, axis=0, other_id=0),),
             self._n((5,), 2),
         )
         with self.assertRaises((ValueError, AssertionError, TypeError)):
@@ -146,12 +146,12 @@ class TestBroadcastingFailures(unittest.TestCase):
         """Fails if LHS/RHS sparse contractions compute to different logical sizes."""
         a = SparseTensor(
             (
-                SparseIndex(
+                DiagonalIndex(
                     0, 4, axis=0, other_id=1, block_size=2, block_axis=1
                 ),
             ),
             (
-                SparseIndex(
+                DiagonalIndex(
                     1, 4, axis=0, other_id=0, block_size=2, block_axis=2
                 ),
             ),
@@ -159,12 +159,12 @@ class TestBroadcastingFailures(unittest.TestCase):
         )  # Logical contraction size: 8
         b = SparseTensor(
             (
-                SparseIndex(
+                DiagonalIndex(
                     0, 4, axis=0, other_id=1, block_size=3, block_axis=1
                 ),
             ),
             (
-                SparseIndex(
+                DiagonalIndex(
                     1, 4, axis=0, other_id=0, block_size=3, block_axis=2
                 ),
             ),

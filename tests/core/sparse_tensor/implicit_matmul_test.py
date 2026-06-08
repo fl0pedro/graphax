@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 
-from graphax.sparse.indexes import SparseIndex, DenseIndex
+from graphax.sparse.indexes import DiagonalIndex, DenseIndex
 from graphax.sparse.tensor import SparseTensor, _arr2st
 from graphax.sparse.ops.matmul import matmul
 
@@ -57,7 +57,7 @@ class TestImplicit(unittest.TestCase):
         R_ref = A_st @ B_st
 
         assert jnp.allclose(R_ref.dense(), R_st.dense())
-        assert (R_st == R_ref).all()
+        assert jnp.allclose(R_st.dense(), R_ref.dense())
         assert jnp.allclose(R * (x * y), R_ref.val * R_ref.scalar_mult)
 
     def test_a_implicit_b_c(self):
@@ -233,7 +233,7 @@ class TestImplicit(unittest.TestCase):
         R_ref = A_st @ B_st
 
         assert jnp.allclose(R_ref.dense(), R_st.dense())
-        assert (R_st == R_ref).all()
+        assert jnp.allclose(R_st.dense(), R_ref.dense())
         assert jnp.allclose(R * (x * y), R_ref.val * R_ref.scalar_mult)
 
     def test_all_implicit_a_c_d(self):

@@ -1,6 +1,6 @@
 """Atomic SparseTensor micro-actions: DIAG, COMPRESS, and QUANT.
 
-Three operations the RL policy can emit per sub-step:
+Operations the RL policy can emit per sub-step:
 
 * :class:`Diag` — block-diagonalise a pair of *logical* indices ``(i, j)`` with
   an explicit positive integer factor. gcd-collapse is *not* a sentinel here —
@@ -14,24 +14,18 @@ Three operations the RL policy can emit per sub-step:
   down. ``abs_min`` / ``abs_max`` pick the entry whose absolute value is
   smallest / largest (closest to zero / furthest from zero), preserving the
   original sign.
-* :class:`Quant` — cast the ``val`` array to a chosen JAX dtype (e.g.
-  ``"float16"``, ``"float8_e4m3fn"``, ``"bfloat16"``). Multiple Quant actions
-  in a sub-episode are applied sequentially — last one wins, no special
-  rounding (plain ``val.astype(dtype)``). Only ``val`` is cast;
-  ``scalar_mult`` and ``fill_value`` keep their native dtype.
 
-The operations are atomic and order-dependent: ``DIAG ∘ COMPRESS ≠
-COMPRESS ∘ DIAG`` and ``DIAG ∘ QUANT ≠ QUANT ∘ DIAG`` in general.
-:func:`apply_micro_actions` applies an ordered sequence; multi-axis
-:class:`Compress` is the natural way to batch several physical-axis
-reductions into one ``jnp.mean`` call when the policy emits them in
-the same coordinate frame.
+The two operations are atomic and order-dependent:
+``DIAG ∘ COMPRESS ≠ COMPRESS ∘ DIAG`` in general. :func:`apply_micro_actions`
+applies an ordered sequence; multi-axis :class:`Compress` is the natural way
+to batch several physical-axis reductions into one ``jnp.mean`` call when the
+policy emits them in the same coordinate frame.
 
 Legality
 --------
 The atomic helpers raise :class:`ValueError` on structural illegality —
 ``i == j``, axes out of range, duplicate physical axes, mismatched
-``SparseIndex`` pairings, etc. Policy code is expected to either mask these
+``DiagonalIndex`` pairings, etc. Policy code is expected to either mask these
 choices out before sampling or catch the ValueError at rollout time.
 
 This module's atomic helpers raise on structural illegality rather than
@@ -47,7 +41,7 @@ from typing import Callable, Sequence, Union
 
 import jax.numpy as jnp
 
-from graphax.sparse.indexes import DenseIndex, Index, SparseIndex
+from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
 from graphax.sparse.tensor import SparseTensor, _apply_block_diagonal
 
 
@@ -62,7 +56,7 @@ class Diag:
 
     ``i`` and ``j`` index into ``st.out_dims + st.primal_dims`` (the
     concatenated logical axis list). ``factor`` is the block size — the
-    resulting :class:`SparseIndex` will have ``size=factor`` and
+    resulting :class:`DiagonalIndex` will have ``size=factor`` and
     ``block_size = N // factor`` for each side. ``factor`` must be a positive
     divisor of both logical sizes. If you want gcd-collapse, pass
     ``factor = math.gcd(N_i, N_j)`` explicitly.
@@ -89,27 +83,6 @@ COMPRESS_KINDS: tuple[str, ...] = (
 )
 NUM_COMPRESS_KINDS = len(COMPRESS_KINDS)
 COMPRESS_KIND_INDEX: dict[str, int] = {k: i for i, k in enumerate(COMPRESS_KINDS)}
-
-
-# Canonical JAX dtype names accepted by :class:`Quant`. The list mirrors
-# the numerical dtypes exposed by ``jax.numpy`` in the repo's pinned JAX —
-# strings (not ``jnp.dtype`` objects) keep :class:`Quant` hashable and match
-# the existing ``Compress.kind: str`` pattern. Indices into
-# :data:`QUANT_DTYPE_INDEX` are the contract between a policy head (which
-# samples an int) and the env-side translator (which looks the int up here
-# to construct a ``Quant``); same wire-format as :data:`COMPRESS_KINDS`.
-QUANT_DTYPES: tuple[str, ...] = (
-    "bool",
-    "int2", "int4", "int8", "int16", "int32", "int64",
-    "uint2", "uint4", "uint8", "uint16", "uint32", "uint64",
-    "float4_e2m1fn",
-    "float8_e3m4", "float8_e4m3", "float8_e4m3b11fnuz", "float8_e4m3fn",
-    "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz", "float8_e8m0fnu",
-    "bfloat16", "float16", "float32", "float64",
-    "complex64", "complex128",
-)
-NUM_QUANT_DTYPES = len(QUANT_DTYPES)
-QUANT_DTYPE_INDEX: dict[str, int] = {d: i for i, d in enumerate(QUANT_DTYPES)}
 
 
 @dataclass(frozen=True)
@@ -157,23 +130,44 @@ class Compress:
             )
 
 
+# Canonical JAX dtype names accepted by :class:`Quant`. Strings (not
+# ``jnp.dtype`` objects) keep :class:`Quant` hashable and match the
+# ``Compress.kind: str`` pattern. The int index into :data:`QUANT_DTYPE_INDEX`
+# is the wire-format contract between a policy head (samples an int) and the
+# env-side translator (looks the int up to construct a ``Quant``) — same
+# convention as :data:`COMPRESS_KINDS`.
+QUANT_DTYPES: tuple[str, ...] = (
+    "bool",
+    "int2", "int4", "int8", "int16", "int32", "int64",
+    "uint2", "uint4", "uint8", "uint16", "uint32", "uint64",
+    "float4_e2m1fn",
+    "float8_e3m4", "float8_e4m3", "float8_e4m3b11fnuz", "float8_e4m3fn",
+    "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz", "float8_e8m0fnu",
+    "bfloat16", "float16", "float32", "float64",
+    "complex64", "complex128",
+)
+NUM_QUANT_DTYPES = len(QUANT_DTYPES)
+QUANT_DTYPE_INDEX: dict[str, int] = {d: i for i, d in enumerate(QUANT_DTYPES)}
+
+
 @dataclass(frozen=True)
 class Quant:
     """Cast :attr:`SparseTensor.val` to a chosen JAX dtype.
 
     Multiple Quant actions in a sub-episode are applied sequentially in
     order — last one wins, no special rounding. Equivalent to chained
-    ``val.astype(d_1).astype(d_2)...``; the chain matters when
-    intermediate dtypes are lossy (e.g. ``int8`` then ``float32``). Only
-    ``val`` is cast; ``scalar_mult`` and ``fill_value`` keep their native
-    dtype — this intentionally differs from :meth:`SparseTensor.astype`,
-    which casts all three.
+    ``val.astype(d_1).astype(d_2)...``; the chain matters when intermediate
+    dtypes are lossy (e.g. ``int8`` then ``float32``). Only ``val`` is cast;
+    ``scalar_mult`` and ``fill_value`` keep their native dtype.
 
     A ``val=None`` SparseTensor (uniform grid) is returned unchanged.
 
-    ``dtype`` is the canonical name (e.g. ``"float16"``,
-    ``"float8_e4m3fn"``, ``"bfloat16"``) and must be a member of
-    :data:`QUANT_DTYPES`.
+    ``dtype`` is the canonical name (e.g. ``"float16"``, ``"float8_e4m3fn"``,
+    ``"bfloat16"``) and must be a member of :data:`QUANT_DTYPES`. Narrow
+    dtypes (float8 / float4 / sub-byte int / complex) have no implicit JAX
+    promotion path; the ops upcast operands to their highest common dtype
+    before arithmetic (see :func:`graphax.sparse.ops.utils._compute_dtype`),
+    so a quantized ``val`` is stored narrow but computable everywhere.
     """
 
     dtype: str
@@ -225,12 +219,12 @@ def apply_diag(st: SparseTensor, action: Diag) -> SparseTensor:
     d1 = st.out_dims[rel_i] if is_out1 else st.primal_dims[rel_i]
     d2 = st.out_dims[rel_j] if is_out2 else st.primal_dims[rel_j]
 
-    if isinstance(d1, SparseIndex) and d1.other_id != d2.id:
+    if d1.is_sparse and d1.other_id != d2.id:
         raise ValueError(
             f"Diag pair conflict: logical index {action.i} is already paired "
             f"with another index (other_id={d1.other_id}, but d2.id={d2.id})."
         )
-    if isinstance(d2, SparseIndex) and d2.other_id != d1.id:
+    if d2.is_sparse and d2.other_id != d1.id:
         raise ValueError(
             f"Diag pair conflict: logical index {action.j} is already paired "
             f"with another index (other_id={d2.other_id}, but d1.id={d1.id})."
@@ -334,10 +328,10 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
 
     def _remap(d: Index) -> Index:
         new_axis = _shift_after_drops(getattr(d, "axis", None))
-        if isinstance(d, SparseIndex):
+        if d.is_sparse:
             new_block_axis = _shift_after_drops(d.block_axis)
             return replace(d, axis=new_axis, block_axis=new_block_axis)
-        if isinstance(d, DenseIndex):
+        if not d.is_sparse:
             return replace(d, axis=new_axis)
         return replace(d, axis=new_axis)
 
@@ -349,7 +343,6 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
         new_primal,
         new_val,
         scalar_mult=st.scalar_mult,
-        sort_val=False,
         check_consistency=False,
     )
 
@@ -362,9 +355,13 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
 def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
     """Cast ``st.val`` to ``action.dtype``.
 
-    Returns ``st`` unchanged if ``val is None`` or if the target dtype
-    already matches the current one. Only ``val`` is cast — ``scalar_mult``
-    and ``fill_value`` are passed through with their original dtypes.
+    Returns ``st`` unchanged if ``val is None`` or the target dtype already
+    matches the current one. Only ``val`` is cast — ``scalar_mult`` and
+    ``fill_value`` keep their native dtype. Narrow targets (float8 /
+    sub-byte int / float4 / complex) have no implicit JAX promotion path, so
+    downstream densify / matmul / elementwise upcast to the highest common
+    dtype before arithmetic (see :func:`graphax.sparse.ops.utils._compute_dtype`);
+    the narrow dtype only sets the at-rest ``val.dtype``.
     """
     if st.val is None:
         return st
@@ -377,7 +374,6 @@ def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
         st.val.astype(target),
         scalar_mult=st.scalar_mult,
         fill_value=st.fill_value,
-        sort_val=False,
         check_consistency=False,
     )
 

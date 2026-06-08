@@ -9,7 +9,7 @@ import jax._src.core as core
 
 from ..sparse.tensor import (
     DenseIndex,
-    SparseIndex,
+    DiagonalIndex,
     SparseTensor,
     _swap_back_axes,
 )
@@ -83,13 +83,13 @@ def make_parallel_jacobian(i, primals, val_out, elemental):
             else:
                 axis = None if elemental_is_scalar else sum(1 for d in out_dims if d.size is not None)
                 out_dims.append(
-                    SparseIndex(j, os, axis, n_out + n_primal + 1)
+                    DiagonalIndex(j, os, axis, n_out + n_primal + 1)
                 )
                 primal_dims.append(
-                    SparseIndex(n_out + n_primal + 1, os, axis, j)
+                    DiagonalIndex(n_out + n_primal + 1, os, axis, j)
                 )
             for k, d in enumerate(primal_dims[:-1]):
-                if isinstance(d, SparseIndex):
+                if d.is_sparse:
                     out_dims[d.other_id] = replace(
                         out_dims[d.other_id], other_id=out_dims[d.other_id].other_id + 1
                     )
@@ -104,9 +104,9 @@ def make_parallel_jacobian(i, primals, val_out, elemental):
         axis_fn = lambda j: j
 
     shape = primal.aval.shape
-    out_dims = [SparseIndex(j, e, axis_fn(j), out_size + j)
+    out_dims = [DiagonalIndex(j, e, axis_fn(j), out_size + j)
                 for j, e in enumerate(shape)]
-    primal_dims = [SparseIndex(out_size + j, e, axis_fn(j), j)
+    primal_dims = [DiagonalIndex(out_size + j, e, axis_fn(j), j)
                    for j, e in enumerate(shape)]
     return SparseTensor(out_dims, primal_dims, elemental)
 

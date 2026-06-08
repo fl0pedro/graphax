@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import jax.random as jr
 
 from graphax.sparse.tensor import SparseTensor
-from graphax.sparse.indexes import DenseIndex, SparseIndex
+from graphax.sparse.indexes import DenseIndex, DiagonalIndex
 from graphax.sparse.ops.matmul import matmul
 from graphax.sparse.ops.elementwise import elementwise
 
@@ -60,13 +60,13 @@ class TestNonZeroFillElementwise(unittest.TestCase):
 
     def test_sparse_pair_nonzero_fill_mul(self):
         lhs = SparseTensor(
-            (SparseIndex(0, 4, axis=0, other_id=1),),
-            (SparseIndex(1, 4, axis=0, other_id=0),),
+            (DiagonalIndex(0, 4, axis=0, other_id=1),),
+            (DiagonalIndex(1, 4, axis=0, other_id=0),),
             _n((4,), 1), fill_value=jnp.array(0.5, dtype=jnp.float32),
         )
         rhs = SparseTensor(
-            (SparseIndex(0, 4, axis=0, other_id=1),),
-            (SparseIndex(1, 4, axis=0, other_id=0),),
+            (DiagonalIndex(0, 4, axis=0, other_id=1),),
+            (DiagonalIndex(1, 4, axis=0, other_id=0),),
             _n((4,), 2), fill_value=jnp.array(1.5, dtype=jnp.float32),
         )
         self._check(lhs, rhs, jax.lax.mul)
@@ -75,13 +75,13 @@ class TestNonZeroFillElementwise(unittest.TestCase):
         # Sparse pair with block_size on both sides.
         N, B = 3, 2
         lhs = SparseTensor(
-            (SparseIndex(0, N, axis=0, other_id=1, block_size=B, block_axis=1),),
-            (SparseIndex(1, N, axis=0, other_id=0, block_size=B, block_axis=2),),
+            (DiagonalIndex(0, N, axis=0, other_id=1, block_size=B, block_axis=1),),
+            (DiagonalIndex(1, N, axis=0, other_id=0, block_size=B, block_axis=2),),
             _n((N, B, B), 1), fill_value=jnp.array(0.25, dtype=jnp.float32),
         )
         rhs = SparseTensor(
-            (SparseIndex(0, N, axis=0, other_id=1, block_size=B, block_axis=1),),
-            (SparseIndex(1, N, axis=0, other_id=0, block_size=B, block_axis=2),),
+            (DiagonalIndex(0, N, axis=0, other_id=1, block_size=B, block_axis=1),),
+            (DiagonalIndex(1, N, axis=0, other_id=0, block_size=B, block_axis=2),),
             _n((N, B, B), 2), fill_value=jnp.array(-0.5, dtype=jnp.float32),
         )
         self._check(lhs, rhs, jax.lax.max)
@@ -118,8 +118,8 @@ class TestNonZeroFillMatmul(unittest.TestCase):
         # Block-diagonal LHS with non-zero fill, dense RHS.
         N, B = 3, 2
         lhs = SparseTensor(
-            (SparseIndex(0, N, axis=0, other_id=1, block_size=B, block_axis=1),),
-            (SparseIndex(1, N, axis=0, other_id=0, block_size=B, block_axis=2),),
+            (DiagonalIndex(0, N, axis=0, other_id=1, block_size=B, block_axis=1),),
+            (DiagonalIndex(1, N, axis=0, other_id=0, block_size=B, block_axis=2),),
             _n((N, B, B), 1), fill_value=jnp.array(0.5, dtype=jnp.float32),
         )
         rhs = SparseTensor(
@@ -131,8 +131,8 @@ class TestNonZeroFillMatmul(unittest.TestCase):
     def test_both_sides_nonzero_fill(self):
         N = 4
         lhs = SparseTensor(
-            (SparseIndex(0, N, axis=0, other_id=1),),
-            (SparseIndex(1, N, axis=0, other_id=0),),
+            (DiagonalIndex(0, N, axis=0, other_id=1),),
+            (DiagonalIndex(1, N, axis=0, other_id=0),),
             _n((N,), 1), fill_value=jnp.array(0.7, dtype=jnp.float32),
         )
         rhs = SparseTensor(
