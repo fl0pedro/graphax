@@ -584,13 +584,24 @@ def _eliminate_vertex(
                     or (pre_val.val is None and not _acts_as_identity(_pre_val))
                 )
                 if _need_contract:
-                    if count_ops:
+                    # A scalar × scalar contraction is an elementwise multiply:
+                    # ``sparse_matmul`` rejects 0-rank operands, so it must NEVER
+                    # be routed through matmul — on either the count or non-count
+                    # path (the count path used to crash here).
+                    if _is_scalar_st(_post_val) and _is_scalar_st(_pre_val):
+                        edge_outval = _post_val * _pre_val
+                        if count_ops:
+                            muls += 1
+                    elif count_ops:
                         edge_outval, (_a, _m, _f) = sparse_matmul(
                             _post_val, _pre_val, count=True
                         )
                         adds += int(_a)
                         muls += int(_m)
                         fmas += int(_f)
+                    else:
+                        edge_outval = _post_val @ _pre_val
+                    if count_ops:
                         post_size = (
                             _post_val.val.size if _post_val.val is not None else 0
                         )
@@ -605,11 +616,6 @@ def _eliminate_vertex(
                             pre_size * _pre_val.dtype.itemsize,
                             out_size * edge_outval.dtype.itemsize,
                         )
-                    else:
-                        if _is_scalar_st(_post_val) and _is_scalar_st(_pre_val):
-                            edge_outval = _post_val * _pre_val
-                        else:
-                            edge_outval = _post_val @ _pre_val
 
                 elif pre_val.val is not None:
                     # post is a pure-diagonal identity up to its scalar_mult:
