@@ -232,28 +232,76 @@ def jacve(
     return jacfun
 
 
-def _check_scalar_output(fun, *args, **kwargs):
-    """jax.grad-style guard: ``fun`` must return a single scalar of inexact
-    dtype. Uses ``jax.eval_shape`` (abstract evaluation — no FLOPs)."""
-    out_shape = jax.eval_shape(fun, *args, **kwargs)
-    leaves = jtu.tree_leaves(out_shape)
+# Per-vertex Jacobian-transform spec — the shared type of the ``transforms``
+# argument on jacve / grad / value_and_grad: ``[(vertex_id, [transform, ...])]``.
+TransformSpec = Sequence[
+    Tuple[int, Sequence[Union[Diag, Compress, Callable[["SparseTensor"], "SparseTensor"]]]]
+]
+
+
+def _leaf_dtype(x):
+    return x.dtype if hasattr(x, "dtype") else jnp.result_type(x)
+
+
+def _validate_grad_io(fun, args, kwargs, argnums):
+    """jax.grad-style validation for grad / value_and_grad. Fail LOUDLY and
+    accurately — rather than crash deep in vertex elimination or silently return
+    a wrong gradient — for anything jax.grad refuses OR that jacve cannot yet
+    handle:
+
+    * keyword arguments to ``fun`` (vertex elimination threads only positional
+      args, so a kwarg would mismatch the traced invars);
+    * pytree / multi-leaf inputs, e.g. a dict of parameters (not yet supported —
+      jacve flattens args into positional invars);
+    * non-floating *differentiated* inputs (integer / complex);
+    * a non-scalar, or non-floating (integer / complex), output.
+
+    The output check uses ``jax.eval_shape`` (abstract — no FLOPs) and is
+    jit-trace-safe. Complex differentiation is rejected outright (graphax does
+    not implement the holomorphic/conjugation handling jax.grad gates behind
+    ``holomorphic=True``)."""
+    if kwargs:
+        raise TypeError(
+            "graphax.grad / value_and_grad do not accept keyword arguments to "
+            f"the differentiated function (got {sorted(kwargs)}). Vertex "
+            "elimination threads only positional args; bind keyword args with "
+            "functools.partial or pass them positionally."
+        )
+    argnums = set(argnums)
+    for j, arg in enumerate(args):
+        leaves = jtu.tree_leaves(arg)
+        if len(leaves) != 1:
+            raise NotImplementedError(
+                f"graphax.grad: argument {j} is a pytree with {len(leaves)} "
+                "leaves; pytree inputs (e.g. a dict of parameters) are not yet "
+                "supported. Flatten with jax.tree_util and differentiate the "
+                "leaves as positional arguments."
+            )
+        if j in argnums and not jnp.issubdtype(_leaf_dtype(leaves[0]), jnp.floating):
+            raise TypeError(
+                "grad requires real (floating) inputs, but the differentiated "
+                f"argument {j} has dtype {_leaf_dtype(leaves[0])} "
+                "(integer / complex differentiation is not supported)."
+            )
+    leaves = jtu.tree_leaves(jax.eval_shape(fun, *args))
     if len(leaves) != 1 or leaves[0].shape != ():
         shapes = [getattr(l, "shape", "?") for l in leaves]
         raise TypeError(
-            "Gradient only defined for scalar-output functions. Output had "
+            "Gradient only defined for scalar-output functions; the output had "
             f"{len(leaves)} leaves with shapes {shapes}."
         )
-    if not jnp.issubdtype(leaves[0].dtype, jnp.inexact):
+    if not jnp.issubdtype(leaves[0].dtype, jnp.floating):
         raise TypeError(
-            "grad requires real- or complex-valued outputs (output dtype "
-            f"was {leaves[0].dtype})."
+            "grad requires a real (floating) scalar output, but the output "
+            f"dtype was {leaves[0].dtype}. Complex output would need holomorphic "
+            "differentiation (unsupported); integer output is not differentiable."
         )
 
 
 def _unwrap_single(x):
     """jacve packs single-output / single-argnum results as a length-1
     tuple-or-list in some arities; normalize to the bare value (jax.grad
-    convention for an int ``argnums``)."""
+    convention for an int ``argnums`` and for the single scalar primal)."""
     if isinstance(x, (tuple, list)) and len(x) == 1:
         return x[0]
     return x
@@ -269,62 +317,64 @@ def _normalize_grads(out, scalar_argnums):
     return out if isinstance(out, tuple) else (out,)
 
 
+def _make_grad(fun, order, argnums, count_ops, transforms, *, return_value):
+    """Shared implementation of :func:`grad` (``return_value=False``) and
+    :func:`value_and_grad` (``return_value=True``). The latter rides jacve's
+    ``has_aux=True`` path, which returns ``(primal_outputs, jacobians)`` from the
+    same elimination pass — no second forward evaluation."""
+    scalar_argnums = isinstance(argnums, int)
+    _argnums = (argnums,) if scalar_argnums else tuple(argnums)
+    jac_fn = jacve(
+        fun, order, _argnums, has_aux=return_value,
+        count_ops=count_ops, transforms=transforms,
+    )
+
+    @wraps(fun)
+    def diff_fn(*args, **kwargs):
+        _validate_grad_io(fun, args, kwargs, _argnums)
+        out = jac_fn(*args)
+        aux_data = None
+        if count_ops:
+            out, aux_data = out
+        if return_value:
+            primal, grads = out
+            result = (_unwrap_single(primal), _normalize_grads(grads, scalar_argnums))
+        else:
+            result = _normalize_grads(out, scalar_argnums)
+        return (result, aux_data) if count_ops else result
+
+    return diff_fn
+
+
 def grad(
     fun: Callable,
     order: EliminationOrder = "rev",
     argnums: Union[int, Sequence[int]] = 0,
     count_ops: bool = False,
-    transforms: Sequence[
-        Tuple[
-            int,
-            Sequence[Union[Diag, Compress, Callable[["SparseTensor"], "SparseTensor"]]],
-        ]
-    ] = None,
+    transforms: TransformSpec = None,
 ) -> Callable:
     """``jax.grad`` analogue computed by vertex elimination (a thin wrapper
     over :func:`jacve` for scalar-output functions).
 
-    Where ``jax.grad`` is hard-wired to one reverse-mode VJP, this exposes the
-    vertex-elimination degrees of freedom:
+    Beyond ``jax.grad``'s single reverse-mode VJP, this forwards the
+    vertex-elimination degrees of freedom to :func:`jacve`:
 
-    * ``order`` — any elimination order (``"rev"`` reproduces classical
-      reverse-mode / jax.grad; ``"fwd"`` forward elimination; an explicit
-      vertex sequence gives cross-country elimination, including partial
-      orders).
-    * ``transforms`` — per-vertex Jacobian transforms (``Diag`` / ``Compress``
-      / callables ``SparseTensor -> SparseTensor``) applied DURING the
-      elimination: structured gradient approximations that ``jax.grad``
-      cannot express.
-    * ``count_ops`` — when True the returned callable yields
-      ``(grads, aux)`` with the adds/muls/fmas/peak-mem accounting of the
-      accumulation.
+    * ``order`` — ``"rev"`` reproduces classical reverse-mode / jax.grad;
+      ``"fwd"`` forward elimination; an explicit vertex sequence gives
+      cross-country / partial elimination. For an EXACT gradient the order is
+      value-invariant (it changes only FLOP/memory cost; ``"rev"`` is near
+      optimal for a scalar output).
+    * ``transforms`` — per-vertex Jacobian transforms (``Diag`` / ``Compress`` /
+      callable) applied DURING elimination: structured gradient *approximations*
+      jax.grad cannot express (the result is then inexact by construction).
+    * ``count_ops`` — when True the callable returns ``(grads, aux)`` with the
+      adds/muls/fmas/peak-mem accounting.
 
-    For a scalar output the Jacobian w.r.t. each ``argnums`` entry IS the
-    gradient (shape of the input), so this returns gradients with
-    ``jax.grad`` conventions: a bare array for an int ``argnums``, a tuple
-    for a sequence.
-
-    Note: unlike ``jax.grad`` there is no ``has_aux`` parameter — jacve's
-    ``has_aux`` flag means "also return the primal outputs" (see
-    :func:`value_and_grad`), not "fun returns (out, aux)".
-    """
-    scalar_argnums = isinstance(argnums, int)
-    _argnums = (argnums,) if scalar_argnums else tuple(argnums)
-    jac_fn = jacve(fun, order, _argnums, count_ops=count_ops, transforms=transforms)
-
-    @wraps(fun)
-    def grad_fn(*args, **kwargs):
-        _check_scalar_output(fun, *args, **kwargs)
-        out = jac_fn(*args, **kwargs)
-        aux_data: dict = {}
-        if count_ops:
-            out, aux_data = out
-        grads = _normalize_grads(out, scalar_argnums)
-        if count_ops:
-            return grads, aux_data
-        return grads
-
-    return grad_fn
+    Returns gradients with jax.grad conventions: a bare array for an int
+    ``argnums``, a tuple for a sequence. Inputs must be positional floating
+    arrays (no kwargs / pytree / integer / complex — see :func:`_validate_grad_io`);
+    there is no ``has_aux`` parameter (see :func:`value_and_grad`)."""
+    return _make_grad(fun, order, argnums, count_ops, transforms, return_value=False)
 
 
 def value_and_grad(
@@ -332,41 +382,15 @@ def value_and_grad(
     order: EliminationOrder = "rev",
     argnums: Union[int, Sequence[int]] = 0,
     count_ops: bool = False,
-    transforms: Sequence[
-        Tuple[
-            int,
-            Sequence[Union[Diag, Compress, Callable[["SparseTensor"], "SparseTensor"]]],
-        ]
-    ] = None,
+    transforms: TransformSpec = None,
 ) -> Callable:
     """``jax.value_and_grad`` analogue via vertex elimination — returns
-    ``(value, grads)``. Rides :func:`jacve`'s ``has_aux=True`` path, which
-    yields ``(primal_outputs, jacobians)`` from the same elimination pass (the
-    primal is evaluated while building the graph, so no second forward pass).
-    Same ``order`` / ``transforms`` / ``count_ops`` semantics as :func:`grad`;
-    with ``count_ops`` the callable returns ``((value, grads), aux)``."""
-    scalar_argnums = isinstance(argnums, int)
-    _argnums = (argnums,) if scalar_argnums else tuple(argnums)
-    jac_fn = jacve(
-        fun, order, _argnums, has_aux=True, count_ops=count_ops,
-        transforms=transforms,
-    )
-
-    @wraps(fun)
-    def value_and_grad_fn(*args, **kwargs):
-        _check_scalar_output(fun, *args, **kwargs)
-        out = jac_fn(*args, **kwargs)
-        aux_data: dict = {}
-        if count_ops:
-            out, aux_data = out
-        primal, grads = out
-        primal = _unwrap_single(primal)  # exactly one (scalar) output
-        grads = _normalize_grads(grads, scalar_argnums)
-        if count_ops:
-            return (primal, grads), aux_data
-        return primal, grads
-
-    return value_and_grad_fn
+    ``(value, grads)`` from a single elimination pass (jacve's ``has_aux=True``
+    path yields ``(primal_outputs, jacobians)``; the primal is evaluated while
+    building the graph, so there is no second forward pass). Same ``order`` /
+    ``transforms`` / ``count_ops`` semantics and input restrictions as
+    :func:`grad`; with ``count_ops`` the callable returns ``((value, grads), aux)``."""
+    return _make_grad(fun, order, argnums, count_ops, transforms, return_value=True)
 
 
 def unload_post_transforms(post, pre):
