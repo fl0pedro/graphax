@@ -75,6 +75,10 @@ def test_grad_cross_country_order():
     ]
     assert len(elim) >= 3, "need a non-trivial graph for a cross-country order"
     order = elim[1:] + elim[:1]  # deterministic rotation: neither fwd nor rev
+    assert order != elim and order != elim[::-1], (
+        "rotation coincides with fwd/rev order — test would not actually "
+        "exercise cross-country accumulation"
+    )
     g = graphax.grad(f, order, argnums=(0, 1))(_x, _y)
     ref = jax.grad(f, argnums=(0, 1))(_x, _y)
     assert graphax.tree_allclose(g, ref)
@@ -104,8 +108,37 @@ def test_grad_rejects_nonscalar_output():
 
 
 def test_grad_rejects_integer_output():
-    with pytest.raises(TypeError, match="real- or complex-valued"):
+    with pytest.raises(TypeError, match="floating"):
         graphax.grad(lambda x: jnp.sum(x).astype(jnp.int32), "rev")(_x)
+
+
+def test_grad_rejects_complex_output():
+    # complex IS inexact but graphax has no holomorphic handling -> reject loudly
+    # (jax.grad also raises without holomorphic=True) instead of a wrong result.
+    with pytest.raises(TypeError, match="floating"):
+        graphax.grad(lambda x: jnp.sum(x.astype(jnp.complex64) ** 2), "rev")(_x)
+
+
+def test_grad_rejects_integer_input():
+    n = jnp.array([1, 2, 3], dtype=jnp.int32)
+    with pytest.raises(TypeError, match="floating"):
+        graphax.grad(lambda a, b: jnp.sum(a.astype(jnp.float32) * b), "rev",
+                     argnums=0)(n, jnp.ones(3))
+
+
+def test_grad_rejects_kwargs():
+    # jacve threads only positional args; a kwarg used to crash cryptically deep
+    # in elimination — now a clear error at the boundary.
+    with pytest.raises(TypeError, match="keyword argument"):
+        graphax.grad(lambda x, scale: jnp.sum(jnp.sin(x) * scale), "rev")(_x, scale=2.0)
+
+
+def test_grad_rejects_pytree_input():
+    # dict-of-params (canonical jax.grad use) used to crash with a confusing
+    # 'takes 1 positional argument but 2 were given'; now a clear NotImplemented.
+    d = {"a": _x, "b": _y}
+    with pytest.raises(NotImplementedError, match="pytree"):
+        graphax.grad(lambda p: jnp.sum(jnp.sin(p["a"]) * p["b"]), "rev")(d)
 
 
 def test_grad_count_ops_aux():
