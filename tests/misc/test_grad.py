@@ -141,7 +141,81 @@ def test_grad_rejects_pytree_input():
         graphax.grad(lambda p: jnp.sum(jnp.sin(p["a"]) * p["b"]), "rev")(d)
 
 
+def test_grad_random_order_is_exact():
+    """Vertex elimination is order-INVARIANT: a RANDOM elimination-order
+    permutation gives the same grad AND value_and_grad as jax and as graphax's
+    default 'rev' order. tree_allclose uses RELATIVE tolerance — different
+    accumulation orders reassociate float32 ops, so large-magnitude gradients
+    differ only in the last ~ULP (an absolute tolerance would false-fail)."""
+    def f(a, b, c):  # well-conditioned multi-input scalar (no nan to confound)
+        return jnp.sum(jnp.tanh(a * b) + jnp.sin(b + c) * jnp.cos(a))
+
+    a = jnp.array([0.3, 1.1, -0.7]); b = jnp.array([0.5, -0.2, 0.9])
+    c = jnp.array([1.2, 0.4, -0.3]); args, an = (a, b, c), (0, 1, 2)
+    N = len(jax.make_jaxpr(f)(*args).jaxpr.eqns)
+    assert N >= 5
+
+    jg = jax.grad(f, an)(*args)
+    jv, jvg = jax.value_and_grad(f, an)(*args)
+    rev_g = graphax.grad(f, "rev", an)(*args)
+
+    rng = np.random.default_rng(0)
+    seen_noncrev = False
+    for _ in range(8):
+        order = [int(o) for o in rng.permutation(np.arange(1, N + 1))]
+        seen_noncrev |= order != list(range(N, 0, -1))
+        g = graphax.grad(f, order, an)(*args)
+        v, vg = graphax.value_and_grad(f, order, an)(*args)
+        assert graphax.tree_allclose(g, jg), f"grad != jax.grad for order {order}"
+        assert graphax.tree_allclose(g, rev_g), f"grad != graphax-rev for order {order}"
+        assert graphax.tree_allclose(vg, jvg), f"value_and_grad != jax for order {order}"
+        assert np.allclose(np.asarray(v), np.asarray(jv), rtol=1e-4, atol=1e-6)
+    assert seen_noncrev, "random orders coincided with reverse — not a real test"
+
+
 def test_grad_count_ops_aux():
     g, aux = graphax.grad(_f2, "rev", argnums=(0, 1), count_ops=True)(_x, _y)
     assert graphax.tree_allclose(g, jax.grad(_f2, argnums=(0, 1))(_x, _y))
     assert {"adds", "muls", "fmas", "mem"} <= set(aux.keys())
+
+
+def test_grad_count_ops_scalar_contraction():
+    """count_ops must handle scalar x scalar contractions — an elementwise
+    multiply, NOT a matmul (sparse_matmul rejects 0-rank operands). A
+    scalar-output gradient whose accumulation hits such an edge (RoeFlux does)
+    used to crash with 'matmul of two 0-rank SparseTensors'. The count path must
+    produce the SAME gradient as the non-count path (and as jax)."""
+    import graphax.examples as ex
+    args = tuple(jnp.array(v) for v in (.1, .2, .3, .15, .25, .35))
+    an = tuple(range(6))
+    sf = lambda *a: sum(jnp.sum(o) for o in jax.tree_util.tree_leaves(ex.RoeFlux_1d(*a)))
+    g_nc = graphax.grad(sf, "rev", an)(*args)
+    # a non-rev order that genuinely hits scalar x scalar contractions (used to
+    # raise); equal_nan=True because RoeFlux is ill-conditioned at these inputs.
+    N = len(jax.make_jaxpr(sf)(*args).jaxpr.eqns)
+    order = [int(o) for o in np.random.default_rng(0).permutation(np.arange(1, N + 1))]
+    g_c, aux = graphax.grad(sf, order, an, count_ops=True)(*args)
+    assert graphax.tree_allclose(g_c, g_nc, equal_nan=True)
+    assert {"adds", "muls", "fmas", "mem"} <= set(aux) and aux["muls"] > 0
+    (v, vg), _ = graphax.value_and_grad(sf, order, an, count_ops=True)(*args)
+    assert graphax.tree_allclose(vg, g_nc, equal_nan=True)
+
+
+def test_grad_count_ops_distinguishes_orders():
+    """count_ops gives DIFFERENT (muls, fmas) for different elimination orders of
+    the same scalar gradient, while the gradient stays exact — i.e. the order
+    genuinely changes the accumulation, not the result."""
+    def f(a, b, c):
+        return jnp.sum(jnp.tanh(a * b) + jnp.sin(b + c) * jnp.cos(a))
+    a, b, c = jnp.array([0.3, 1.1, -0.7]), jnp.array([0.5, -0.2, 0.9]), jnp.array([1.2, 0.4, -0.3])
+    args, an = (a, b, c), (0, 1, 2)
+    N = len(jax.make_jaxpr(f)(*args).jaxpr.eqns)
+    ref = graphax.grad(f, "rev", an)(*args)
+    rng = np.random.default_rng(0)
+    costs = set()
+    for _ in range(8):
+        order = [int(o) for o in rng.permutation(np.arange(1, N + 1))]
+        g, aux = graphax.grad(f, order, an, count_ops=True)(*args)
+        assert graphax.tree_allclose(g, ref)
+        costs.add((aux["muls"], aux["fmas"]))
+    assert len(costs) > 1, "different orders should yield different op counts"
