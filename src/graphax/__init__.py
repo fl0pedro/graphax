@@ -1,7 +1,7 @@
 import sys
 
 from . import instrumentation
-from .core import jacve, set_pjit_elimination_order
+from .core import grad, jacve, set_pjit_elimination_order, value_and_grad
 
 from .sparse import sparse_tensor_zeros_like
 from .utils import tree_allclose

@@ -232,6 +232,143 @@ def jacve(
     return jacfun
 
 
+def _check_scalar_output(fun, *args, **kwargs):
+    """jax.grad-style guard: ``fun`` must return a single scalar of inexact
+    dtype. Uses ``jax.eval_shape`` (abstract evaluation — no FLOPs)."""
+    out_shape = jax.eval_shape(fun, *args, **kwargs)
+    leaves = jtu.tree_leaves(out_shape)
+    if len(leaves) != 1 or leaves[0].shape != ():
+        shapes = [getattr(l, "shape", "?") for l in leaves]
+        raise TypeError(
+            "Gradient only defined for scalar-output functions. Output had "
+            f"{len(leaves)} leaves with shapes {shapes}."
+        )
+    if not jnp.issubdtype(leaves[0].dtype, jnp.inexact):
+        raise TypeError(
+            "grad requires real- or complex-valued outputs (output dtype "
+            f"was {leaves[0].dtype})."
+        )
+
+
+def _unwrap_single(x):
+    """jacve packs single-output / single-argnum results as a length-1
+    tuple-or-list in some arities; normalize to the bare value (jax.grad
+    convention for an int ``argnums``)."""
+    if isinstance(x, (tuple, list)) and len(x) == 1:
+        return x[0]
+    return x
+
+
+def _normalize_grads(out, scalar_argnums):
+    """Match jax.grad argnums conventions: an int ``argnums`` yields the bare
+    gradient; a *sequence* ``argnums`` always yields a tuple. jacve unwraps a
+    length-1 sequence (and single-arg functions) inconsistently, so re-impose
+    the convention here."""
+    if scalar_argnums:
+        return _unwrap_single(out)
+    return out if isinstance(out, tuple) else (out,)
+
+
+def grad(
+    fun: Callable,
+    order: EliminationOrder = "rev",
+    argnums: Union[int, Sequence[int]] = 0,
+    count_ops: bool = False,
+    transforms: Sequence[
+        Tuple[
+            int,
+            Sequence[Union[Diag, Compress, Callable[["SparseTensor"], "SparseTensor"]]],
+        ]
+    ] = None,
+) -> Callable:
+    """``jax.grad`` analogue computed by vertex elimination (a thin wrapper
+    over :func:`jacve` for scalar-output functions).
+
+    Where ``jax.grad`` is hard-wired to one reverse-mode VJP, this exposes the
+    vertex-elimination degrees of freedom:
+
+    * ``order`` — any elimination order (``"rev"`` reproduces classical
+      reverse-mode / jax.grad; ``"fwd"`` forward elimination; an explicit
+      vertex sequence gives cross-country elimination, including partial
+      orders).
+    * ``transforms`` — per-vertex Jacobian transforms (``Diag`` / ``Compress``
+      / callables ``SparseTensor -> SparseTensor``) applied DURING the
+      elimination: structured gradient approximations that ``jax.grad``
+      cannot express.
+    * ``count_ops`` — when True the returned callable yields
+      ``(grads, aux)`` with the adds/muls/fmas/peak-mem accounting of the
+      accumulation.
+
+    For a scalar output the Jacobian w.r.t. each ``argnums`` entry IS the
+    gradient (shape of the input), so this returns gradients with
+    ``jax.grad`` conventions: a bare array for an int ``argnums``, a tuple
+    for a sequence.
+
+    Note: unlike ``jax.grad`` there is no ``has_aux`` parameter — jacve's
+    ``has_aux`` flag means "also return the primal outputs" (see
+    :func:`value_and_grad`), not "fun returns (out, aux)".
+    """
+    scalar_argnums = isinstance(argnums, int)
+    _argnums = (argnums,) if scalar_argnums else tuple(argnums)
+    jac_fn = jacve(fun, order, _argnums, count_ops=count_ops, transforms=transforms)
+
+    @wraps(fun)
+    def grad_fn(*args, **kwargs):
+        _check_scalar_output(fun, *args, **kwargs)
+        out = jac_fn(*args, **kwargs)
+        aux_data: dict = {}
+        if count_ops:
+            out, aux_data = out
+        grads = _normalize_grads(out, scalar_argnums)
+        if count_ops:
+            return grads, aux_data
+        return grads
+
+    return grad_fn
+
+
+def value_and_grad(
+    fun: Callable,
+    order: EliminationOrder = "rev",
+    argnums: Union[int, Sequence[int]] = 0,
+    count_ops: bool = False,
+    transforms: Sequence[
+        Tuple[
+            int,
+            Sequence[Union[Diag, Compress, Callable[["SparseTensor"], "SparseTensor"]]],
+        ]
+    ] = None,
+) -> Callable:
+    """``jax.value_and_grad`` analogue via vertex elimination — returns
+    ``(value, grads)``. Rides :func:`jacve`'s ``has_aux=True`` path, which
+    yields ``(primal_outputs, jacobians)`` from the same elimination pass (the
+    primal is evaluated while building the graph, so no second forward pass).
+    Same ``order`` / ``transforms`` / ``count_ops`` semantics as :func:`grad`;
+    with ``count_ops`` the callable returns ``((value, grads), aux)``."""
+    scalar_argnums = isinstance(argnums, int)
+    _argnums = (argnums,) if scalar_argnums else tuple(argnums)
+    jac_fn = jacve(
+        fun, order, _argnums, has_aux=True, count_ops=count_ops,
+        transforms=transforms,
+    )
+
+    @wraps(fun)
+    def value_and_grad_fn(*args, **kwargs):
+        _check_scalar_output(fun, *args, **kwargs)
+        out = jac_fn(*args, **kwargs)
+        aux_data: dict = {}
+        if count_ops:
+            out, aux_data = out
+        primal, grads = out
+        primal = _unwrap_single(primal)  # exactly one (scalar) output
+        grads = _normalize_grads(grads, scalar_argnums)
+        if count_ops:
+            return (primal, grads), aux_data
+        return primal, grads
+
+    return value_and_grad_fn
+
+
 def unload_post_transforms(post, pre):
     new_post = post.copy()
     for transform in pre.post_transforms:
