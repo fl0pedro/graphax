@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, Sequence, Set, Tuple, Union, cast
 
 import immutables
 import jax
+import numpy as np
 import jax._src.core as core
 import jax.numpy as jnp
 import jax.tree_util as jtu
@@ -40,8 +41,37 @@ ComputationalGraph = Dict[core.Var, Dict[core.Var, jnp.ndarray]]
 ENABLE_CACHE = os.environ.get("GX_ENABLE_CACHE", "1") != "0"
 
 
+def _leaf_cache_key(leaf):
+    """Hashable cache key for one pytree leaf.
+
+    Array leaves are keyed by (shape, dtype, content-digest) rather than by
+    ``id(leaf)``. Keying by object identity is unsound here: a cached result may
+    bake the leaf's *values* into a value-dependent structure (e.g. the eager
+    elemental edges in :func:`_build_graph`) while NOT retaining the leaf array
+    itself. Once such a leaf is garbage-collected, a later array allocated at the
+    same address reuses its ``id()`` -> the cache returns the stale, wrong-valued
+    result. A content digest makes the key correct regardless of value
+    dependence: distinct values yield distinct keys, identical values reuse the
+    entry. ``_get_eliminator`` is consulted once per ``jacve`` call (and once at
+    trace time under ``jax.jit``), so the O(size) digest is off the per-vertex
+    hot path.
+    """
+    if hasattr(leaf, "shape"):
+        # Abstract tracers have no concrete buffer; under jax.jit the leaf
+        # values are deferred to runtime, so keying by (shape, dtype) is both
+        # all we can do and correct (no concrete value is baked at trace time).
+        if isinstance(leaf, core.Tracer):
+            return (leaf.shape, str(leaf.dtype))
+        # Concrete array: hash the raw buffer. ``hash(bytes)`` is a fast C
+        # routine; combined with shape + dtype the collision probability is
+        # negligible for caching.
+        buf = np.asarray(leaf).tobytes()
+        return (leaf.shape, str(leaf.dtype), hash(buf))
+    return hash(leaf)
+
+
 def pytree_hash_cache(maxsize: int | None = None):
-    """Decorator that memoizes a function on its (args, kwargs) pytree shape/dtype.
+    """Decorator that memoizes a function on its (args, kwargs) pytree content.
 
     Disabled at call-time when ``ENABLE_CACHE`` is False so the wrapped
     function is invoked directly without consulting the cache.
@@ -58,12 +88,7 @@ def pytree_hash_cache(maxsize: int | None = None):
                 return func(*args, **kwargs)
 
             leaves, treedef = jtu.tree_flatten((args, kwargs))
-            leaf_hashes = tuple(
-                (id(leaf), leaf.shape, leaf.dtype)
-                if hasattr(leaf, "shape")
-                else hash(leaf)
-                for leaf in leaves
-            )
+            leaf_hashes = tuple(_leaf_cache_key(leaf) for leaf in leaves)
             key = hash((hash(treedef), leaf_hashes))
 
             must_compute = False
