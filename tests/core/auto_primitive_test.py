@@ -149,8 +149,7 @@ def test_abs_at_zero_matches_jax():
     assert tree_allclose(g, ref)
 
 
-@pytest.mark.xfail(reason=BUG_EXP2, strict=True)
-def test_exp2_matches_jax():
+def test_exp2_matches_jax():  # was BUG_EXP2: lambda lacked accuracy=None
     check(lambda x: jnp.exp2(x), (0,), lambda k: (randn(k, (8,)),))
 
 
@@ -208,19 +207,19 @@ def test_reduce_sum(axes):
     check(lambda x: jnp.sum(x, axis=axes), (0,), lambda k: (randn(k, (4, 5)),))
 
 
-def test_reduce_max_last_axis():
-    check(lambda x: jnp.max(x, axis=1), (0,), lambda k: (randn(k, (4, 5)),))
-    check(lambda x: jnp.max(x), (0,), lambda k: (randn(k, (4, 5)),))
+@pytest.mark.parametrize("axis", [0, 1, None], ids=["ax0", "ax1", "all"])
+def test_reduce_max(axis):
+    check(lambda x: jnp.max(x, axis=axis), (0,), lambda k: (randn(k, (4, 5)),))
 
 
-@pytest.mark.xfail(reason=BUG_REDUCE_TOPO, strict=True)
-def test_reduce_max_3d_middle_axis():
-    check(lambda x: jnp.max(x, axis=1), (0,), lambda k: (randn(k, (2, 3, 4)),), n=2)
+@pytest.mark.parametrize("axis", [0, 1, 2, None], ids=["ax0", "ax1", "ax2", "all"])
+def test_reduce_max_3d(axis):  # was BUG_REDUCE_TOPO: ids collided for a kept axis after a reduced one
+    check(lambda x: jnp.max(x, axis=axis), (0,), lambda k: (randn(k, (2, 3, 4)),), n=3)
 
 
-@pytest.mark.xfail(reason=BUG_REDUCE_MIN_BCAST, strict=True)
-def test_reduce_min_nonleading_axis():
-    check(lambda x: jnp.min(x, axis=1), (0,), lambda k: (randn(k, (4, 5)),), n=2)
+@pytest.mark.parametrize("axis", [0, 1, 2, None], ids=["ax0", "ax1", "ax2", "all"])
+def test_reduce_min_3d(axis):  # was BUG_REDUCE_MIN_BCAST + BUG_REDUCE_TOPO
+    check(lambda x: jnp.min(x, axis=axis), (0,), lambda k: (randn(k, (2, 3, 4)),), n=3)
 
 
 # =========================================================================== #
@@ -389,15 +388,17 @@ def test_scatter_add_operand():
           lambda k: (randn(k, (5,)),))
 
 
-@pytest.mark.xfail(reason=BUG_SCATTER_UPDATES, strict=True)
-def test_scatter_add_updates():
+@pytest.mark.parametrize("name,sf", [("add", lax.scatter_add), ("sub", lax.scatter_sub)],
+                         ids=["add", "sub"])
+def test_scatter_updates(name, sf):  # was BUG_SCATTER_UPDATES: dropped at slot 1
     idx = jnp.array([[0], [2], [4]])
     dn = lax.ScatterDimensionNumbers((), (0,), (0,))
 
     def f(o, u):
-        return lax.scatter_add(o, idx, u, dn)
-    check(f, (1,), lambda k: (randn(jax.random.split(k)[0], (5,)),
-                              randn(jax.random.split(k)[1], (3,))), n=2)
+        return jnp.sin(sf(o, idx, u, dn))
+    # both argnums -> the updates Jacobian (slot 2) must be present and correct
+    check(f, (0, 1), lambda k: tuple(randn(kk, s) for kk, s in
+                                     zip(jax.random.split(k), [(5,), (3,)])), n=3)
 
 
 @pytest.mark.xfail(reason=BUG_SQUEEZE_IDS, strict=True)
