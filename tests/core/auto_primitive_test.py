@@ -264,33 +264,59 @@ def test_dot_general_permuted_batch():
 
 
 # =========================================================================== #
-# 5. Convolution  (ML core — currently broken for ALL configs)
+# 5. Convolution  (ML core) — exact windowed-Jacobian rule
 # =========================================================================== #
-def _conv(strides, padding, lhs_dil=None, rhs_dil=None):
+def _conv(strides, padding, labels, sl, sr, lhs_dil=None, rhs_dil=None):
+    dn = lax.conv_dimension_numbers(sl, sr, labels)
+
     def f(lhs, rhs):
-        dn = lax.conv_dimension_numbers(lhs.shape, rhs.shape, ("NCH", "OIH", "NCH"))
         return lax.conv_general_dilated(lhs, rhs, strides, padding,
                                         lhs_dilation=lhs_dil, rhs_dilation=rhs_dil,
                                         dimension_numbers=dn)
     return f
 
 
+# (name, strides, padding, labels, lhs_shape, rhs_shape, lhs_dil, rhs_dil)
 _CONV_CFG = [
-    ("1x1_s1", (1,), "VALID", (1, 1, 5), (1, 1, 1)),
-    ("k3_s1_valid", (1,), "VALID", (1, 1, 6), (1, 1, 3)),
-    ("k3_s2", (2,), "VALID", (1, 1, 7), (1, 1, 3)),
-    ("k3_same", (1,), "SAME", (1, 1, 6), (1, 1, 3)),
-    ("multichannel", (1,), "VALID", (2, 3, 6), (4, 3, 3)),
+    # --- 1D (NCH) over kernel / stride / padding / dilation / channels ---
+    ("1d_1x1_s1", (1,), "VALID", ("NCH", "OIH", "NCH"), (1, 1, 5), (1, 1, 1), None, None),
+    ("1d_k3_valid", (1,), "VALID", ("NCH", "OIH", "NCH"), (2, 1, 6), (1, 1, 3), None, None),
+    ("1d_k3_s2", (2,), "VALID", ("NCH", "OIH", "NCH"), (1, 1, 7), (1, 1, 3), None, None),
+    ("1d_k3_same", (1,), "SAME", ("NCH", "OIH", "NCH"), (2, 1, 6), (1, 1, 3), None, None),
+    ("1d_multichan", (1,), "VALID", ("NCH", "OIH", "NCH"), (2, 3, 6), (4, 3, 3), None, None),
+    # pointwise / 1x1 conv (pass-through spatial -> DiagonalIndex path)
+    ("1d_pointwise", (1,), "VALID", ("NCH", "OIH", "NCH"), (2, 3, 7), (5, 3, 1), None, None),
+    ("2d_pointwise", (1, 1), "VALID", ("NCHW", "OIHW", "NCHW"), (2, 3, 4, 4), (5, 3, 1, 1), None, None),
+    ("1d_rdil2", (1,), "VALID", ("NCH", "OIH", "NCH"), (1, 2, 9), (3, 2, 3), None, (2,)),
+    ("1d_ldil2", (1,), [(2, 2)], ("NCH", "OIH", "NCH"), (1, 2, 5), (3, 2, 3), (2,), None),
+    # --- 2D (NCHW / OIHW) ---
+    ("2d_k3", (1, 1), "VALID", ("NCHW", "OIHW", "NCHW"), (2, 3, 5, 5), (4, 3, 3, 3), None, None),
+    ("2d_s2_same", (2, 2), "SAME", ("NCHW", "OIHW", "NCHW"), (1, 3, 7, 7), (4, 3, 3, 3), None, None),
+    # --- 2D permuted dimension_numbers (NHWC, the flax/keras default) ---
+    ("2d_NHWC", (1, 1), "VALID", ("NHWC", "HWIO", "NHWC"), (2, 5, 5, 3), (3, 3, 3, 4), None, None),
 ]
 
 
-@pytest.mark.xfail(reason=BUG_CONV, strict=True)
-@pytest.mark.parametrize("name,strides,pad,sl,sr", _CONV_CFG, ids=[c[0] for c in _CONV_CFG])
-def test_conv1d(name, strides, pad, sl, sr):
+@pytest.mark.parametrize("name,strides,pad,labels,sl,sr,ld,rd", _CONV_CFG,
+                         ids=[c[0] for c in _CONV_CFG])
+def test_conv(name, strides, pad, labels, sl, sr, ld, rd):
     def fac(k):
         a, b = jax.random.split(k)
         return (randn(a, sl), randn(b, sr))
-    check(_conv(strides, pad), (0, 1), fac, n=3, seed=hash(name) & 0xFFFF)
+    check(_conv(strides, pad, labels, sl, sr, ld, rd), (0, 1), fac, n=3,
+          seed=hash(name) & 0xFFFF)
+
+
+def test_conv_grouped_raises_clearly():
+    # grouped / depthwise conv is not yet supported — must fail LOUDLY, not
+    # silently produce a wrong Jacobian.
+    sl, sr = (1, 4, 6), (4, 2, 3)  # feature_group_count=2
+    dn = lax.conv_dimension_numbers(sl, sr, ("NCH", "OIH", "NCH"))
+    f = lambda a, b: lax.conv_general_dilated(a, b, (1,), "VALID",
+                                              dimension_numbers=dn, feature_group_count=2)
+    with pytest.raises(NotImplementedError, match="group"):
+        jacve(f, "rev", (0, 1))(randn(jax.random.PRNGKey(0), sl),
+                                randn(jax.random.PRNGKey(1), sr))
 
 
 # =========================================================================== #
