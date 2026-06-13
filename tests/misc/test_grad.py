@@ -201,6 +201,28 @@ def test_grad_count_ops_scalar_contraction():
     assert graphax.tree_allclose(vg, g_nc, equal_nan=True)
 
 
+def test_grad_count_ops_rev_after_noncount_is_real():
+    """count_ops must report REAL counts for 'rev' even when a no-count run
+    primed the elimination prefix-cache first. The GraphState cache stores op
+    counts, defaulting to 0; a count_ops=False run used to cache those zeros and
+    a later count_ops=True run reused them -> muls/adds=0 and an empty
+    order_counts. The count path must (a) ignore the zero-count cached prefix,
+    and (b) agree with an explicit reversed numeric order."""
+    import graphax.examples as ex
+    args = tuple(jnp.array(v) for v in (.1, .2, .3, .15, .25, .35))
+    an = tuple(range(6))
+    sf = lambda *a: sum(jnp.sum(o) for o in jax.tree_util.tree_leaves(ex.RoeFlux_1d(*a)))
+    g_nc = graphax.grad(sf, "rev", an)(*args)            # primes cache with zero counts
+    g_c, aux = graphax.grad(sf, "rev", an, count_ops=True)(*args)
+    assert graphax.tree_allclose(g_c, g_nc, equal_nan=True)
+    assert aux["muls"] > 0 and aux["adds"] > 0 and len(aux["order_counts"]) > 0
+    # 'rev' must count identically to the equivalent explicit reversed order.
+    N = len(jax.make_jaxpr(sf)(*args).jaxpr.eqns)
+    _, aux_list = graphax.grad(sf, list(range(N, 0, -1)), an, count_ops=True)(*args)
+    assert (aux["muls"], aux["adds"], aux["fmas"]) == \
+           (aux_list["muls"], aux_list["adds"], aux_list["fmas"])
+
+
 def test_grad_count_ops_distinguishes_orders():
     """count_ops gives DIFFERENT (muls, fmas) for different elimination orders of
     the same scalar gradient, while the gradient stays exact — i.e. the order

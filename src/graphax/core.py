@@ -1227,7 +1227,13 @@ class VertexEliminator:
             int(v): tuple(ts) for v, ts in (transforms or ())
         }
 
-        if ENABLE_CACHE:
+        # When counting, never reuse the cached prefix: a node's stored counts
+        # are only real if the run that created it had count_ops=True. A prior
+        # count_ops=False run caches zeros (GraphState defaults), so reusing the
+        # prefix here would report muls/adds=0 and an empty per-step breakdown.
+        # Re-run the full order so the counts are honest (count_ops is an
+        # analysis path, not the hot path); the graph result is identical.
+        if ENABLE_CACHE and not count_ops:
             for vertex in order:
                 v_transforms = t_dict.get(vertex, ())
                 key = (vertex, v_transforms)
