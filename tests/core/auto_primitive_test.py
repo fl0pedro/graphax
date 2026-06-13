@@ -458,6 +458,20 @@ def test_gather_dynamic_index():  # argmax-driven single-element gather (was squ
     check(lambda x: x[jnp.argmax(x)], (0,), lambda k: (randn(k, (8,)),))
 
 
+def test_jit_inlined():
+    # jit/pjit bodies are inlined before elimination (was a macro-vertex that
+    # mis-shaped the inner Jacobian).
+    check(lambda x: jax.jit(lambda y: jnp.sin(y) * 2.0)(x), (0,), lambda k: (randn(k, (6,)),))
+    check(lambda x: jax.jit(lambda y: jax.jit(lambda z: jnp.tanh(z))(y) + 1.0)(x),
+          (0,), lambda k: (randn(k, (6,)),))
+
+
+def test_custom_jvp_inlined():
+    # custom_jvp_call body is inlined (differentiate the primal decomposition).
+    # hard_sigmoid's body has no shared-input select fan-out, so it composes.
+    check(lambda x: jax.nn.hard_sigmoid(x), (0,), lambda k: (randn(k, (6,)),))
+
+
 @pytest.mark.parametrize("oshape,ushape,start", [((8,), (3,), (2,)), ((5, 6), (2, 3), (1, 2))],
                          ids=["1d", "2d"])
 def test_dynamic_update_slice(oshape, ushape, start):  # was BUG_DUS_UPDATES (wrong-direction)

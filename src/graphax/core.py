@@ -159,6 +159,71 @@ def _force(edge):
     return edge.value if isinstance(edge, LazyEdge) else edge
 
 
+def _inline_call_primitives(jaxpr, consts):
+    """Splice jit/pjit (and nested) bodies into the parent jaxpr so vertex
+    elimination only ever sees primitives with registered elemental rules.
+
+    jit/pjit is pure structural plumbing — its body is a closed sub-jaxpr — so we
+    re-point the body's invars onto the outer call args, recurse into the body's
+    equations, and re-point the outer outvars onto the body's results. This is
+    correct and composes far better than treating ``jit_p`` as a *macro vertex*
+    (recursively differentiating the body and re-wrapping its Jacobian, which
+    mis-shaped the inner Jacobian during the OUTER composition — e.g. a (6,6,6)
+    -> (6,6) reshape for ``jax.nn`` activations). Returns ``(new_jaxpr,
+    new_consts)``; inner consts are hoisted to top-level constvars. A no-op (the
+    original objects) when there are no call primitives to inline."""
+    sub: Dict[Any, Any] = {}
+    has_call = [False]
+
+    def resolve(v):
+        seen = set()
+        while not isinstance(v, core.Literal) and v in sub and id(v) not in seen:
+            seen.add(id(v))
+            v = sub[v]
+        return v
+
+    new_eqns = []
+    constvars = list(jaxpr.constvars)
+    new_consts = list(consts)
+
+    def _call_body(eqn):
+        """The closed inner jaxpr for jit/pjit or custom_jvp_call/custom_vjp_call,
+        else None. custom_jvp ignores its bespoke tangent rule and differentiates
+        the primal decomposition (call_jaxpr) — correct where the body is
+        differentiable (softplus = log1p(exp(x)), etc.)."""
+        if eqn.primitive is jit_p:
+            return eqn.params["jaxpr"]
+        name = getattr(eqn.primitive, "name", "")
+        if name in ("custom_jvp_call", "custom_vjp_call"):
+            cj = eqn.params.get("call_jaxpr") or eqn.params.get("fun_jaxpr")
+            return cj
+        return None
+
+    def process(eqns):
+        for eqn in eqns:
+            inner_closed = _call_body(eqn)
+            if inner_closed is not None:
+                has_call[0] = True
+                inner = inner_closed.jaxpr
+                for cv, cval in zip(inner.constvars, inner_closed.consts):
+                    constvars.append(cv)
+                    new_consts.append(cval)
+                for iv, ov in zip(inner.invars, eqn.invars):
+                    sub[iv] = resolve(ov)
+                process(inner.eqns)
+                for iov, oov in zip(inner.outvars, eqn.outvars):
+                    sub[oov] = resolve(iov)
+            else:
+                new_eqns.append(eqn.replace(invars=[resolve(v) for v in eqn.invars]))
+
+    process(jaxpr.eqns)
+    if not has_call[0]:
+        return jaxpr, consts
+    new_outvars = [resolve(v) for v in jaxpr.outvars]
+    new_jaxpr = jaxpr.replace(constvars=constvars, eqns=new_eqns, outvars=new_outvars)
+    return new_jaxpr, new_consts
+
+
 def jacve(
     fun: Callable,
     order: EliminationOrder,
@@ -211,11 +276,14 @@ def jacve(
         # TODO Make repackaging work properly with one input value only
         flattened_args, in_tree = jtu.tree_flatten(args)
         closed_jaxpr = jax.make_jaxpr(fun)(*flattened_args, **kwargs)
+        inlined_jaxpr, inlined_consts = _inline_call_primitives(
+            closed_jaxpr.jaxpr, closed_jaxpr.literals
+        )
 
         out = vertex_elimination_jaxpr(
-            closed_jaxpr.jaxpr,
+            inlined_jaxpr,
             order,
-            closed_jaxpr.literals,
+            inlined_consts,
             *args,
             has_aux=has_aux,
             argnums=argnums,
