@@ -401,22 +401,24 @@ defelemental(lax.rem_p, rem_elemental_rule)
 
 
 # igamma(a, x): regularized lower incomplete gamma P(a, x)
-# d/da is complex (involves log terms), we use zeros as approximation
-# d/dx = x^(a-1) * exp(-x) / Gamma(a)
+# d/da = the exact regularized-incomplete-gamma shape derivative (jax exposes it
+# as lax.igamma_grad_a; was a zeros approximation). d/dx = x^(a-1) e^-x / Gamma(a).
 @with_type_promotion
 def igamma_elemental_rule(a, x):
+    da = lax.igamma_grad_a(a, x)
     dx = jnp.exp((a - 1.0) * jnp.log(x) - x - lax.lgamma(a))
-    return (jnp.zeros_like(a), dx)
+    return (da, dx)
 
 
 defelemental(lax.igamma_p, igamma_elemental_rule)
 
 
-# igammac(a, x) = 1 - igamma(a, x): negate the igamma derivatives
+# igammac(a, x) = 1 - igamma(a, x): negate both igamma derivatives.
 @with_type_promotion
 def igammac_elemental_rule(a, x):
+    da = -lax.igamma_grad_a(a, x)
     dx = -jnp.exp((a - 1.0) * jnp.log(x) - x - lax.lgamma(a))
-    return (jnp.zeros_like(a), dx)
+    return (da, dx)
 
 
 defelemental(lax.igammac_p, igammac_elemental_rule)
@@ -2153,12 +2155,8 @@ def scatter_mul_elemental_rule(primals, **params):
     ]
     op_tensor = SparseTensor(op_out_dims, op_primal_dims, op_coeff)
 
-    # d/d(updates): operand[out_idx] at scattered positions
-    up_coeff = jnp.array(operand)
-    jac = _build_scatter_update_jac(
-        indices, out_shape, up_shape, params, coeff=up_coeff
-    )
-    # Need to use operand values at the output positions as coefficients
+    # d/d(updates) = operand value at the scattered output positions (product
+    # rule: out = operand * updates there, so d out/d updates = operand).
     jac_shape = list(out_shape) + list(up_shape)
     jac2 = jnp.zeros(jac_shape, dtype=jnp.float32)
     for up_idx in itertools.product(*(range(s) for s in up_shape)):
