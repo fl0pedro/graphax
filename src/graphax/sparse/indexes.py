@@ -170,6 +170,77 @@ class BandedIndex(CompressedIndex):
         )
 
 
+# ToeplitzIndex roles — which axis of the conv incidence M[p, q, k] a dim is.
+TOEPLITZ_OUT = 0   # output position p
+TOEPLITZ_IN = 1    # input position q
+TOEPLITZ_TAP = 2   # kernel tap k
+
+
+@dataclass(frozen=True)
+class ToeplitzIndex(CompressedIndex):
+    """Windowed (Toeplitz / convolutional) compressed dim — one side of a conv
+    axis-pair.
+
+    A convolution's elemental Jacobian is sparse along a *windowed* axis pair:
+    the incidence of (output position ``p``, input position ``q``, kernel tap
+    ``k``) is the rank-3 indicator ``M[p, q, k] = 1`` iff
+    ``q * base_dilation == p * stride + k * win_dilation - pad_lo`` (within
+    bounds). A ToeplitzIndex *pair* (linked by ``other_id``) occupies TWO of
+    those three roles; the remaining role is the axis stored compactly in
+    ``val`` and contracted away at densify time — the kernel weights for
+    ``d out/d lhs`` (pair = OUT×IN, val = TAP), the activations for
+    ``d out/d rhs`` (pair = OUT×TAP, val = IN).
+
+    Storage is the operand-sized buffer (kernel ``O·I·K`` or input ``N·I·X``),
+    NOT the dense windowed block (``…·P·Q·…``) — up to a ``K×`` saving that
+    holds until the op boundary, where :func:`_densify_toeplitz` rebuilds the
+    dense pair via a SCATTER-FREE ``M`` (pure iota broadcasts) contracted with
+    ``val`` in one XLA-fusable einsum.
+
+    Extra fields (full window geometry, identical on both sides of the pair):
+      * ``out_size`` / ``in_size`` / ``kernel_size``: the P / X / K extents.
+      * ``stride`` / ``win_dilation`` (rhs) / ``base_dilation`` (lhs) / ``pad_lo``.
+      * ``role``: which incidence axis THIS dim is (OUT / IN / TAP).
+      * ``primary``: the side that owns (``axis`` points at) the contracted
+        ``val`` axis; the partner carries ``axis=None``.
+    """
+
+    out_size: int = 1
+    in_size: int = 1
+    kernel_size: int = 1
+    stride: int = 1
+    win_dilation: int = 1
+    base_dilation: int = 1
+    pad_lo: int = 0
+    role: int = 0
+    primary: bool = True
+
+    def reduces_to_diagonal(self) -> bool:
+        # A length-1 stride-1 undilated unpadded window with P==X is an identity
+        # pair — but the conv rule emits that as a DiagonalIndex directly, so a
+        # ToeplitzIndex is only ever built for genuinely windowed axes.
+        return False
+
+    def indicator(self):
+        """Scatter-free ``M[p, q, k]`` (iota broadcasts + equality), shape
+        ``(out_size, in_size, kernel_size)`` — XLA fuses this into the densify
+        einsum (no ``lax.scatter``/``gather``)."""
+        import jax.numpy as jnp
+
+        P, X, K = self.out_size, self.in_size, self.kernel_size
+        p = jnp.arange(P)[:, None, None]
+        q = jnp.arange(X)[None, :, None]
+        k = jnp.arange(K)[None, None, :]
+        dilated = p * self.stride + k * self.win_dilation - self.pad_lo
+        if self.base_dilation > 1:
+            col = dilated // self.base_dilation
+            valid = (dilated % self.base_dilation) == 0
+        else:
+            col = dilated
+            valid = True
+        return ((q == col) & (col >= 0) & (col < X) & valid).astype(jnp.float32)
+
+
 @dataclass(frozen=True)
 class SetIndex(CompressedIndex):
     """Set-theoretic compressed dim for elementwise outputs — one side of a
