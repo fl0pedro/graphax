@@ -615,6 +615,162 @@ def reduce_min_elemental_rule(primals, **params):
 elemental_rules[lax.reduce_min_p] = reduce_min_elemental_rule
 
 
+def reduce_prod_elemental_rule(primals, **params):
+    """d prod / d x_i = product of the OTHER reduced elements. Same dim layout as
+    reduce_max (kept axes DiagonalIndex, reduced axes DenseIndex); the val is the
+    per-element product-of-others, robust to zeros."""
+    val_out = lax.reduce_prod_p.bind(*primals, **params)
+    primal = primals[0]
+    axes = params["axes"]
+    shape = list(get_shape(val_out))
+
+    new_out_dims, new_primal_dims = [], []
+    reduce_all = axes is None
+    if reduce_all:
+        axes = tuple(range(primal.ndim))
+        new_out_dims.append(DenseIndex(0, 1, 0))
+    elif isinstance(axes, int):
+        axes = (axes,)
+
+    l = get_ndim(val_out)
+    base = 1 if reduce_all else l
+    for i, size in enumerate(get_shape(primal)):
+        if i in axes:
+            shape.insert(i, 1)
+            new_primal_dims.append(DenseIndex(base + i, size, i))
+        else:
+            ll = len(new_out_dims)
+            new_out_dims.append(DiagonalIndex(ll, size, i, l + i))
+            new_primal_dims.append(DiagonalIndex(l + i, size, i, ll))
+
+    # prod_others, robust to zeros: tot/x_i for non-zero x_i; for x_i == 0,
+    # the product of the rest when it is the UNIQUE zero, else 0.
+    tot = val_out.reshape(shape)                       # full product (0 if any 0)
+    n_zeros = jnp.sum(primal == 0, axis=axes, keepdims=True)
+    prod_nonzero = jnp.prod(jnp.where(primal == 0, 1.0, primal), axis=axes, keepdims=True)
+    safe = jnp.where(primal != 0, primal, 1.0)
+    new_val = jnp.where(
+        primal != 0, tot / safe,
+        jnp.where(n_zeros == 1, prod_nonzero, 0.0),
+    ).astype(jnp.float32)
+    return val_out, [
+        _swap_back_axes(SparseTensor(new_out_dims, new_primal_dims, new_val))
+    ]
+
+
+elemental_rules[lax.reduce_prod_p] = reduce_prod_elemental_rule
+
+
+def cumsum_elemental_rule(primals, **params):
+    """Cumulative sum: ``out[i] = sum_{j<=i} x[j]`` along ``axis`` (``j>=i`` when
+    ``reverse``). The Jacobian on the scan axis is a triangular ones matrix; all
+    other axes are independent (DiagonalIndex). The triangular block is
+    position-invariant, so it lives in a small ``(n, n)`` val and the other axes
+    broadcast (axis=None)."""
+    val_out = lax.cumsum_p.bind(*primals, **params)
+    x = primals[0]
+    axis = params["axis"]
+    reverse = params.get("reverse", False)
+    shape = get_shape(x)
+    N = len(shape)
+    n = shape[axis]
+
+    new_out_dims, new_primal_dims = [], []
+    for i, size in enumerate(shape):
+        if i == axis:                                  # scan axis: dense (out, in) pair
+            new_out_dims.append(DenseIndex(i, size, 0))
+            new_primal_dims.append(DenseIndex(N + i, size, 1))
+        else:                                          # independent axis: diagonal
+            new_out_dims.append(DiagonalIndex(i, size, None, N + i))
+            new_primal_dims.append(DiagonalIndex(N + i, size, None, i))
+
+    idx = jnp.arange(n)
+    # val[i, j] = d out[i] / d x[j]; axis0=out i, axis1=in j.
+    L = (idx[None, :] >= idx[:, None]) if reverse else (idx[None, :] <= idx[:, None])
+    return val_out, [
+        _swap_back_axes(SparseTensor(new_out_dims, new_primal_dims, L.astype(jnp.float32)))
+    ]
+
+
+elemental_rules[lax.cumsum_p] = cumsum_elemental_rule
+
+
+def sort_elemental_rule(primals, **params):
+    """Single-operand ``sort``: ``out = x[argsort(x)]`` along ``dimension``. The
+    Jacobian is the selection (permutation) matrix from the argsort indices on
+    the sort axis; other axes are independent (DiagonalIndex). ``sort_p`` is
+    multiple_results, hence the ``[tensor]`` (one per output) return shape."""
+    operand = primals[0]
+    dim = params["dimension"]
+    num_keys = params.get("num_keys", 1)
+    if len(primals) != 1 or num_keys != 1:
+        raise NotImplementedError(
+            "sort_elemental_rule supports the single-operand case only "
+            f"(got {len(primals)} operands, num_keys={num_keys})."
+        )
+    val_out_list = lax.sort_p.bind(*primals, **params)
+    shape = get_shape(operand)
+    n = len(shape)
+    S = shape[dim]
+
+    perm = jnp.argsort(operand, axis=dim)
+    perm_e = jnp.expand_dims(perm, dim + 1)
+    j_idx = jnp.arange(S).reshape([S if k == dim + 1 else 1 for k in range(n + 1)])
+    indicator = (perm_e == j_idx).astype(jnp.float32)  # out[i] picks in[perm[i]]
+
+    new_out_dims, new_primal_dims = [], []
+    for i, size in enumerate(shape):
+        if i == dim:
+            new_out_dims.append(DenseIndex(i, size, dim))
+            new_primal_dims.append(DenseIndex(n + i, size, dim + 1))
+        else:
+            vd = i if i < dim else i + 1   # val axis (shifted past the extra in-axis)
+            new_out_dims.append(DiagonalIndex(i, size, vd, n + i))
+            new_primal_dims.append(DiagonalIndex(n + i, size, vd, i))
+    st = _swap_back_axes(SparseTensor(new_out_dims, new_primal_dims, indicator))
+    return val_out_list, [st]
+
+
+elemental_rules[lax.sort_p] = sort_elemental_rule
+
+
+def rev_elemental_rule(primals, **params):
+    """``rev`` (``jnp.flip``): each flipped axis is a reverse permutation
+    (``out[i] = x[n-1-i]``, Jacobian ``R[i,j] = (j == n-1-i)``); unflipped axes
+    are independent (DiagonalIndex). The reverse indicator is value-independent,
+    so flipped axes get a small dense (out,in) pair and the others broadcast."""
+    val_out = lax.rev_p.bind(*primals, **params)
+    x = primals[0]
+    dims = params["dimensions"]
+    shape = get_shape(x)
+    N = len(shape)
+
+    new_out_dims, new_primal_dims, Rs, vax = [], [], [], 0
+    for i, size in enumerate(shape):
+        if i in dims:
+            new_out_dims.append(DenseIndex(i, size, vax))
+            new_primal_dims.append(DenseIndex(N + i, size, vax + 1))
+            idx = jnp.arange(size)
+            Rs.append((idx[None, :] == (size - 1 - idx[:, None])).astype(jnp.float32))
+            vax += 2
+        else:
+            new_out_dims.append(DiagonalIndex(i, size, None, N + i))
+            new_primal_dims.append(DiagonalIndex(N + i, size, None, i))
+
+    if not Rs:
+        val = jnp.array(1.0, dtype=jnp.float32)
+    else:
+        val = Rs[0]
+        for R in Rs[1:]:                               # outer product over flipped axes
+            val = val[..., None, None] * R[None, None, ...]
+    return val_out, [
+        _swap_back_axes(SparseTensor(new_out_dims, new_primal_dims, val))
+    ]
+
+
+elemental_rules[lax.rev_p] = rev_elemental_rule
+
+
 # first draft unified reduce, TODO: test!
 def reduce_elemental_rule(primals, agg, **params):
     assert agg in {"sum", "min", "max"}, (
