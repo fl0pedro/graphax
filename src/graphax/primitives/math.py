@@ -30,7 +30,7 @@ defelemental2(lax.tan_p, lambda out, primal, accuracy: 1.0 + out**2)
 defelemental(lax.atan_p, lambda x: 1.0 / (1.0 + x**2))
 
 defelemental(lax.sinh_p, lax.cosh)
-defelemental(lax.asinh_p, lambda x: lax.sqrt(1.0 + x**2))
+defelemental(lax.asinh_p, lambda x: 1.0 / lax.sqrt(1.0 + x**2))
 defelemental(lax.cosh_p, lax.sinh)
 defelemental(lax.acosh_p, lambda x: 1.0 / lax.sqrt(x**2 - 1.0))
 defelemental2(lax.tanh_p, lambda out, primal, accuracy: 1.0 - out**2)
