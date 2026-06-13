@@ -264,8 +264,9 @@ defelemental(lax.is_finite_p, lambda x: jnp.zeros_like(x))
 # copy: d/dx = 1 (identity)
 defelemental(lax.copy_p, lambda x: jnp.ones_like(x))
 
-# exp2: d/dx(2^x) = 2^x * ln(2) = out * ln(2)
-defelemental2(lax.exp2_p, lambda out, x: out * jnp.log(2.0))
+# exp2: d/dx(2^x) = 2^x * ln(2) = out * ln(2). accuracy=None: current JAX puts an
+# `accuracy` param on exp2_p's eqn; without it the lambda crashes under jacve.
+defelemental2(lax.exp2_p, lambda out, x, accuracy=None: out * jnp.log(2.0))
 
 # erfc: d/dx(erfc(x)) = -2/sqrt(pi) * exp(-x^2)
 defelemental(lax.erfc_p, lambda x: -2.0 / jnp.sqrt(jnp.pi) * jnp.exp(-(x**2)))
@@ -531,19 +532,24 @@ def reduce_max_elemental_rule(primals, **params):
     shape = list(get_shape(val_out))
 
     new_out_dims, new_primal_dims, _shape = [], [], []
-    if axes is None:
+    reduce_all = axes is None
+    if reduce_all:
         axes = tuple(range(primal.ndim))
         new_out_dims.append(DenseIndex(0, 1, 0))
     elif isinstance(axes, int):
         axes = (axes,)
 
-    l = get_ndim(val_out)  # TODO rename l, bad name ...
+    l = get_ndim(val_out)  # number of kept (out) axes
+    # Primal-dim ids must be contiguous with the out ids: every primal axis gets
+    # id ``base + i`` (``base`` = #out dims = 1 dummy scalar for a full reduction,
+    # else ``l`` kept axes), matching the kept DiagonalIndex pairs and
+    # reduce_sum. The old ``len(out)+len(primal)`` counter collided with a kept
+    # axis that followed a reduced one (ids like [0,1,2,2,4] -> Topology Error).
+    base = 1 if reduce_all else l
     for i, size in enumerate(get_shape(primal)):
         if i in axes:
             shape.insert(i, 1)
-            idx = len(new_out_dims) + len(new_primal_dims)
-            idx = max(idx, 1) if val_out.ndim > 0 else idx
-            new_primal_dims.append(DenseIndex(idx, size, i))
+            new_primal_dims.append(DenseIndex(base + i, size, i))
             _shape.append(size)
         else:
             ll = len(new_out_dims)
@@ -569,29 +575,33 @@ def reduce_min_elemental_rule(primals, **params):
 
     primal = primals[0]
     axes = params["axes"]
+    shape = list(get_shape(val_out))
 
     new_out_dims, new_primal_dims, _shape = [], [], []
-    if axes is None:
+    reduce_all = axes is None
+    if reduce_all:
         axes = tuple(range(primal.ndim))
         new_out_dims.append(DenseIndex(0, 1, 0))
     elif isinstance(axes, int):
         axes = (axes,)
 
     l = get_ndim(val_out)
-    count = 0
+    base = 1 if reduce_all else l   # contiguous ids; see reduce_max
     for i, size in enumerate(get_shape(primal)):
         if i in axes:
-            idx = len(new_out_dims) + len(new_primal_dims)
-            idx = max(idx, 1) if val_out.ndim > 0 else idx
-            new_primal_dims.append(DenseIndex(idx, size, i))
+            shape.insert(i, 1)
+            new_primal_dims.append(DenseIndex(base + i, size, i))
             _shape.append(size)
-            count += 1
         else:
             ll = len(new_out_dims)
             new_out_dims.append(DiagonalIndex(ll, size, i, l + i))
             new_primal_dims.append(DiagonalIndex(l + i, size, i, ll))
 
-    new_val = primal == val_out
+    # Reshape val_out with size-1 at the reduced axes so the equality broadcasts
+    # against the full-shape primal (reduce_max had this; reduce_min lacked it ->
+    # broadcast crash for any reduction not over a leading axis).
+    _val_out = val_out.reshape(shape)
+    new_val = primal == _val_out
     # NOTE: Normalization is important if the minimum is not unique
     norm = jnp.sum(new_val, axis=axes, keepdims=True)
     new_val = new_val / norm
@@ -1799,7 +1809,10 @@ def scatter_add_elemental_rule(primals, **params):
     ]
     up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac)
 
-    return val_out, [op_tensor, up_tensor]
+    # invars are (operand=0, indices=1, updates=2); core indexes elementals by
+    # eqn.invars position, so the updates Jacobian must sit at slot 2 with a None
+    # for the non-differentiable integer indices (else it is silently dropped).
+    return val_out, [op_tensor, None, up_tensor]
 
 
 elemental_rules[lax.scatter_add_p] = scatter_add_elemental_rule
@@ -1832,7 +1845,10 @@ def scatter_sub_elemental_rule(primals, **params):
     ]
     up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac)
 
-    return val_out, [op_tensor, up_tensor]
+    # invars are (operand=0, indices=1, updates=2); core indexes elementals by
+    # eqn.invars position, so the updates Jacobian must sit at slot 2 with a None
+    # for the non-differentiable integer indices (else it is silently dropped).
+    return val_out, [op_tensor, None, up_tensor]
 
 
 elemental_rules[lax.scatter_sub_p] = scatter_sub_elemental_rule
@@ -1864,7 +1880,10 @@ def scatter_set_elemental_rule(primals, **params):
     ]
     up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac)
 
-    return val_out, [op_tensor, up_tensor]
+    # invars are (operand=0, indices=1, updates=2); core indexes elementals by
+    # eqn.invars position, so the updates Jacobian must sit at slot 2 with a None
+    # for the non-differentiable integer indices (else it is silently dropped).
+    return val_out, [op_tensor, None, up_tensor]
 
 
 elemental_rules[lax.scatter_p] = scatter_set_elemental_rule
@@ -1919,7 +1938,8 @@ def scatter_mul_elemental_rule(primals, **params):
     ]
     up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac2)
 
-    return val_out, [op_tensor, up_tensor]
+    # See scatter_add: updates Jacobian at slot 2, None for the integer indices.
+    return val_out, [op_tensor, None, up_tensor]
 
 
 elemental_rules[lax.scatter_mul_p] = scatter_mul_elemental_rule
@@ -1970,7 +1990,10 @@ def scatter_min_elemental_rule(primals, **params):
     ]
     up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac)
 
-    return val_out, [op_tensor, up_tensor]
+    # invars are (operand=0, indices=1, updates=2); core indexes elementals by
+    # eqn.invars position, so the updates Jacobian must sit at slot 2 with a None
+    # for the non-differentiable integer indices (else it is silently dropped).
+    return val_out, [op_tensor, None, up_tensor]
 
 
 elemental_rules[lax.scatter_min_p] = scatter_min_elemental_rule
@@ -2021,7 +2044,10 @@ def scatter_max_elemental_rule(primals, **params):
     ]
     up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac)
 
-    return val_out, [op_tensor, up_tensor]
+    # invars are (operand=0, indices=1, updates=2); core indexes elementals by
+    # eqn.invars position, so the updates Jacobian must sit at slot 2 with a None
+    # for the non-differentiable integer indices (else it is silently dropped).
+    return val_out, [op_tensor, None, up_tensor]
 
 
 elemental_rules[lax.scatter_max_p] = scatter_max_elemental_rule

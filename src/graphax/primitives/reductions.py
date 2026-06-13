@@ -114,19 +114,23 @@ def _reduce_max_elementals(primals, val_out, **params):
     shape = list(get_shape(val_out))
 
     new_out_dims, new_primal_dims, _shape = [], [], []
-    if axes is None:
+    reduce_all = axes is None
+    if reduce_all:
         axes = tuple(range(primal.ndim))
         new_out_dims.append(DenseIndex(0, 1, 0, True))
     elif isinstance(axes, int):
         axes = (axes,)
 
-    l = get_ndim(val_out)  # TODO rename l, bad name ...
+    l = get_ndim(val_out)  # number of kept (out) axes
+    # Contiguous ids: every primal axis gets ``base + i`` (base = #out dims),
+    # matching the kept DiagonalIndex pairs. The old ``len(out)+len(primal)``
+    # counter collided with a kept axis following a reduced one on >=3D
+    # (ids like [0,1,2,2,4] -> Topology Error).
+    base = 1 if reduce_all else l
     for i, size in enumerate(get_shape(primal)):
         if i in axes:
             shape.insert(i, 1)
-            idx = len(new_out_dims) + len(new_primal_dims)
-            idx = max(idx, 1) if val_out.ndim > 0 else idx
-            new_primal_dims.append(DenseIndex(idx, size, i))
+            new_primal_dims.append(DenseIndex(base + i, size, i))
             _shape.append(size)
         else:
             ll = len(new_out_dims)
@@ -160,29 +164,32 @@ elemental_only_rules[lax.reduce_max_p] = reduce_max_elemental_only
 def _reduce_min_elementals(primals, val_out, **params):
     primal = primals[0]
     axes = params["axes"]
+    shape = list(get_shape(val_out))
 
     new_out_dims, new_primal_dims, _shape = [], [], []
-    if axes is None:
+    reduce_all = axes is None
+    if reduce_all:
         axes = tuple(range(primal.ndim))
         new_out_dims.append(DenseIndex(0, 1, 0, True))
     elif isinstance(axes, int):
         axes = (axes,)
 
     l = get_ndim(val_out)
-    count = 0
+    base = 1 if reduce_all else l   # contiguous ids; see _reduce_max_elementals
     for i, size in enumerate(get_shape(primal)):
         if i in axes:
-            idx = len(new_out_dims) + len(new_primal_dims)
-            idx = max(idx, 1) if val_out.ndim > 0 else idx
-            new_primal_dims.append(DenseIndex(idx, size, i))
+            shape.insert(i, 1)
+            new_primal_dims.append(DenseIndex(base + i, size, i))
             _shape.append(size)
-            count += 1
         else:
             ll = len(new_out_dims)
             new_out_dims.append(DiagonalIndex(ll, size, i, l + i))
             new_primal_dims.append(DiagonalIndex(l + i, size, i, ll))
 
-    new_val = jnp.where(primal == val_out, 1, 0)
+    # Reshape val_out with size-1 at reduced axes so the equality broadcasts
+    # against the full-shape primal (reduce_max had this; reduce_min lacked it).
+    _val_out = val_out.reshape(shape)
+    new_val = jnp.where(primal == _val_out, 1, 0)
     # NOTE: Normalization is important if the minimum is not unique
     norm = jnp.sum(new_val, axis=axes, keepdims=True)
     new_val = new_val / norm
