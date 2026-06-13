@@ -408,39 +408,41 @@ def _squeeze_elementals(primals, val_out, **params):
         )
 
     def inverse_squeeze_transform(post):
-        new_dims = params["dimensions"]
-        new_out_dims = list(copy.deepcopy(post.out_dims))
-        new_primal_dims = list(copy.deepcopy(post.primal_dims))
-        for dim in new_dims:
-            axis = sum(1 for d in new_out_dims if d.axis is not None)
-            axis += sum(
-                1
-                for d in new_primal_dims[:dim]
-                if d.axis is not None and not d.is_sparse
-            )
-            new_primal_dims.insert(dim, DenseIndex(dim, 1, axis))
-            for j in range(dim, len(new_primal_dims)):
-                d = new_primal_dims[j]
-                updates = {"id": d.id + 1}
-                if d.axis is not None:
-                    updates["axis"] = d.axis + 1
-                new_primal_dims[j] = replace(d, **updates)
-                if d.is_sparse:
-                    other_id = d.other_id
-                    _d = new_out_dims[other_id]
-                    _updates = {"other_id": _d.other_id + 1}
-                    if _d.axis is not None:
-                        _updates["axis"] = _d.axis + 1
-                    new_out_dims[other_id] = replace(_d, **_updates)
+        # Re-insert each squeezed (size-1) primal axis at its ORIGINAL input
+        # position. Insert in ascending order so earlier insertions don't shift
+        # later positions. Each inserted dim gets a fresh size-1 val axis at the
+        # correct VAL position (after the out-dense and preceding primal-dense
+        # axes) — NOT at the input-axis index, which was the old bug. Ids are
+        # renumbered contiguously at the end (the old code collided ids and
+        # expanded val at the wrong axis).
+        new_dims = sorted(params["dimensions"])
+        out_dims = list(copy.deepcopy(post.out_dims))
+        primal_dims = list(copy.deepcopy(post.primal_dims))
+        num_out = len(out_dims)
+        val = post.val
 
-        new_val = jnp.expand_dims(post.val, axis=new_dims)
-        return SparseTensor(
-            new_out_dims,
-            new_primal_dims,
-            new_val,
-            scalar_mult=post.scalar_mult,
-            fill_value=post.fill_value,
-        )
+        # Each re-inserted size-1 primal axis gets a FRESH val axis appended at
+        # the end; _swap_back_axes then permutes val into canonical dim order.
+        # (Computing the exact insertion axis by hand is unsound because diagonal
+        # pairs share a val axis, so a dim-count overshoots val.ndim.)
+        for dim in new_dims:
+            if val is not None:
+                new_ax = val.ndim
+                val = jnp.expand_dims(val, axis=new_ax)
+            else:
+                new_ax = None
+            primal_dims.insert(dim, DenseIndex(-1, 1, new_ax))  # id fixed below
+
+        old_to_new = {d.id: num_out + pos for pos, d in enumerate(primal_dims) if d.id != -1}
+        new_primal = [replace(d, id=num_out + pos) for pos, d in enumerate(primal_dims)]
+        new_out = [
+            replace(d, other_id=old_to_new[d.other_id]) if d.is_sparse else d
+            for d in out_dims
+        ]
+        return _swap_back_axes(SparseTensor(
+            new_out, new_primal, val,
+            scalar_mult=post.scalar_mult, fill_value=post.fill_value,
+        ))
 
     transform = JacobianTransform(squeeze_transform, inverse_squeeze_transform)
     return [SparseTensor([], [], None, pre_transforms=[transform])]

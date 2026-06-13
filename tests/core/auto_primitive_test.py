@@ -448,9 +448,14 @@ def test_scatter_updates(name, sf):  # was BUG_SCATTER_UPDATES: dropped at slot 
                                      zip(jax.random.split(k), [(5,), (3,)])), n=3)
 
 
-@pytest.mark.xfail(reason=BUG_SQUEEZE_IDS, strict=True)
-def test_squeeze_carrying_jacobian():
-    check(lambda x: jnp.sin(jnp.squeeze(x, 0)), (0,), lambda k: (randn(k, (1, 4, 5)),), n=2)
+@pytest.mark.parametrize("shape,ax", [((1, 4, 5), 0), ((4, 1, 5), 1), ((4, 5, 1), 2),
+                                       ((1, 1, 5), (0, 1))], ids=["ax0", "ax1", "ax2", "ax01"])
+def test_squeeze_carrying_jacobian(shape, ax):  # was BUG_SQUEEZE_IDS (inverse-transform axis/id)
+    check(lambda x: jnp.sin(jnp.squeeze(x, ax)), (0,), lambda k: (randn(k, shape),), n=3)
+
+
+def test_gather_dynamic_index():  # argmax-driven single-element gather (was squeeze-transform crash)
+    check(lambda x: x[jnp.argmax(x)], (0,), lambda k: (randn(k, (8,)),))
 
 
 @pytest.mark.parametrize("oshape,ushape,start", [((8,), (3,), (2,)), ((5, 6), (2, 3), (1, 2))],
