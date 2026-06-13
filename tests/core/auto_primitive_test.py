@@ -233,6 +233,37 @@ def test_reduce_min_3d(axis):  # was BUG_REDUCE_MIN_BCAST + BUG_REDUCE_TOPO
     check(lambda x: jnp.min(x, axis=axis), (0,), lambda k: (randn(k, (2, 3, 4)),), n=3)
 
 
+# --- newly added rules: reduce_prod / cumulative / sort / flip ---
+@pytest.mark.parametrize("axis", [0, 1, None], ids=["ax0", "ax1", "all"])
+def test_reduce_prod(axis):  # ADDED rule
+    check(lambda x: jnp.prod(x, axis=axis), (0,), lambda k: (pos(k, (4, 5)),))
+
+
+@pytest.mark.parametrize("axis,rev", [(0, False), (1, False), (0, True)], ids=["ax0", "ax1", "rev"])
+def test_cumsum(axis, rev):  # ADDED rule
+    check(lambda x: lax.cumsum(x, axis, reverse=rev), (0,), lambda k: (randn(k, (4, 5)),))
+
+
+@pytest.mark.parametrize("axis,rev", [(0, False), (1, False), (0, True)], ids=["ax0", "ax1", "rev"])
+def test_cumprod(axis, rev):  # ADDED rule (value-dependent)
+    check(lambda x: lax.cumprod(x, axis, reverse=rev), (0,), lambda k: (pos(k, (4, 5)),))
+
+
+@pytest.mark.parametrize("fn,name", [(lax.cummax, "cummax"), (lax.cummin, "cummin")], ids=["max", "min"])
+def test_cum_extremum(fn, name):  # ADDED rule (value-dependent, tie-normalized)
+    check(lambda x: jnp.sin(fn(x, 1)), (0,), lambda k: (randn(k, (3, 5)),))
+
+
+@pytest.mark.parametrize("axis", [0, 1], ids=["ax0", "ax1"])
+def test_sort(axis):  # ADDED rule (argsort permutation)
+    check(lambda x: jnp.sort(x, axis=axis), (0,), lambda k: (randn(k, (4, 5)),))
+
+
+@pytest.mark.parametrize("axes", [(0,), (1,), (0, 1)], ids=["ax0", "ax1", "both"])
+def test_flip(axes):  # ADDED rule (rev / reverse permutation)
+    check(lambda x: jnp.sin(jnp.flip(x, axes)), (0,), lambda k: (randn(k, (4, 5)),))
+
+
 # =========================================================================== #
 # 4. dot_general  (ML: matmul, batched matmul, attention scores)
 # =========================================================================== #
