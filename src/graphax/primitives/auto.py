@@ -691,18 +691,20 @@ def dot_general_elemental_rule(primals, **params):
 
     num_out_dims = len(out_shape)
 
-    i, ii = 0, 0
     batch_dim_counter = 0
+    # Pair each contracting/batch axis with its partner by POSITION in the
+    # dimension_numbers tuple, not by iteration order: rhs_contracting_dims may
+    # list axes in any order (e.g. ``ijk,kjl``), so ``...index(lid)`` finds which
+    # pair this axis belongs to. The old running counters silently mis-paired
+    # permuted contractions/batches -> wrong shape / broadcast error.
     for lid, ld in enumerate(lhs_shape):
         other_lid = lid + len(out_shape)
         if lid in lhs_contracting_dims:
-            dim = rhs_contracting_dims[i]
+            dim = rhs_contracting_dims[lhs_contracting_dims.index(lid)]
             lhs_primal_dims.append(DenseIndex(other_lid, rhs_shape[dim], dim))
-            i += 1
         else:
             if lid in lhs_batch_dims:
-                dim = rhs_batch_dims[ii]
-                ii += 1
+                dim = rhs_batch_dims[lhs_batch_dims.index(lid)]
 
                 lhs_out_dims.insert(
                     batch_dim_counter,
@@ -725,18 +727,15 @@ def dot_general_elemental_rule(primals, **params):
                 lhs_primal_dims.append(DiagonalIndex(other_lid, ld, None, _lid))
                 rhs_out_dims.append(DenseIndex(len(rhs_out_dims), ld, lid))
 
-    j, jj = 0, 0
     batch_dim_counter = 0
     for rid, rd in enumerate(rhs_shape):
         other_rid = rid + len(out_shape)
         if rid in rhs_contracting_dims:
-            dim = lhs_contracting_dims[j]
+            dim = lhs_contracting_dims[rhs_contracting_dims.index(rid)]
             rhs_primal_dims.append(DenseIndex(other_rid, lhs_shape[dim], dim))
-            j += 1
         else:
             if rid in rhs_batch_dims:
-                dim = lhs_batch_dims[jj]
-                jj += 1
+                dim = lhs_batch_dims[rhs_batch_dims.index(rid)]
                 rhs_out_dims.insert(
                     batch_dim_counter,
                     DiagonalIndex(batch_dim_counter, rd, dim, other_rid),
