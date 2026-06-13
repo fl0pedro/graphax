@@ -142,8 +142,7 @@ def test_abs_nonzero_matches_jax():
           lambda k: (jax.random.normal(k, (8,)) + 2.0,))  # away from 0
 
 
-@pytest.mark.xfail(reason=BUG_ABS_ZERO, strict=True)
-def test_abs_at_zero_matches_jax():
+def test_abs_at_zero_matches_jax():  # was BUG_ABS_ZERO: primal/out = 0/0 = NaN
     g = jacve(lambda x: jnp.abs(x), "rev", (0,))(jnp.array([0.0, 1.0, -1.0]))
     ref = jax.jacrev(lambda x: jnp.abs(x), (0,))(jnp.array([0.0, 1.0, -1.0]))
     assert tree_allclose(g, ref)
@@ -180,6 +179,18 @@ def test_pow():
 
 def test_clamp_wrt_x():
     check(lambda x: jnp.clip(x, -0.5, 0.5), (0,), lambda k: (randn(k, (10,)),))
+
+
+def test_clamp_all_three_args():
+    # gradient w.r.t. lo / x / hi (was: 3-input parallel Jacobian unsupported +
+    # lo/hi hard-zeroed). lo<hi guaranteed so the clamp is well-formed.
+    def f(lo, x, hi):
+        return lax.clamp(lo, x, hi)
+    def fac(k):
+        a, b, c = jax.random.split(k, 3)
+        return (-jnp.abs(randn(a, (8,))) - 0.2, randn(b, (8,)),
+                jnp.abs(randn(c, (8,))) + 0.2)
+    check(f, (0, 1, 2), fac)
 
 
 def test_select_n():
