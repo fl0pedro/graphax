@@ -1581,6 +1581,27 @@ def dynamic_slice_elemental_rule(primals, **params):
 elemental_rules[lax.dynamic_slice_p] = dynamic_slice_elemental_rule
 
 
+def _build_dus_update_jac(start_list, out_shape, up_shape):
+    """``d out/d update`` for dynamic_update_slice: the update is embedded into
+    the output window, so ``J[out_idx, up_idx] = 1`` iff
+    ``out_idx == start + up_idx`` (within the window). Built as the outer product
+    of per-axis shifted-identity indicators ``E_d[i, j] = (i == start_d + j)`` via
+    one einsum (vectorized, scatter-free). Shape: ``out_shape + up_shape``."""
+    n = len(up_shape)
+    if n == 0:
+        return jnp.array(1.0, dtype=jnp.float32)
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    Es, subs, o_letters, u_letters = [], [], [], []
+    for d in range(n):
+        i = jnp.arange(out_shape[d])[:, None]
+        j = jnp.arange(up_shape[d])[None, :]
+        Es.append((i == start_list[d] + j).astype(jnp.float32))
+        o, u = letters[2 * d], letters[2 * d + 1]
+        subs.append(o + u); o_letters.append(o); u_letters.append(u)
+    eq = ",".join(subs) + "->" + "".join(o_letters) + "".join(u_letters)
+    return jnp.einsum(eq, *Es)
+
+
 def dynamic_update_slice_elemental_rule(primals, **params):
     val_out = lax.dynamic_update_slice_p.bind(*primals, **params)
     operand = primals[0]
@@ -1604,14 +1625,16 @@ def dynamic_update_slice_elemental_rule(primals, **params):
     ]
     op_tensor = SparseTensor(op_out_dims, op_primal_dims, mask)
 
-    # Jacobian for update: identity in updated region (embed into larger array)
-    up_start = start_list
-    up_limit = [s + sz for s, sz in zip(start_list, up_shape)]
-    up_transform = JacobianTransform(
-        make_slice_transform(up_start, up_limit, up_shape),
-        make_inverse_slice_transform(up_start, up_limit, op_shape),
-    )
-    up_tensor = SparseTensor([], [], None, pre_transforms=[up_transform])
+    # Jacobian for update: the update is embedded into the output window, so
+    # d out/d update is an (out_shape x up_shape) embedding — NOT an operand-
+    # shaped identity. The old slice-transform built it in the operand direction
+    # (wrong shape/values for the update arg).
+    jac = _build_dus_update_jac(start_list, out_shape, up_shape)
+    up_out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
+    up_primal_dims = [
+        DenseIndex(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
+    ]
+    up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac)
 
     return val_out, [op_tensor, up_tensor]
 

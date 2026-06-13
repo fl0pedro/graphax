@@ -417,9 +417,11 @@ def test_squeeze_carrying_jacobian():
     check(lambda x: jnp.sin(jnp.squeeze(x, 0)), (0,), lambda k: (randn(k, (1, 4, 5)),), n=2)
 
 
-@pytest.mark.xfail(reason=BUG_DUS_UPDATES, strict=True)
-def test_dynamic_update_slice_updates():
+@pytest.mark.parametrize("oshape,ushape,start", [((8,), (3,), (2,)), ((5, 6), (2, 3), (1, 2))],
+                         ids=["1d", "2d"])
+def test_dynamic_update_slice(oshape, ushape, start):  # was BUG_DUS_UPDATES (wrong-direction)
     def f(o, u):
-        return lax.dynamic_update_slice(o, u, (2,))
-    check(f, (1,), lambda k: (randn(jax.random.split(k)[0], (8,)),
-                              randn(jax.random.split(k)[1], (3,))), n=2)
+        return jnp.sin(lax.dynamic_update_slice(o, u, start))
+    # both argnums -> operand AND update Jacobians must be correct
+    check(f, (0, 1), lambda k: tuple(randn(kk, s) for kk, s in
+                                     zip(jax.random.split(k), [oshape, ushape])), n=3)
