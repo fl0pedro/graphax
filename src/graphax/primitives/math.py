@@ -10,9 +10,9 @@ Array = jax.Array
 
 
 defelemental(lax.neg_p, lambda x: -1.0)
-defelemental2(
-    lax.abs_p, lambda out, primal: primal / out
-)  # NOTE: not differentiable here!
+# d|x|/dx = sign(x); jnp.sign avoids the 0/0 = NaN of primal/out at x==0, and
+# matches jax's subgradient convention there (jax.grad(abs)(0.) == 1.0).
+defelemental(lax.abs_p, lambda x: jnp.where(x == 0, 1.0, jnp.sign(x)))
 defelemental(lax.integer_pow_p, lambda x, y: y * lax.integer_pow(x, y - 1))
 
 defelemental2(lax.exp_p, lambda out, primal: out)

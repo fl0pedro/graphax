@@ -92,7 +92,11 @@ def make_parallel_jacobian(i, primals, val_out, elemental):
             primal_dims = [
                 DiagonalIndex(out_size + i, e, i, i) for i, e in enumerate(out_shape)
             ]
-    elif len(primals) == 2:
+    else:
+        # >= 2 inputs (mul/add/.../clamp's 3). The per-input logic below only
+        # ever reads primals[i] / the i-th elemental, so it is N-ary; the prior
+        # ``len == 2`` guard needlessly raised for 3-input elementwise primitives
+        # (e.g. clamp) whose partials are each a plain diagonal Jacobian.
         if primal_size == 0 and out_size == 0:
             # Singletons
             out_dims = []
@@ -154,10 +158,6 @@ def make_parallel_jacobian(i, primals, val_out, elemental):
                 DiagonalIndex(out_size + i, e, i, i)
                 for i, e in enumerate(get_shape(primal))
             ]
-    else:
-        raise NotImplementedError(
-            f"Parallel Jacobians with {len(primals)} inputs not yet supported!"
-        )
 
     return SparseTensor(out_dims, primal_dims, elemental)
 
@@ -382,8 +382,10 @@ defelemental(lax.ge_p, eq_elemental_rule)
 # clamp(lo, x, hi): d/dx = indicator(lo <= x <= hi), d/dlo = 0, d/dhi = 0
 @with_type_promotion
 def clamp_elemental_rule(lo, x, hi):
+    # clamp = max(lo, min(x, hi)): gradient flows to whichever bound is active —
+    # lo where x<lo, hi where x>hi, else x. (Was hard-zero for lo/hi.)
     in_range = ((x >= lo) & (x <= hi)).astype(x.dtype)
-    return (jnp.zeros_like(lo), in_range, jnp.zeros_like(hi))
+    return ((x < lo).astype(x.dtype), in_range, (x > hi).astype(x.dtype))
 
 
 defelemental(lax.clamp_p, clamp_elemental_rule)
