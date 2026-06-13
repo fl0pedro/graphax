@@ -257,20 +257,20 @@ def test_dot_general_aligned(name, dn, sl, sr):
     check(_dg(dn), (0, 1), fac, seed=hash(name) & 0xFFFF)
 
 
-@pytest.mark.xfail(reason=BUG_DG_PERM, strict=True)
-def test_dot_general_permuted_contract():
-    dn = (((1, 2), (2, 1)), ((), ()))  # permuted contracting dims
+@pytest.mark.parametrize("name,dn,sl,sr", [
+    ("ijk,lkj", (((1, 2), (2, 1)), ((), ())), (3, 4, 5), (6, 5, 4)),
+    ("ijk,kjl", (((1, 2), (1, 0)), ((), ())), (3, 4, 5), (5, 4, 6)),
+], ids=["ijk,lkj", "ijk,kjl"])
+def test_dot_general_permuted_contract(name, dn, sl, sr):  # was BUG_DG_PERM
     check(_dg(dn), (0, 1),
-          lambda k: tuple(randn(kk, s) for kk, s in zip(jax.random.split(k), [(3, 4, 5), (6, 5, 4)])),
-          n=2)
+          lambda k: tuple(randn(kk, s) for kk, s in zip(jax.random.split(k), [sl, sr])), n=3)
 
 
-@pytest.mark.xfail(reason=BUG_DG_PERM, strict=True)
-def test_dot_general_permuted_batch():
+def test_dot_general_permuted_batch():  # was BUG_DG_PERM
     dn = (((3,), (2,)), ((0, 1), (1, 0)))  # permuted batch mapping
     check(_dg(dn), (0, 1),
           lambda k: tuple(randn(kk, s) for kk, s in zip(jax.random.split(k), [(2, 3, 4, 5), (3, 2, 5, 6)])),
-          n=2)
+          n=3)
 
 
 # =========================================================================== #
@@ -360,6 +360,11 @@ def test_broadcast_in_dim():
 def test_gather():
     idx = jnp.array([0, 2, 2, 4, 1])
     check(lambda x: x[idx], (0,), lambda k: (randn(k, (6,)),))
+
+
+@pytest.mark.parametrize("shape,kk", [((8,), 3), ((4, 6), 2)], ids=["1d", "batched"])
+def test_top_k(shape, kk):  # multi-output rule; safe now the cache keys by content
+    check(lambda x: lax.top_k(x, kk)[0], (0,), lambda key: (randn(key, shape),))
 
 
 def test_pad_and_crop():

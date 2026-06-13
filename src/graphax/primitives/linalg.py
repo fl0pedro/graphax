@@ -1,5 +1,3 @@
-from dataclasses import replace
-
 import jax.lax as lax
 
 from .base import elemental_rules, elemental_only_rules, get_shape
@@ -33,85 +31,75 @@ def _dot_general_elementals(primals, out_shape, **params):
     lhs_primal_dims, rhs_primal_dims = [], []
 
     num_out_dims = len(out_shape)
+    num_batch = len(lhs_batch_dims)
 
-    i, ii = 0, 0
-    batch_dim_counter = 0
+    # The output of ``dot_general`` always lays the batch axes out first, in the
+    # order they appear in the batch tuples (``lhs_batch_dims[p]`` pairs with
+    # ``rhs_batch_dims[p]`` at output position ``p``). We therefore emit the
+    # batch DiagonalIndex pairs FIRST, in canonical ``p`` order, so output
+    # positions 0..num_batch-1 are correct even when the batch / contracting
+    # axes are permuted between lhs and rhs. (The previous encounter-order build
+    # placed batch axes in lhs-/rhs-axis order, corrupting permuted-batch
+    # Jacobians.)
+    for p in range(num_batch):
+        l_ax = lhs_batch_dims[p]
+        r_ax = rhs_batch_dims[p]
+        size = lhs_shape[l_ax]
+        # lhs_tensor (val = rhs): out batch axis indexes the rhs val at ``r_ax``.
+        lhs_out_dims.append(DiagonalIndex(p, size, r_ax, num_out_dims + l_ax))
+        # rhs_tensor (val = lhs): out batch axis indexes the lhs val at ``l_ax``.
+        rhs_out_dims.append(DiagonalIndex(p, size, l_ax, num_out_dims + r_ax))
+
+    # Pre-size primal lists so contracting / free dims can be assigned by their
+    # natural primal slot (``num_out_dims + axis``); batch primals are filled in
+    # at the matching slot too. Placeholders are overwritten in every loop below.
+    lhs_primal_dims = [None] * len(lhs_shape)
+    rhs_primal_dims = [None] * len(rhs_shape)
+
+    for p in range(num_batch):
+        l_ax = lhs_batch_dims[p]
+        r_ax = rhs_batch_dims[p]
+        size = lhs_shape[l_ax]
+        lhs_primal_dims[l_ax] = DiagonalIndex(num_out_dims + l_ax, size, r_ax, p)
+        rhs_primal_dims[r_ax] = DiagonalIndex(num_out_dims + r_ax, size, l_ax, p)
+
     for lid, ld in enumerate(lhs_shape):
-        other_lid = lid + len(out_shape)
+        other_lid = lid + num_out_dims
         if lid in lhs_contracting_dims:
-            # Contracting dimension
-            dim = rhs_contracting_dims[i]
-            lhs_primal_dims.append(DenseIndex(other_lid, rhs_shape[dim], dim))
-            i += 1
-        else:
-            if lid in lhs_batch_dims:
-                # If it is a batch dimension, we need to treat it as a DiagonalIndex
-                # with a valid `axis`
-                dim = rhs_batch_dims[ii]
-                ii += 1
+            # Contracting dimension. Pair ``lid`` with its rhs partner
+            # *positionally* — ``lhs_contracting_dims[p]`` contracts with
+            # ``rhs_contracting_dims[p]`` — by looking ``lid`` up in
+            # ``lhs_contracting_dims`` rather than relying on encounter order
+            # (which only matches when the contracting dims are listed ascending;
+            # breaks for permuted contractions). The DenseIndex carries the lhs
+            # axis's own size ``ld`` and an ``axis`` pointing at the partner rhs
+            # axis (the val_dim into the ``rhs`` val).
+            dim = rhs_contracting_dims[lhs_contracting_dims.index(lid)]
+            lhs_primal_dims[lid] = DenseIndex(other_lid, ld, dim)
+        elif lid not in lhs_batch_dims:
+            # Free lhs axis: appears in the output (after all batch axes) and is
+            # the diagonal of the lhs-Jacobian; on the rhs side it is a plain
+            # dense axis indexing the rhs val.
+            _lid = len(lhs_out_dims)
+            lhs_out_dims.append(DiagonalIndex(_lid, ld, None, other_lid))
+            lhs_primal_dims[lid] = DiagonalIndex(other_lid, ld, None, _lid)
+            rhs_out_dims.append(DenseIndex(len(rhs_out_dims), ld, lid))
 
-                lhs_out_dims.insert(
-                    batch_dim_counter,
-                    DiagonalIndex(batch_dim_counter, ld, dim, other_lid)
-                )
-                lhs_primal_dims.append(
-                    DiagonalIndex(other_lid, ld, dim, batch_dim_counter)
-                )
-                batch_dim_counter += 1
-                for k in range(batch_dim_counter, len(lhs_out_dims)):
-                    d = lhs_out_dims[k]
-                    lhs_out_dims[k] = replace(d, id=d.id + 1)
-                    if d.is_sparse:
-                        partner = d.other_id - num_out_dims
-                        _d = lhs_primal_dims[partner]
-                        lhs_primal_dims[partner] = replace(
-                            _d, other_id=_d.other_id + 1
-                        )
-            else:
-                # Otherwise, we can just set `axis` to None
-                _lid = len(lhs_out_dims)
-                lhs_out_dims.append(DiagonalIndex(_lid, ld, None, other_lid))
-                lhs_primal_dims.append(DiagonalIndex(other_lid, ld, None, _lid))
-                rhs_out_dims.append(DenseIndex(len(rhs_out_dims), ld, lid))
-
-    j, jj = 0, 0
-    batch_dim_counter = 0
     for rid, rd in enumerate(rhs_shape):
-        other_rid = rid + len(out_shape)
+        other_rid = rid + num_out_dims
         if rid in rhs_contracting_dims:
-            # Contracting dimension
-            dim = lhs_contracting_dims[j]
-            rhs_primal_dims.append(DenseIndex(other_rid, lhs_shape[dim], dim))
-            j += 1
-        else:
-            if rid in rhs_batch_dims:
-                # If it is a batch dimension, we need to treat it as a
-                # DiagonalIndex with a valid `axis`
-                dim = lhs_batch_dims[jj]
-                jj += 1
-                rhs_out_dims.insert(
-                    batch_dim_counter,
-                    DiagonalIndex(batch_dim_counter, rd, dim, other_rid)
-                )
-                rhs_primal_dims.append(
-                    DiagonalIndex(other_rid, rd, dim, batch_dim_counter)
-                )
-                batch_dim_counter += 1
-                for k in range(batch_dim_counter, len(rhs_out_dims)):
-                    d = rhs_out_dims[k]
-                    rhs_out_dims[k] = replace(d, id=d.id + 1)
-                    if d.is_sparse:
-                        partner = d.other_id - num_out_dims
-                        _d = rhs_primal_dims[partner]
-                        rhs_primal_dims[partner] = replace(
-                            _d, other_id=_d.other_id + 1
-                        )
-            else:
-                # Otherwise, we can just set `axis` to None
-                _rid = len(rhs_out_dims)
-                rhs_out_dims.append(DiagonalIndex(_rid, rd, None, other_rid))
-                rhs_primal_dims.append(DiagonalIndex(other_rid, rd, None, _rid))
-                lhs_out_dims.append(DenseIndex(len(lhs_out_dims), rd, rid))
+            # Contracting dimension. Symmetric to the lhs loop: pair ``rid`` with
+            # its lhs partner positionally via its index in ``rhs_contracting_dims``.
+            # Carries the rhs axis's own size ``rd`` and an ``axis`` pointing at the
+            # partner lhs axis (the val_dim into the ``lhs`` val).
+            dim = lhs_contracting_dims[rhs_contracting_dims.index(rid)]
+            rhs_primal_dims[rid] = DenseIndex(other_rid, rd, dim)
+        elif rid not in rhs_batch_dims:
+            # Free rhs axis: diagonal of the rhs-Jacobian, dense on the lhs side.
+            _rid = len(rhs_out_dims)
+            rhs_out_dims.append(DiagonalIndex(_rid, rd, None, other_rid))
+            rhs_primal_dims[rid] = DiagonalIndex(other_rid, rd, None, _rid)
+            lhs_out_dims.append(DenseIndex(len(lhs_out_dims), rd, rid))
 
     lhs_tensor = SparseTensor(lhs_out_dims, lhs_primal_dims, rhs)
     rhs_tensor = SparseTensor(rhs_out_dims, rhs_primal_dims, lhs)
