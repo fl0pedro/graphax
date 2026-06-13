@@ -767,85 +767,163 @@ def _build_windowed_jacobian_1d(out_s, in_s, wd, ws, pad_lo, bd=1, wid=1):
     return J
 
 
+# Spatial einsum letters, excluding the fixed batch/feature symbols n/i/o.
+_SPATIAL_LETTERS = "abcdefghjklm"
+
+
+def _windowed_tap_indicator(out_s, in_s, wd, ws, pad_lo, bd=1, wid=1):
+    """``M[p, q, k] = 1`` iff output position ``p`` and kernel tap ``k`` map to
+    input position ``q`` under stride ``ws``, window/kernel dilation ``wid``
+    (``rhs_dilation``), base/input dilation ``bd`` (``lhs_dilation``) and low
+    padding ``pad_lo``.
+
+    Same window geometry as :func:`_build_windowed_jacobian_1d` but it KEEPS the
+    kernel-tap axis ``k`` instead of summing it out — convolution gathers a
+    different weight per tap, whereas pooling weights every tap equally (which
+    is why the reduce_window builder can collapse ``k``).
+    """
+    p_idx = jnp.repeat(jnp.arange(out_s), wd)
+    k_idx = jnp.tile(jnp.arange(wd), out_s)
+    dilated_pos = p_idx * ws + k_idx * wid - pad_lo
+    if bd > 1:
+        valid_dilation = dilated_pos % bd == 0
+        cols = dilated_pos // bd
+    else:
+        valid_dilation = jnp.ones_like(dilated_pos, dtype=bool)
+        cols = dilated_pos
+    valid = (cols >= 0) & (cols < in_s) & valid_dilation
+    safe_cols = jnp.where(valid, cols, 0)
+    M = jnp.zeros((out_s, in_s, wd), dtype=jnp.float32)
+    M = M.at[p_idx, safe_cols, k_idx].add(jnp.where(valid, 1.0, 0.0))
+    return M
+
+
 def conv_general_dilated_elemental_rule(primals, **params):
+    """Exact sparse Jacobian of ``conv_general_dilated`` w.r.t. both operands.
+
+    For each output spatial axis the (out-pos, in-pos, kernel-tap) incidence is
+    the windowed indicator ``M_s[p, q, k]`` (:func:`_windowed_tap_indicator`).
+    Writing the conv as ``out[n,o,P] = sum_{i,K} lhs[n,i,Q(P,K)] * rhs[o,i,K]``:
+
+      * d out / d lhs  has value ``W[o,P,i,Q] = sum_K (prod_s M_s) rhs[o,i,K]``
+        with the batch axis a DiagonalIndex pair (n == n').
+      * d out / d rhs  has value ``V[n,P,i,K] = sum_Q (prod_s M_s) lhs[n,i,Q]``
+        with the out-feature axis a DiagonalIndex pair (o == o').
+
+    The windowed (Toeplitz) coupling between out-spatial and in-spatial/tap is
+    materialized once per axis and contracted into the other operand, so the
+    encoding stays sparse on the genuinely-diagonal batch/feature axis instead
+    of densifying it. Validated to 0 error vs ``jax.jacfwd``/``jax.jacrev``.
+    """
     val_out = lax.conv_general_dilated_p.bind(*primals, **params)
     lhs, rhs = primals
 
-    dimension_numbers = params["dimension_numbers"]
-    lhs_spec, rhs_spec, out_spec = dimension_numbers
+    dn = params["dimension_numbers"]
+    lhs_spec, rhs_spec, out_spec = dn.lhs_spec, dn.rhs_spec, dn.out_spec
 
     lhs_shape = list(get_shape(lhs))
     rhs_shape = list(get_shape(rhs))
     out_shape = list(get_shape(val_out))
-    num_out_dims = len(out_shape)
+    out_ndim = len(out_shape)
+    nsp = out_ndim - 2
 
-    # --- Jacobian w.r.t. lhs (activations) ---
-    # Batch dim: DiagonalIndex pair
-    # Output feature dim (from rhs): DenseIndex in out
-    # Input feature dim (contracted): DenseIndex in primal
-    # Spatial dims: DenseIndex (windowed relationship)
-    # Value: rhs (weights)
-    lhs_out_dims, lhs_primal_dims = [], []
-
-    lhs_batch_dim = lhs_spec[0]
-    out_batch_dim = out_spec[0]
-    batch_size = lhs_shape[lhs_batch_dim]
-
-    # Batch: DiagonalIndex pair
-    lhs_out_dims.append(DiagonalIndex(0, batch_size, None, num_out_dims))
-    # Non-batch out dims: DenseIndex
-    out_val_idx = 0
-    for i, s in enumerate(out_shape):
-        if i == out_batch_dim:
-            continue
-        lhs_out_dims.append(DenseIndex(len(lhs_out_dims), s, out_val_idx))
-        out_val_idx += 1
-    # Primal batch dim
-    lhs_primal_dims.append(DiagonalIndex(num_out_dims, batch_size, None, 0))
-    # Non-batch primal dims: DenseIndex
-    for i, s in enumerate(lhs_shape):
-        if i == lhs_batch_dim:
-            continue
-        lhs_primal_dims.append(
-            DenseIndex(num_out_dims + len(lhs_primal_dims), s, out_val_idx)
+    if params.get("feature_group_count", 1) != 1 or params.get("batch_group_count", 1) != 1:
+        raise NotImplementedError(
+            "conv elemental rule supports feature_group_count == "
+            "batch_group_count == 1 only (grouped / depthwise conv: TODO)"
         )
-        out_val_idx += 1
 
-    lhs_tensor = _swap_back_axes(SparseTensor(lhs_out_dims, lhs_primal_dims, rhs))
+    strides = params["window_strides"]
+    padding = params["padding"]
+    lhs_dil = params["lhs_dilation"] or (1,) * nsp       # base / input dilation
+    rhs_dil = params["rhs_dilation"] or (1,) * nsp       # window / kernel dilation
 
-    # --- Jacobian w.r.t. rhs (weights) ---
-    # No batch dim in rhs typically, but output has batch.
-    # Output batch dim: DenseIndex (from lhs)
-    # Output feature dim: DiagonalIndex pair with rhs output feature
-    # Spatial/channel dims: DenseIndex
-    # Value: lhs (activations)
-    rhs_out_dims, rhs_primal_dims = [], []
+    N = lhs_shape[lhs_spec[0]]
+    I = lhs_shape[lhs_spec[1]]
+    O = rhs_shape[rhs_spec[0]]
 
-    rhs_out_feature_dim = rhs_spec[0]
-    out_feature_dim = out_spec[1]
-    feature_size = rhs_shape[rhs_out_feature_dim]
+    # Per-spatial windowed tap indicators M_s[P_s, X_s, K_s], plus a
+    # pass-through flag: a stride-1, kernel-1, undilated, unpadded axis whose
+    # out/in sizes match contributes an IDENTITY block to the activation
+    # Jacobian, so it can be a DiagonalIndex pair (no dense P x Q block) — the
+    # reduce_window_sum pass-through pattern, i.e. the 1x1 / pointwise-conv win.
+    Ms, passthrough = [], []
+    for s in range(nsp):
+        P_s = out_shape[out_spec[2 + s]]
+        X_s = lhs_shape[lhs_spec[2 + s]]
+        K_s = rhs_shape[rhs_spec[2 + s]]
+        pad_lo, pad_hi = padding[s]
+        passthrough.append(
+            K_s == 1 and strides[s] == 1 and lhs_dil[s] == 1 and rhs_dil[s] == 1
+            and pad_lo == 0 and pad_hi == 0 and P_s == X_s)
+        Ms.append(_windowed_tap_indicator(
+            P_s, X_s, K_s, strides[s], pad_lo, lhs_dil[s], rhs_dil[s]))
 
-    # Output feature: DiagonalIndex pair
-    rhs_out_dims.append(DiagonalIndex(0, feature_size, None, num_out_dims))
-    # Non-feature out dims: DenseIndex
-    rhs_out_val_idx = 0
-    for i, s in enumerate(out_shape):
-        if i == out_feature_dim:
-            continue
-        rhs_out_dims.append(DenseIndex(len(rhs_out_dims), s, rhs_out_val_idx))
-        rhs_out_val_idx += 1
-    # Primal feature dim
-    rhs_primal_dims.append(DiagonalIndex(num_out_dims, feature_size, None, 0))
-    # Non-feature primal dims: DenseIndex
-    for i, s in enumerate(rhs_shape):
-        if i == rhs_out_feature_dim:
-            continue
-        rhs_primal_dims.append(
-            DenseIndex(num_out_dims + len(rhs_primal_dims), s, rhs_out_val_idx)
-        )
-        rhs_out_val_idx += 1
+    # Canonicalize operands to (feat-first, spatial-last) so the einsum is
+    # independent of the dimension_numbers permutation.
+    rhs_c = jnp.transpose(rhs, [rhs_spec[0], rhs_spec[1], *(rhs_spec[2 + s] for s in range(nsp))])
+    lhs_c = jnp.transpose(lhs, [lhs_spec[0], lhs_spec[1], *(lhs_spec[2 + s] for s in range(nsp))])
 
-    rhs_tensor = _swap_back_axes(SparseTensor(rhs_out_dims, rhs_primal_dims, lhs))
+    pqk = [(_SPATIAL_LETTERS[3 * s], _SPATIAL_LETTERS[3 * s + 1], _SPATIAL_LETTERS[3 * s + 2])
+           for s in range(nsp)]
+
+    # --- d out / d rhs : out-feature is the DiagonalIndex pair, value = V ---
+    # Every spatial axis here is a dense (out-pos x kernel-tap) relation.
+    m_subs = [p + q + k for (p, q, k) in pqk]
+    ps = "".join(p for p, _, _ in pqk)
+    qs = "".join(q for _, q, _ in pqk)
+    ks = "".join(k for _, _, k in pqk)
+    # V[n, P.., i, K..] = sum_Q (prod_s M_s) lhs[n, i, Q..]
+    V = jnp.einsum(",".join(m_subs + ["ni" + qs]) + "->n" + ps + "i" + ks, *Ms, lhs_c)
+    rhs_out = [None] * out_ndim
+    rhs_primal = [None] * len(rhs_shape)
+    f_out, f_prim = out_spec[1], out_ndim + rhs_spec[0]
+    rhs_out[out_spec[0]] = DenseIndex(out_spec[0], N, 0)
+    rhs_out[out_spec[1]] = DiagonalIndex(out_spec[1], O, None, f_prim)
+    rhs_primal[rhs_spec[0]] = DiagonalIndex(f_prim, O, None, f_out)
+    rhs_primal[rhs_spec[1]] = DenseIndex(out_ndim + rhs_spec[1], I, 1 + nsp)
+    for s in range(nsp):
+        oa, ra = out_spec[2 + s], rhs_spec[2 + s]
+        rhs_out[oa] = DenseIndex(oa, out_shape[oa], 1 + s)
+        rhs_primal[ra] = DenseIndex(out_ndim + ra, rhs_shape[ra], 2 + nsp + s)
+    rhs_tensor = _swap_back_axes(SparseTensor(rhs_out, rhs_primal, V))
+
+    # --- d out / d lhs : batch DiagonalIndex pair; pass-through spatial axes
+    #     are DiagonalIndex (identity), windowed axes are dense, value = W ---
+    win = [s for s in range(nsp) if not passthrough[s]]   # windowed spatial axes
+    widx = {s: j for j, s in enumerate(win)}
+    nw = len(win)
+    # Drop pass-through kernel axes (size 1) before contracting the weights.
+    rhs_red = rhs_c[(slice(None), slice(None))
+                    + tuple(0 if passthrough[s] else slice(None) for s in range(nsp))]
+    if nw:
+        m_subs_w = [pqk[s][0] + pqk[s][1] + pqk[s][2] for s in win]
+        ps_w = "".join(pqk[s][0] for s in win)
+        qs_w = "".join(pqk[s][1] for s in win)
+        ks_w = "".join(pqk[s][2] for s in win)
+        # W[o, Pw.., i, Qw..] = sum_Kw (prod M_s) rhs[o, i, Kw..]
+        W = jnp.einsum(",".join(m_subs_w + ["oi" + ks_w]) + "->o" + ps_w + "i" + qs_w,
+                       *[Ms[s] for s in win], rhs_red)
+    else:
+        W = rhs_red                                       # (O, I) — pure 1x1 conv
+    # W axis layout: feat O=0, Pw_j=1+j, contracted-feat I=1+nw, Qw_j=2+nw+j.
+    lhs_out = [None] * out_ndim
+    lhs_primal = [None] * len(lhs_shape)
+    b_out, b_prim = out_spec[0], out_ndim + lhs_spec[0]
+    lhs_out[out_spec[0]] = DiagonalIndex(out_spec[0], N, None, b_prim)
+    lhs_out[out_spec[1]] = DenseIndex(out_spec[1], O, 0)
+    lhs_primal[lhs_spec[0]] = DiagonalIndex(b_prim, N, None, b_out)
+    lhs_primal[lhs_spec[1]] = DenseIndex(out_ndim + lhs_spec[1], I, 1 + nw)
+    for s in range(nsp):
+        oa, la = out_spec[2 + s], lhs_spec[2 + s]
+        if passthrough[s]:
+            lhs_out[oa] = DiagonalIndex(oa, out_shape[oa], None, out_ndim + la)
+            lhs_primal[la] = DiagonalIndex(out_ndim + la, lhs_shape[la], None, oa)
+        else:
+            j = widx[s]
+            lhs_out[oa] = DenseIndex(oa, out_shape[oa], 1 + j)
+            lhs_primal[la] = DenseIndex(out_ndim + la, lhs_shape[la], 2 + nw + j)
+    lhs_tensor = _swap_back_axes(SparseTensor(lhs_out, lhs_primal, W))
 
     return val_out, [lhs_tensor, rhs_tensor]
 
