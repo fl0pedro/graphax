@@ -771,6 +771,78 @@ def rev_elemental_rule(primals, **params):
 elemental_rules[lax.rev_p] = rev_elemental_rule
 
 
+def _cumulative_dims(shape, axis, N):
+    """Dim lists for a value-DEPENDENT cumulative op (cumprod/cummax/cummin):
+    the scan axis is a dense (out i, in j) pair (val axes ``axis``/``axis+1``);
+    every other axis is a DiagonalIndex reading its own (shifted) val axis — the
+    val carries the full per-position matrix, unlike cumsum's broadcast block."""
+    out_dims, primal_dims = [], []
+    for i, size in enumerate(shape):
+        if i == axis:
+            out_dims.append(DenseIndex(i, size, axis))
+            primal_dims.append(DenseIndex(N + i, size, axis + 1))
+        else:
+            vd = i if i < axis else i + 1
+            out_dims.append(DiagonalIndex(i, size, vd, N + i))
+            primal_dims.append(DiagonalIndex(N + i, size, vd, i))
+    return out_dims, primal_dims
+
+
+def _cumulative_mask(n, axis, N, reverse):
+    """Triangular ``(j<=i)`` mask (``j>=i`` if reverse), broadcastable to the
+    full val with the scan-out axis at ``axis`` and scan-in axis at ``axis+1``."""
+    idx = jnp.arange(n)
+    m = (idx[None, :] >= idx[:, None]) if reverse else (idx[None, :] <= idx[:, None])
+    mshape = [1] * (N + 1)
+    mshape[axis] = n; mshape[axis + 1] = n
+    return m.astype(jnp.float32).reshape(mshape)
+
+
+def cumprod_elemental_rule(primals, **params):
+    """``out[i] = prod_{j<=i} x[j]``; d out[i]/d x[j] = (j<=i)·out[i]/x[j]."""
+    val_out = lax.cumprod_p.bind(*primals, **params)
+    x = primals[0]; axis = params["axis"]; reverse = params.get("reverse", False)
+    shape = get_shape(x); N = len(shape)
+    out_dims, primal_dims = _cumulative_dims(shape, axis, N)
+    mask = _cumulative_mask(shape[axis], axis, N, reverse)
+    out_e = jnp.expand_dims(val_out, axis + 1)         # out[i] at scan-out axis
+    x_e = jnp.expand_dims(x, axis)                      # x[j] at scan-in axis
+    safe = jnp.where(x_e != 0, x_e, 1.0)
+    V = jnp.where(x_e != 0, mask * out_e / safe, 0.0).astype(jnp.float32)
+    return val_out, [_swap_back_axes(SparseTensor(out_dims, primal_dims, V))]
+
+
+elemental_rules[lax.cumprod_p] = cumprod_elemental_rule
+
+
+def _cum_extremum_rule(prim, primals, params):
+    """Shared cummax/cummin: d out[i]/d x[j] = (j<=i)·[x[j]==out[i]] normalised by
+    the number of tie positions <= i (matches jax's tie convention)."""
+    val_out = prim.bind(*primals, **params)
+    x = primals[0]; axis = params["axis"]; reverse = params.get("reverse", False)
+    shape = get_shape(x); N = len(shape)
+    out_dims, primal_dims = _cumulative_dims(shape, axis, N)
+    mask = _cumulative_mask(shape[axis], axis, N, reverse)
+    out_e = jnp.expand_dims(val_out, axis + 1)
+    x_e = jnp.expand_dims(x, axis)
+    hit = mask * (x_e == out_e).astype(jnp.float32)
+    norm = jnp.sum(hit, axis=axis + 1, keepdims=True)  # #ties up to i
+    V = (hit / norm).astype(jnp.float32)
+    return val_out, [_swap_back_axes(SparseTensor(out_dims, primal_dims, V))]
+
+
+def cummax_elemental_rule(primals, **params):
+    return _cum_extremum_rule(lax.cummax_p, primals, params)
+
+
+def cummin_elemental_rule(primals, **params):
+    return _cum_extremum_rule(lax.cummin_p, primals, params)
+
+
+elemental_rules[lax.cummax_p] = cummax_elemental_rule
+elemental_rules[lax.cummin_p] = cummin_elemental_rule
+
+
 # first draft unified reduce, TODO: test!
 def reduce_elemental_rule(primals, agg, **params):
     assert agg in {"sum", "min", "max"}, (
