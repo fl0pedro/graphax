@@ -279,6 +279,9 @@ def jacve(
         inlined_jaxpr, inlined_consts = _inline_call_primitives(
             closed_jaxpr.jaxpr, closed_jaxpr.literals
         )
+        # An inlined jaxpr is a fresh object -> bypass the id-keyed eliminator
+        # cache to avoid GC id-reuse staleness (see vertex_elimination_jaxpr).
+        was_inlined = inlined_jaxpr is not closed_jaxpr.jaxpr
 
         out = vertex_elimination_jaxpr(
             inlined_jaxpr,
@@ -289,6 +292,7 @@ def jacve(
             argnums=argnums,
             count_ops=count_ops,
             sparse_representation=sparse_representation,
+            fresh_eliminator=was_inlined,
             transforms=transforms,
         )
 
@@ -1418,6 +1422,7 @@ def vertex_elimination_jaxpr(
     argnums: Sequence[int] = (0,),
     count_ops: bool = False,
     sparse_representation: bool = False,
+    fresh_eliminator: bool = False,
     transforms: Sequence[
         Tuple[
             int,
@@ -1469,7 +1474,16 @@ def vertex_elimination_jaxpr(
     jaxpr_invars = [invar for i, invar in enumerate(jaxpr.invars) if i in argnums]
     env, _, _, vo_vertices = _build_graph(jaxpr, args, consts)
 
-    eliminator = _get_eliminator(jaxpr, args, consts, tuple(argnums))
+    # A freshly INLINED jaxpr (from jit/pjit/custom_jvp inlining) is a brand-new
+    # object whose ``__hash__`` is identity-based; the eliminator cache would key
+    # it by object id, and GC id-reuse then yields stale, wrong-valued hits
+    # (nondeterministically). Inlined jaxprs are rebuilt every call anyway, so the
+    # cache offers them nothing — bypass it (fresh eliminator). Non-inlined jaxprs
+    # use the cache as before.
+    if fresh_eliminator:
+        eliminator = _get_eliminator.__wrapped__(jaxpr, args, consts, tuple(argnums))
+    else:
+        eliminator = _get_eliminator(jaxpr, args, consts, tuple(argnums))
     order = _checkify_order(order, jaxpr, vo_vertices)
     graph, _, adds, muls, fmas, mem, counts = eliminator.eliminate(
         order, jaxpr, transforms, vo_vertices, count_ops
