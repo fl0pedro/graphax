@@ -20,6 +20,7 @@ from .primitives import (
     NO_EDGE,
     elemental_only_rules,
     elemental_rules,
+    jit_name_rules,
     multi_output_elemental_only_rules,
 )
 from .sparse.ops import add_w_counts
@@ -195,8 +196,14 @@ def _inline_call_primitives(jaxpr, consts):
         handled by a dedicated elemental rule that HONORS the user rule (see
         ``custom_jvp_elemental_only`` / ``custom_vjp_elemental_only`` in
         primitives/auto.py). Inlining the primal would silently ignore the rule
-        and disagree with jax (e.g. relu'(0): jax says 0, max(x,0) says 0.5)."""
+        and disagree with jax (e.g. relu'(0): jax says 0, max(x,0) says 0.5).
+
+        A jit whose ``name`` graphax has its own Jacobian for (``jit_name_rules``,
+        e.g. jax.nn.elu/selu/...) is likewise NOT inlined — it is dispatched to
+        that named rule via multi_output_elemental_only_rules[jit_p]."""
         if eqn.primitive is jit_p:
+            if eqn.params.get("name") in jit_name_rules:
+                return None
             return eqn.params["jaxpr"]
         return None
 
@@ -988,6 +995,9 @@ def _eval_primal(eqn, invals):
     if name in ("custom_jvp_call", "custom_vjp_call"):
         cj = eqn.params["call_jaxpr"]
         return core.eval_jaxpr(cj.jaxpr, cj.consts, *invals)
+    if eqn.primitive is jit_p:  # named jit kept for by-name dispatch
+        cj = eqn.params["jaxpr"]
+        return core.eval_jaxpr(cj.jaxpr, cj.consts, *invals)
     return eqn.primitive.bind(*invals, **eqn.params)
 
 
@@ -1741,6 +1751,18 @@ def extract_jaxpr(
 
 def _make_pjit_multi_output_elemental_only(order):
     def pjit_multi_output_elemental_only(primal_outs, primals, **params):
+        # If graphax has its own hand-written Jacobian for this named jit
+        # (jax.nn.elu/selu/...), use it — it gives the exact analytic subgradient
+        # at kinks rather than the select_n/max/min decomposition's. It raises on
+        # non-default static args, in which case we fall back to differentiating
+        # the jit body below (which bakes the actual args).
+        if params.get("name") in jit_name_rules:
+            from .primitives.activations import jit_named_elemental_only
+            try:
+                return jit_named_elemental_only(primal_outs, primals, **params)
+            except NotImplementedError:
+                pass
+
         inner_closed = params["jaxpr"]
         inner_jaxpr = inner_closed.jaxpr
         consts = inner_closed.literals

@@ -1,4 +1,10 @@
-from .base import NO_EDGE, elemental_rules, elemental_only_rules, multi_output_elemental_only_rules
+from .base import (
+    NO_EDGE,
+    elemental_rules,
+    elemental_only_rules,
+    multi_output_elemental_only_rules,
+    jit_name_rules,
+)
 
 # Import submodules to trigger elemental rule registrations
 # transforms must come before structural because structural imports _slice_elementals from it
@@ -13,5 +19,8 @@ from . import structural
 # overlapping primitives override the manual ones above; non-overlapping
 # primitives are added to the registry.
 from . import auto
+
+# Named-jit Jacobians (jax.nn activations dispatched by jit_p params['name']).
+from . import activations
 
 from .transforms import JacobianTransform
