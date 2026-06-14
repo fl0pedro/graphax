@@ -3641,7 +3641,39 @@ def eigh_elemental_rule(primals, **params):
     return val_out, [[V_tensor], [w_tensor]]
 
 
-elemental_rules[lax_linalg.eigh_p] = eigh_elemental_rule
+def _multi_output_only(rule):
+    """Adapt a ``(primals, **params) -> (val_out, elementals[out][invar])`` rule
+    (the matrix-decomposition rules below) to the
+    ``multi_output_elemental_only_rules`` contract. These primitives are
+    ``multiple_results`` (eigh -> (V, w), svd -> (s, U, Vt), ...), so they MUST
+    dispatch through the multi-output path; registering them in single-output
+    ``elemental_rules`` made the dispatcher try to treat the per-output lists as
+    SparseTensors and crash ('list' object has no attribute 'dims')."""
+    def _only(primal_outs, primals, **params):
+        return rule(primals, **params)[1]
+    return _only
+
+
+def _unsupported_decomposition(name):
+    """Loud guard for a decomposition whose elemental rule is not yet correct.
+
+    Better to fail clearly than to (a) crash with a cryptic 'list has no attribute
+    dims' (the old single-output mis-registration) or (b) silently return a wrong
+    Jacobian. eigh and svd (singular values) ARE verified against jax; qr/lu/eig
+    are not — their analytical rules are incorrect (and eig's eigenvector
+    derivatives are unsupported by jax itself)."""
+    def _only(primal_outs, primals, **params):
+        raise NotImplementedError(
+            f"graphax does not yet have a correct elemental rule for {name}. "
+            f"eigh and svd are supported; differentiate through those, or supply "
+            f"a custom rule for {name}."
+        )
+    return _only
+
+
+multi_output_elemental_only_rules[lax_linalg.eigh_p] = _multi_output_only(
+    eigh_elemental_rule
+)
 
 
 # svd: A -> (s, U, Vt)
@@ -3672,7 +3704,7 @@ def svd_elemental_rule(primals, **params):
             algorithm=params.get("algorithm"),
         )
 
-    s_shape = list(get_shape(val_out[0] if compute_uv else val_out))
+    s_shape = list(get_shape(s))   # ``s`` is already unpacked (works for compute_uv=False)
     s_ndim = len(s_shape)
 
     # s Jacobian: ds_q = sum_{i,j} U[i,q] * dA[i,j] * V[j,q]
@@ -3802,7 +3834,9 @@ def svd_elemental_rule(primals, **params):
     return val_out, [[s_tensor], [U_tensor], [Vt_tensor]]
 
 
-elemental_rules[lax_linalg.svd_p] = svd_elemental_rule
+multi_output_elemental_only_rules[lax_linalg.svd_p] = _multi_output_only(
+    svd_elemental_rule
+)
 
 
 # qr: A -> (Q, R)
@@ -3910,7 +3944,7 @@ def qr_elemental_rule(primals, **params):
     return val_out, [[Q_tensor], [R_tensor]]
 
 
-elemental_rules[lax_linalg.qr_p] = qr_elemental_rule
+multi_output_elemental_only_rules[lax_linalg.qr_p] = _unsupported_decomposition("qr")
 
 
 # tridiagonal_solve: (dl, d, du, b) -> x
@@ -4050,7 +4084,7 @@ def lu_elemental_rule(primals, **params):
     return val_out, [[lu_tensor], [], []]
 
 
-elemental_rules[lax_linalg.lu_p] = lu_elemental_rule
+multi_output_elemental_only_rules[lax_linalg.lu_p] = _unsupported_decomposition("lu")
 
 
 def eig_elemental_rule(primals, **params):
@@ -4168,7 +4202,7 @@ def eig_elemental_rule(primals, **params):
     return val_out, tensors_out
 
 
-elemental_rules[lax_linalg.eig_p] = eig_elemental_rule
+multi_output_elemental_only_rules[lax_linalg.eig_p] = _unsupported_decomposition("eig")
 
 from jax._src.lax.lax import ragged_dot_general_p
 

@@ -402,6 +402,49 @@ def test_gather():
     check(lambda x: x[idx], (0,), lambda k: (randn(k, (6,)),))
 
 
+# Matrix decompositions: eigh/svd(singular values)/cholesky go through the
+# multi-output path (were mis-registered in single-output elemental_rules and
+# crashed). qr/lu/eig rules are not yet correct, so they fail loudly.
+def _sympd(k, n=3):
+    M = randn(k, (n, n))
+    return M @ M.T + n * jnp.eye(n)
+
+
+def _sym(k, n=3):
+    M = randn(k, (n, n))
+    return 0.5 * (M + M.T)
+
+
+def test_eigh_eigenvalues():
+    check(lambda a: jnp.linalg.eigh(a)[0], (0,), lambda k: (_sym(k),), n=2, atol=1e-3)
+
+
+def test_eigh_eigenvectors():
+    check(lambda a: jnp.sum(jnp.sin(jnp.linalg.eigh(a)[1])), (0,),
+          lambda k: (_sym(k),), n=2, atol=1e-3)
+
+
+@pytest.mark.parametrize("shape", [(3, 3), (2, 4), (4, 2)], ids=["sq", "wide", "tall"])
+def test_svd_singular_values(shape):
+    check(lambda a: jnp.linalg.svd(a, compute_uv=False), (0,),
+          lambda k: (randn(k, shape),), n=2, atol=1e-3)
+
+
+def test_cholesky():
+    check(lambda a: jnp.linalg.cholesky(a), (0,), lambda k: (_sympd(k),), n=2, atol=1e-3)
+
+
+@pytest.mark.parametrize("fn", [
+    lambda a: jnp.linalg.qr(a)[1],
+    lambda a: jax.scipy.linalg.lu_factor(a)[0],
+], ids=["qr", "lu"])
+def test_unsupported_decompositions_raise(fn):
+    # Loud failure beats a cryptic crash or a silently-wrong Jacobian.
+    A = jnp.array([[1.0, 2.0], [3.0, 5.0]])
+    with pytest.raises(NotImplementedError):
+        jacve(fn, "rev", (0,))(A)
+
+
 @pytest.mark.parametrize("shape,kk", [((8,), 3), ((4, 6), 2)], ids=["1d", "batched"])
 def test_top_k(shape, kk):  # multi-output rule; safe now the cache keys by content
     check(lambda x: lax.top_k(x, kk)[0], (0,), lambda key: (randn(key, shape),))
