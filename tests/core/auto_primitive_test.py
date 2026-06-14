@@ -263,6 +263,15 @@ def test_cum_extremum(fn, name):  # ADDED rule (value-dependent, tie-normalized)
     check(lambda x: jnp.sin(fn(x, 1)), (0,), lambda k: (randn(k, (3, 5)),))
 
 
+@pytest.mark.parametrize("axis,rev", [(0, False), (1, False), (0, True)], ids=["ax0", "ax1", "rev"])
+def test_cumlogsumexp(axis, rev):  # ADDED rule (CTC/HMM log-domain prefix)
+    check(lambda x: lax.cumlogsumexp(x, axis, reverse=rev), (0,), lambda k: (randn(k, (4, 5)),))
+
+
+def test_reduce_precision():  # ADDED rule (identity under AD; mixed-precision sim)
+    check(lambda x: lax.reduce_precision(x, 8, 7) * 2.0, (0,), lambda k: (randn(k, (6,)),))
+
+
 @pytest.mark.parametrize("axis", [0, 1], ids=["ax0", "ax1"])
 def test_sort(axis):  # ADDED rule (argsort permutation)
     check(lambda x: jnp.sort(x, axis=axis), (0,), lambda k: (randn(k, (4, 5)),))

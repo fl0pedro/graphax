@@ -264,6 +264,9 @@ defelemental(lax.is_finite_p, lambda x: jnp.zeros_like(x))
 # copy: d/dx = 1 (identity)
 defelemental(lax.copy_p, lambda x: jnp.ones_like(x))
 
+# reduce_precision (mixed-precision / quantization-aware sim): identity under AD.
+defelemental(lax.reduce_precision_p, lambda x, **kw: jnp.ones_like(x))
+
 # exp2: d/dx(2^x) = 2^x * ln(2) = out * ln(2). accuracy=None: current JAX puts an
 # `accuracy` param on exp2_p's eqn; without it the lambda crashes under jacve.
 defelemental2(lax.exp2_p, lambda out, x, accuracy=None: out * jnp.log(2.0))
@@ -845,6 +848,24 @@ def cumprod_elemental_rule(primals, **params):
 
 
 elemental_rules[lax.cumprod_p] = cumprod_elemental_rule
+
+
+def cumlogsumexp_elemental_rule(primals, **params):
+    """``out[i] = log(sum_{j<=i} exp(x[j]))``; d out[i]/d x[j] (for j<=i) is the
+    softmax weight ``exp(x[j] - out[i])`` over the prefix window. Same triangular
+    value-dependent layout as cumprod. (CTC loss / HMM-CRF forward passes.)"""
+    val_out = lax.cumlogsumexp_p.bind(*primals, **params)
+    x = primals[0]; axis = params["axis"]; reverse = params.get("reverse", False)
+    shape = get_shape(x); N = len(shape)
+    out_dims, primal_dims = _cumulative_dims(shape, axis, N)
+    mask = _cumulative_mask(shape[axis], axis, N, reverse)
+    out_e = jnp.expand_dims(val_out, axis + 1)         # out[i] at scan-out axis
+    x_e = jnp.expand_dims(x, axis)                      # x[j] at scan-in axis
+    V = (mask * jnp.exp(x_e - out_e)).astype(jnp.float32)
+    return val_out, [_swap_back_axes(SparseTensor(out_dims, primal_dims, V))]
+
+
+elemental_rules[lax.cumlogsumexp_p] = cumlogsumexp_elemental_rule
 
 
 def _cum_extremum_rule(prim, primals, params):
