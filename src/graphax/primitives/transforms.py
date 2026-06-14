@@ -52,6 +52,59 @@ def _inverse_permutation(permutation):
     return inverse
 
 
+def _is_scalar_identity_post(post) -> bool:
+    """A post edge that is the bare identity seed: no out/primal dims and no
+    stored ``val`` (the structure is the all-ones identity up to
+    ``scalar_mult``). This is what an inverse transform receives in forward
+    ('fwd') elimination order when the identity output-seed is drained through a
+    transform-only edge BEFORE any val-carrying edge has shaped it. In that
+    state ``post.dense()`` is rank-0, so the inverse rules below cannot run
+    their scatter/embedding logic — they must first re-expand the seed into the
+    explicit identity Jacobian over the op's OUTPUT shape."""
+    return (
+        not post.out_dims
+        and not post.primal_dims
+        and post.val is None
+    )
+
+
+def _identity_post_over(post, out_shape):
+    """Re-expand a bare scalar-identity ``post`` (see ``_is_scalar_identity_post``)
+    into the explicit dense identity Jacobian ``s * I`` over ``out_shape`` —
+    ``out_dims`` and ``primal_dims`` both equal ``out_shape`` and ``val`` is the
+    reshaped identity matrix scaled by ``post.scalar_mult``. The resulting tensor
+    feeds the regular (non-scalar) branch of each inverse rule unchanged, so the
+    'fwd' path reconstructs exactly the same op Jacobian the 'rev' path builds.
+
+    ``scalar_mult`` is folded into ``val``; the synthesized tensor keeps the
+    default ``scalar_mult`` so the downstream rule (which copies ``scalar_mult``
+    through verbatim) does not double-apply it."""
+    out_shape = tuple(int(s) for s in out_shape)
+    n = 1
+    for s in out_shape:
+        n *= s
+    eye = jnp.eye(n, dtype=jnp.float32)
+    scalar = post.scalar_mult
+    if scalar is not None:
+        eye = eye * scalar
+    val = eye.reshape(out_shape + out_shape)
+    counter = 0
+    new_out_dims = []
+    for s in out_shape:
+        new_out_dims.append(DenseIndex(counter, s, counter))
+        counter += 1
+    new_primal_dims = []
+    for s in out_shape:
+        new_primal_dims.append(DenseIndex(counter, s, counter))
+        counter += 1
+    return SparseTensor(
+        new_out_dims,
+        new_primal_dims,
+        val,
+        fill_value=post.fill_value,
+    )
+
+
 # ---------- transpose ----------
 
 
@@ -224,6 +277,13 @@ def _slice_elementals(primals, val_out, **params):
     def inverse_slice_transform(post):
         start_indices = list(params["start_indices"])
         limit_indices = list(params["limit_indices"])
+        # In 'fwd' elimination order this inverse can be drained against the bare
+        # identity output-seed (no out/primal dims, val=None). Re-expand that seed
+        # into the explicit identity Jacobian over the slice's OUTPUT shape so the
+        # scatter logic below — which assumes post.dense() is (out..., slice_out...)
+        # with the slice-output dims trailing — runs exactly as in 'rev' order.
+        if _is_scalar_identity_post(post):
+            post = _identity_post_over(post, val_out.shape)
         full_val = post.dense()
         new_shape = []
         new_out_dims = []
@@ -662,6 +722,15 @@ def _concatenate_elementals(primals, val_out, **params):
         )
 
     def inverse_concatenate_transform(primal_idx, post):
+        # In 'fwd' elimination order this inverse can be drained against the bare
+        # identity output-seed (no out/primal dims, val=None). The seed has lost
+        # the embedding structure (which concat slot maps to which output rows),
+        # so re-expand it into the explicit identity Jacobian over the concat
+        # OUTPUT shape. Then post.primal_dims[dim] is the concat-axis dimension and
+        # the regular slicing branch extracts this slot's embedding block exactly
+        # as in 'rev' order, instead of returning the structureless scalar.
+        if _is_scalar_identity_post(post):
+            post = _identity_post_over(post, val_out.shape)
         new_out_dims = list(copy.deepcopy(post.out_dims))
         new_primal_dims = list(copy.deepcopy(post.primal_dims))
 

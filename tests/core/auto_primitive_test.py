@@ -493,6 +493,16 @@ def test_where_shared_input():
     check(lambda x: jnp.where(x > 0, jnp.sin(x), 2 * x), (0,), lambda k: (randn(k, (8,)),))
 
 
+@pytest.mark.parametrize("shift,axis,shape", [(2, None, (6,)), (-1, None, (6,)), (9, None, (6,)),
+                                              (1, 1, (3, 5))],
+                         ids=["s2", "s-1", "big", "2d"])
+def test_roll(shift, axis, shape):
+    # roll = slice+slice+concatenate; fwd mode used to crash on the scalar-identity
+    # seed in the slice/concat inverse transforms. check() asserts fwd==rev==jax
+    # (vertex elimination is order-invariant).
+    check(lambda x: jnp.sin(jnp.roll(x, shift, axis=axis)), (0,), lambda k: (randn(k, shape),))
+
+
 @pytest.mark.parametrize("oshape,ushape,start", [((8,), (3,), (2,)), ((5, 6), (2, 3), (1, 2))],
                          ids=["1d", "2d"])
 def test_dynamic_update_slice(oshape, ushape, start):  # was BUG_DUS_UPDATES (wrong-direction)
