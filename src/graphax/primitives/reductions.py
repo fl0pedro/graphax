@@ -73,20 +73,24 @@ elemental_only_rules[lax.select_n_p] = select_elemental_only
 def _reduce_sum_elementals(primals, val_out_ndim, **params):
     primal = primals[0]
     axes = params["axes"]
-    if axes is None:
+
+    new_out_dims, new_primal_dims, shape = [], [], []
+    reduce_all = axes is None
+    if reduce_all:
+        # Full reduction -> scalar output (one size-1 out axis). The append used
+        # to run before this list existed -> UnboundLocalError (latent: jnp.sum
+        # always lowers explicit axes, never None).
         axes = tuple(range(primal.ndim))
         new_out_dims.append(DenseIndex(0, 1, 0))
     elif isinstance(axes, int):
         axes = (axes,)
 
-    new_out_dims, new_primal_dims, shape = [], [], []
-    l = val_out_ndim  # TODO rename l, bad name...
+    l = val_out_ndim
+    base = 1 if reduce_all else l  # contiguous ids; see _reduce_max_elementals
     count = 0
     for i, size in enumerate(get_shape(primal)):
         if i in axes:
-            # idx = len(new_out_dims) + len(new_primal_dims)
-            # idx = max(idx, 1) if val_out.ndim > 0 else idx
-            new_primal_dims.append(DenseIndex(l + i, size, count))
+            new_primal_dims.append(DenseIndex(base + i, size, count))
             shape.append(size)
             count += 1
         else:
@@ -212,59 +216,3 @@ def reduce_min_elemental_only(primal_out, primals, **params):
 
 elemental_rules[lax.reduce_min_p] = reduce_min_elemental_rule
 elemental_only_rules[lax.reduce_min_p] = reduce_min_elemental_only
-
-
-# ---------- unified reduce (draft, untested) ----------
-
-# first draft unified reduce, TODO: test!
-def reduce_elemental_rule(primals, agg, **params):
-    assert agg in {"sum", "min", "max"}, (
-        f"{agg} is not one of the valid aggregate functions `sum`, `min`, `max`"
-    )
-    val_out = getattr(lax, f"reduce_{agg}_p").bind(*primals, **params)
-
-    shape = list(get_shape(val_out))
-    primal = primals[0]
-    axes = params["axes"]
-
-    new_out_dims, new_primal_dims, _shape = [], [], []
-    if axes is None:
-        axes = tuple(range(primal.ndim))
-        new_out_dims.append(DenseIndex(0, 1, 0))
-    elif isinstance(axes, int):
-        axes = (axes,)
-
-    l = get_ndim(val_out)
-    for i, size in enumerate(get_shape(primal)):
-        if i in axes:
-            if agg == "sum":
-                idx = l + i
-            else:
-                shape.insert(i, 1)
-                idx = len(new_out_dims) + len(new_primal_dims)
-                idx = max(idx, 1) if val_out.ndim > 0 else idx
-
-            new_primal_dims.append(DenseIndex(idx, size, i))
-            _shape.append(size)
-        else:
-            ll = len(new_out_dims)
-            val = None if "sum" else i
-            new_out_dims.append(DiagonalIndex(ll, size, val, l + i))
-            new_primal_dims.append(DiagonalIndex(l + i, size, val, ll))
-
-    if agg == "sum":
-        new_val = jnp.ones(_shape, dtype=jnp.float32)
-    else:
-        _val_out = val_out.reshape(shape)
-        new_val = jnp.where(primal == _val_out, 1, 0)
-        norm = jnp.sum(new_val, axis=axes, keepdims=True)
-        new_val /= norm
-
-    return val_out, [
-        _swap_back_axes(SparseTensor(new_out_dims, new_primal_dims, new_val))
-    ]
-
-
-# elemental_rules[lax.reduce_sum_p] = partial(reduce_elemental_rule, agg="sum")
-# elemental_rules[lax.reduce_min_p] = partial(reduce_elemental_rule, agg="min")
-# elemental_rules[lax.reduce_max_p] = partial(reduce_elemental_rule, agg="max")

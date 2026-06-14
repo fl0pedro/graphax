@@ -208,9 +208,10 @@ def standard_elemental2(elementalrule, primitive, primals, **params):
 
 # Define elemental partials
 defelemental(lax.neg_p, lambda x: -jnp.ones_like(x))
-defelemental2(
-    lax.abs_p, lambda out, primal: primal / out
-)  # NOTE: not differentiable here!
+# abs subgradient via sign (sign(0)=0 -> use 1 there); the old primal/out was a
+# 0/0 NaN at x=0. (math.py registers the live elemental_only version; kept in
+# sync here so the two registrations never diverge — see max/min/pow.)
+defelemental(lax.abs_p, lambda x: jnp.where(x == 0, 1.0, jnp.sign(x)))
 defelemental(lax.integer_pow_p, lambda x, y: y * x ** (y - 1))
 
 defelemental2(lax.exp_p, lambda out, primal, accuracy=None: out)
