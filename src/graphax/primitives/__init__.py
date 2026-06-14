@@ -22,5 +22,6 @@ from . import auto
 
 # Named-jit Jacobians (jax.nn activations dispatched by jit_p params['name']).
 from . import activations
+from .activations import jit_named_elemental_only
 
 from .transforms import JacobianTransform

@@ -8,8 +8,8 @@ inlining + differentiating the decomposition we look the name up in
 ``ACTIVATION_DERIVS`` and emit graphax's own (diagonal) Jacobian directly.
 
 The set of handled names is registered in ``jit_name_rules`` so the eliminator
-knows not to inline them (``core._inline_call_primitives`` / ``_eval_primal``).
-``core``'s jit_p rule (``_make_pjit_multi_output_elemental_only``) calls
+keeps them as vertices (``core._jit_kept_as_vertex``) instead of inlining them.
+``core``'s jit_p rule (``_make_jit_elemental_rule``) calls
 ``jit_named_elemental_only`` for a registered name, and falls back to
 differentiating the jit body when this rule raises (non-default static args).
 

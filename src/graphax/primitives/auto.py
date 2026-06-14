@@ -8,7 +8,6 @@ import jax.lax as lax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
-from jax._src.pjit import jit_p
 from jax.typing import ArrayLike
 
 from ..sparse.tensor import (
@@ -1580,50 +1579,6 @@ def _subjaxpr_dfs_traverse(jaxpr):
 
 
 # use this in reverse [::-1] if you want to traverse w/o dependency issues
-
-
-# TODO: this is a very ugly hack that treats pjit as a normal primitive with a stop_grad
-def pjit_elemental_rule(
-    primals,
-    jaxpr,
-    in_shardings,
-    out_shardings,
-    in_layouts,
-    out_layouts,
-    resource_env,
-    donated_invars,
-    name,
-    keep_unused,
-    inline,
-):
-    # TODO Jamie: How do we handle the gradients here?
-    # jaxpr_cce = cce_core.cce_jaxpr(jaxpr)
-    # print("pjit primals", primals)
-    # print("pjit zero", zero_elementals)
-    # print("pjit jaxpr", jaxpr)
-    # outs, elementals, subgraph, transpose_subgraph, vo_vertices = _trace_subjaxpr(jaxpr.jaxpr, primals, ())
-    # print("### pjit outs", outs)
-    # print("### pjit elementals", elementals)
-    # print("### pjit jaxpr", jaxpr)
-    outputs = jit_p.bind(
-        *primals,
-        jaxpr=jaxpr,
-        in_shardings=(*in_shardings,),
-        out_shardings=(*out_shardings,),
-        in_layouts=(*in_layouts,),
-        out_layouts=(*out_layouts,),
-        resource_env=resource_env,
-        donated_invars=(*donated_invars,),
-        name=name,
-        keep_unused=keep_unused,
-        inline=inline,
-    )
-    # print("pjit val_out:", outputs)
-    out_primals = outputs
-    return out_primals, []
-
-
-elemental_rules[jit_p] = pjit_elemental_rule
 
 
 # Should work for high-dimensional stuff
@@ -3231,87 +3186,15 @@ elemental_rules[lax.argmax_p] = argmax_elemental_rule
 from jax._src.lax.control_flow.conditionals import cond_p
 
 
-def pjit_elemental_rule(primals, **params):
-    from .core import vertex_elimination_jaxpr
-
-    jaxpr = params.get("jaxpr")
-    if jaxpr is None:
-        # Fallback for unexpected cases
-        val_out = jit_p.bind(*primals, **params)
-        return val_out, [[]] * (
-            len(primals) if not getattr(jit_p, "multiple_results", False) else 1
-        )
-
-    # argnums should be indices of invars that are Variables
-    argnums = [i for i, v in enumerate(jaxpr.jaxpr.invars) if isinstance(v, core.Var)]
-
-    # Recursively compute the Jacobian of the internal jaxpr
-    res = vertex_elimination_jaxpr(
-        jaxpr.jaxpr,
-        "fwd",
-        jaxpr.consts,
-        *primals,
-        argnums=argnums,
-        sparse_representation=True,
-    )
-    primal_outvals, jac_vals_flat = res
-
-    # vertex_elimination_jaxpr returns (primal_outs, jac_vals)
-    # jac_vals is [ (J_out0_in0, ...), (J_out1_in0, ...), ... ] if n > 1
-    # or [ J_out0_in0, J_out1_in0, ... ] if n == 1
-    num_invars = len(argnums)
-    jaxpr_outvars = jaxpr.jaxpr.outvars
-    jaxpr_invars = [jaxpr.jaxpr.invars[i] for i in argnums]
-
-    from ..sparse.tensor import DenseIndex, SparseTensor
-
-    def ensure_st(j, out_var, in_var):
-        if j is not None:
-            return j
-        out_shape = out_var.aval.shape
-        in_shape = in_var.aval.shape
-        out_size = len(out_shape)
-        out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
-        primal_dims = [
-            DenseIndex(out_size + i, s, i + out_size)
-            for i, s in enumerate(in_shape)
-        ]
-        return SparseTensor.zeros(out_dims, primal_dims, out_var.aval.dtype)
-
-    elemental_outvals = []
-    for i, out_var in enumerate(jaxpr_outvars):
-        out_jacs = []
-        for j, in_var in enumerate(jaxpr_invars):
-            if num_invars > 1:
-                jac = jac_vals_flat[i][j]
-            else:
-                jac = jac_vals_flat[i]
-            out_jacs.append(ensure_st(jac, out_var, in_var))
-        elemental_outvals.append(out_jacs)
-
-    # jit_p.bind returns a single value if not multiple_results
-    is_multiple = getattr(jit_p, "multiple_results", False)
-    print(
-        f"DEBUG: jit_p.multiple_results={is_multiple}, len(outvars)={len(primal_outvals) if isinstance(primal_outvals, list) else 1}"
-    )
-    if not is_multiple:
-        print(
-            f"DEBUG: Returning single. primal type: {type(primal_outvals[0])}, elemental type: {type(elemental_outvals[0])}"
-        )
-        return primal_outvals[0], elemental_outvals[0]
-    print(
-        f"DEBUG: Returning multiple. primal type: {type(primal_outvals)}, elemental type: {type(elemental_outvals)}"
-    )
-    return primal_outvals, elemental_outvals
-
-
 def cond_elemental_rule(primals, **params):
     val_out = cond_p.bind(*primals, **params)
     return val_out, []
 
 
 elemental_rules[cond_p] = cond_elemental_rule
-elemental_rules[jit_p] = pjit_elemental_rule
+# jit_p is handled by core's single multi-output rule (named-activation Jacobian
+# DB or recursive body-differentiation); ordinary jits are inlined before
+# elimination. See core._make_jit_elemental_rule / _inline_call_primitives.
 
 
 # Collective operations: psum, all_gather, reduce_scatter, all_to_all

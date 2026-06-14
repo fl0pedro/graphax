@@ -21,6 +21,7 @@ from .primitives import (
     elemental_only_rules,
     elemental_rules,
     jit_name_rules,
+    jit_named_elemental_only,
     multi_output_elemental_only_rules,
 )
 from .sparse.ops import add_w_counts
@@ -160,17 +161,31 @@ def _force(edge):
     return edge.value if isinstance(edge, LazyEdge) else edge
 
 
+def _jit_kept_as_vertex(eqn) -> bool:
+    """A jit is kept as a vertex (NOT inlined) iff graphax has its own Jacobian
+    for its name. This single predicate ties the two halves of the invariant
+    together: the inline gate (``_call_body``) leaves these eqns in place, and the
+    jit elemental rule (``_make_jit_elemental_rule``) dispatches them by name.
+    Every other jit is inlined into the parent graph."""
+    return eqn.primitive is jit_p and eqn.params.get("name") in jit_name_rules
+
+
 def _inline_call_primitives(jaxpr, consts):
     """Splice jit/pjit (and nested) bodies into the parent jaxpr so vertex
     elimination only ever sees primitives with registered elemental rules.
 
-    jit/pjit is pure structural plumbing — its body is a closed sub-jaxpr — so we
-    re-point the body's invars onto the outer call args, recurse into the body's
-    equations, and re-point the outer outvars onto the body's results. This is
-    correct and composes far better than treating ``jit_p`` as a *macro vertex*
-    (recursively differentiating the body and re-wrapping its Jacobian, which
-    mis-shaped the inner Jacobian during the OUTER composition — e.g. a (6,6,6)
-    -> (6,6) reshape for ``jax.nn`` activations). Returns ``(new_jaxpr,
+    This is the PRIMARY path for jit: its body is a closed sub-jaxpr — pure
+    structural plumbing — so we re-point the body's invars onto the outer call
+    args, recurse into the body's equations, and re-point the outer outvars onto
+    the body's results. Inlining composes far better than the *macro-vertex*
+    alternative (recursively differentiating the body and re-wrapping its
+    Jacobian, which mis-shaped the inner Jacobian during the OUTER composition —
+    e.g. a (6,6,6) -> (6,6) reshape for ``jax.nn`` activations).
+
+    The ONE exception is a jit graphax has its own Jacobian for
+    (``_jit_kept_as_vertex`` — jax.nn.elu/selu/...): that one is kept as a vertex
+    so the named rule can apply the exact analytic Jacobian (the macro-vertex
+    survives only as that rule's non-default-args fallback). Returns ``(new_jaxpr,
     new_consts)``; inner consts are hoisted to top-level constvars. A no-op (the
     original objects) when there are no call primitives to inline.
 
@@ -188,22 +203,17 @@ def _inline_call_primitives(jaxpr, consts):
     new_consts = list(consts)
 
     def _call_body(eqn):
-        """The closed inner jaxpr for jit/pjit, else None.
+        """The closed inner jaxpr to inline for this eqn, else None.
 
-        custom_jvp / custom_vjp are deliberately NOT inlined: their bespoke
-        jvp/bwd rules can differ from the primal decomposition's derivative
-        (kink subgradients, straight-through / surrogate gradients), so each is
-        handled by a dedicated elemental rule that HONORS the user rule (see
-        ``custom_jvp_elemental_only`` / ``custom_vjp_elemental_only`` in
-        primitives/auto.py). Inlining the primal would silently ignore the rule
-        and disagree with jax (e.g. relu'(0): jax says 0, max(x,0) says 0.5).
-
-        A jit whose ``name`` graphax has its own Jacobian for (``jit_name_rules``,
-        e.g. jax.nn.elu/selu/...) is likewise NOT inlined — it is dispatched to
-        that named rule via multi_output_elemental_only_rules[jit_p]."""
-        if eqn.primitive is jit_p:
-            if eqn.params.get("name") in jit_name_rules:
-                return None
+        Only ordinary jits are inlined. custom_jvp / custom_vjp are NOT inlined:
+        their bespoke jvp/bwd rules can differ from the primal decomposition's
+        derivative (kink subgradients, straight-through / surrogate gradients),
+        so each is handled by a dedicated elemental rule that HONORS the user
+        rule (``custom_jvp_elemental_only`` / ``custom_vjp_elemental_only`` in
+        primitives/auto.py). A named jit graphax has its own Jacobian for
+        (``_jit_kept_as_vertex``) is likewise NOT inlined — it is dispatched by
+        name by the jit elemental rule."""
+        if eqn.primitive is jit_p and not _jit_kept_as_vertex(eqn):
             return eqn.params["jaxpr"]
         return None
 
@@ -1735,34 +1745,34 @@ def extract_jaxpr(
 
 
 # ---------------------------------------------------------------------------
-# jit_p (pjit) elemental-only rule
+# The jit_p elemental rule (the ONLY registration for jit_p; ordinary jits never
+# reach it — they are inlined by _inline_call_primitives). It is reached only for
+# a jit KEPT as a vertex (``_jit_kept_as_vertex``: a jax.nn activation graphax has
+# its own Jacobian for) and dispatches:
 #
-# jit_p is a macro vertex: its params["jaxpr"] contains the full sub-computation
-# as a closed jaxpr.  The correct elemental is the Jacobian of that inner
-# function, which we compute by recursively applying vertex_elimination_jaxpr.
+#   1. name in jit_name_rules + default static args -> graphax's own clean
+#      Jacobian (jit_named_elemental_only), exact analytic subgradient at kinks;
+#   2. otherwise (non-default alpha / negative_slope) -> fall back to the
+#      macro-vertex: recursively differentiate params["jaxpr"] with
+#      vertex_elimination_jaxpr. Its order is configurable via
+#      set_pjit_elimination_order() (default "reverse").
 #
-# Registered here (not in primitives/pjit.py) to avoid a circular import:
-# pjit.py -> core.py -> primitives -> pjit.py.
-#
-# The elimination order for the inner jaxpr is configurable via
-# set_pjit_elimination_order().  Default: "reverse" (reverse-mode-like).
+# Registered here (not in a primitives/pjit.py) to avoid a circular import:
+# core.py needs vertex_elimination_jaxpr, which lives here.
 # ---------------------------------------------------------------------------
 
 
-def _make_pjit_multi_output_elemental_only(order):
-    def pjit_multi_output_elemental_only(primal_outs, primals, **params):
-        # If graphax has its own hand-written Jacobian for this named jit
-        # (jax.nn.elu/selu/...), use it — it gives the exact analytic subgradient
-        # at kinks rather than the select_n/max/min decomposition's. It raises on
-        # non-default static args, in which case we fall back to differentiating
-        # the jit body below (which bakes the actual args).
+def _make_jit_elemental_rule(order):
+    def jit_elemental_rule(primal_outs, primals, **params):
+        # 1. graphax's own named-activation Jacobian (clean kink subgradient).
+        #    Raises on non-default static args -> fall through to the body diff.
         if params.get("name") in jit_name_rules:
-            from .primitives.activations import jit_named_elemental_only
             try:
                 return jit_named_elemental_only(primal_outs, primals, **params)
             except NotImplementedError:
                 pass
 
+        # 2. Macro-vertex fallback: Jacobian of the inner jaxpr by recursion.
         inner_closed = params["jaxpr"]
         inner_jaxpr = inner_closed.jaxpr
         consts = inner_closed.literals
@@ -1790,11 +1800,16 @@ def _make_pjit_multi_output_elemental_only(order):
             # Each entry is a tuple of N SparseTensors (one per input) for one output.
             return [list(jac_tuple) for jac_tuple in jac_vals]
 
-    return pjit_multi_output_elemental_only
+    return jit_elemental_rule
 
 
 def set_pjit_elimination_order(order: str = "reverse") -> None:
-    """Set the vertex elimination order used when differentiating through jax.jit.
+    """Set the vertex elimination order for the jit_p macro-vertex fallback.
+
+    Ordinary jits are inlined, so this order only affects the rare fallback path:
+    a named jax.nn activation called with NON-default static args (where graphax's
+    name-keyed Jacobian doesn't apply), whose body is then differentiated by
+    recursion.
 
     Args:
         order: Any elimination order accepted by jacve — ``"forward"``, ``"fwd"``,
@@ -1802,9 +1817,7 @@ def set_pjit_elimination_order(order: str = "reverse") -> None:
                Defaults to ``"reverse"``.
     """
     elemental_only_rules.pop(jit_p, None)  # remove any prior single-output registration
-    multi_output_elemental_only_rules[jit_p] = _make_pjit_multi_output_elemental_only(
-        order
-    )
+    multi_output_elemental_only_rules[jit_p] = _make_jit_elemental_rule(order)
 
 
 # Register with the default order at import time.
