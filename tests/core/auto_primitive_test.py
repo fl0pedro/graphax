@@ -472,6 +472,27 @@ def test_custom_jvp_inlined():
     check(lambda x: jax.nn.hard_sigmoid(x), (0,), lambda k: (randn(k, (6,)),))
 
 
+# Conditional / jit-wrapped activations: each uses select_n/where with the SAME
+# input feeding multiple branches — was crashing/silently-wrong until the
+# select_n masked-identity Jacobian carried its values (axis=i, not None).
+_COND_ACTS = [
+    ("relu", jax.nn.relu), ("elu", jax.nn.elu), ("selu", jax.nn.selu),
+    ("celu", jax.nn.celu), ("leaky_relu", jax.nn.leaky_relu),
+    ("softplus", jax.nn.softplus), ("mish", jax.nn.mish),
+]
+
+
+@pytest.mark.parametrize("name,fn", _COND_ACTS, ids=[c[0] for c in _COND_ACTS])
+@pytest.mark.parametrize("shape", [(8,), (3, 4)], ids=["1d", "2d"])
+def test_conditional_activations(name, fn, shape):
+    check(lambda x: fn(x), (0,), lambda k: (randn(k, shape),), seed=hash((name, shape)) & 0xFFFF)
+
+
+def test_where_shared_input():
+    # x feeds predicate AND both branches
+    check(lambda x: jnp.where(x > 0, jnp.sin(x), 2 * x), (0,), lambda k: (randn(k, (8,)),))
+
+
 @pytest.mark.parametrize("oshape,ushape,start", [((8,), (3,), (2,)), ((5, 6), (2, 3), (1, 2))],
                          ids=["1d", "2d"])
 def test_dynamic_update_slice(oshape, ushape, start):  # was BUG_DUS_UPDATES (wrong-direction)

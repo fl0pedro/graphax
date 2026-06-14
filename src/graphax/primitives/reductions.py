@@ -34,11 +34,16 @@ def _select_elementals(primals, val_out, **params):
     def _masked_identity(mask):
         if out_ndim == 0:
             return SparseTensor([], [], mask)
+        # Diagonal Jacobian whose diagonal carries the per-element mask values, so
+        # each DiagonalIndex must read its own axis of ``mask`` (axis=i). axis=None
+        # marked the dim as a pure (value-less) identity, which DISCARDED the mask
+        # -> select_n/where Jacobians were silently wrong (and mis-shaped when the
+        # same input fed multiple branches).
         out_dims = [
-            DiagonalIndex(i, s, None, out_ndim + i) for i, s in enumerate(out_shape)
+            DiagonalIndex(i, s, i, out_ndim + i) for i, s in enumerate(out_shape)
         ]
         primal_dims = [
-            DiagonalIndex(out_ndim + i, s, None, i) for i, s in enumerate(out_shape)
+            DiagonalIndex(out_ndim + i, s, i, i) for i, s in enumerate(out_shape)
         ]
         return SparseTensor(out_dims, primal_dims, mask)
 
