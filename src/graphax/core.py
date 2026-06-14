@@ -171,16 +171,16 @@ def _inline_call_primitives(jaxpr, consts):
     mis-shaped the inner Jacobian during the OUTER composition — e.g. a (6,6,6)
     -> (6,6) reshape for ``jax.nn`` activations). Returns ``(new_jaxpr,
     new_consts)``; inner consts are hoisted to top-level constvars. A no-op (the
-    original objects) when there are no call primitives to inline."""
-    sub: Dict[Any, Any] = {}
-    has_call = [False]
+    original objects) when there are no call primitives to inline.
 
-    def resolve(v):
-        seen = set()
-        while not isinstance(v, core.Literal) and v in sub and id(v) not in seen:
-            seen.add(id(v))
-            v = sub[v]
-        return v
+    Inner bodies are renamed into FRESH variables per call site: JAX reuses the
+    *same* inner-jaxpr object (hence the same ``Var`` instances) for every call of
+    a given jitted/custom function, so a single global substitution keyed by those
+    shared Vars would let a second call site overwrite the first's mapping and
+    silently corrupt the graph (e.g. a shared MLP block applied twice). ``gensym``
+    gives every inlined Var a fresh identity local to its call site."""
+    has_call = [False]
+    newvar = core.gensym()
 
     new_eqns = []
     constvars = list(jaxpr.constvars)
@@ -199,27 +199,60 @@ def _inline_call_primitives(jaxpr, consts):
             return cj
         return None
 
-    def process(eqns):
+    def process(eqns, env, fresh):
+        """Emit ``eqns`` with vars resolved through ``env``. ``fresh`` is True for
+        equations that came from an inlined body — their outvars are renamed to
+        fresh Vars so repeated call sites of the same shared inner jaxpr never
+        collide. Top-level equations (``fresh=False``) keep their already-unique
+        Vars untouched."""
+        def resolve(v):
+            if isinstance(v, core.Literal):
+                return v
+            return env.get(v, v)
+
         for eqn in eqns:
             inner_closed = _call_body(eqn)
             if inner_closed is not None:
                 has_call[0] = True
                 inner = inner_closed.jaxpr
+                # Each inlining gets its own child scope, seeded with the outer
+                # env so inner invars can resolve onto outer call args.
+                child = dict(env)
                 for cv, cval in zip(inner.constvars, inner_closed.consts):
-                    constvars.append(cv)
+                    nv = newvar(cv.aval)
+                    child[cv] = nv
+                    constvars.append(nv)
                     new_consts.append(cval)
                 for iv, ov in zip(inner.invars, eqn.invars):
-                    sub[iv] = resolve(ov)
-                process(inner.eqns)
-                for iov, oov in zip(inner.outvars, eqn.outvars):
-                    sub[oov] = resolve(iov)
+                    child[iv] = resolve(ov)
+                process(inner.eqns, child, True)
+                for oov, iov in zip(eqn.outvars, inner.outvars):
+                    if isinstance(oov, core.DropVar):
+                        continue
+                    env[oov] = iov if isinstance(iov, core.Literal) else child.get(iov, iov)
+            elif fresh:
+                new_invars = [resolve(v) for v in eqn.invars]
+                new_outvars = []
+                for ov in eqn.outvars:
+                    if isinstance(ov, core.DropVar):
+                        new_outvars.append(ov)
+                    else:
+                        nv = newvar(ov.aval)
+                        env[ov] = nv
+                        new_outvars.append(nv)
+                new_eqns.append(eqn.replace(invars=new_invars, outvars=new_outvars))
             else:
                 new_eqns.append(eqn.replace(invars=[resolve(v) for v in eqn.invars]))
 
-    process(jaxpr.eqns)
+    top_env: Dict[Any, Any] = {}
+    process(jaxpr.eqns, top_env, False)
     if not has_call[0]:
         return jaxpr, consts
-    new_outvars = [resolve(v) for v in jaxpr.outvars]
+
+    def resolve_out(v):
+        return v if isinstance(v, core.Literal) else top_env.get(v, v)
+
+    new_outvars = [resolve_out(v) for v in jaxpr.outvars]
     new_jaxpr = jaxpr.replace(constvars=constvars, eqns=new_eqns, outvars=new_outvars)
     return new_jaxpr, new_consts
 
