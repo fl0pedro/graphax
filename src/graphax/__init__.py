@@ -1,6 +1,7 @@
 import sys
 
 from . import instrumentation
+from . import nn
 from .core import grad, jacve, set_pjit_elimination_order, value_and_grad
 
 from .sparse import sparse_tensor_zeros_like
