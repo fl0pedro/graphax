@@ -249,6 +249,15 @@ def test_cumprod(axis, rev):  # ADDED rule (value-dependent)
     check(lambda x: lax.cumprod(x, axis, reverse=rev), (0,), lambda k: (pos(k, (4, 5)),))
 
 
+@pytest.mark.parametrize("x", [
+    [2.0, 0.0, 3.0], [0.0, 3.0, 4.0], [2.0, 3.0, 0.0],
+    [2.0, 0.0, 3.0, 0.0, 5.0],  # two zeros: every partial product-of-others = 0
+], ids=["zmid", "zfirst", "zlast", "twozeros"])
+def test_cumprod_with_zeros(x):  # zero-robust: out[i]/x[j] was 0/0, dropped the edge
+    arr = jnp.asarray(x)
+    check(lambda z: lax.cumprod(z, 0), (0,), lambda k: (arr,), n=1)
+
+
 @pytest.mark.parametrize("fn,name", [(lax.cummax, "cummax"), (lax.cummin, "cummin")], ids=["max", "min"])
 def test_cum_extremum(fn, name):  # ADDED rule (value-dependent, tie-normalized)
     check(lambda x: jnp.sin(fn(x, 1)), (0,), lambda k: (randn(k, (3, 5)),))

@@ -801,7 +801,13 @@ def _cumulative_mask(n, axis, N, reverse):
 
 
 def cumprod_elemental_rule(primals, **params):
-    """``out[i] = prod_{j<=i} x[j]``; d out[i]/d x[j] = (j<=i)·out[i]/x[j]."""
+    """``out[i] = prod_{j<=i} x[j]``; d out[i]/d x[j] (for j<=i) = product of the
+    OTHER factors up to ``i``. For ``x[j] != 0`` that is ``out[i]/x[j]``; for
+    ``x[j] == 0`` it is the cumulative product of the non-zeros up to ``i`` when
+    ``x[j]`` is the UNIQUE zero in that window, else 0 (a second zero ≤ i makes
+    every partial-product-of-others vanish). The naive ``out[i]/x[j]`` was a 0/0
+    at zeros and dropped that contribution — wrong for any input with a zero
+    (e.g. a masked / post-ReLU activation)."""
     val_out = lax.cumprod_p.bind(*primals, **params)
     x = primals[0]; axis = params["axis"]; reverse = params.get("reverse", False)
     shape = get_shape(x); N = len(shape)
@@ -809,8 +815,20 @@ def cumprod_elemental_rule(primals, **params):
     mask = _cumulative_mask(shape[axis], axis, N, reverse)
     out_e = jnp.expand_dims(val_out, axis + 1)         # out[i] at scan-out axis
     x_e = jnp.expand_dims(x, axis)                      # x[j] at scan-in axis
+    # Cumulative (same direction as the op) zero-count and non-zero product up to i.
+    is_zero = (x == 0).astype(jnp.float32)
+    nz_count = lax.cumsum(is_zero, axis=axis, reverse=reverse)
+    prod_nz = lax.cumprod(jnp.where(x == 0, 1.0, x).astype(jnp.float32),
+                          axis=axis, reverse=reverse)
+    nz_count_i = jnp.expand_dims(nz_count, axis + 1)    # zeros up to i
+    prod_nz_i = jnp.expand_dims(prod_nz, axis + 1)      # prod of non-zeros up to i
     safe = jnp.where(x_e != 0, x_e, 1.0)
-    V = jnp.where(x_e != 0, mask * out_e / safe, 0.0).astype(jnp.float32)
+    deriv = jnp.where(
+        x_e != 0,
+        out_e / safe,                                  # 0 if another zero <= i
+        jnp.where(nz_count_i == 1, prod_nz_i, 0.0),    # x[j] is the unique zero
+    )
+    V = (mask * deriv).astype(jnp.float32)
     return val_out, [_swap_back_axes(SparseTensor(out_dims, primal_dims, V))]
 
 
