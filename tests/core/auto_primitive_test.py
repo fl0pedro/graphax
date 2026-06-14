@@ -472,6 +472,44 @@ def test_custom_jvp_inlined():
     check(lambda x: jax.nn.hard_sigmoid(x), (0,), lambda k: (randn(k, (6,)),))
 
 
+def _ste(x):
+    # Straight-through estimator: round forward, identity gradient.
+    f = jax.custom_vjp(lambda y: jnp.round(y))
+    f.defvjp(lambda y: (jnp.round(y), ()), lambda res, ct: (ct,))
+    return f(x)
+
+
+def _surrogate(x):
+    # Deliberately non-primal gradient (2*cos instead of cos).
+    f = jax.custom_vjp(lambda y: jnp.sin(y))
+    f.defvjp(lambda y: (jnp.sin(y), (y,)), lambda res, ct: (2 * jnp.cos(res[0]) * ct,))
+    return f(x)
+
+
+def _clipgrad(x):
+    f = jax.custom_vjp(lambda y: y)
+    f.defvjp(lambda y: (y, ()), lambda res, ct: (jnp.clip(ct, -1.0, 1.0),))
+    return f(x)
+
+
+@pytest.mark.parametrize("name,fn", [("ste", _ste), ("surrogate", _surrogate),
+                                     ("clipgrad", _clipgrad)],
+                         ids=["ste", "surrogate", "clipgrad"])
+def test_custom_vjp_honored(name, fn):
+    # custom_vjp is NOT inlined: its bwd rule may differ from the primal
+    # derivative (straight-through / surrogate / clipped gradients). jacve must
+    # honor bwd in BOTH elimination orders. jax.jacfwd can't trace a custom_vjp
+    # (no fwd rule), so jax.jacrev is the reference for both graphax modes.
+    for i, key in enumerate(_keys(N_DRAWS, hash(name) & 0xFFFF)):
+        x = randn(key, (6,))
+        ref = jax.jacrev(fn, (0,))(x)
+        for mode in ("fwd", "rev"):
+            got = jacve(fn, mode, (0,))(x)
+            assert tree_allclose(got, ref, rtol=1e-4, atol=1e-5), (
+                f"custom_vjp '{name}' jacve('{mode}') != jax.jacrev, draw {i}"
+            )
+
+
 # Conditional / jit-wrapped activations: each uses select_n/where with the SAME
 # input feeding multiple branches — was crashing/silently-wrong until the
 # select_n masked-identity Jacobian carried its values (axis=i, not None).

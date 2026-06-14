@@ -4133,3 +4133,113 @@ def ragged_dot_general_elemental_rule(primals, **params):
 
 
 elemental_rules[ragged_dot_general_p] = ragged_dot_general_elemental_rule
+
+
+# ---------- custom_vjp_call: honor the user's reverse rule ----------
+
+from jax.custom_derivatives import custom_vjp_call_p as _custom_vjp_call_p
+
+
+def _custom_vjp_dense_jacobians(primals, **params):
+    """Build the exact Jacobian of a ``custom_vjp`` call by HONORING the user's
+    ``bwd`` rule instead of structurally differentiating the primal (which would
+    silently discard straight-through / surrogate / clipped gradients, and crash
+    when the primal is non-differentiable). We probe ``bwd`` with one-hot output
+    cotangents to read off each row of the (dense) Jacobian, exactly as reverse
+    mode would.
+
+    Returns ``elementals[output_idx][invar_idx]`` per the
+    ``multi_output_elemental_only_rules`` contract; the first ``num_consts`` invars
+    (closed-over constants) and any input ``bwd`` reports no cotangent for get
+    ``None`` (no edge)."""
+    fwd_jaxpr_thunk = params["fwd_jaxpr_thunk"]
+    bwd = params["bwd"]
+    out_trees = params["out_trees"]
+    num_consts = params["num_consts"]
+
+    # Reconstruct fwd (residuals + outputs) — its store must fill BEFORE out_trees.
+    # The thunk takes one symbolic-zero flag per NON-const input (jax splits the
+    # num_consts closed-over constants off first; see custom_derivatives.py).
+    n_args = len(primals) - num_consts
+    fwd_closed = core.ClosedJaxpr(
+        *fwd_jaxpr_thunk.call_wrapped(*([False] * n_args))
+    )
+    out_tree, res_tree, input_fwds = out_trees()
+    # The fwd jaxpr closes over the num_consts constants, so it takes only the
+    # non-const inputs (jax: `eval_jaxpr(fwd_jaxpr, fwd_consts, *primals)`).
+    args_only = primals[num_consts:]
+    fwd_out = core.eval_jaxpr(fwd_closed.jaxpr, fwd_closed.consts, *args_only)
+
+    # fwd output layout is [non-forwarded residuals ..., outputs ...]; some
+    # residuals are forwarded inputs (input_fwds[i] = index into the FULL input
+    # list, consts included).
+    n_out = out_tree.num_leaves
+    num_fwd = sum(f is not None for f in input_fwds)
+    num_res_out = res_tree.num_leaves - num_fwd
+    res_nonfwd = iter(fwd_out[:num_res_out])
+    out_leaves = fwd_out[num_res_out:num_res_out + n_out]
+    res_leaves = [
+        primals[f] if f is not None else next(res_nonfwd) for f in input_fwds
+    ]
+
+    # bwd returns one cotangent per non-const arg (n_args, computed above).
+    out_shapes = [get_shape(o) for o in out_leaves]
+    out_sizes = [int(np.prod(s)) if s else 1 for s in out_shapes]
+
+    elementals = []
+    for li in range(n_out):
+        out_shape = out_shapes[li]
+        out_size = len(out_shape)
+        # Probe bwd once per output element with a one-hot cotangent: the returned
+        # input cotangent IS that row of the Jacobian (reverse mode is vjp).
+        rows = []
+        for j in range(out_sizes[li]):
+            cts = [
+                jnp.zeros(s, dtype=getattr(o, "dtype", jnp.float32))
+                for s, o in zip(out_shapes, out_leaves)
+            ]
+            cts[li] = cts[li].reshape(-1).at[j].set(1.0).reshape(out_shape)
+            rows.append(list(bwd.call_wrapped(*res_leaves, *cts)))
+
+        per_invar = [None] * len(primals)
+        for ai in range(n_args):
+            ct_col = [rows[j][ai] for j in range(out_sizes[li])]
+            if any(c is None for c in ct_col):
+                continue  # bwd reports no dependency on this input
+            inval = primals[num_consts + ai]
+            in_shape = get_shape(inval)
+            J = jnp.stack(
+                [jnp.asarray(c).reshape(-1) for c in ct_col], axis=0
+            ).reshape(tuple(out_shape) + tuple(in_shape))
+            out_dims = [DenseIndex(k, s, k) for k, s in enumerate(out_shape)]
+            primal_dims = [
+                DenseIndex(out_size + k, s, out_size + k)
+                for k, s in enumerate(in_shape)
+            ]
+            per_invar[num_consts + ai] = SparseTensor(out_dims, primal_dims, J)
+        elementals.append(per_invar)
+    return elementals
+
+
+def custom_vjp_elemental_only(primal_outs, primals, **params):
+    """Multi-output elemental rule for ``custom_vjp_call`` honoring ``bwd``.
+
+    ``custom_vjp_call_p`` is always ``multiple_results``, so it dispatches through
+    ``multi_output_elemental_only_rules``. Any reconstruction failure (e.g.
+    ``symbolic_zeros=True`` or an exotic residual structure we don't model yet) is
+    raised loudly rather than silently falling back to the wrong primal
+    derivative."""
+    try:
+        return _custom_vjp_dense_jacobians(primals, **params)
+    except NotImplementedError:
+        raise
+    except Exception as e:
+        raise NotImplementedError(
+            "graphax could not honor this custom_vjp rule "
+            f"({type(e).__name__}: {e}). custom_vjp with symbolic_zeros or an "
+            "unusual residual structure is not yet supported; differentiate the "
+            "underlying primal explicitly if that is the intended gradient."
+        ) from e
+
+
+multi_output_elemental_only_rules[_custom_vjp_call_p] = custom_vjp_elemental_only

@@ -187,14 +187,19 @@ def _inline_call_primitives(jaxpr, consts):
     new_consts = list(consts)
 
     def _call_body(eqn):
-        """The closed inner jaxpr for jit/pjit or custom_jvp_call/custom_vjp_call,
-        else None. custom_jvp ignores its bespoke tangent rule and differentiates
-        the primal decomposition (call_jaxpr) — correct where the body is
-        differentiable (softplus = log1p(exp(x)), etc.)."""
+        """The closed inner jaxpr for jit/pjit or custom_jvp_call, else None.
+
+        custom_jvp ignores its bespoke tangent rule and differentiates the primal
+        decomposition (call_jaxpr) — correct where the body is differentiable
+        (softplus = log1p(exp(x)), etc.) since a custom_jvp's tangent must agree
+        with the primal's derivative. custom_vjp is deliberately NOT inlined: its
+        ``bwd`` rule may differ from the primal derivative (straight-through /
+        surrogate gradients), so it is handled by a dedicated elemental rule that
+        honors ``bwd`` (see ``custom_vjp_elemental_only`` in primitives/auto.py)."""
         if eqn.primitive is jit_p:
             return eqn.params["jaxpr"]
         name = getattr(eqn.primitive, "name", "")
-        if name in ("custom_jvp_call", "custom_vjp_call"):
+        if name == "custom_jvp_call":
             cj = eqn.params.get("call_jaxpr") or eqn.params.get("fun_jaxpr")
             return cj
         return None
@@ -975,6 +980,20 @@ def _checkify_order(
     return [o for o in order if o in vertex_set]
 
 
+def _eval_primal(eqn, invals):
+    """Compute an equation's primal output value(s).
+
+    Most primitives bind directly. ``custom_vjp_call_p`` cannot be re-bound from
+    ``eqn.params`` (its sub-functions live in a ``subfuns`` slot the generic bind
+    pops), so we evaluate its primal ``call_jaxpr`` instead — the gradient is
+    supplied separately by the bwd-honoring elemental rule."""
+    name = getattr(eqn.primitive, "name", "")
+    if name == "custom_vjp_call":
+        cj = eqn.params["call_jaxpr"]
+        return core.eval_jaxpr(cj.jaxpr, cj.consts, *invals)
+    return eqn.primitive.bind(*invals, **eqn.params)
+
+
 def _build_graph(
     jaxpr: core.Jaxpr,
     args: Sequence[jnp.ndarray],
@@ -1084,7 +1103,7 @@ def _build_graph(
         # entirely — but still bind the primitive so `env` carries the primal
         # for downstream use (output value selection, vo_vertices accounting).
         if active_vars is not None and not var_positions:
-            primal_outvals = eqn.primitive.bind(*invals_snapshot, **eqn.params)
+            primal_outvals = _eval_primal(eqn, invals_snapshot)
             if eqn.primitive.multiple_results:
                 safe_map(write, eqn.outvars, primal_outvals)
             else:
@@ -1101,7 +1120,7 @@ def _build_graph(
         if eqn.primitive in multi_output_elemental_only_rules:
             # Multi-output path: primitive produces multiple output variables.
             # The rule returns elementals[outvar_idx][invar_idx].
-            primal_outvals = eqn.primitive.bind(*invals_snapshot, **eqn.params)
+            primal_outvals = _eval_primal(eqn, invals_snapshot)
             safe_map(write, eqn.outvars, primal_outvals)
 
             fn = multi_output_elemental_only_rules[eqn.primitive]
@@ -1124,7 +1143,7 @@ def _build_graph(
             # Deferred dispatch path: bind primal eagerly, defer all elemental
             # JAX ops to lazy thunks that fire only when the edge is consumed.
             outvar = eqn.outvars[0]
-            primal_outvals = eqn.primitive.bind(*invals_snapshot, **eqn.params)
+            primal_outvals = _eval_primal(eqn, invals_snapshot)
             if eqn.primitive.multiple_results:
                 safe_map(write, eqn.outvars, primal_outvals)
             else:
