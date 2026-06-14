@@ -4351,3 +4351,99 @@ def custom_vjp_elemental_only(primal_outs, primals, **params):
 
 
 multi_output_elemental_only_rules[_custom_vjp_call_p] = custom_vjp_elemental_only
+
+
+# ---------- custom_jvp_call: honor the user's forward (jvp) rule ----------
+
+from jax.custom_derivatives import custom_jvp_call_p as _custom_jvp_call_p
+
+
+def _custom_jvp_dense_jacobians(primals, **params):
+    """Build the exact Jacobian of a ``custom_jvp`` call by HONORING the user's
+    jvp rule instead of structurally differentiating the primal (which would
+    disagree with jax at kinks — e.g. relu'(0) is 0 by jax's custom_jvp but 0.5
+    via ``max(x, 0)``). We probe the jvp with one-hot input tangents to read off
+    each COLUMN of the (dense) Jacobian (forward mode is jvp).
+
+    Returns ``elementals[output_idx][invar_idx]`` per the
+    ``multi_output_elemental_only_rules`` contract."""
+    jvp_jaxpr_fun = params["jvp_jaxpr_fun"]
+    num_consts = params["num_consts"]
+    n_args = len(primals) - num_consts
+    args_only = primals[num_consts:]
+
+    # Build the jvp jaxpr assuming every input tangent is present (no symbolic
+    # zeros). It maps (primals..., tangents...) -> (out_primals..., out_tangents).
+    jvp_jaxpr, jvp_consts, out_zeros = jvp_jaxpr_fun.call_wrapped(*([False] * n_args))
+    n_out = len(out_zeros)
+
+    in_shapes = [get_shape(a) for a in args_only]
+    in_sizes = [int(np.prod(s)) if s else 1 for s in in_shapes]
+
+    def _jvp_columns(ai):
+        """For input ``ai``, one out-tangent list (per output) per input element:
+        the response to a one-hot tangent IS that column of the Jacobian."""
+        cols = []
+        for j in range(in_sizes[ai]):
+            tangents = [
+                jnp.zeros(s, dtype=getattr(a, "dtype", jnp.float32))
+                for s, a in zip(in_shapes, args_only)
+            ]
+            tangents[ai] = tangents[ai].reshape(-1).at[j].set(1.0).reshape(in_shapes[ai])
+            out = core.eval_jaxpr(jvp_jaxpr, jvp_consts, *args_only, *tangents)
+            out_primals, nz = out[:n_out], iter(out[n_out:])
+            out_tangents = [
+                jnp.zeros(get_shape(out_primals[li]),
+                          dtype=getattr(out_primals[li], "dtype", jnp.float32))
+                if out_zeros[li] else next(nz)
+                for li in range(n_out)
+            ]
+            cols.append(out_tangents)
+        return cols
+
+    per_input_cols = [_jvp_columns(ai) for ai in range(n_args)]
+    if n_args == 0:                                  # all inputs are constants
+        return [[None] * len(primals) for _ in range(n_out)]
+    # Output shapes = shapes of the probed out-tangents (one per output).
+    out_shapes = [get_shape(per_input_cols[0][0][li]) for li in range(n_out)]
+
+    elementals = []
+    for li in range(n_out):
+        out_shape = out_shapes[li]
+        out_size = len(out_shape)
+        per_invar = [None] * len(primals)
+        for ai in range(n_args):
+            cols = [per_input_cols[ai][j][li] for j in range(in_sizes[ai])]
+            # Each column has out_shape; stack along a trailing input axis.
+            J = jnp.stack(
+                [jnp.asarray(c).reshape(-1) for c in cols], axis=-1
+            ).reshape(tuple(out_shape) + tuple(in_shapes[ai]))
+            out_dims = [DenseIndex(k, s, k) for k, s in enumerate(out_shape)]
+            primal_dims = [
+                DenseIndex(out_size + k, s, out_size + k)
+                for k, s in enumerate(in_shapes[ai])
+            ]
+            per_invar[num_consts + ai] = SparseTensor(out_dims, primal_dims, J)
+        elementals.append(per_invar)
+    return elementals
+
+
+def custom_jvp_elemental_only(primal_outs, primals, **params):
+    """Multi-output elemental rule for ``custom_jvp_call`` honoring the jvp rule.
+
+    ``custom_jvp_call_p`` is always ``multiple_results``. Any reconstruction
+    failure (e.g. ``symbolic_zeros=True`` or an exotic structure) is raised
+    loudly rather than silently differentiating the primal decomposition."""
+    try:
+        return _custom_jvp_dense_jacobians(primals, **params)
+    except NotImplementedError:
+        raise
+    except Exception as e:
+        raise NotImplementedError(
+            "graphax could not honor this custom_jvp rule "
+            f"({type(e).__name__}: {e}). custom_jvp with symbolic_zeros or an "
+            "unusual structure is not yet supported."
+        ) from e
+
+
+multi_output_elemental_only_rules[_custom_jvp_call_p] = custom_jvp_elemental_only

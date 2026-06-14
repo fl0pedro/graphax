@@ -187,21 +187,17 @@ def _inline_call_primitives(jaxpr, consts):
     new_consts = list(consts)
 
     def _call_body(eqn):
-        """The closed inner jaxpr for jit/pjit or custom_jvp_call, else None.
+        """The closed inner jaxpr for jit/pjit, else None.
 
-        custom_jvp ignores its bespoke tangent rule and differentiates the primal
-        decomposition (call_jaxpr) — correct where the body is differentiable
-        (softplus = log1p(exp(x)), etc.) since a custom_jvp's tangent must agree
-        with the primal's derivative. custom_vjp is deliberately NOT inlined: its
-        ``bwd`` rule may differ from the primal derivative (straight-through /
-        surrogate gradients), so it is handled by a dedicated elemental rule that
-        honors ``bwd`` (see ``custom_vjp_elemental_only`` in primitives/auto.py)."""
+        custom_jvp / custom_vjp are deliberately NOT inlined: their bespoke
+        jvp/bwd rules can differ from the primal decomposition's derivative
+        (kink subgradients, straight-through / surrogate gradients), so each is
+        handled by a dedicated elemental rule that HONORS the user rule (see
+        ``custom_jvp_elemental_only`` / ``custom_vjp_elemental_only`` in
+        primitives/auto.py). Inlining the primal would silently ignore the rule
+        and disagree with jax (e.g. relu'(0): jax says 0, max(x,0) says 0.5)."""
         if eqn.primitive is jit_p:
             return eqn.params["jaxpr"]
-        name = getattr(eqn.primitive, "name", "")
-        if name == "custom_jvp_call":
-            cj = eqn.params.get("call_jaxpr") or eqn.params.get("fun_jaxpr")
-            return cj
         return None
 
     def process(eqns, env, fresh):
@@ -983,12 +979,13 @@ def _checkify_order(
 def _eval_primal(eqn, invals):
     """Compute an equation's primal output value(s).
 
-    Most primitives bind directly. ``custom_vjp_call_p`` cannot be re-bound from
-    ``eqn.params`` (its sub-functions live in a ``subfuns`` slot the generic bind
-    pops), so we evaluate its primal ``call_jaxpr`` instead — the gradient is
-    supplied separately by the bwd-honoring elemental rule."""
+    Most primitives bind directly. ``custom_jvp_call_p`` / ``custom_vjp_call_p``
+    cannot be re-bound from ``eqn.params`` (their sub-functions live in a
+    ``subfuns`` slot the generic bind pops), so we evaluate the primal
+    ``call_jaxpr`` instead — the gradient is supplied separately by the
+    jvp/bwd-honoring elemental rules."""
     name = getattr(eqn.primitive, "name", "")
-    if name == "custom_vjp_call":
+    if name in ("custom_jvp_call", "custom_vjp_call"):
         cj = eqn.params["call_jaxpr"]
         return core.eval_jaxpr(cj.jaxpr, cj.consts, *invals)
     return eqn.primitive.bind(*invals, **eqn.params)
