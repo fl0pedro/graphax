@@ -352,7 +352,10 @@ defelemental(lax.atan2_p, atan2_elemental_rule)
 
 @with_type_promotion
 def max_elemental_rule(x, y, **kwargs):
-    return (x < y, x >= y)
+    # Balanced subgradient at a tie (x == y): split 0.5/0.5, matching JAX's
+    # _balanced_eq. The old (x<y, x>=y) sent the whole gradient to y at ties.
+    eq = (x == y).astype(x.dtype) * 0.5
+    return ((x > y).astype(x.dtype) + eq, (y > x).astype(x.dtype) + eq)
 
 
 defelemental(lax.max_p, max_elemental_rule)
@@ -360,7 +363,8 @@ defelemental(lax.max_p, max_elemental_rule)
 
 @with_type_promotion
 def min_elemental_rule(x, y, **kwargs):
-    return (x < y, x <= y)
+    eq = (x == y).astype(x.dtype) * 0.5
+    return ((x < y).astype(x.dtype) + eq, (y < x).astype(x.dtype) + eq)
 
 
 defelemental(lax.min_p, min_elemental_rule)
@@ -384,8 +388,12 @@ defelemental(lax.ge_p, eq_elemental_rule)
 def clamp_elemental_rule(lo, x, hi):
     # clamp = max(lo, min(x, hi)): gradient flows to whichever bound is active —
     # lo where x<lo, hi where x>hi, else x. (Was hard-zero for lo/hi.)
-    in_range = ((x >= lo) & (x <= hi)).astype(x.dtype)
-    return ((x < lo).astype(x.dtype), in_range, (x > hi).astype(x.dtype))
+    # asarray guards scalar/Literal bounds: ``lax.clamp(0.0, x, 1.0)`` makes the
+    # comparisons Python bools otherwise, which lack ``.astype``.
+    x = jnp.asarray(x); lo = jnp.asarray(lo); hi = jnp.asarray(hi)
+    dt = x.dtype
+    in_range = ((x >= lo) & (x <= hi)).astype(dt)
+    return ((x < lo).astype(dt), in_range, (x > hi).astype(dt))
 
 
 defelemental(lax.clamp_p, clamp_elemental_rule)
@@ -489,7 +497,11 @@ elemental_rules[lax.select_n_p] = select_elemental_rule
 
 @with_type_promotion
 def pow_elemental_rule(out, x, y):
-    return (y * x ** (y - 1), jnp.log(x) * out)
+    # d/dy = log(x)*x^y. At x==0 the true derivative is 0, but log(0)*out is
+    # 0*(-inf)=NaN; guard with a safe log. (x<0 stays NaN, matching JAX.)
+    safe_x = jnp.where(x == 0, jnp.ones_like(x), x)
+    dy = jnp.where(x == 0, jnp.zeros_like(out), jnp.log(safe_x) * out)
+    return (y * x ** (y - 1), dy)
 
 
 defelemental2(lax.pow_p, pow_elemental_rule)
@@ -1975,26 +1987,31 @@ elemental_rules[lax.gather_p] = gather_elemental_rule
 
 
 def _update_to_output_index(up_idx, indices, dn, operand_ndim, up_ndim):
+    """Map an update-array multi-index to the operand position it writes to.
+
+    XLA scatter places each window at ``start + window_offset``: the start comes
+    from the scatter index vector (selected by the update's non-window dims) and
+    the offset from the update's window dims. The previous version set
+    out_idx = start OR offset (never both) and skipped the start entirely when
+    every update dim was a window dim (a slice scatter, e.g. ``x.at[1:2].max(u)``),
+    so the whole Jacobian was mis-placed at offset 0 instead of the slice start."""
     update_window_dims = dn.update_window_dims
     inserted_window_dims = dn.inserted_window_dims
     scatter_dims_to_operand_dims = dn.scatter_dims_to_operand_dims
 
+    # The update's non-window dims select WHICH window (its index vector).
     scatter_dims = [d for d in range(up_ndim) if d not in update_window_dims]
+    scatter_idx = tuple(up_idx[d] for d in scatter_dims)
+    idx_vec = jnp.reshape(indices[scatter_idx], (-1,))
+
     out_idx = [0] * operand_ndim
-
-    if len(scatter_dims) > 0:
-        scatter_idx = tuple(up_idx[d] for d in scatter_dims)
-        idx_val = indices[scatter_idx]
-        if hasattr(idx_val, "ndim") and idx_val.ndim == 0:
-            idx_val = idx_val.reshape(1)
-        for k, op_dim in enumerate(scatter_dims_to_operand_dims):
-            out_idx[op_dim] = (
-                int(idx_val[k]) if hasattr(idx_val, "__getitem__") else int(idx_val)
-            )
-
+    # Base: scatter start for each operand dim named by scatter_dims_to_operand_dims.
+    for k, op_dim in enumerate(scatter_dims_to_operand_dims):
+        out_idx[op_dim] = int(idx_vec[k])
+    # Offset: add each window dim's position within the window.
     non_inserted = [d for d in range(operand_ndim) if d not in inserted_window_dims]
     for w_i, w_dim in enumerate(update_window_dims):
-        out_idx[non_inserted[w_i]] = up_idx[w_dim]
+        out_idx[non_inserted[w_i]] += int(up_idx[w_dim])
 
     return tuple(out_idx)
 
@@ -2197,6 +2214,17 @@ def scatter_mul_elemental_rule(primals, **params):
 elemental_rules[lax.scatter_mul_p] = scatter_mul_elemental_rule
 
 
+def _min_tie_split(a, b):
+    """Subgradient weight for ``a`` in ``min(a, b)``: 1 if a<b, 0.5 if a==b
+    (balanced, matching JAX), 0 if a>b."""
+    return 1.0 if a < b else (0.5 if a == b else 0.0)
+
+
+def _max_tie_split(a, b):
+    """Subgradient weight for ``a`` in ``max(a, b)``: 1 if a>b, 0.5 if a==b, 0."""
+    return 1.0 if a > b else (0.5 if a == b else 0.0)
+
+
 def scatter_min_elemental_rule(primals, **params):
     val_out = lax.scatter_min_p.bind(*primals, **params)
     operand, indices, updates = primals[0], primals[1], primals[2]
@@ -2216,8 +2244,11 @@ def scatter_min_elemental_rule(primals, **params):
         out_idx = _update_to_output_index(
             up_idx, indices, dn, len(out_shape), len(up_shape)
         )
-        indicator = float(operand[out_idx] <= updates[up_idx])
-        op_coeff = op_coeff.at[out_idx].set(indicator)
+        # Balanced subgradient at a tie (operand == update): 0.5 to each side,
+        # matching JAX. Was operand<=update -> 1.0 (operand took all the credit).
+        op_coeff = op_coeff.at[out_idx].set(
+            _min_tie_split(operand[out_idx], updates[up_idx])
+        )
 
     op_out_dims = [DiagonalIndex(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
     op_primal_dims = [
@@ -2225,14 +2256,14 @@ def scatter_min_elemental_rule(primals, **params):
     ]
     op_tensor = SparseTensor(op_out_dims, op_primal_dims, op_coeff)
 
-    # d/d(updates): 1 where updates < operand at scattered positions
+    # d/d(updates): 1 where updates < operand, 0.5 at a tie
     jac_shape = list(out_shape) + list(up_shape)
     jac = jnp.zeros(jac_shape, dtype=jnp.float32)
     for up_idx in itertools.product(*(range(s) for s in up_shape)):
         out_idx = _update_to_output_index(
             up_idx, indices, dn, len(out_shape), len(up_shape)
         )
-        indicator = float(updates[up_idx] < operand[out_idx])
+        indicator = _min_tie_split(updates[up_idx], operand[out_idx])
         full_idx = tuple(out_idx) + tuple(up_idx)
         jac = jac.at[full_idx].set(indicator)
 
@@ -2270,8 +2301,11 @@ def scatter_max_elemental_rule(primals, **params):
         out_idx = _update_to_output_index(
             up_idx, indices, dn, len(out_shape), len(up_shape)
         )
-        indicator = float(operand[out_idx] >= updates[up_idx])
-        op_coeff = op_coeff.at[out_idx].set(indicator)
+        # Balanced subgradient at a tie (operand == update): 0.5 each (was 1.0
+        # operand / 0.0 update).
+        op_coeff = op_coeff.at[out_idx].set(
+            _max_tie_split(operand[out_idx], updates[up_idx])
+        )
 
     op_out_dims = [DiagonalIndex(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
     op_primal_dims = [
@@ -2279,14 +2313,14 @@ def scatter_max_elemental_rule(primals, **params):
     ]
     op_tensor = SparseTensor(op_out_dims, op_primal_dims, op_coeff)
 
-    # d/d(updates): 1 where updates > operand at scattered positions
+    # d/d(updates): 1 where updates > operand, 0.5 at a tie
     jac_shape = list(out_shape) + list(up_shape)
     jac = jnp.zeros(jac_shape, dtype=jnp.float32)
     for up_idx in itertools.product(*(range(s) for s in up_shape)):
         out_idx = _update_to_output_index(
             up_idx, indices, dn, len(out_shape), len(up_shape)
         )
-        indicator = float(updates[up_idx] > operand[out_idx])
+        indicator = _max_tie_split(updates[up_idx], operand[out_idx])
         full_idx = tuple(out_idx) + tuple(up_idx)
         jac = jac.at[full_idx].set(indicator)
 

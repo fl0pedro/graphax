@@ -457,6 +457,25 @@ def test_scatter_updates(name, sf):  # was BUG_SCATTER_UPDATES: dropped at slot 
                                      zip(jax.random.split(k), [(5,), (3,)])), n=3)
 
 
+_O1 = jnp.array([5.0, 2.0, 3.0, 7.0])
+_U1 = jnp.array([2.0, 4.0])           # u[0]==o[1] -> a tie for max/min
+_O2 = jnp.arange(12.0).reshape(3, 4)
+
+
+@pytest.mark.parametrize("op,args", [
+    (lambda o, u: o.at[1:3].max(u), (_O1, _U1)),
+    (lambda o, u: o.at[1:3].min(u), (_O1, _U1)),
+    (lambda o, u: o.at[1:3].add(u), (_O1, _U1)),
+    (lambda o, u: o.at[1:3].set(u), (_O1, _U1)),
+    (lambda o, u: o.at[0:2, 1:3].max(u), (_O2, jnp.ones((2, 2)))),
+], ids=["max", "min", "add", "set", "max2d"])
+def test_scatter_slice(op, args):
+    # Slice scatters (window-dim dimension_numbers) — _update_to_output_index
+    # used to drop the scatter start, mis-placing the whole Jacobian at offset 0.
+    # max/min also exercise the balanced 0.5/0.5 tie convention.
+    check(op, (0, 1), lambda k: args, n=1)
+
+
 @pytest.mark.parametrize("shape,ax", [((1, 4, 5), 0), ((4, 1, 5), 1), ((4, 5, 1), 2),
                                        ((1, 1, 5), (0, 1))], ids=["ax0", "ax1", "ax2", "ax01"])
 def test_squeeze_carrying_jacobian(shape, ax):  # was BUG_SQUEEZE_IDS (inverse-transform axis/id)

@@ -90,7 +90,10 @@ defelemental(lax.atan2_p, atan2_elemental_rule)
 
 @with_type_promotion
 def max_elemental_rule(x, y):
-    return (x >= y, x < y)
+    # Balanced subgradient at a tie (x == y): 0.5/0.5, matching JAX. The old
+    # (x>=y, x<y) sent the whole gradient to x at ties.
+    eq = (x == y).astype(x.dtype) * 0.5
+    return ((x > y).astype(x.dtype) + eq, (y > x).astype(x.dtype) + eq)
 
 
 defelemental(lax.max_p, max_elemental_rule)
@@ -98,7 +101,8 @@ defelemental(lax.max_p, max_elemental_rule)
 
 @with_type_promotion
 def min_elemental_rule(x, y):
-    return (jnp.where(x < y, 1, 0), jnp.where(x < y, 0, 1))
+    eq = (x == y).astype(x.dtype) * 0.5
+    return ((x < y).astype(x.dtype) + eq, (y < x).astype(x.dtype) + eq)
 
 
 defelemental(lax.min_p, min_elemental_rule)
@@ -116,7 +120,10 @@ defelemental(lax.lt_p, eq_elemental_rule)
 
 @with_type_promotion
 def pow_elemental_rule(out, x, y):
-    return (y * x ** (y - 1), jnp.log(x) * out)
+    # d/dy = log(x)*x^y; at x==0 the true derivative is 0 but log(0)*out is NaN.
+    safe_x = jnp.where(x == 0, jnp.ones_like(x), x)
+    dy = jnp.where(x == 0, jnp.zeros_like(out), jnp.log(safe_x) * out)
+    return (y * x ** (y - 1), dy)
 
 
 defelemental2(lax.pow_p, pow_elemental_rule)
