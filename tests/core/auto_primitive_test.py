@@ -475,6 +475,28 @@ def test_slice():
     check(lambda x: jnp.sin(x[1:5]), (0,), lambda k: (randn(k, (8,)),))
 
 
+@pytest.mark.parametrize("start,limit,stride", [(0, 8, 2), (1, 8, 2), (0, 9, 3), (2, 8, 1)],
+                         ids=["s2", "s2off", "s3", "s1"])
+def test_slice_strided(start, limit, stride):
+    # strides were ignored -> the Jacobian selected contiguous rows. The inverse
+    # (fwd order) embeds via interior padding.
+    check(lambda x: lax.slice(jnp.sin(x), (start,), (limit,), (stride,)), (0,),
+          lambda k: (randn(k, (9,)),))
+
+
+def test_concat_float64():
+    # concatenate hardcoded float32 eye/zeros -> lax.scatter dtype crash on f64.
+    jax.config.update("jax_enable_x64", True)
+    try:
+        x = jnp.linspace(0.1, 0.3, 3).astype(jnp.float64)
+        f = lambda z: jnp.concatenate([jnp.sin(z), jnp.cos(z)])
+        ref = jax.jacrev(f, (0,))(x)
+        for m in ("fwd", "rev"):
+            assert tree_allclose(jacve(f, m, (0,))(x), ref, rtol=1e-9, atol=1e-9)
+    finally:
+        jax.config.update("jax_enable_x64", False)
+
+
 # =========================================================================== #
 # 8. Scatter — updates-direction Jacobian currently dropped
 # =========================================================================== #

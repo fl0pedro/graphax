@@ -68,7 +68,7 @@ def _is_scalar_identity_post(post) -> bool:
     )
 
 
-def _identity_post_over(post, out_shape):
+def _identity_post_over(post, out_shape, dtype=jnp.float32):
     """Re-expand a bare scalar-identity ``post`` (see ``_is_scalar_identity_post``)
     into the explicit dense identity Jacobian ``s * I`` over ``out_shape`` —
     ``out_dims`` and ``primal_dims`` both equal ``out_shape`` and ``val`` is the
@@ -83,7 +83,7 @@ def _identity_post_over(post, out_shape):
     n = 1
     for s in out_shape:
         n *= s
-    eye = jnp.eye(n, dtype=jnp.float32)
+    eye = jnp.eye(n, dtype=dtype)
     scalar = post.scalar_mult
     if scalar is not None:
         eye = eye * scalar
@@ -256,6 +256,8 @@ def _slice_elementals(primals, val_out, **params):
     def slice_transform(pre):
         start_indices = list(params["start_indices"])
         limit_indices = list(params["limit_indices"])
+        strides = params.get("strides")
+        strides = [1] * len(start_indices) if strides is None else list(strides)
         full_val = pre.dense()
         new_out_dims = []
         new_primal_dims = []
@@ -269,46 +271,52 @@ def _slice_elementals(primals, val_out, **params):
             new_primal_dims.append(DenseIndex(counter, d.size, counter))
             start_indices.append(0)
             limit_indices.append(d.size)
+            strides.append(1)  # primal dims are not sliced
             counter += 1
 
-        new_val = lax.slice(full_val, start_indices, limit_indices)
+        new_val = lax.slice(full_val, start_indices, limit_indices, strides)
         return SparseTensor(new_out_dims, new_primal_dims, new_val)
 
     def inverse_slice_transform(post):
         start_indices = list(params["start_indices"])
-        limit_indices = list(params["limit_indices"])
+        strides = params.get("strides")
+        strides = [1] * len(start_indices) if strides is None else list(strides)
         # In 'fwd' elimination order this inverse can be drained against the bare
         # identity output-seed (no out/primal dims, val=None). Re-expand that seed
         # into the explicit identity Jacobian over the slice's OUTPUT shape so the
-        # scatter logic below — which assumes post.dense() is (out..., slice_out...)
+        # embedding below — which assumes post.dense() is (out..., slice_out...)
         # with the slice-output dims trailing — runs exactly as in 'rev' order.
         if _is_scalar_identity_post(post):
-            post = _identity_post_over(post, val_out.shape)
+            post = _identity_post_over(post, val_out.shape, val_out.dtype)
         full_val = post.dense()
-        new_shape = []
         new_out_dims = []
         new_primal_dims = []
         counter = 0
 
+        # The transpose of a (possibly strided) slice is a pad: each slice-output
+        # element gradient lands at input position ``start + k*stride``, i.e. low
+        # pad = start and interior pad = stride-1. (The old version used a
+        # contiguous scatter that ignored ``strides`` AND hardcoded the input
+        # dtype via jnp.zeros, mis-placing strided slices and crashing on f64.)
+        pad_config = []
         for d in post.out_dims:
             new_out_dims.append(DenseIndex(counter, d.size, counter))
-            new_shape.append(d.size)
-            counter += 1
-        scatter_zeros = jnp.zeros(counter, dtype=jnp.int32)
-
-        for s in primals[0].shape:
-            new_primal_dims.append(DenseIndex(counter, s, counter))
-            new_shape.append(s)
+            pad_config.append((0, 0, 0))
             counter += 1
 
-        zeros = jnp.zeros(new_shape)
-        dims = tuple(range(zeros.ndim))
-        scatter_dims = lax.ScatterDimensionNumbers(dims, (), dims)
-        _scatter_indices = jnp.array(start_indices, dtype=jnp.int32)
-        scatter_indices = jnp.concatenate([scatter_zeros, _scatter_indices])
+        in_shape = primals[0].shape
+        slice_out_sizes = full_val.shape[len(post.out_dims):]
+        for ax, L in enumerate(in_shape):
+            new_primal_dims.append(DenseIndex(counter, L, counter))
+            n = slice_out_sizes[ax]
+            st, stride = start_indices[ax], strides[ax]
+            high = L - st - (n - 1) * stride - 1
+            pad_config.append((st, high, stride - 1))
+            counter += 1
 
-        new_val = lax.scatter(zeros, scatter_indices, full_val, scatter_dims)
-
+        new_val = lax.pad(
+            full_val, jnp.array(0.0, dtype=full_val.dtype), pad_config
+        )
         return SparseTensor(new_out_dims, new_primal_dims, new_val)
 
     transform = JacobianTransform(slice_transform, inverse_slice_transform)
@@ -616,7 +624,7 @@ def _concatenate_elementals(primals, val_out, **params):
                 # Materialize the sparse dimensions related to the concatenation dimension
                 new_val = _materialize_indexes(pre, [d.id])
 
-                sub_iota = jnp.eye(d.size, dtype=jnp.float32)
+                sub_iota = jnp.eye(d.size, dtype=new_val.dtype)
 
                 shape = [1 for _ in range(pre.val.ndim)]
                 shape[_d.axis] = _d.size
@@ -625,12 +633,14 @@ def _concatenate_elementals(primals, val_out, **params):
 
                 new_val = new_val * sub_iota
 
-                # Make zeros for insertion
+                # Make zeros for insertion (match new_val's dtype: the scatter below
+                # requires identical operand/update dtypes — was hardcoded float32,
+                # crashing under jax_enable_x64 / non-float32 Jacobian vals).
                 _size = val_out.shape[dim]
                 _shape = list(new_val.shape)
                 _shape[d.axis] = _size
                 _shape[axis] = d.size
-                zeros = jnp.zeros(_shape, dtype=jnp.float32)
+                zeros = jnp.zeros(_shape, dtype=new_val.dtype)
 
                 # scatter_indices: where in `zeros` to place `new_val`
                 scatter_indices = [0 for _ in _shape]
@@ -682,7 +692,7 @@ def _concatenate_elementals(primals, val_out, **params):
                 else:
                     new_val = pre.val
 
-                sub_iota = jnp.eye(d.size, dtype=jnp.float32)
+                sub_iota = jnp.eye(d.size, dtype=new_val.dtype)
 
                 shape = [1 for _ in range(pre.val.ndim)]
                 shape.insert(out_axis, _d.size)
@@ -690,11 +700,11 @@ def _concatenate_elementals(primals, val_out, **params):
 
                 new_val = new_val * sub_iota
 
-                # Make zeros for insertion
+                # Make zeros for insertion (dtype must match new_val for the scatter)
                 _shape = list(pre.val.shape)
                 _shape.insert(out_axis, _size)
                 _shape.insert(primal_axis, _d.size)
-                zeros = jnp.zeros(_shape, dtype=jnp.float32)
+                zeros = jnp.zeros(_shape, dtype=new_val.dtype)
 
                 scatter_dims = lax.ScatterDimensionNumbers(
                     (out_axis, primal_axis), (), (out_axis, primal_axis)
@@ -730,7 +740,7 @@ def _concatenate_elementals(primals, val_out, **params):
         # the regular slicing branch extracts this slot's embedding block exactly
         # as in 'rev' order, instead of returning the structureless scalar.
         if _is_scalar_identity_post(post):
-            post = _identity_post_over(post, val_out.shape)
+            post = _identity_post_over(post, val_out.shape, val_out.dtype)
         new_out_dims = list(copy.deepcopy(post.out_dims))
         new_primal_dims = list(copy.deepcopy(post.primal_dims))
 
@@ -775,7 +785,7 @@ def _concatenate_elementals(primals, val_out, **params):
                 # Materialize the sparse dimensions related to the concatenation dimension
                 new_val = _materialize_indexes(post, [d.id])
 
-                sub_iota = jnp.eye(d.size, dtype=jnp.float32)
+                sub_iota = jnp.eye(d.size, dtype=new_val.dtype)
 
                 shape = [1 for _ in range(post.val.ndim)]
                 shape[_d.axis] = _d.size
@@ -834,13 +844,14 @@ def _concatenate_elementals(primals, val_out, **params):
                         )
 
                 # Build the column slice of identity: shape (_d.size, size).
-                sub_iota = jnp.eye(_d.size, dtype=jnp.float32)
+                _dt = post.val.dtype if post.val is not None else jnp.float32
+                sub_iota = jnp.eye(_d.size, dtype=_dt)
                 sub_iota = lax.slice_in_dim(sub_iota, s, e, axis=1)
 
                 base_val = (
                     post.val
                     if post.val is not None
-                    else jnp.array(1.0, dtype=jnp.float32)
+                    else jnp.array(1.0, dtype=_dt)
                 )
                 new_val = jnp.expand_dims(base_val, axis=out_axis)
                 new_val = jnp.expand_dims(new_val, axis=primal_axis)
