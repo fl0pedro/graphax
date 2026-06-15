@@ -1234,110 +1234,6 @@ class JacobianTransform:
         return self.inverse_transform(tensor)
 
 
-def _inverse_permutation(permutation):
-    inverse = [0] * len(permutation)
-    for i, p in enumerate(permutation):
-        inverse[p] = i
-    return inverse
-
-
-from collections import defaultdict
-
-from jax._src.util import safe_map
-
-# Proper pjit and custom grad implementation only possible with a proper tracing system
-
-
-def _trace_subjaxpr(jaxpr, args, consts):
-    env = {}  # env stores the primal value associated with the core.Var object
-
-    graph = defaultdict(lambda: defaultdict())  # Input connectivity
-    transpose_graph = defaultdict(lambda: defaultdict())  # Output connectivity
-
-    vo_vertices = set()  # contains all intermediate and output vertices
-    counter = 1  # vertex id counter
-    var_id = {}  # associates every application of a JaxprEqn with a unique integer
-    # identifier that is later used when using the vertex elimination order.
-    # NOTE: This only works well if the output is a single value.
-    # It is ill-defined when having functions with more than one output!.
-
-    # Reads variable and corresponding traced shaped array
-    def read(var):
-        if isinstance(var, core.Literal):
-            return var.val
-        return env[var]
-
-    # Adds new variable and corresponding traced shaped array
-    def write(var, val):
-        env[var] = val
-
-    # Writes a new elemental partial to the graph and transpose_graph
-    def write_elemental(outvar, invar, val):
-        # _checkify_tensor(val)
-        if isinstance(invar, core.Var):
-            graph[invar][outvar] = val
-            transpose_graph[outvar][invar] = val
-
-    safe_map(write, jaxpr.invars, args)
-    safe_map(write, jaxpr.constvars, consts)
-
-    # NOTE: this is essentially the tracing part. Probably should write a proper
-    # tracing system with lift etc. for better compatibility with JAX
-    # Loop though elemental partials and create an abstract representation of
-    # the computational graph
-    for eqn in jaxpr.eqns:
-        # Treatment of intermediate variables that are also output variables
-        for outvar in eqn.outvars:
-            if isinstance(outvar, core.Var) and outvar not in var_id.keys():
-                var_id[outvar] = counter
-                counter += 1
-
-        for invar in eqn.invars:
-            if invar in jaxpr._outvars:
-                vertex = var_id[invar]
-                vo_vertices.add(vertex)
-
-        # print("eqn:", eqn)
-        # print("invars", eqn.invars)
-        # print("outvars", eqn.outvars)
-        invals = safe_map(read, eqn.invars)
-
-        if eqn.primitive not in elemental_rules:
-            raise NotImplementedError(
-                f"{eqn.primitive} does not have registered elemental partial."
-            )
-        cce = elemental_rules.get(eqn.primitive)
-        primal_outvals, elemental_outvals = cce(invals, **eqn.params)
-        if eqn.primitive.multiple_results:
-            safe_map(write, eqn.outvars, primal_outvals)
-        else:
-            safe_map(write, eqn.outvars, [primal_outvals])
-        invars = [invar for invar in eqn.invars if isinstance(invar, core.Var)]
-        # NOTE: Currently only able to treat one output variable
-
-        if len(invars) == len(elemental_outvals):
-            for i, invar in enumerate(invars):
-                write_elemental(eqn.outvars[0], invar, elemental_outvals[i])
-
-    return eqn.outvars, graph, transpose_graph, vo_vertices
-
-
-def _subjaxpr_dfs_traverse(jaxpr):
-    stack = [jaxpr]
-    res = []
-    while stack:
-        jaxpr = stack.pop()
-        res.append(jaxpr)
-        for eqn in jaxpr.eqns:
-            if "jaxpr" in eqn.params:
-                jaxpr = eqn.params["jaxpr"]
-                stack.append(jaxpr)
-    return res
-
-
-# use this in reverse [::-1] if you want to traverse w/o dependency issues
-
-
 def make_slice_transform(start_indices, limit_indices, out_shape):
     def slice_transform(pre):
         s_idx = list(start_indices)
@@ -2167,10 +2063,6 @@ elemental_rules[all_to_all_p] = all_to_all_elemental_rule
 # Matrix decompositions and linear solvers
 # ============================================================================
 import jax._src.lax.linalg as lax_linalg
-
-
-def _batch_diag(x):
-    return jnp.diagonal(x, axis1=-2, axis2=-1)
 
 
 # triangular_solve: (A, b) -> x where Ax = b (with A triangular)
