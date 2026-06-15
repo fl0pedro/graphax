@@ -1188,6 +1188,20 @@ def reduce_window_elemental_rule(primals, **params):
 
 elemental_rules[lax.reduce_window_p] = reduce_window_elemental_rule
 
+
+# Max/min pooling (reduce_window with a max/min reducer) is not yet supported —
+# fail loudly rather than crash with a generic "no elemental partial" message.
+# Only reduce_window with the SUM reducer (average pooling) is implemented.
+def _reduce_window_extremum_unsupported(primals, **params):
+    raise NotImplementedError(
+        "graphax does not yet support max/min pooling (reduce_window with a "
+        "max/min reducer); only the sum reducer (average pooling) is implemented."
+    )
+
+
+elemental_rules[lax.reduce_window_max_p] = _reduce_window_extremum_unsupported
+elemental_rules[lax.reduce_window_min_p] = _reduce_window_extremum_unsupported
+
 ### Transforms
 
 Transform = Callable[[SparseTensor, SparseTensor, jnp.ndarray], SparseTensor]
@@ -2409,6 +2423,17 @@ def svd_elemental_rule(primals, **params):
     val_out = lax_linalg.svd_p.bind(*primals, **params)
     A = primals[0]
     compute_uv = params.get("compute_uv", True)
+
+    # Only the SINGULAR-VALUE gradient is correct. The singular-VECTOR (U / Vt)
+    # Jacobians here disagree with jax (gauge ambiguity / wrong formula), so the
+    # full-uv path fails loudly rather than returning a wrong gradient. Use
+    # ``jnp.linalg.svd(a, compute_uv=False)`` for singular-value gradients.
+    if compute_uv:
+        raise NotImplementedError(
+            "graphax supports gradients of svd singular VALUES only. Differentiate "
+            "jnp.linalg.svd(a, compute_uv=False); singular-vector (U/Vt) gradients "
+            "are not yet correct."
+        )
 
     A_shape = list(get_shape(A))
     M, N = A_shape[-2], A_shape[-1]
