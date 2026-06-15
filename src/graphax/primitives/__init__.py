@@ -6,10 +6,11 @@ from .base import (
     jit_name_rules,
 )
 
-# Import submodules to trigger elemental rule registrations. These are all
-# non-overlapping primitives, so any order after `base` is fine — except that
-# transforms must come before indexing (which imports JacobianTransform from it)
-# and before passthrough (which imports _slice_elementals from it).
+# Import submodules to trigger elemental rule registrations. Each module owns a
+# DISJOINT set of primitives, so the listing order does not affect which rule
+# wins (no overwrites). Cross-module imports (e.g. indexing -> transforms for
+# JacobianTransform) are resolved by Python's import machinery on demand and do
+# NOT depend on this order — there are no import cycles among these modules.
 from . import math
 from . import linalg
 from . import reductions

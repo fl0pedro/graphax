@@ -87,7 +87,7 @@ def _reduce_sum_elementals(primals, val_out_ndim, **params):
         axes = (axes,)
 
     l = val_out_ndim
-    base = 1 if reduce_all else l  # contiguous ids; see _reduce_max_elementals
+    base = 1 if reduce_all else l  # contiguous ids; see _reduce_extremum_elementals
     count = 0
     for i, size in enumerate(get_shape(primal)):
         if i in axes:
@@ -116,9 +116,16 @@ elemental_rules[lax.reduce_sum_p] = reduce_sum_elemental_rule
 elemental_only_rules[lax.reduce_sum_p] = reduce_sum_elemental_only
 
 
-# ---------- reduce_max ----------
+# ---------- reduce_max / reduce_min ----------
 
-def _reduce_max_elementals(primals, val_out, **params):
+def _reduce_extremum_elementals(primals, val_out, **params):
+    """Shared elemental for BOTH reduce_max and reduce_min.
+
+    The subgradient is the indicator of the positions that achieved the extremum
+    — ``primal == val_out`` — normalized so a non-unique extremum splits the
+    gradient equally across the ties. This is identical for max and min because
+    ``val_out`` already IS the achieved extremum, so equality selects the
+    argmax / argmin positions either way."""
     primal = primals[0]
     axes = params["axes"]
     shape = list(get_shape(val_out))
@@ -147,72 +154,36 @@ def _reduce_max_elementals(primals, val_out, **params):
             new_out_dims.append(DiagonalIndex(ll, size, i, l + i))
             new_primal_dims.append(DiagonalIndex(l + i, size, i, ll))
 
+    # Reshape val_out with size-1 at reduced axes so the equality broadcasts
+    # against the full-shape primal.
     _val_out = val_out.reshape(shape)
     new_val = jnp.where(primal == _val_out, 1, 0)
-    # NOTE: Normalization is important if the maximum is not unique
+    # NOTE: Normalization is important if the extremum is not unique (ties split).
     norm = jnp.sum(new_val, axis=axes, keepdims=True)
     new_val = new_val / norm
-
     return [_swap_back_axes(SparseTensor(new_out_dims, new_primal_dims, new_val))]
 
 
 def reduce_max_elemental_rule(primals, **params):
     val_out = lax.reduce_max_p.bind(*primals, **params)
-    return val_out, _reduce_max_elementals(primals, val_out, **params)
+    return val_out, _reduce_extremum_elementals(primals, val_out, **params)
 
 
 def reduce_max_elemental_only(primal_out, primals, **params):
-    return _reduce_max_elementals(primals, primal_out, **params)
+    return _reduce_extremum_elementals(primals, primal_out, **params)
 
 
 elemental_rules[lax.reduce_max_p] = reduce_max_elemental_rule
 elemental_only_rules[lax.reduce_max_p] = reduce_max_elemental_only
 
 
-# ---------- reduce_min ----------
-
-def _reduce_min_elementals(primals, val_out, **params):
-    primal = primals[0]
-    axes = params["axes"]
-    shape = list(get_shape(val_out))
-
-    new_out_dims, new_primal_dims, _shape = [], [], []
-    reduce_all = axes is None
-    if reduce_all:
-        axes = tuple(range(primal.ndim))
-        new_out_dims.append(DenseIndex(0, 1, 0, True))
-    elif isinstance(axes, int):
-        axes = (axes,)
-
-    l = get_ndim(val_out)
-    base = 1 if reduce_all else l   # contiguous ids; see _reduce_max_elementals
-    for i, size in enumerate(get_shape(primal)):
-        if i in axes:
-            shape.insert(i, 1)
-            new_primal_dims.append(DenseIndex(base + i, size, i))
-            _shape.append(size)
-        else:
-            ll = len(new_out_dims)
-            new_out_dims.append(DiagonalIndex(ll, size, i, l + i))
-            new_primal_dims.append(DiagonalIndex(l + i, size, i, ll))
-
-    # Reshape val_out with size-1 at reduced axes so the equality broadcasts
-    # against the full-shape primal (reduce_max had this; reduce_min lacked it).
-    _val_out = val_out.reshape(shape)
-    new_val = jnp.where(primal == _val_out, 1, 0)
-    # NOTE: Normalization is important if the minimum is not unique
-    norm = jnp.sum(new_val, axis=axes, keepdims=True)
-    new_val = new_val / norm
-    return [_swap_back_axes(SparseTensor(new_out_dims, new_primal_dims, new_val))]
-
-
 def reduce_min_elemental_rule(primals, **params):
     val_out = lax.reduce_min_p.bind(*primals, **params)
-    return val_out, _reduce_min_elementals(primals, val_out, **params)
+    return val_out, _reduce_extremum_elementals(primals, val_out, **params)
 
 
 def reduce_min_elemental_only(primal_out, primals, **params):
-    return _reduce_min_elementals(primals, primal_out, **params)
+    return _reduce_extremum_elementals(primals, primal_out, **params)
 
 
 elemental_rules[lax.reduce_min_p] = reduce_min_elemental_rule

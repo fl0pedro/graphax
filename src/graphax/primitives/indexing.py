@@ -272,27 +272,37 @@ def _update_to_output_index(up_idx, indices, dn, operand_ndim, up_ndim):
     return tuple(out_idx)
 
 
-def _build_scatter_update_jac(indices, out_shape, up_shape, params, coeff=None):
+def _build_scatter_update_jac(indices, out_shape, up_shape, params, value_fn):
+    """``d out / d updates`` dense Jacobian (shape ``out_shape + up_shape``): each
+    update element is embedded at the output position it scatters to, carrying
+    ``value_fn(out_idx, up_idx)`` — 1 for add/set, -1 for sub, the operand value
+    for mul, a tie-split weight for min/max."""
     ndim_out = len(out_shape)
     ndim_up = len(up_shape)
     dn = params["dimension_numbers"]
-    jac_shape = list(out_shape) + list(up_shape)
-    jac = jnp.zeros(jac_shape, dtype=jnp.float32)
-
+    jac = jnp.zeros(list(out_shape) + list(up_shape), dtype=jnp.float32)
 
     for up_idx in itertools.product(*(range(s) for s in up_shape)):
         out_idx = _update_to_output_index(up_idx, indices, dn, ndim_out, ndim_up)
-        full_idx = tuple(out_idx) + tuple(up_idx)
-        val = (
-            1.0
-            if coeff is None
-            else float(coeff[up_idx])
-            if hasattr(coeff, "__getitem__")
-            else float(coeff)
-        )
-        jac = jac.at[full_idx].set(val)
+        jac = jac.at[tuple(out_idx) + tuple(up_idx)].set(value_fn(out_idx, up_idx))
 
     return jac
+
+
+def _build_scatter_operand_coeff(indices, out_shape, up_shape, params, value_fn):
+    """Per-output-element ``d out / d operand`` coefficient: identity (1.0)
+    everywhere except scattered positions, where it is ``value_fn(out_idx,
+    up_idx)`` (the updates value for mul, a tie-split weight for min/max)."""
+    ndim_out = len(out_shape)
+    ndim_up = len(up_shape)
+    dn = params["dimension_numbers"]
+    coeff = jnp.ones(out_shape, dtype=jnp.float32)
+
+    for up_idx in itertools.product(*(range(s) for s in up_shape)):
+        out_idx = _update_to_output_index(up_idx, indices, dn, ndim_out, ndim_up)
+        coeff = coeff.at[out_idx].set(value_fn(out_idx, up_idx))
+
+    return coeff
 
 
 def _build_scatter_mask(indices, out_shape, up_shape, params):
@@ -309,36 +319,53 @@ def _build_scatter_mask(indices, out_shape, up_shape, params):
     return mask
 
 
-def scatter_add_elemental_rule(primals, **params):
-    val_out = lax.scatter_add_p.bind(*primals, **params)
-    operand, indices, updates = primals[0], primals[1], primals[2]
-    out_shape, op_shape, up_shape = (
+def _scatter_shapes(val_out, operand, updates):
+    return (
         get_shape(val_out),
         get_shape(operand),
         get_shape(updates),
-    )
-    ndim = get_ndim(val_out)
-
-    # d/d(operand) = identity
-    op_out_dims = [DiagonalIndex(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
-    op_primal_dims = [
-        DiagonalIndex(ndim + i, s, i, i) for i, s in enumerate(op_shape)
-    ]
-    op_tensor = SparseTensor(
-        op_out_dims, op_primal_dims, jnp.ones(out_shape, dtype=jnp.float32)
+        get_ndim(val_out),
     )
 
-    # d/d(updates) = one-hot embedding (coeff = 1)
-    jac = _build_scatter_update_jac(indices, out_shape, up_shape, params)
-    up_out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
-    up_primal_dims = [
-        DenseIndex(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
-    ]
-    up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac)
 
-    # invars are (operand=0, indices=1, updates=2); core indexes elementals by
-    # eqn.invars position, so the updates Jacobian must sit at slot 2 with a None
-    # for the non-differentiable integer indices (else it is silently dropped).
+def _scatter_operand_tensor(out_shape, op_shape, ndim, coeff):
+    """``d out / d operand`` SparseTensor: a diagonal identity carrying the
+    per-output-element ``coeff`` (1 for add/sub; 1-mask for set; the updates
+    value for mul; a tie-split weight for min/max)."""
+    out_dims = [DiagonalIndex(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
+    primal_dims = [DiagonalIndex(ndim + i, s, i, i) for i, s in enumerate(op_shape)]
+    return SparseTensor(out_dims, primal_dims, coeff)
+
+
+def _scatter_updates_tensor(out_shape, up_shape, ndim, jac):
+    """``d out / d updates`` SparseTensor wrapping the dense embedding ``jac``
+    (shape ``out_shape + up_shape``)."""
+    out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
+    primal_dims = [DenseIndex(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)]
+    return SparseTensor(out_dims, primal_dims, jac)
+
+
+# Every scatter rule returns ``[op_tensor, None, up_tensor]``: invars are
+# (operand=0, indices=1, updates=2), and core indexes elementals by eqn.invars
+# position, so the updates Jacobian must sit at slot 2 with a None for the
+# non-differentiable integer indices (else it is silently dropped). The two
+# tensors share an identical dim layout across all six rules — only the operand
+# ``coeff`` and the updates ``value_fn`` differ.
+
+
+def scatter_add_elemental_rule(primals, **params):
+    val_out = lax.scatter_add_p.bind(*primals, **params)
+    operand, indices, updates = primals[0], primals[1], primals[2]
+    out_shape, op_shape, up_shape, ndim = _scatter_shapes(val_out, operand, updates)
+
+    # d/d(operand) = identity; d/d(updates) = one-hot embedding (coeff = 1).
+    op_tensor = _scatter_operand_tensor(
+        out_shape, op_shape, ndim, jnp.ones(out_shape, dtype=jnp.float32)
+    )
+    jac = _build_scatter_update_jac(
+        indices, out_shape, up_shape, params, lambda o, u: 1.0
+    )
+    up_tensor = _scatter_updates_tensor(out_shape, up_shape, ndim, jac)
     return val_out, [op_tensor, None, up_tensor]
 
 
@@ -348,33 +375,16 @@ elemental_rules[lax.scatter_add_p] = scatter_add_elemental_rule
 def scatter_sub_elemental_rule(primals, **params):
     val_out = lax.scatter_sub_p.bind(*primals, **params)
     operand, indices, updates = primals[0], primals[1], primals[2]
-    out_shape, op_shape, up_shape = (
-        get_shape(val_out),
-        get_shape(operand),
-        get_shape(updates),
+    out_shape, op_shape, up_shape, ndim = _scatter_shapes(val_out, operand, updates)
+
+    # d/d(operand) = identity; d/d(updates) = -1 × one-hot embedding.
+    op_tensor = _scatter_operand_tensor(
+        out_shape, op_shape, ndim, jnp.ones(out_shape, dtype=jnp.float32)
     )
-    ndim = get_ndim(val_out)
-
-    # d/d(operand) = identity
-    op_out_dims = [DiagonalIndex(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
-    op_primal_dims = [
-        DiagonalIndex(ndim + i, s, i, i) for i, s in enumerate(op_shape)
-    ]
-    op_tensor = SparseTensor(
-        op_out_dims, op_primal_dims, jnp.ones(out_shape, dtype=jnp.float32)
+    jac = _build_scatter_update_jac(
+        indices, out_shape, up_shape, params, lambda o, u: -1.0
     )
-
-    # d/d(updates) = -1 × one-hot embedding
-    jac = _build_scatter_update_jac(indices, out_shape, up_shape, params, coeff=-1.0)
-    up_out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
-    up_primal_dims = [
-        DenseIndex(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
-    ]
-    up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac)
-
-    # invars are (operand=0, indices=1, updates=2); core indexes elementals by
-    # eqn.invars position, so the updates Jacobian must sit at slot 2 with a None
-    # for the non-differentiable integer indices (else it is silently dropped).
+    up_tensor = _scatter_updates_tensor(out_shape, up_shape, ndim, jac)
     return val_out, [op_tensor, None, up_tensor]
 
 
@@ -384,32 +394,17 @@ elemental_rules[lax.scatter_sub_p] = scatter_sub_elemental_rule
 def scatter_set_elemental_rule(primals, **params):
     val_out = lax.scatter_p.bind(*primals, **params)
     operand, indices, updates = primals[0], primals[1], primals[2]
-    out_shape, op_shape, up_shape = (
-        get_shape(val_out),
-        get_shape(operand),
-        get_shape(updates),
-    )
-    ndim = get_ndim(val_out)
+    out_shape, op_shape, up_shape, ndim = _scatter_shapes(val_out, operand, updates)
 
-    # d/d(operand) = identity * (1 - mask) — zeroed at overwritten positions
+    # d/d(operand) = identity * (1 - mask) — zeroed at overwritten positions.
     mask = _build_scatter_mask(indices, out_shape, up_shape, params)
-    op_out_dims = [DiagonalIndex(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
-    op_primal_dims = [
-        DiagonalIndex(ndim + i, s, i, i) for i, s in enumerate(op_shape)
-    ]
-    op_tensor = SparseTensor(op_out_dims, op_primal_dims, 1.0 - mask)
+    op_tensor = _scatter_operand_tensor(out_shape, op_shape, ndim, 1.0 - mask)
 
-    # d/d(updates) = one-hot embedding (coeff = 1)
-    jac = _build_scatter_update_jac(indices, out_shape, up_shape, params)
-    up_out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
-    up_primal_dims = [
-        DenseIndex(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
-    ]
-    up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac)
-
-    # invars are (operand=0, indices=1, updates=2); core indexes elementals by
-    # eqn.invars position, so the updates Jacobian must sit at slot 2 with a None
-    # for the non-differentiable integer indices (else it is silently dropped).
+    # d/d(updates) = one-hot embedding (coeff = 1).
+    jac = _build_scatter_update_jac(
+        indices, out_shape, up_shape, params, lambda o, u: 1.0
+    )
+    up_tensor = _scatter_updates_tensor(out_shape, up_shape, ndim, jac)
     return val_out, [op_tensor, None, up_tensor]
 
 
@@ -419,48 +414,19 @@ elemental_rules[lax.scatter_p] = scatter_set_elemental_rule
 def scatter_mul_elemental_rule(primals, **params):
     val_out = lax.scatter_mul_p.bind(*primals, **params)
     operand, indices, updates = primals[0], primals[1], primals[2]
-    out_shape, op_shape, up_shape = (
-        get_shape(val_out),
-        get_shape(operand),
-        get_shape(updates),
+    out_shape, op_shape, up_shape, ndim = _scatter_shapes(val_out, operand, updates)
+
+    # Product rule on out = operand * updates at the scattered positions:
+    #   d/d(operand) = the updates value there (identity elsewhere),
+    #   d/d(updates) = the operand value there.
+    op_coeff = _build_scatter_operand_coeff(
+        indices, out_shape, up_shape, params, lambda o, u: float(updates[u])
     )
-    ndim = get_ndim(val_out)
-    dn = params["dimension_numbers"]
-
-    # d/d(operand): identity at non-scattered; updates value at scattered
-    # Build per-element operand coefficient
-    op_coeff = jnp.ones(out_shape, dtype=jnp.float32)
-
-    for up_idx in itertools.product(*(range(s) for s in up_shape)):
-        out_idx = _update_to_output_index(
-            up_idx, indices, dn, len(out_shape), len(up_shape)
-        )
-        op_coeff = op_coeff.at[out_idx].set(float(updates[up_idx]))
-
-    op_out_dims = [DiagonalIndex(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
-    op_primal_dims = [
-        DiagonalIndex(ndim + i, s, i, i) for i, s in enumerate(op_shape)
-    ]
-    op_tensor = SparseTensor(op_out_dims, op_primal_dims, op_coeff)
-
-    # d/d(updates) = operand value at the scattered output positions (product
-    # rule: out = operand * updates there, so d out/d updates = operand).
-    jac_shape = list(out_shape) + list(up_shape)
-    jac2 = jnp.zeros(jac_shape, dtype=jnp.float32)
-    for up_idx in itertools.product(*(range(s) for s in up_shape)):
-        out_idx = _update_to_output_index(
-            up_idx, indices, dn, len(out_shape), len(up_shape)
-        )
-        full_idx = tuple(out_idx) + tuple(up_idx)
-        jac2 = jac2.at[full_idx].set(float(operand[out_idx]))
-
-    up_out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
-    up_primal_dims = [
-        DenseIndex(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
-    ]
-    up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac2)
-
-    # See scatter_add: updates Jacobian at slot 2, None for the integer indices.
+    op_tensor = _scatter_operand_tensor(out_shape, op_shape, ndim, op_coeff)
+    jac = _build_scatter_update_jac(
+        indices, out_shape, up_shape, params, lambda o, u: float(operand[o])
+    )
+    up_tensor = _scatter_updates_tensor(out_shape, up_shape, ndim, jac)
     return val_out, [op_tensor, None, up_tensor]
 
 
@@ -481,53 +447,21 @@ def _max_tie_split(a, b):
 def scatter_min_elemental_rule(primals, **params):
     val_out = lax.scatter_min_p.bind(*primals, **params)
     operand, indices, updates = primals[0], primals[1], primals[2]
-    out_shape, op_shape, up_shape = (
-        get_shape(val_out),
-        get_shape(operand),
-        get_shape(updates),
+    out_shape, op_shape, up_shape, ndim = _scatter_shapes(val_out, operand, updates)
+
+    # Balanced subgradient at a tie (operand == update): 0.5 to each side,
+    # matching JAX. operand wins where operand < update; updates win where
+    # updates < operand.
+    op_coeff = _build_scatter_operand_coeff(
+        indices, out_shape, up_shape, params,
+        lambda o, u: _min_tie_split(operand[o], updates[u]),
     )
-    ndim = get_ndim(val_out)
-    dn = params["dimension_numbers"]
-
-    # d/d(operand): 1 where operand <= updates at scattered pos, 1 elsewhere
-    op_coeff = jnp.ones(out_shape, dtype=jnp.float32)
-
-    for up_idx in itertools.product(*(range(s) for s in up_shape)):
-        out_idx = _update_to_output_index(
-            up_idx, indices, dn, len(out_shape), len(up_shape)
-        )
-        # Balanced subgradient at a tie (operand == update): 0.5 to each side,
-        # matching JAX. Was operand<=update -> 1.0 (operand took all the credit).
-        op_coeff = op_coeff.at[out_idx].set(
-            _min_tie_split(operand[out_idx], updates[up_idx])
-        )
-
-    op_out_dims = [DiagonalIndex(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
-    op_primal_dims = [
-        DiagonalIndex(ndim + i, s, i, i) for i, s in enumerate(op_shape)
-    ]
-    op_tensor = SparseTensor(op_out_dims, op_primal_dims, op_coeff)
-
-    # d/d(updates): 1 where updates < operand, 0.5 at a tie
-    jac_shape = list(out_shape) + list(up_shape)
-    jac = jnp.zeros(jac_shape, dtype=jnp.float32)
-    for up_idx in itertools.product(*(range(s) for s in up_shape)):
-        out_idx = _update_to_output_index(
-            up_idx, indices, dn, len(out_shape), len(up_shape)
-        )
-        indicator = _min_tie_split(updates[up_idx], operand[out_idx])
-        full_idx = tuple(out_idx) + tuple(up_idx)
-        jac = jac.at[full_idx].set(indicator)
-
-    up_out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
-    up_primal_dims = [
-        DenseIndex(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
-    ]
-    up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac)
-
-    # invars are (operand=0, indices=1, updates=2); core indexes elementals by
-    # eqn.invars position, so the updates Jacobian must sit at slot 2 with a None
-    # for the non-differentiable integer indices (else it is silently dropped).
+    op_tensor = _scatter_operand_tensor(out_shape, op_shape, ndim, op_coeff)
+    jac = _build_scatter_update_jac(
+        indices, out_shape, up_shape, params,
+        lambda o, u: _min_tie_split(updates[u], operand[o]),
+    )
+    up_tensor = _scatter_updates_tensor(out_shape, up_shape, ndim, jac)
     return val_out, [op_tensor, None, up_tensor]
 
 
@@ -537,53 +471,20 @@ elemental_rules[lax.scatter_min_p] = scatter_min_elemental_rule
 def scatter_max_elemental_rule(primals, **params):
     val_out = lax.scatter_max_p.bind(*primals, **params)
     operand, indices, updates = primals[0], primals[1], primals[2]
-    out_shape, op_shape, up_shape = (
-        get_shape(val_out),
-        get_shape(operand),
-        get_shape(updates),
+    out_shape, op_shape, up_shape, ndim = _scatter_shapes(val_out, operand, updates)
+
+    # Balanced subgradient at a tie (operand == update): 0.5 each. operand wins
+    # where operand > update; updates win where updates > operand.
+    op_coeff = _build_scatter_operand_coeff(
+        indices, out_shape, up_shape, params,
+        lambda o, u: _max_tie_split(operand[o], updates[u]),
     )
-    ndim = get_ndim(val_out)
-    dn = params["dimension_numbers"]
-
-    # d/d(operand): 1 where operand >= updates at scattered pos, 1 elsewhere
-    op_coeff = jnp.ones(out_shape, dtype=jnp.float32)
-
-    for up_idx in itertools.product(*(range(s) for s in up_shape)):
-        out_idx = _update_to_output_index(
-            up_idx, indices, dn, len(out_shape), len(up_shape)
-        )
-        # Balanced subgradient at a tie (operand == update): 0.5 each (was 1.0
-        # operand / 0.0 update).
-        op_coeff = op_coeff.at[out_idx].set(
-            _max_tie_split(operand[out_idx], updates[up_idx])
-        )
-
-    op_out_dims = [DiagonalIndex(i, s, i, ndim + i) for i, s in enumerate(out_shape)]
-    op_primal_dims = [
-        DiagonalIndex(ndim + i, s, i, i) for i, s in enumerate(op_shape)
-    ]
-    op_tensor = SparseTensor(op_out_dims, op_primal_dims, op_coeff)
-
-    # d/d(updates): 1 where updates > operand, 0.5 at a tie
-    jac_shape = list(out_shape) + list(up_shape)
-    jac = jnp.zeros(jac_shape, dtype=jnp.float32)
-    for up_idx in itertools.product(*(range(s) for s in up_shape)):
-        out_idx = _update_to_output_index(
-            up_idx, indices, dn, len(out_shape), len(up_shape)
-        )
-        indicator = _max_tie_split(updates[up_idx], operand[out_idx])
-        full_idx = tuple(out_idx) + tuple(up_idx)
-        jac = jac.at[full_idx].set(indicator)
-
-    up_out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
-    up_primal_dims = [
-        DenseIndex(ndim + i, s, ndim + i) for i, s in enumerate(up_shape)
-    ]
-    up_tensor = SparseTensor(up_out_dims, up_primal_dims, jac)
-
-    # invars are (operand=0, indices=1, updates=2); core indexes elementals by
-    # eqn.invars position, so the updates Jacobian must sit at slot 2 with a None
-    # for the non-differentiable integer indices (else it is silently dropped).
+    op_tensor = _scatter_operand_tensor(out_shape, op_shape, ndim, op_coeff)
+    jac = _build_scatter_update_jac(
+        indices, out_shape, up_shape, params,
+        lambda o, u: _max_tie_split(updates[u], operand[o]),
+    )
+    up_tensor = _scatter_updates_tensor(out_shape, up_shape, ndim, jac)
     return val_out, [op_tensor, None, up_tensor]
 
 

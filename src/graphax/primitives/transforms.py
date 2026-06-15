@@ -4,6 +4,7 @@ from functools import partial
 from typing import Callable
 
 import jax.lax as lax
+import jax._src.lax.lax as lax_src
 import jax.numpy as jnp
 
 from ..sparse.tensor import (
@@ -13,7 +14,11 @@ from ..sparse.tensor import (
     _materialize_indexes,
     _swap_back_axes,
 )
-from .base import elemental_only_rules, elemental_rules
+from .base import (
+    elemental_only_rules,
+    elemental_rules,
+    multi_output_elemental_only_rules,
+)
 
 Transform = Callable[[SparseTensor], SparseTensor]
 
@@ -981,3 +986,45 @@ def convert_element_type_only(primal_out, primals, **params):
 
 elemental_rules[lax.convert_element_type_p] = convert_element_type_rule
 elemental_only_rules[lax.convert_element_type_p] = convert_element_type_only
+
+
+# ---------- split (each output is a lax.slice of the input) ----------
+
+def _split_elemental_for_output(primal, primal_out_k, start_k, end_k, axis):
+    """Elemental partial for the k-th output of split w.r.t. the input.
+
+    This is identical to the lax.slice elemental with start/limit indices
+    chosen to select the k-th chunk along the split axis.
+    """
+    ndim = primal.ndim
+    start_indices = tuple(start_k if i == axis else 0 for i in range(ndim))
+    limit_indices = tuple(end_k if i == axis else primal.shape[i] for i in range(ndim))
+    slice_params = {
+        'start_indices': start_indices,
+        'limit_indices': limit_indices,
+        'strides': None,
+    }
+    # _slice_elementals returns list[SparseTensor] with one entry per invar
+    return _slice_elementals([primal], primal_out_k, **slice_params)
+
+
+def split_elemental_only(primal_outs, primals, **params):
+    """Multi-output elemental rule for lax.split_p.
+
+    Returns elementals[outvar_idx][invar_idx].  split has one invar and N
+    outvars, so the outer list has N entries, each a length-1 list.
+    """
+    primal = primals[0]
+    sizes = params['sizes']
+    axis = params['axis']
+
+    result = []
+    start = 0
+    for size, primal_out_k in zip(sizes, primal_outs):
+        end = start + int(size)
+        result.append(_split_elemental_for_output(primal, primal_out_k, start, end, axis))
+        start = end
+    return result
+
+
+multi_output_elemental_only_rules[lax_src.split_p] = split_elemental_only

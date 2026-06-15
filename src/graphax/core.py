@@ -1774,7 +1774,7 @@ def extract_jaxpr(
 #   2. otherwise (non-default alpha / negative_slope) -> fall back to the
 #      macro-vertex: recursively differentiate params["jaxpr"] with
 #      vertex_elimination_jaxpr. Its order is configurable via
-#      set_pjit_elimination_order() (default "reverse").
+#      set_jit_fallback_order() (default "reverse").
 #
 # Registered here (not in a primitives/pjit.py) to avoid a circular import:
 # core.py needs vertex_elimination_jaxpr, which lives here.
@@ -1823,13 +1823,13 @@ def _make_jit_elemental_rule(order):
     return jit_elemental_rule
 
 
-def set_pjit_elimination_order(order: str = "reverse") -> None:
+def set_jit_fallback_order(order: str = "reverse") -> None:
     """Set the vertex elimination order for the jit_p macro-vertex fallback.
 
-    Ordinary jits are inlined, so this order only affects the rare fallback path:
-    a named jax.nn activation called with NON-default static args (where graphax's
-    name-keyed Jacobian doesn't apply), whose body is then differentiated by
-    recursion.
+    Ordinary jits are inlined and named jax.nn activations are dispatched by
+    name, so this order only affects the rare FALLBACK path: a named activation
+    called with NON-default static args (where graphax's name-keyed Jacobian
+    doesn't apply), whose body is then differentiated by recursion.
 
     Args:
         order: Any elimination order accepted by jacve — ``"forward"``, ``"fwd"``,
@@ -1840,10 +1840,11 @@ def set_pjit_elimination_order(order: str = "reverse") -> None:
     multi_output_elemental_only_rules[jit_p] = _make_jit_elemental_rule(order)
 
 
-# Preferred public name: the order governs the jit_p macro-vertex FALLBACK (an
-# inlined / name-dispatched jit never reaches it), and "pjit" is legacy JAX
-# terminology. ``set_pjit_elimination_order`` is kept as a back-compat alias.
-set_jit_fallback_order = set_pjit_elimination_order
+# Back-compat alias: this used to be the only public name, but the order governs
+# the jit_p macro-vertex FALLBACK (an inlined / name-dispatched jit never reaches
+# it) and "pjit" is legacy JAX terminology, so ``set_jit_fallback_order`` is now
+# the preferred name. Both refer to the same function.
+set_pjit_elimination_order = set_jit_fallback_order
 
 
 # Register with the default order at import time.
