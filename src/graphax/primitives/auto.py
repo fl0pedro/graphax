@@ -7,8 +7,6 @@ import jax._src.core as core
 import jax.lax as lax
 import jax.numpy as jnp
 import numpy as np
-from jax import Array
-from jax.typing import ArrayLike
 
 from ..sparse.tensor import (
     DenseIndex,
@@ -27,43 +25,9 @@ from .base import (
     elemental_rules,
     elemental_only_rules,
     multi_output_elemental_only_rules,
+    get_ndim,
+    get_shape,
 )
-
-
-def get_ndim(val: ArrayLike) -> int:
-    """
-    Safely get the ndim of an Array.
-
-    Args:
-        val (ArrayLike): Array with or without abstract value attribute, or scalar.
-
-    Returns:
-        int: The shape of the input value.
-    """
-    if isinstance(val, Array):
-        return get_ndim(val.aval)
-    elif not isinstance(val, (float, int, complex)):
-        return val.ndim
-    else:
-        return 0
-
-
-def get_shape(val: ArrayLike) -> tuple[int, ...]:
-    """
-    Safely get the shape of an Array.
-
-    Args:
-        val (ArrayLike): Array with or without abstract value attribute, or scalar.
-
-    Returns:
-        int: The shape of the input value.
-    """
-    if isinstance(val, Array):
-        return get_shape(val.aval)
-    elif not isinstance(val, (float, int, complex)):
-        return val.shape
-    else:
-        return ()
 
 
 def _build_windowed_jacobian_1d(out_s, in_s, wd, ws, pad_lo, bd=1, wid=1):

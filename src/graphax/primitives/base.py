@@ -16,14 +16,14 @@ from ..sparse.tensor import (
 
 
 def get_ndim(arr):
-    if isinstance(arr, (float, int, jax._src.literals.TypedFloat)):
+    if isinstance(arr, (float, int, complex, jax._src.literals.TypedFloat)):
         return 0
     else:
         return arr.ndim
 
 
 def get_shape(arr):
-    if isinstance(arr, (float, int, jax._src.literals.TypedFloat)):
+    if isinstance(arr, (float, int, complex, jax._src.literals.TypedFloat)):
         return ()
     else:
         return arr.shape
