@@ -896,60 +896,6 @@ elemental_rules[lax.cummax_p] = cummax_elemental_rule
 elemental_rules[lax.cummin_p] = cummin_elemental_rule
 
 
-# first draft unified reduce, TODO: test!
-def reduce_elemental_rule(primals, agg, **params):
-    assert agg in {"sum", "min", "max"}, (
-        f"{agg} is not one of the valid aggregate functions `sum`, `min`, `max`"
-    )
-    val_out = getattr(lax, f"reduce_{agg}_p").bind(*primals, **params)
-
-    shape = list(get_shape(val_out))
-    primal = primals[0]
-    axes = params["axes"]
-
-    new_out_dims, new_primal_dims, _shape = [], [], []
-    if axes is None:
-        axes = tuple(range(primal.ndim))
-        new_out_dims.append(DenseIndex(0, 1, 0))
-    elif isinstance(axes, int):
-        axes = (axes,)
-
-    l = get_ndim(val_out)
-    for i, size in enumerate(get_shape(primal)):
-        if i in axes:
-            if agg == "sum":
-                idx = l + i
-            else:
-                shape.insert(i, 1)
-                idx = len(new_out_dims) + len(new_primal_dims)
-                idx = max(idx, 1) if val_out.ndim > 0 else idx
-
-            new_primal_dims.append(DenseIndex(idx, size, i))
-            _shape.append(size)
-        else:
-            ll = len(new_out_dims)
-            val = None if "sum" else i
-            new_out_dims.append(DiagonalIndex(ll, size, val, l + i))
-            new_primal_dims.append(DiagonalIndex(l + i, size, val, ll))
-
-    if agg == "sum":
-        new_val = jnp.ones(_shape, dtype=jnp.float32)
-    else:
-        _val_out = val_out.reshape(shape)
-        new_val = primal == _val_out
-        norm = jnp.sum(new_val, axis=axes, keepdims=True)
-        new_val /= norm
-
-    return val_out, [
-        _swap_back_axes(SparseTensor(new_out_dims, new_primal_dims, new_val))
-    ]
-
-
-# elemental_rules[lax.reduce_sum_p] = partial(reduce_elemental_rule, agg="sum")
-# elemental_rules[lax.reduce_min_p] = partial(reduce_elemental_rule, agg="min")
-# elemental_rules[lax.reduce_max_p] = partial(reduce_elemental_rule, agg="max")
-
-
 def dot_general_elemental_rule(primals, **params):
     val_out = lax.dot_general_p.bind(*primals, **params)
     lhs, rhs = primals
@@ -3181,20 +3127,10 @@ def argmax_elemental_rule(primals, **params):
 elemental_rules[lax.argmax_p] = argmax_elemental_rule
 
 
-# cond: selects one of multiple branches based on a predicate.
-# Sub-jaxpr tracing not yet supported, so we treat this as stop-gradient.
-from jax._src.lax.control_flow.conditionals import cond_p
-
-
-def cond_elemental_rule(primals, **params):
-    val_out = cond_p.bind(*primals, **params)
-    return val_out, []
-
-
-elemental_rules[cond_p] = cond_elemental_rule
-# jit_p is handled by core's single multi-output rule (named-activation Jacobian
-# DB or recursive body-differentiation); ordinary jits are inlined before
-# elimination. See core._make_jit_elemental_rule / _inline_call_primitives.
+# cond_p / switch and jit_p are handled by core (they need vertex_elimination_
+# jaxpr): cond differentiates the taken branch (core.cond_elemental_rule), jit is
+# inlined or dispatched by name (core._make_jit_elemental_rule). Not registered
+# here.
 
 
 # Collective operations: psum, all_gather, reduce_scatter, all_to_all
