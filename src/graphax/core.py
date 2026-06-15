@@ -222,7 +222,7 @@ def _inline_call_primitives(jaxpr, consts):
         derivative (kink subgradients, straight-through / surrogate gradients),
         so each is handled by a dedicated elemental rule that HONORS the user
         rule (``custom_jvp_elemental_only`` / ``custom_vjp_elemental_only`` in
-        primitives/auto.py). A named jit graphax has its own Jacobian for
+        primitives/custom.py). A named jit graphax has its own Jacobian for
         (``_jit_kept_as_vertex``) is likewise NOT inlined — it is dispatched by
         name by the jit elemental rule."""
         if eqn.primitive is jit_p and not _jit_kept_as_vertex(eqn):

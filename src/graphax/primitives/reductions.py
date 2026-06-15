@@ -7,6 +7,7 @@ from .base import (
     NO_EDGE,
     elemental_rules,
     elemental_only_rules,
+    multi_output_elemental_only_rules,
     get_ndim,
     get_shape,
 )
@@ -485,3 +486,51 @@ def cummin_elemental_rule(primals, **params):
 
 elemental_rules[lax.cummax_p] = cummax_elemental_rule
 elemental_rules[lax.cummin_p] = cummin_elemental_rule
+
+
+# ---------- top_k / argmax (selection: one-hot value Jacobian; integer indices carry no grad) ----------
+
+# top_k: returns (values, indices); values' Jacobian wrt x is a one-hot selection
+# matrix, indices are integer (no gradient). multiple_results -> handled by the
+# multi-output rule below.
+def top_k_elemental_only(primal_outs, primals, **params):
+    """Multi-output elemental rule for ``top_k`` (returns values + indices).
+
+    ``top_k`` is ``multiple_results`` so it must go through
+    ``multi_output_elemental_only_rules``: the return is
+    ``elementals[outvar_idx][invar_idx]``. The single input ``x`` (invar 0) flows
+    to the VALUES output via the one-hot selection Jacobian; the integer INDICES
+    output carries no gradient (None). (The cache-key fix in core.py makes this
+    value-dependent indicator safe across repeated jacve calls.)"""
+    x = primals[0]
+    values, indices = primal_outs
+    k = params["k"]
+    x_shape = get_shape(x)
+    val_ndim = len(get_shape(values))
+    x_ndim = len(x_shape)
+    n = x_shape[-1]
+
+    out_dims, primal_dims = [], []
+    axis_count = 0
+    for i, s in enumerate(x_shape[:-1]):  # batch dims: diagonal
+        out_dims.append(DiagonalIndex(i, s, axis_count, val_ndim + i))
+        primal_dims.append(DiagonalIndex(val_ndim + i, s, axis_count, i))
+        axis_count += 1
+    out_dims.append(DenseIndex(val_ndim - 1, k, axis_count)); axis_count += 1
+    primal_dims.append(DenseIndex(val_ndim + x_ndim - 1, n, axis_count))
+    indicator = (indices[..., :, None] == jnp.arange(n)[None, :]).astype(x.dtype)
+    tensor = _swap_back_axes(SparseTensor(out_dims, primal_dims, indicator))
+    # outputs = [values, indices]; one invar (x). indices -> no edge (None).
+    return [[tensor], [None]]
+
+
+multi_output_elemental_only_rules[lax.top_k_p] = top_k_elemental_only
+
+
+# argmax: returns integer indices, derivative is zero everywhere
+def argmax_elemental_rule(primals, **params):
+    val_out = lax.argmax_p.bind(*primals, **params)
+    return val_out, []
+
+
+elemental_rules[lax.argmax_p] = argmax_elemental_rule

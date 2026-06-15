@@ -1,6 +1,7 @@
-"""Correctness of the auto-generated elemental Jacobian rules in
-``graphax.primitives.auto`` (+ the elementwise rules in ``primitives.math``)
-against JAX, with an emphasis on ML-core primitives: convolution,
+"""Correctness of the elemental Jacobian rules across the ``graphax.primitives``
+category modules (``indexing`` / ``conv`` / ``reductions`` / ``custom`` and the
+elementwise rules in ``math``) against JAX, with an emphasis on ML-core
+primitives: convolution,
 ``dot_general`` (matmul / attention contractions), windowed pooling,
 activations, reductions, and gather/scatter.
 

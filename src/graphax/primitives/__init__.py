@@ -6,8 +6,10 @@ from .base import (
     jit_name_rules,
 )
 
-# Import submodules to trigger elemental rule registrations
-# transforms must come before structural because structural imports _slice_elementals from it
+# Import submodules to trigger elemental rule registrations. These are all
+# non-overlapping primitives, so any order after `base` is fine — except that
+# transforms must come before indexing (which imports JacobianTransform from it)
+# and before structural (which imports _slice_elementals from it).
 from . import math
 from . import linalg
 from . import reductions
@@ -15,12 +17,6 @@ from . import transforms
 from . import indexing
 from . import conv
 from . import structural
-
-# Auto-generated primitive rules (parallelism, advanced linalg, scatter/gather,
-# reduce_window, dynamic slicing, etc.). Imported last so registrations for
-# overlapping primitives override the manual ones above; non-overlapping
-# primitives are added to the registry.
-from . import auto
 
 # User-supplied-derivative honoring: custom_vjp/custom_jvp call rules + named-jit
 # (jax.nn activation) Jacobians dispatched by jit_p params['name'].
