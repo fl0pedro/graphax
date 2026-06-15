@@ -371,9 +371,9 @@ def _densify_multi_banded(
     fill_value: Array,
 ) -> Array:
     """Materialize the dense form of a K-axis block-banded buffer for ANY K
-    via a single fused per-axis broadcast+where+sum. Standalone successor to
-    ``MultiAxisBlockBanded.to_dense`` (Phase 8) so the K≥2 densify no longer
-    depends on the legacy ``MultiAxisBlockBanded`` pytree class.
+    via a single fused per-axis broadcast+where+sum. Standalone successor to the (now-removed) multi-axis block-banded
+    ``to_dense`` (Phase 8) — the K≥2 densify no longer depends on any legacy
+    storage pytree class.
 
     ``data`` layout: ``(M_p_0, W_0, ..., M_p_{K-1}, W_{K-1}, B_row_0, ...,
     B_row_{K-1}, B_col_0, ..., B_col_{K-1}, *L)``. ``axes`` is K

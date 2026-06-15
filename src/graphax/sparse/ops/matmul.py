@@ -1269,12 +1269,12 @@ def _should_emit_multi_axis_banded(
     rhs_leftover: list[int],
 ) -> MultiAxisBandedLayout | None:
     """K=2 multi-contract probe: detect when both contract pairs are
-    misaligned and emission as :class:`MultiAxisBlockBanded` strictly
+    misaligned and emission as a multi-axis block-banded output strictly
     beats the dense 4-D output.
 
     K=2 only for now; K>2 would mirror the same per-pair logic and emit
-    a higher-rank ``MultiAxisBlockBanded`` once the
-    ``MultiAxisBlockBanded.to_dense`` kernel extends to K>2.
+    a higher-rank multi-axis block-banded output once the K-axis
+    ``to_dense`` kernel extends to K>2.
     """
     K = len(pairs)
     if K < 2:
@@ -1306,7 +1306,7 @@ def _should_emit_multi_axis_banded(
         if B_a_w % B_b_h == 0 or B_b_h % B_a_w == 0:
             return None
         # K=2 multi-axis with per-axis n_meta>1 is a follow-up (would
-        # require ``MultiAxisBlockBanded.to_dense`` per-batch handling).
+        # require multi-axis block-banded ``to_dense`` per-batch handling).
         if math.gcd(M_a, M_b) > 1:
             return None
 
@@ -1420,7 +1420,7 @@ def _pack_dense_to_multi_axis_banded(
 ) -> Array:
     """Pack a dense ``(M_row_0*B_row_0, ..., M_row_{K-1}*B_row_{K-1},
     M_col_0*B_col_0, ..., M_col_{K-1}*B_col_{K-1}, *L)`` K-axis matmul
-    output into ``MultiAxisBlockBanded`` data shape
+    output into multi-axis block-banded data shape
     ``(M_p_0, W_0, ..., M_p_{K-1}, W_{K-1}, B_row_0, ..., B_row_{K-1},
        B_col_0, ..., B_col_{K-1}, *L)`` via per-axis broadcast+where+sum.
 
@@ -1500,7 +1500,7 @@ def _pack_dense_to_multi_axis_banded(
     Ms_axes = tuple(3 * i + 1 for i in range(K))
     out = jnp.where(combined_mask, grid_b, 0).sum(axis=Ms_axes)
     # Shape: (M_p_0, W_0, M_p_1, W_1, ..., B_row_0, ..., B_col_{K-1}, *L)
-    # — matches MultiAxisBlockBanded data layout.
+    # — matches the multi-axis block-banded data layout.
     return out
 
 
