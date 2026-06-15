@@ -4,6 +4,7 @@ from functools import partial
 from typing import Callable
 
 import jax.lax as lax
+import jax._src.lax.lax as lax_src
 import jax.numpy as jnp
 
 from ..sparse.tensor import (
@@ -13,7 +14,11 @@ from ..sparse.tensor import (
     _materialize_indexes,
     _swap_back_axes,
 )
-from .base import elemental_only_rules, elemental_rules
+from .base import (
+    elemental_only_rules,
+    elemental_rules,
+    multi_output_elemental_only_rules,
+)
 
 Transform = Callable[[SparseTensor], SparseTensor]
 
@@ -50,6 +55,59 @@ def _inverse_permutation(permutation):
     for i, p in enumerate(permutation):
         inverse[p] = i
     return inverse
+
+
+def _is_scalar_identity_post(post) -> bool:
+    """A post edge that is the bare identity seed: no out/primal dims and no
+    stored ``val`` (the structure is the all-ones identity up to
+    ``scalar_mult``). This is what an inverse transform receives in forward
+    ('fwd') elimination order when the identity output-seed is drained through a
+    transform-only edge BEFORE any val-carrying edge has shaped it. In that
+    state ``post.dense()`` is rank-0, so the inverse rules below cannot run
+    their scatter/embedding logic — they must first re-expand the seed into the
+    explicit identity Jacobian over the op's OUTPUT shape."""
+    return (
+        not post.out_dims
+        and not post.primal_dims
+        and post.val is None
+    )
+
+
+def _identity_post_over(post, out_shape, dtype=jnp.float32):
+    """Re-expand a bare scalar-identity ``post`` (see ``_is_scalar_identity_post``)
+    into the explicit dense identity Jacobian ``s * I`` over ``out_shape`` —
+    ``out_dims`` and ``primal_dims`` both equal ``out_shape`` and ``val`` is the
+    reshaped identity matrix scaled by ``post.scalar_mult``. The resulting tensor
+    feeds the regular (non-scalar) branch of each inverse rule unchanged, so the
+    'fwd' path reconstructs exactly the same op Jacobian the 'rev' path builds.
+
+    ``scalar_mult`` is folded into ``val``; the synthesized tensor keeps the
+    default ``scalar_mult`` so the downstream rule (which copies ``scalar_mult``
+    through verbatim) does not double-apply it."""
+    out_shape = tuple(int(s) for s in out_shape)
+    n = 1
+    for s in out_shape:
+        n *= s
+    eye = jnp.eye(n, dtype=dtype)
+    scalar = post.scalar_mult
+    if scalar is not None:
+        eye = eye * scalar
+    val = eye.reshape(out_shape + out_shape)
+    counter = 0
+    new_out_dims = []
+    for s in out_shape:
+        new_out_dims.append(DenseIndex(counter, s, counter))
+        counter += 1
+    new_primal_dims = []
+    for s in out_shape:
+        new_primal_dims.append(DenseIndex(counter, s, counter))
+        counter += 1
+    return SparseTensor(
+        new_out_dims,
+        new_primal_dims,
+        val,
+        fill_value=post.fill_value,
+    )
 
 
 # ---------- transpose ----------
@@ -203,6 +261,8 @@ def _slice_elementals(primals, val_out, **params):
     def slice_transform(pre):
         start_indices = list(params["start_indices"])
         limit_indices = list(params["limit_indices"])
+        strides = params.get("strides")
+        strides = [1] * len(start_indices) if strides is None else list(strides)
         full_val = pre.dense()
         new_out_dims = []
         new_primal_dims = []
@@ -216,39 +276,52 @@ def _slice_elementals(primals, val_out, **params):
             new_primal_dims.append(DenseIndex(counter, d.size, counter))
             start_indices.append(0)
             limit_indices.append(d.size)
+            strides.append(1)  # primal dims are not sliced
             counter += 1
 
-        new_val = lax.slice(full_val, start_indices, limit_indices)
+        new_val = lax.slice(full_val, start_indices, limit_indices, strides)
         return SparseTensor(new_out_dims, new_primal_dims, new_val)
 
     def inverse_slice_transform(post):
         start_indices = list(params["start_indices"])
-        limit_indices = list(params["limit_indices"])
+        strides = params.get("strides")
+        strides = [1] * len(start_indices) if strides is None else list(strides)
+        # In 'fwd' elimination order this inverse can be drained against the bare
+        # identity output-seed (no out/primal dims, val=None). Re-expand that seed
+        # into the explicit identity Jacobian over the slice's OUTPUT shape so the
+        # embedding below — which assumes post.dense() is (out..., slice_out...)
+        # with the slice-output dims trailing — runs exactly as in 'rev' order.
+        if _is_scalar_identity_post(post):
+            post = _identity_post_over(post, val_out.shape, val_out.dtype)
         full_val = post.dense()
-        new_shape = []
         new_out_dims = []
         new_primal_dims = []
         counter = 0
 
+        # The transpose of a (possibly strided) slice is a pad: each slice-output
+        # element gradient lands at input position ``start + k*stride``, i.e. low
+        # pad = start and interior pad = stride-1. (The old version used a
+        # contiguous scatter that ignored ``strides`` AND hardcoded the input
+        # dtype via jnp.zeros, mis-placing strided slices and crashing on f64.)
+        pad_config = []
         for d in post.out_dims:
             new_out_dims.append(DenseIndex(counter, d.size, counter))
-            new_shape.append(d.size)
-            counter += 1
-        scatter_zeros = jnp.zeros(counter, dtype=jnp.int32)
-
-        for s in primals[0].shape:
-            new_primal_dims.append(DenseIndex(counter, s, counter))
-            new_shape.append(s)
+            pad_config.append((0, 0, 0))
             counter += 1
 
-        zeros = jnp.zeros(new_shape)
-        dims = tuple(range(zeros.ndim))
-        scatter_dims = lax.ScatterDimensionNumbers(dims, (), dims)
-        _scatter_indices = jnp.array(start_indices, dtype=jnp.int32)
-        scatter_indices = jnp.concatenate([scatter_zeros, _scatter_indices])
+        in_shape = primals[0].shape
+        slice_out_sizes = full_val.shape[len(post.out_dims):]
+        for ax, L in enumerate(in_shape):
+            new_primal_dims.append(DenseIndex(counter, L, counter))
+            n = slice_out_sizes[ax]
+            st, stride = start_indices[ax], strides[ax]
+            high = L - st - (n - 1) * stride - 1
+            pad_config.append((st, high, stride - 1))
+            counter += 1
 
-        new_val = lax.scatter(zeros, scatter_indices, full_val, scatter_dims)
-
+        new_val = lax.pad(
+            full_val, jnp.array(0.0, dtype=full_val.dtype), pad_config
+        )
         return SparseTensor(new_out_dims, new_primal_dims, new_val)
 
     transform = JacobianTransform(slice_transform, inverse_slice_transform)
@@ -408,39 +481,41 @@ def _squeeze_elementals(primals, val_out, **params):
         )
 
     def inverse_squeeze_transform(post):
-        new_dims = params["dimensions"]
-        new_out_dims = list(copy.deepcopy(post.out_dims))
-        new_primal_dims = list(copy.deepcopy(post.primal_dims))
-        for dim in new_dims:
-            axis = sum(1 for d in new_out_dims if d.axis is not None)
-            axis += sum(
-                1
-                for d in new_primal_dims[:dim]
-                if d.axis is not None and not d.is_sparse
-            )
-            new_primal_dims.insert(dim, DenseIndex(dim, 1, axis))
-            for j in range(dim, len(new_primal_dims)):
-                d = new_primal_dims[j]
-                updates = {"id": d.id + 1}
-                if d.axis is not None:
-                    updates["axis"] = d.axis + 1
-                new_primal_dims[j] = replace(d, **updates)
-                if d.is_sparse:
-                    other_id = d.other_id
-                    _d = new_out_dims[other_id]
-                    _updates = {"other_id": _d.other_id + 1}
-                    if _d.axis is not None:
-                        _updates["axis"] = _d.axis + 1
-                    new_out_dims[other_id] = replace(_d, **_updates)
+        # Re-insert each squeezed (size-1) primal axis at its ORIGINAL input
+        # position. Insert in ascending order so earlier insertions don't shift
+        # later positions. Each inserted dim gets a fresh size-1 val axis at the
+        # correct VAL position (after the out-dense and preceding primal-dense
+        # axes) — NOT at the input-axis index, which was the old bug. Ids are
+        # renumbered contiguously at the end (the old code collided ids and
+        # expanded val at the wrong axis).
+        new_dims = sorted(params["dimensions"])
+        out_dims = list(copy.deepcopy(post.out_dims))
+        primal_dims = list(copy.deepcopy(post.primal_dims))
+        num_out = len(out_dims)
+        val = post.val
 
-        new_val = jnp.expand_dims(post.val, axis=new_dims)
-        return SparseTensor(
-            new_out_dims,
-            new_primal_dims,
-            new_val,
-            scalar_mult=post.scalar_mult,
-            fill_value=post.fill_value,
-        )
+        # Each re-inserted size-1 primal axis gets a FRESH val axis appended at
+        # the end; _swap_back_axes then permutes val into canonical dim order.
+        # (Computing the exact insertion axis by hand is unsound because diagonal
+        # pairs share a val axis, so a dim-count overshoots val.ndim.)
+        for dim in new_dims:
+            if val is not None:
+                new_ax = val.ndim
+                val = jnp.expand_dims(val, axis=new_ax)
+            else:
+                new_ax = None
+            primal_dims.insert(dim, DenseIndex(-1, 1, new_ax))  # id fixed below
+
+        old_to_new = {d.id: num_out + pos for pos, d in enumerate(primal_dims) if d.id != -1}
+        new_primal = [replace(d, id=num_out + pos) for pos, d in enumerate(primal_dims)]
+        new_out = [
+            replace(d, other_id=old_to_new[d.other_id]) if d.is_sparse else d
+            for d in out_dims
+        ]
+        return _swap_back_axes(SparseTensor(
+            new_out, new_primal, val,
+            scalar_mult=post.scalar_mult, fill_value=post.fill_value,
+        ))
 
     transform = JacobianTransform(squeeze_transform, inverse_squeeze_transform)
     return [SparseTensor([], [], None, pre_transforms=[transform])]
@@ -554,7 +629,7 @@ def _concatenate_elementals(primals, val_out, **params):
                 # Materialize the sparse dimensions related to the concatenation dimension
                 new_val = _materialize_indexes(pre, [d.id])
 
-                sub_iota = jnp.eye(d.size, dtype=jnp.float32)
+                sub_iota = jnp.eye(d.size, dtype=new_val.dtype)
 
                 shape = [1 for _ in range(pre.val.ndim)]
                 shape[_d.axis] = _d.size
@@ -563,12 +638,14 @@ def _concatenate_elementals(primals, val_out, **params):
 
                 new_val = new_val * sub_iota
 
-                # Make zeros for insertion
+                # Make zeros for insertion (match new_val's dtype: the scatter below
+                # requires identical operand/update dtypes — was hardcoded float32,
+                # crashing under jax_enable_x64 / non-float32 Jacobian vals).
                 _size = val_out.shape[dim]
                 _shape = list(new_val.shape)
                 _shape[d.axis] = _size
                 _shape[axis] = d.size
-                zeros = jnp.zeros(_shape, dtype=jnp.float32)
+                zeros = jnp.zeros(_shape, dtype=new_val.dtype)
 
                 # scatter_indices: where in `zeros` to place `new_val`
                 scatter_indices = [0 for _ in _shape]
@@ -620,7 +697,7 @@ def _concatenate_elementals(primals, val_out, **params):
                 else:
                     new_val = pre.val
 
-                sub_iota = jnp.eye(d.size, dtype=jnp.float32)
+                sub_iota = jnp.eye(d.size, dtype=new_val.dtype)
 
                 shape = [1 for _ in range(pre.val.ndim)]
                 shape.insert(out_axis, _d.size)
@@ -628,11 +705,11 @@ def _concatenate_elementals(primals, val_out, **params):
 
                 new_val = new_val * sub_iota
 
-                # Make zeros for insertion
+                # Make zeros for insertion (dtype must match new_val for the scatter)
                 _shape = list(pre.val.shape)
                 _shape.insert(out_axis, _size)
                 _shape.insert(primal_axis, _d.size)
-                zeros = jnp.zeros(_shape, dtype=jnp.float32)
+                zeros = jnp.zeros(_shape, dtype=new_val.dtype)
 
                 scatter_dims = lax.ScatterDimensionNumbers(
                     (out_axis, primal_axis), (), (out_axis, primal_axis)
@@ -660,6 +737,15 @@ def _concatenate_elementals(primals, val_out, **params):
         )
 
     def inverse_concatenate_transform(primal_idx, post):
+        # In 'fwd' elimination order this inverse can be drained against the bare
+        # identity output-seed (no out/primal dims, val=None). The seed has lost
+        # the embedding structure (which concat slot maps to which output rows),
+        # so re-expand it into the explicit identity Jacobian over the concat
+        # OUTPUT shape. Then post.primal_dims[dim] is the concat-axis dimension and
+        # the regular slicing branch extracts this slot's embedding block exactly
+        # as in 'rev' order, instead of returning the structureless scalar.
+        if _is_scalar_identity_post(post):
+            post = _identity_post_over(post, val_out.shape, val_out.dtype)
         new_out_dims = list(copy.deepcopy(post.out_dims))
         new_primal_dims = list(copy.deepcopy(post.primal_dims))
 
@@ -704,7 +790,7 @@ def _concatenate_elementals(primals, val_out, **params):
                 # Materialize the sparse dimensions related to the concatenation dimension
                 new_val = _materialize_indexes(post, [d.id])
 
-                sub_iota = jnp.eye(d.size, dtype=jnp.float32)
+                sub_iota = jnp.eye(d.size, dtype=new_val.dtype)
 
                 shape = [1 for _ in range(post.val.ndim)]
                 shape[_d.axis] = _d.size
@@ -763,13 +849,14 @@ def _concatenate_elementals(primals, val_out, **params):
                         )
 
                 # Build the column slice of identity: shape (_d.size, size).
-                sub_iota = jnp.eye(_d.size, dtype=jnp.float32)
+                _dt = post.val.dtype if post.val is not None else jnp.float32
+                sub_iota = jnp.eye(_d.size, dtype=_dt)
                 sub_iota = lax.slice_in_dim(sub_iota, s, e, axis=1)
 
                 base_val = (
                     post.val
                     if post.val is not None
-                    else jnp.array(1.0, dtype=jnp.float32)
+                    else jnp.array(1.0, dtype=_dt)
                 )
                 new_val = jnp.expand_dims(base_val, axis=out_axis)
                 new_val = jnp.expand_dims(new_val, axis=primal_axis)
@@ -899,3 +986,45 @@ def convert_element_type_only(primal_out, primals, **params):
 
 elemental_rules[lax.convert_element_type_p] = convert_element_type_rule
 elemental_only_rules[lax.convert_element_type_p] = convert_element_type_only
+
+
+# ---------- split (each output is a lax.slice of the input) ----------
+
+def _split_elemental_for_output(primal, primal_out_k, start_k, end_k, axis):
+    """Elemental partial for the k-th output of split w.r.t. the input.
+
+    This is identical to the lax.slice elemental with start/limit indices
+    chosen to select the k-th chunk along the split axis.
+    """
+    ndim = primal.ndim
+    start_indices = tuple(start_k if i == axis else 0 for i in range(ndim))
+    limit_indices = tuple(end_k if i == axis else primal.shape[i] for i in range(ndim))
+    slice_params = {
+        'start_indices': start_indices,
+        'limit_indices': limit_indices,
+        'strides': None,
+    }
+    # _slice_elementals returns list[SparseTensor] with one entry per invar
+    return _slice_elementals([primal], primal_out_k, **slice_params)
+
+
+def split_elemental_only(primal_outs, primals, **params):
+    """Multi-output elemental rule for lax.split_p.
+
+    Returns elementals[outvar_idx][invar_idx].  split has one invar and N
+    outvars, so the outer list has N entries, each a length-1 list.
+    """
+    primal = primals[0]
+    sizes = params['sizes']
+    axis = params['axis']
+
+    result = []
+    start = 0
+    for size, primal_out_k in zip(sizes, primal_outs):
+        end = start + int(size)
+        result.append(_split_elemental_for_output(primal, primal_out_k, start, end, axis))
+        start = end
+    return result
+
+
+multi_output_elemental_only_rules[lax_src.split_p] = split_elemental_only

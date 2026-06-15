@@ -16,14 +16,14 @@ from ..sparse.tensor import (
 
 
 def get_ndim(arr):
-    if isinstance(arr, (float, int, jax._src.literals.TypedFloat)):
+    if isinstance(arr, (float, int, complex, jax._src.literals.TypedFloat)):
         return 0
     else:
         return arr.ndim
 
 
 def get_shape(arr):
-    if isinstance(arr, (float, int, jax._src.literals.TypedFloat)):
+    if isinstance(arr, (float, int, complex, jax._src.literals.TypedFloat)):
         return ()
     else:
         return arr.shape
@@ -37,9 +37,11 @@ def get_aval_shape(val):
 
 
 def make_parallel_jacobian(i, primals, val_out, elemental):
-    if len(primals) > 2:
-        raise NotImplementedError(f"Parallel Jacobians with {len(primals)} inputs not yet supported!")
-
+    # N-ary: only primals[i] and the i-th elemental are read, so 3-input
+    # elementwise primitives (e.g. clamp) work — each partial is a plain diagonal
+    # (or broadcast-singleton) Jacobian handled by the per-input branches below.
+    # (The broadcasting branch stays 2-input-specific; clamp's scalar bounds take
+    # the primal_size==0 singleton branch instead.)
     primal = primals[i]
     primal_size = get_ndim(primal)
     out_size = get_ndim(val_out)
@@ -126,6 +128,12 @@ elemental_only_rules = {}
 # Maps primitive -> (primal_outs, primals, **params) -> list[list[SparseTensor]]
 # For primitives with multiple_results=True. Returns elementals[outvar_idx][invar_idx].
 multi_output_elemental_only_rules = {}
+
+# Names of jit-wrapped functions (jit_p ``params['name']``) for which graphax has
+# its OWN hand-written Jacobian. When the eliminator meets such a jit it does NOT
+# inline + differentiate the decomposition; it dispatches to the named rule (via
+# multi_output_elemental_only_rules[jit_p]). Populated by primitives/custom.py.
+jit_name_rules = set()
 
 
 def _filter_params(fn, params):

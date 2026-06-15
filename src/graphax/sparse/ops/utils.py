@@ -121,6 +121,73 @@ def _dense_pair_result(tensor, dense, K, fill_value=_KEEP):
     return _rewrap(tensor, out, primal, dense, fill_value=fill_value)
 
 
+def _densify_toeplitz(tensor):
+    """Densify a tensor whose compressed dims are ``ToeplitzIndex`` pairs (conv
+    Jacobians), which may COEXIST with plain Dense/Diagonal dims — unlike the
+    pure-pair banded/set path below.
+
+    Each Toeplitz pair contracts its stored ``val`` axis (the kernel taps for
+    ``d out/d lhs``, the input positions for ``d out/d rhs``) against the
+    scatter-free windowed indicator ``M[p, q, k]`` and produces the pair's two
+    roles as fresh dense axes. Dense dims ride through the same einsum; Diagonal
+    (``axis is None``) dims are untouched (not stored in ``val``). One einsum
+    per tensor — XLA fuses the iota-built ``M`` into it. The result is a plain
+    Dense/Diagonal tensor, exactly what matmul / elementwise consume."""
+    from graphax.sparse.indexes import ToeplitzIndex, DenseIndex
+
+    val = tensor.val
+    out_dims, primal_dims = list(tensor.out_dims), list(tensor.primal_dims)
+    by_id = {d.id: d for d in (*out_dims, *primal_dims)}
+
+    pool = iter("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    val_letter = {a: next(pool) for a in range(val.ndim)}
+    out_letter: dict[int, str] = {}      # dim id -> its produced einsum letter
+    m_subs, m_arrays = [], []
+
+    # Toeplitz pairs: the primary owns the contracted val axis.
+    handled: set[int] = set()
+    for d in (*out_dims, *primal_dims):
+        if not (isinstance(d, ToeplitzIndex) and d.primary):
+            continue
+        partner = by_id[d.other_id]
+        contracted = val_letter[d.axis]                  # the val-role axis
+        roles = [None, None, None]
+        val_role = ({0, 1, 2} - {d.role, partner.role}).pop()
+        roles[val_role] = contracted
+        roles[d.role] = lo = next(pool)
+        roles[partner.role] = lp = next(pool)
+        m_subs.append("".join(roles))
+        m_arrays.append(d.indicator())
+        out_letter[d.id], out_letter[partner.id] = lo, lp
+        handled.add(d.id); handled.add(partner.id)
+
+    # Dense (non-Toeplitz, val-backed) dims carry their letter straight through.
+    for d in (*out_dims, *primal_dims):
+        if d.id not in handled and d.axis is not None:
+            out_letter[d.id] = val_letter[d.axis]
+
+    out_block = [d for d in out_dims if d.id in out_letter]
+    primal_block = [d for d in primal_dims if d.id in out_letter]
+    eq = (",".join(["".join(val_letter[a] for a in range(val.ndim))] + m_subs)
+          + "->" + "".join(out_letter[d.id] for d in out_block + primal_block))
+    dense = jnp.einsum(eq, val, *m_arrays)
+
+    no = len(out_block)
+    new_out, oi = [], 0
+    for d in out_dims:
+        if d.id in out_letter:
+            new_out.append(DenseIndex(d.id, d.size, oi)); oi += 1
+        else:
+            new_out.append(d)                            # diagonal pass-through
+    new_primal, pi = [], no
+    for d in primal_dims:
+        if d.id in out_letter:
+            new_primal.append(DenseIndex(d.id, d.size, pi)); pi += 1
+        else:
+            new_primal.append(d)
+    return _rewrap(tensor, tuple(new_out), tuple(new_primal), dense)
+
+
 def _densify_compressed_dims(tensor, compact: bool = False):
     """Replace a tensor's compressed Index dims (``BandedIndex`` / ``SetIndex``)
     with their densified ``DenseIndex`` / ``DiagonalIndex`` equivalents, writing
@@ -145,7 +212,14 @@ def _densify_compressed_dims(tensor, compact: bool = False):
     if not comp:
         return tensor
 
-    from graphax.sparse.indexes import BandedIndex, SetIndex, DiagonalIndex
+    from graphax.sparse.indexes import (
+        BandedIndex, SetIndex, DiagonalIndex, ToeplitzIndex,
+    )
+
+    # ToeplitzIndex (conv) pairs may coexist with Dense/Diagonal dims, so they
+    # have their own mixed-tensor densify rather than the pure-pair paths below.
+    if any(isinstance(d, ToeplitzIndex) for d in comp):
+        return _densify_toeplitz(tensor)
 
     banded = [d for d in comp if isinstance(d, BandedIndex)]
     # Kernels consume the fill as a concrete array (``_eff_fill`` → 0 when the
@@ -347,7 +421,11 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
     dim_map = {d.id: d for d in st.dims}
     block_axiss = set()
     for d in st.dims:
-        if d.is_sparse:
+        # Compressed pairs (BandedIndex / ToeplitzIndex) legitimately link axes
+        # of DIFFERENT sizes (e.g. a conv's out-pos P vs kernel-tap K) and carry
+        # their own densify-time validation, so they are exempt from the
+        # size-equality sparse-pair invariant below.
+        if d.is_sparse and not d.is_compressed:
             if not _check_sparse_dim_pair(d, dim_map):
                 raise ValueError(
                     f"Topology Error: Invalid sparse dimension pair configuration for dimension {d.id}"

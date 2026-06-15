@@ -7,11 +7,13 @@ from typing import Any, Callable, Dict, Sequence, Set, Tuple, Union, cast
 
 import immutables
 import jax
+import numpy as np
 import jax._src.core as core
 import jax.numpy as jnp
 import jax.tree_util as jtu
 from jax._src.core import ShapeDtypeStruct
 from jax._src.pjit import jit_p
+from jax._src.lax.control_flow.conditionals import cond_p
 from jax._src.util import safe_map
 
 from .jaxpr import VEJaxpr
@@ -19,6 +21,8 @@ from .primitives import (
     NO_EDGE,
     elemental_only_rules,
     elemental_rules,
+    jit_name_rules,
+    jit_named_elemental_only,
     multi_output_elemental_only_rules,
 )
 from .sparse.ops import add_w_counts
@@ -40,8 +44,37 @@ ComputationalGraph = Dict[core.Var, Dict[core.Var, jnp.ndarray]]
 ENABLE_CACHE = os.environ.get("GX_ENABLE_CACHE", "1") != "0"
 
 
+def _leaf_cache_key(leaf):
+    """Hashable cache key for one pytree leaf.
+
+    Array leaves are keyed by (shape, dtype, content-digest) rather than by
+    ``id(leaf)``. Keying by object identity is unsound here: a cached result may
+    bake the leaf's *values* into a value-dependent structure (e.g. the eager
+    elemental edges in :func:`_build_graph`) while NOT retaining the leaf array
+    itself. Once such a leaf is garbage-collected, a later array allocated at the
+    same address reuses its ``id()`` -> the cache returns the stale, wrong-valued
+    result. A content digest makes the key correct regardless of value
+    dependence: distinct values yield distinct keys, identical values reuse the
+    entry. ``_get_eliminator`` is consulted once per ``jacve`` call (and once at
+    trace time under ``jax.jit``), so the O(size) digest is off the per-vertex
+    hot path.
+    """
+    if hasattr(leaf, "shape"):
+        # Abstract tracers have no concrete buffer; under jax.jit the leaf
+        # values are deferred to runtime, so keying by (shape, dtype) is both
+        # all we can do and correct (no concrete value is baked at trace time).
+        if isinstance(leaf, core.Tracer):
+            return (leaf.shape, str(leaf.dtype))
+        # Concrete array: hash the raw buffer. ``hash(bytes)`` is a fast C
+        # routine; combined with shape + dtype the collision probability is
+        # negligible for caching.
+        buf = np.asarray(leaf).tobytes()
+        return (leaf.shape, str(leaf.dtype), hash(buf))
+    return hash(leaf)
+
+
 def pytree_hash_cache(maxsize: int | None = None):
-    """Decorator that memoizes a function on its (args, kwargs) pytree shape/dtype.
+    """Decorator that memoizes a function on its (args, kwargs) pytree content.
 
     Disabled at call-time when ``ENABLE_CACHE`` is False so the wrapped
     function is invoked directly without consulting the cache.
@@ -58,12 +91,7 @@ def pytree_hash_cache(maxsize: int | None = None):
                 return func(*args, **kwargs)
 
             leaves, treedef = jtu.tree_flatten((args, kwargs))
-            leaf_hashes = tuple(
-                (id(leaf), leaf.shape, leaf.dtype)
-                if hasattr(leaf, "shape")
-                else hash(leaf)
-                for leaf in leaves
-            )
+            leaf_hashes = tuple(_leaf_cache_key(leaf) for leaf in leaves)
             key = hash((hash(treedef), leaf_hashes))
 
             must_compute = False
@@ -134,6 +162,131 @@ def _force(edge):
     return edge.value if isinstance(edge, LazyEdge) else edge
 
 
+def _jit_kept_as_vertex(eqn) -> bool:
+    """A jit is kept as a vertex (NOT inlined) iff graphax has its own Jacobian
+    for its name. This single predicate ties the two halves of the invariant
+    together: the inline gate (``_call_body``) leaves these eqns in place, and the
+    jit elemental rule (``_make_jit_elemental_rule``) dispatches them by name.
+    Every other jit is inlined into the parent graph."""
+    return eqn.primitive is jit_p and eqn.params.get("name") in jit_name_rules
+
+
+def _has_recursive_macro_vertex(jaxpr) -> bool:
+    """True if the jaxpr contains a value-dependent macro-vertex kept AS a vertex
+    — cond/switch (differentiates the taken branch) or a named jit (name-keyed
+    Jacobian). Their Jacobians depend on runtime values, so such a top-level
+    jaxpr must bypass the id-keyed eliminator cache (like inlined jaxprs) to
+    avoid returning a stale eliminator built for a different, GC'd function whose
+    object id was reused."""
+    return any(eqn.primitive is cond_p or _jit_kept_as_vertex(eqn)
+               for eqn in jaxpr.eqns)
+
+
+def _inline_call_primitives(jaxpr, consts):
+    """Splice jit/pjit (and nested) bodies into the parent jaxpr so vertex
+    elimination only ever sees primitives with registered elemental rules.
+
+    This is the PRIMARY path for jit: its body is a closed sub-jaxpr — pure
+    structural plumbing — so we re-point the body's invars onto the outer call
+    args, recurse into the body's equations, and re-point the outer outvars onto
+    the body's results. Inlining composes far better than the *macro-vertex*
+    alternative (recursively differentiating the body and re-wrapping its
+    Jacobian, which mis-shaped the inner Jacobian during the OUTER composition —
+    e.g. a (6,6,6) -> (6,6) reshape for ``jax.nn`` activations).
+
+    The ONE exception is a jit graphax has its own Jacobian for
+    (``_jit_kept_as_vertex`` — jax.nn.elu/selu/...): that one is kept as a vertex
+    so the named rule can apply the exact analytic Jacobian (the macro-vertex
+    survives only as that rule's non-default-args fallback). Returns ``(new_jaxpr,
+    new_consts)``; inner consts are hoisted to top-level constvars. A no-op (the
+    original objects) when there are no call primitives to inline.
+
+    Inner bodies are renamed into FRESH variables per call site: JAX reuses the
+    *same* inner-jaxpr object (hence the same ``Var`` instances) for every call of
+    a given jitted/custom function, so a single global substitution keyed by those
+    shared Vars would let a second call site overwrite the first's mapping and
+    silently corrupt the graph (e.g. a shared MLP block applied twice). ``gensym``
+    gives every inlined Var a fresh identity local to its call site."""
+    has_call = [False]
+    newvar = core.gensym()
+
+    new_eqns = []
+    constvars = list(jaxpr.constvars)
+    new_consts = list(consts)
+
+    def _call_body(eqn):
+        """The closed inner jaxpr to inline for this eqn, else None.
+
+        Only ordinary jits are inlined. custom_jvp / custom_vjp are NOT inlined:
+        their bespoke jvp/bwd rules can differ from the primal decomposition's
+        derivative (kink subgradients, straight-through / surrogate gradients),
+        so each is handled by a dedicated elemental rule that HONORS the user
+        rule (``custom_jvp_elemental_only`` / ``custom_vjp_elemental_only`` in
+        primitives/custom.py). A named jit graphax has its own Jacobian for
+        (``_jit_kept_as_vertex``) is likewise NOT inlined — it is dispatched by
+        name by the jit elemental rule."""
+        if eqn.primitive is jit_p and not _jit_kept_as_vertex(eqn):
+            return eqn.params["jaxpr"]
+        return None
+
+    def process(eqns, env, fresh):
+        """Emit ``eqns`` with vars resolved through ``env``. ``fresh`` is True for
+        equations that came from an inlined body — their outvars are renamed to
+        fresh Vars so repeated call sites of the same shared inner jaxpr never
+        collide. Top-level equations (``fresh=False``) keep their already-unique
+        Vars untouched."""
+        def resolve(v):
+            if isinstance(v, core.Literal):
+                return v
+            return env.get(v, v)
+
+        for eqn in eqns:
+            inner_closed = _call_body(eqn)
+            if inner_closed is not None:
+                has_call[0] = True
+                inner = inner_closed.jaxpr
+                # Each inlining gets its own child scope, seeded with the outer
+                # env so inner invars can resolve onto outer call args.
+                child = dict(env)
+                for cv, cval in zip(inner.constvars, inner_closed.consts):
+                    nv = newvar(cv.aval)
+                    child[cv] = nv
+                    constvars.append(nv)
+                    new_consts.append(cval)
+                for iv, ov in zip(inner.invars, eqn.invars):
+                    child[iv] = resolve(ov)
+                process(inner.eqns, child, True)
+                for oov, iov in zip(eqn.outvars, inner.outvars):
+                    if isinstance(oov, core.DropVar):
+                        continue
+                    env[oov] = iov if isinstance(iov, core.Literal) else child.get(iov, iov)
+            elif fresh:
+                new_invars = [resolve(v) for v in eqn.invars]
+                new_outvars = []
+                for ov in eqn.outvars:
+                    if isinstance(ov, core.DropVar):
+                        new_outvars.append(ov)
+                    else:
+                        nv = newvar(ov.aval)
+                        env[ov] = nv
+                        new_outvars.append(nv)
+                new_eqns.append(eqn.replace(invars=new_invars, outvars=new_outvars))
+            else:
+                new_eqns.append(eqn.replace(invars=[resolve(v) for v in eqn.invars]))
+
+    top_env: Dict[Any, Any] = {}
+    process(jaxpr.eqns, top_env, False)
+    if not has_call[0]:
+        return jaxpr, consts
+
+    def resolve_out(v):
+        return v if isinstance(v, core.Literal) else top_env.get(v, v)
+
+    new_outvars = [resolve_out(v) for v in jaxpr.outvars]
+    new_jaxpr = jaxpr.replace(constvars=constvars, eqns=new_eqns, outvars=new_outvars)
+    return new_jaxpr, new_consts
+
+
 def jacve(
     fun: Callable,
     order: EliminationOrder,
@@ -186,16 +339,25 @@ def jacve(
         # TODO Make repackaging work properly with one input value only
         flattened_args, in_tree = jtu.tree_flatten(args)
         closed_jaxpr = jax.make_jaxpr(fun)(*flattened_args, **kwargs)
+        inlined_jaxpr, inlined_consts = _inline_call_primitives(
+            closed_jaxpr.jaxpr, closed_jaxpr.literals
+        )
+        # Bypass the id-keyed eliminator cache when the jaxpr is a fresh inlined
+        # object, OR contains a value-dependent macro-vertex (cond / named jit) —
+        # both are exposed to GC id-reuse staleness (see vertex_elimination_jaxpr).
+        was_inlined = (inlined_jaxpr is not closed_jaxpr.jaxpr
+                       or _has_recursive_macro_vertex(inlined_jaxpr))
 
         out = vertex_elimination_jaxpr(
-            closed_jaxpr.jaxpr,
+            inlined_jaxpr,
             order,
-            closed_jaxpr.literals,
+            inlined_consts,
             *args,
             has_aux=has_aux,
             argnums=argnums,
             count_ops=count_ops,
             sparse_representation=sparse_representation,
+            fresh_eliminator=was_inlined,
             transforms=transforms,
         )
 
@@ -845,6 +1007,29 @@ def _checkify_order(
     return [o for o in order if o in vertex_set]
 
 
+def _eval_primal(eqn, invals):
+    """Compute an equation's primal output value(s).
+
+    Most primitives bind directly. ``custom_jvp_call_p`` / ``custom_vjp_call_p``
+    cannot be re-bound from ``eqn.params`` (their sub-functions live in a
+    ``subfuns`` slot the generic bind pops), so we evaluate the primal
+    ``call_jaxpr`` instead — the gradient is supplied separately by the
+    jvp/bwd-honoring elemental rules."""
+    name = getattr(eqn.primitive, "name", "")
+    if name in ("custom_jvp_call", "custom_vjp_call"):
+        cj = eqn.params["call_jaxpr"]
+        return core.eval_jaxpr(cj.jaxpr, cj.consts, *invals)
+    if eqn.primitive is jit_p:  # named jit kept for by-name dispatch
+        cj = eqn.params["jaxpr"]
+        return core.eval_jaxpr(cj.jaxpr, cj.consts, *invals)
+    if eqn.primitive is cond_p:  # evaluate the TAKEN branch (index is concrete)
+        branches = eqn.params["branches"]
+        index = max(0, min(int(invals[0]), len(branches) - 1))
+        b = branches[index]
+        return core.eval_jaxpr(b.jaxpr, b.consts, *invals[1:])
+    return eqn.primitive.bind(*invals, **eqn.params)
+
+
 def _build_graph(
     jaxpr: core.Jaxpr,
     args: Sequence[jnp.ndarray],
@@ -954,7 +1139,7 @@ def _build_graph(
         # entirely — but still bind the primitive so `env` carries the primal
         # for downstream use (output value selection, vo_vertices accounting).
         if active_vars is not None and not var_positions:
-            primal_outvals = eqn.primitive.bind(*invals_snapshot, **eqn.params)
+            primal_outvals = _eval_primal(eqn, invals_snapshot)
             if eqn.primitive.multiple_results:
                 safe_map(write, eqn.outvars, primal_outvals)
             else:
@@ -971,7 +1156,7 @@ def _build_graph(
         if eqn.primitive in multi_output_elemental_only_rules:
             # Multi-output path: primitive produces multiple output variables.
             # The rule returns elementals[outvar_idx][invar_idx].
-            primal_outvals = eqn.primitive.bind(*invals_snapshot, **eqn.params)
+            primal_outvals = _eval_primal(eqn, invals_snapshot)
             safe_map(write, eqn.outvars, primal_outvals)
 
             fn = multi_output_elemental_only_rules[eqn.primitive]
@@ -994,7 +1179,7 @@ def _build_graph(
             # Deferred dispatch path: bind primal eagerly, defer all elemental
             # JAX ops to lazy thunks that fire only when the edge is consumed.
             outvar = eqn.outvars[0]
-            primal_outvals = eqn.primitive.bind(*invals_snapshot, **eqn.params)
+            primal_outvals = _eval_primal(eqn, invals_snapshot)
             if eqn.primitive.multiple_results:
                 safe_map(write, eqn.outvars, primal_outvals)
             else:
@@ -1325,6 +1510,7 @@ def vertex_elimination_jaxpr(
     argnums: Sequence[int] = (0,),
     count_ops: bool = False,
     sparse_representation: bool = False,
+    fresh_eliminator: bool = False,
     transforms: Sequence[
         Tuple[
             int,
@@ -1376,7 +1562,16 @@ def vertex_elimination_jaxpr(
     jaxpr_invars = [invar for i, invar in enumerate(jaxpr.invars) if i in argnums]
     env, _, _, vo_vertices = _build_graph(jaxpr, args, consts)
 
-    eliminator = _get_eliminator(jaxpr, args, consts, tuple(argnums))
+    # A freshly INLINED jaxpr (from jit/pjit/custom_jvp inlining) is a brand-new
+    # object whose ``__hash__`` is identity-based; the eliminator cache would key
+    # it by object id, and GC id-reuse then yields stale, wrong-valued hits
+    # (nondeterministically). Inlined jaxprs are rebuilt every call anyway, so the
+    # cache offers them nothing — bypass it (fresh eliminator). Non-inlined jaxprs
+    # use the cache as before.
+    if fresh_eliminator:
+        eliminator = _get_eliminator.__wrapped__(jaxpr, args, consts, tuple(argnums))
+    else:
+        eliminator = _get_eliminator(jaxpr, args, consts, tuple(argnums))
     order = _checkify_order(order, jaxpr, vo_vertices)
     graph, _, adds, muls, fmas, mem, counts = eliminator.eliminate(
         order, jaxpr, transforms, vo_vertices, count_ops
@@ -1569,22 +1764,34 @@ def extract_jaxpr(
 
 
 # ---------------------------------------------------------------------------
-# jit_p (pjit) elemental-only rule
+# The jit_p elemental rule (the ONLY registration for jit_p; ordinary jits never
+# reach it — they are inlined by _inline_call_primitives). It is reached only for
+# a jit KEPT as a vertex (``_jit_kept_as_vertex``: a jax.nn activation graphax has
+# its own Jacobian for) and dispatches:
 #
-# jit_p is a macro vertex: its params["jaxpr"] contains the full sub-computation
-# as a closed jaxpr.  The correct elemental is the Jacobian of that inner
-# function, which we compute by recursively applying vertex_elimination_jaxpr.
+#   1. name in jit_name_rules + default static args -> graphax's own clean
+#      Jacobian (jit_named_elemental_only), exact analytic subgradient at kinks;
+#   2. otherwise (non-default alpha / negative_slope) -> fall back to the
+#      macro-vertex: recursively differentiate params["jaxpr"] with
+#      vertex_elimination_jaxpr. Its order is configurable via
+#      set_jit_fallback_order() (default "reverse").
 #
-# Registered here (not in primitives/pjit.py) to avoid a circular import:
-# pjit.py -> core.py -> primitives -> pjit.py.
-#
-# The elimination order for the inner jaxpr is configurable via
-# set_pjit_elimination_order().  Default: "reverse" (reverse-mode-like).
+# Registered here (not in a primitives/pjit.py) to avoid a circular import:
+# core.py needs vertex_elimination_jaxpr, which lives here.
 # ---------------------------------------------------------------------------
 
 
-def _make_pjit_multi_output_elemental_only(order):
-    def pjit_multi_output_elemental_only(primal_outs, primals, **params):
+def _make_jit_elemental_rule(order):
+    def jit_elemental_rule(primal_outs, primals, **params):
+        # 1. graphax's own named-activation Jacobian (clean kink subgradient).
+        #    Raises on non-default static args -> fall through to the body diff.
+        if params.get("name") in jit_name_rules:
+            try:
+                return jit_named_elemental_only(primal_outs, primals, **params)
+            except NotImplementedError:
+                pass
+
+        # 2. Macro-vertex fallback: Jacobian of the inner jaxpr by recursion.
         inner_closed = params["jaxpr"]
         inner_jaxpr = inner_closed.jaxpr
         consts = inner_closed.literals
@@ -1598,6 +1805,7 @@ def _make_pjit_multi_output_elemental_only(order):
             *primals,
             argnums=argnums,
             sparse_representation=True,
+            fresh_eliminator=True,  # sub-jaxpr: bypass the id-keyed eliminator cache
         )
 
         # vertex_elimination_jaxpr output layout (sparse_representation=True):
@@ -1612,11 +1820,16 @@ def _make_pjit_multi_output_elemental_only(order):
             # Each entry is a tuple of N SparseTensors (one per input) for one output.
             return [list(jac_tuple) for jac_tuple in jac_vals]
 
-    return pjit_multi_output_elemental_only
+    return jit_elemental_rule
 
 
-def set_pjit_elimination_order(order: str = "reverse") -> None:
-    """Set the vertex elimination order used when differentiating through jax.jit.
+def set_jit_fallback_order(order: str = "reverse") -> None:
+    """Set the vertex elimination order for the jit_p macro-vertex fallback.
+
+    Ordinary jits are inlined and named jax.nn activations are dispatched by
+    name, so this order only affects the rare FALLBACK path: a named activation
+    called with NON-default static args (where graphax's name-keyed Jacobian
+    doesn't apply), whose body is then differentiated by recursion.
 
     Args:
         order: Any elimination order accepted by jacve — ``"forward"``, ``"fwd"``,
@@ -1624,13 +1837,56 @@ def set_pjit_elimination_order(order: str = "reverse") -> None:
                Defaults to ``"reverse"``.
     """
     elemental_only_rules.pop(jit_p, None)  # remove any prior single-output registration
-    multi_output_elemental_only_rules[jit_p] = _make_pjit_multi_output_elemental_only(
-        order
-    )
+    multi_output_elemental_only_rules[jit_p] = _make_jit_elemental_rule(order)
+
+
+# Back-compat alias: this used to be the only public name, but the order governs
+# the jit_p macro-vertex FALLBACK (an inlined / name-dispatched jit never reaches
+# it) and "pjit" is legacy JAX terminology, so ``set_jit_fallback_order`` is now
+# the preferred name. Both refer to the same function.
+set_pjit_elimination_order = set_jit_fallback_order
 
 
 # Register with the default order at import time.
-set_pjit_elimination_order()
+set_jit_fallback_order()
+
+
+# ---------------------------------------------------------------------------
+# cond_p / switch elemental rule
+#
+# lax.cond / lax.switch select one of `branches` by an integer index. That index
+# is concrete during graphax's forward pass, so we differentiate the TAKEN branch
+# (recursively, like the jit macro-vertex) — matching jax, which also only
+# differentiates the taken branch. The integer index carries no gradient.
+# (The old auto.py stub returned `[]`, silently zeroing the gradient of ALL
+# control flow.) Registered here because it needs vertex_elimination_jaxpr.
+# ---------------------------------------------------------------------------
+def cond_elemental_rule(primal_outs, primals, **params):
+    branches = params["branches"]
+    index = max(0, min(int(primals[0]), len(branches) - 1))
+    branch = branches[index]
+    operands = primals[1:]
+    n = len(operands)
+
+    jac_vals = vertex_elimination_jaxpr(
+        branch.jaxpr,
+        "reverse",
+        branch.consts,
+        *operands,
+        argnums=tuple(range(n)),
+        sparse_representation=True,
+        fresh_eliminator=True,  # sub-jaxpr: bypass the id-keyed eliminator cache
+    )
+
+    # jac_vals[outvar_idx] is a single SparseTensor (n==1) or a per-operand tuple
+    # (n>1). eqn invars are (index, *operands), so prepend None for the
+    # non-differentiable index, then one entry per operand.
+    if n == 1:
+        return [[None, jac] for jac in jac_vals]
+    return [[None, *jac_tuple] for jac_tuple in jac_vals]
+
+
+multi_output_elemental_only_rules[cond_p] = cond_elemental_rule
 
 
 # ---------------------------------------------------------------------------
