@@ -91,6 +91,15 @@ def pytree_hash_cache(maxsize: int | None = None):
                 return func(*args, **kwargs)
 
             leaves, treedef = jtu.tree_flatten((args, kwargs))
+            # Under an abstract trace (jax.jit / vmap) the leaves are tracers with
+            # no concrete value, so they can only be keyed by (shape, dtype) —
+            # which COLLIDES across distinct traces of equally-shaped inputs. A
+            # hit would then return a cached result whose SparseTensor edges hold
+            # a PRIOR trace's tracers, which escape the current trace
+            # (UnexpectedTracerError). Always compute fresh while tracing; jit's
+            # own compilation cache already memoizes repeated calls.
+            if any(isinstance(leaf, core.Tracer) for leaf in leaves):
+                return func(*args, **kwargs)
             leaf_hashes = tuple(_leaf_cache_key(leaf) for leaf in leaves)
             key = hash((hash(treedef), leaf_hashes))
 
