@@ -27,18 +27,24 @@ from graphax.sparse.tensor import SparseTensor
 
 
 def _make_dense_pair_st(
-    n1: int, n2: int, dtype=jnp.float32,
+    n1: int, n2: int, dtype=jnp.float32, fill_value=None,
 ) -> tuple[SparseTensor, jnp.ndarray]:
-    """Build a SparseTensor backed by a fully-dense (n1, n2) val."""
+    """Build a SparseTensor backed by a fully-dense (n1, n2) val.
+
+    ``fill_value`` defaults to ``None`` (the post-Phase-8 statically-zero
+    marker); pass an explicit array to exercise a materialized fill.
+    """
     val = jnp.arange(n1 * n2, dtype=dtype).reshape(n1, n2)
     d1 = DenseIndex(id=0, size=n1, axis=0)
     d2 = DenseIndex(id=1, size=n2, axis=1)
-    return SparseTensor((d1,), (d2,), val), val
+    return SparseTensor((d1,), (d2,), val, fill_value=fill_value), val
 
 
 def test_quant_basic_cast_val_only():
     """float32 → float16 casts val; scalar_mult and fill_value stay native."""
-    st, _ = _make_dense_pair_st(4, 4)
+    # Explicit float32 fill so we can assert it is preserved unquantized
+    # (the default fill_value=None stays None — checked separately below).
+    st, _ = _make_dense_pair_st(4, 4, fill_value=jnp.array(0.0, dtype=jnp.float32))
     assert st.val.dtype == jnp.float32
     assert st.scalar_mult.dtype == jnp.float32
     assert st.fill_value.dtype == jnp.float32
@@ -50,6 +56,11 @@ def test_quant_basic_cast_val_only():
     # intentionally preserved in their native dtype.
     assert new_st.scalar_mult.dtype == jnp.float32
     assert new_st.fill_value.dtype == jnp.float32
+
+    # The statically-zero (fill_value=None) default is likewise preserved.
+    st_none, _ = _make_dense_pair_st(4, 4)
+    assert st_none.fill_value is None
+    assert apply_quant(st_none, Quant("float16")).fill_value is None
 
 
 def test_quant_noop_same_dtype_returns_same_instance():
