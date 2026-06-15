@@ -9,14 +9,14 @@ from .base import (
 # Import submodules to trigger elemental rule registrations. These are all
 # non-overlapping primitives, so any order after `base` is fine — except that
 # transforms must come before indexing (which imports JacobianTransform from it)
-# and before structural (which imports _slice_elementals from it).
+# and before passthrough (which imports _slice_elementals from it).
 from . import math
 from . import linalg
 from . import reductions
 from . import transforms
 from . import indexing
 from . import conv
-from . import structural
+from . import passthrough
 
 # User-supplied-derivative honoring: custom_vjp/custom_jvp call rules + named-jit
 # (jax.nn activation) Jacobians dispatched by jit_p params['name'].

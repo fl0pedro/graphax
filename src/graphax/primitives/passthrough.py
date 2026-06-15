@@ -1,3 +1,11 @@
+"""Pass-through primitives.
+
+``iota`` / ``device_put`` / ``stop_gradient`` carry no gradient (empty elemental
+list), and ``split`` is a structural slice — each output is a ``lax.slice`` of
+the input. None of these compute a new value-dependent Jacobian; they just route
+or block gradient flow.
+"""
+
 import jax.lax as lax
 import jax._src.lax.lax as lax_src
 

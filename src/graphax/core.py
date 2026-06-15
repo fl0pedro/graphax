@@ -1840,8 +1840,14 @@ def set_pjit_elimination_order(order: str = "reverse") -> None:
     multi_output_elemental_only_rules[jit_p] = _make_jit_elemental_rule(order)
 
 
+# Preferred public name: the order governs the jit_p macro-vertex FALLBACK (an
+# inlined / name-dispatched jit never reaches it), and "pjit" is legacy JAX
+# terminology. ``set_pjit_elimination_order`` is kept as a back-compat alias.
+set_jit_fallback_order = set_pjit_elimination_order
+
+
 # Register with the default order at import time.
-set_pjit_elimination_order()
+set_jit_fallback_order()
 
 
 # ---------------------------------------------------------------------------
