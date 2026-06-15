@@ -37,9 +37,11 @@ def get_aval_shape(val):
 
 
 def make_parallel_jacobian(i, primals, val_out, elemental):
-    if len(primals) > 2:
-        raise NotImplementedError(f"Parallel Jacobians with {len(primals)} inputs not yet supported!")
-
+    # N-ary: only primals[i] and the i-th elemental are read, so 3-input
+    # elementwise primitives (e.g. clamp) work — each partial is a plain diagonal
+    # (or broadcast-singleton) Jacobian handled by the per-input branches below.
+    # (The broadcasting branch stays 2-input-specific; clamp's scalar bounds take
+    # the primal_size==0 singleton branch instead.)
     primal = primals[i]
     primal_size = get_ndim(primal)
     out_size = get_ndim(val_out)
