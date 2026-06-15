@@ -13,6 +13,7 @@ from . import linalg
 from . import reductions
 from . import transforms
 from . import indexing
+from . import conv
 from . import structural
 
 # Auto-generated primitive rules (parallelism, advanced linalg, scatter/gather,
