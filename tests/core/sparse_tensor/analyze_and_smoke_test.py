@@ -15,7 +15,12 @@ import jax.random as jr
 from graphax.sparse.ops.elementwise import elementwise
 from graphax.sparse.ops.matmul import matmul as _sparse_matmul
 from graphax.sparse.tensor import DenseIndex, DiagonalIndex, SparseTensor
-from jax_memory_monitor import PeakMemoryMonitor
+
+# jax_memory_monitor renamed PeakMemoryMonitor -> ResourceMonitor (same .peak /
+# .peak_mb context-manager API). importorskip so the file SKIPS cleanly when the
+# nanobind bridge isn't built for this interpreter instead of erroring at collection.
+import pytest as _pytest
+PeakMemoryMonitor = _pytest.importorskip("jax_memory_monitor").ResourceMonitor
 
 ANALYZE = os.getenv("ANALYZE", "0") == "1"
 SCALE = int(os.getenv("SCALE", "1"))

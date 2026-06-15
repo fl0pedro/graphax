@@ -44,7 +44,12 @@ from graphax.sparse.indexes import DiagonalIndex, DenseIndex, SetIndex, BandedIn
 from graphax.sparse.ops.elementwise import elementwise
 from graphax.sparse.ops.matmul import matmul as sparse_matmul
 from graphax.sparse.ops._path_tracking import track_paths
-from jax_memory_monitor import PeakMemoryMonitor
+
+# jax_memory_monitor renamed PeakMemoryMonitor -> ResourceMonitor (same .peak /
+# .peak_mb context-manager API). importorskip so the file SKIPS cleanly when the
+# nanobind bridge isn't built for this interpreter instead of erroring at collection.
+import pytest as _pytest
+PeakMemoryMonitor = _pytest.importorskip("jax_memory_monitor").ResourceMonitor
 
 
 def _n(shape, key=0):
