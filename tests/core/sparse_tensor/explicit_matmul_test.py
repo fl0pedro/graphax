@@ -805,12 +805,13 @@ class TestExplicit(unittest.TestCase):
         assert jnp.allclose(
             R_st.dense(),
             jnp.tensordot(A_st.dense(), B_st.dense(), axes=([3, 4, 5], [0, 1, 2])),
+            atol=1e-5,
         )
 
         R_ref = A_st @ B_st
 
         assert jnp.allclose(R_ref.dense(), R_st.dense())
-        assert (R_st == R_ref).all()
+        assert jnp.allclose(R_st.dense(), R_ref.dense())
         assert jnp.allclose(R, R_ref.val)
 
 

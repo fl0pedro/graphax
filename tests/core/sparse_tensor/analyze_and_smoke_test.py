@@ -750,7 +750,11 @@ class TestSmokeScreen(unittest.TestCase):
         # ``axis`` / ``block_axis`` still points to its own physical slot). The
         # invariant that matters is ``res.dense() == manual.dense()`` — verify
         # that, not the storage layout.
-        tol = {"atol": 1e-3} if ANALYZE else {}
+        # Float32 block-sparse and dense matmul paths accumulate in different
+        # orders, so near-zero result elements can differ by O(1e-6) — a valid
+        # reordering, not a correctness gap. Compare with a small absolute
+        # tolerance (the ``rtol`` default alone is too strict for tiny values).
+        tol = {"atol": 1e-3} if ANALYZE else {"atol": 1e-5}
         if res_dense is not None:
             self.assertTrue(jnp.allclose(res.dense(), res_dense.dense(), **tol))
         self.assertEqual(res.shape, res_manual.shape)

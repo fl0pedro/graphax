@@ -17,6 +17,7 @@ import numpy as np
 from jax import Array
 
 from graphax.sparse.indexes import Index, DenseIndex, DiagonalIndex, _split_fill
+from graphax.sparse.dtype_compute import _compute_dtype, _scaled_mul
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
@@ -61,7 +62,10 @@ def _apply_scalar_mult(value: Array, tensor) -> Array:
     this operand's scalar_mult to a buffer", shared by elementwise + matmul."""
     if tensor.dtype == jnp.bool_:
         return value & tensor.scalar_mult.astype(jnp.bool_)
-    return value * tensor.scalar_mult
+    # Highest-common-dtype multiply: a Quant'd narrow ``value`` (float8 /
+    # sub-byte int / …) has no implicit promotion path with a float32
+    # scalar_mult, so upcast both to their common dtype before the op.
+    return _scaled_mul(value, tensor.scalar_mult)
 
 
 def _scaled_fill(tensor) -> Array:

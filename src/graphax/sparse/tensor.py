@@ -16,6 +16,7 @@ from jax.tree_util import register_pytree_node_class
 from jax.typing import DTypeLike
 
 from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
+from graphax.sparse.dtype_compute import _scaled_mul
 from graphax.sparse.ops.dense import dense  # noqa: F401  (re-exported: callers do `from graphax.sparse.tensor import dense`)
 from graphax.sparse.ops.elementwise import elementwise
 from graphax.sparse.ops.matmul import matmul
@@ -581,8 +582,8 @@ class SparseTensor(SparseMathMixin):
           == 0``.
         * otherwise (all/any): an idempotent fold applied only when fill cells
           exist; ``fold_fn`` maps the fill's truthiness itself."""
-        val_part = reduce_fn(self._stored_val() * self.scalar_mult)
-        scaled_fill = self._eff_fill * self.scalar_mult
+        val_part = reduce_fn(_scaled_mul(self._stored_val(), self.scalar_mult))
+        scaled_fill = _scaled_mul(self._eff_fill, self.scalar_mult)
         # weighted (sum/prod) always folds (branchless, vanishes when n_fill==0);
         # all/any fold only when fill cells exist.
         if weighted or self._n_fill_cells > 0:
@@ -614,10 +615,10 @@ class SparseTensor(SparseMathMixin):
         fill."""
         val = self._stored_val()
         if val.size == 0:
-            return self._eff_fill * self.scalar_mult
-        m = reduce_fn(val * self.scalar_mult)
+            return _scaled_mul(self._eff_fill, self.scalar_mult)
+        m = reduce_fn(_scaled_mul(val, self.scalar_mult))
         if self._n_fill_cells > 0:
-            m = fold_fn(m, self._eff_fill * self.scalar_mult)
+            m = fold_fn(m, _scaled_mul(self._eff_fill, self.scalar_mult))
         return m
 
     @_on_materialized

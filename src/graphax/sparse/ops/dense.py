@@ -70,6 +70,7 @@ import jax.numpy as jnp
 from jax import Array
 
 from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
+from graphax.sparse.dtype_compute import _scaled_mul
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
@@ -167,7 +168,8 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
             # dense()/dense_for_matmul inconsistency: it materialised 0 instead
             # of 1 for a fully-dense val=None operand.)
             return jnp.broadcast_to(
-                jnp.array(1.0, dtype=tensor.dtype) * tensor.scalar_mult, tensor.shape
+                _scaled_mul(jnp.array(1.0, dtype=tensor.dtype), tensor.scalar_mult),
+                tensor.shape,
             )
         v = tensor.val
         perm = [d.axis for d in tensor.dims if d.axis is not None]
@@ -178,7 +180,7 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
             and perm != list(range(len(perm)))
         ):
             v = v.transpose(perm)
-        v = v * tensor.scalar_mult
+        v = _scaled_mul(v, tensor.scalar_mult)
         # Broadcast back up to the logical shape: a SparseTensor can carry a
         # rank-0 (or otherwise rank-reduced) ``val`` while its dims advertise
         # a larger structural shape (e.g. concat-transformed Jacobians where
@@ -219,7 +221,7 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
         logical_outer, logical_inner = N * B_o, N * B_i
         gather_axes = [d_o.axis, d_o.block_axis, d_i.block_axis]
         if all(a is not None for a in gather_axes):
-            v = tensor.val * tensor.scalar_mult
+            v = _scaled_mul(tensor.val, tensor.scalar_mult)
             leftover = [a for a in range(v.ndim) if a not in gather_axes]
             v = v.transpose(gather_axes + leftover)
             # v.shape: (N, B_o, B_i, *leftover_sizes). Collapse (N, B_o) → logical_outer
@@ -237,7 +239,7 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
             mask = blk_o[:, None] == blk_i[None, :]
             mask_b = mask[(..., *((None,) * len(leftover_sizes)))]
             dense_pair = jnp.where(
-                mask_b, gathered, tensor._eff_fill * tensor.scalar_mult
+                mask_b, gathered, _scaled_mul(tensor._eff_fill, tensor.scalar_mult)
             )
             # Reorder dense_pair's axes to match tensor.dims order. ``target_axes[i]`` is
             # the dense_pair axis that should land at result position ``i``, so the
@@ -255,9 +257,10 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
         # Purely structural after hard densify ⇒ all-ones × scalar_mult (val=None
         # semantics; see the fully-dense branch above).
         return jnp.broadcast_to(
-            jnp.array(1.0, dtype=tensor.dtype) * tensor.scalar_mult, densified.shape
+            _scaled_mul(jnp.array(1.0, dtype=tensor.dtype), tensor.scalar_mult),
+            densified.shape,
         )
-    return val * tensor.scalar_mult
+    return _scaled_mul(val, tensor.scalar_mult)
 
 
 # --- Internals -----------------------------------------------------------
