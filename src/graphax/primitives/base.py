@@ -132,7 +132,7 @@ multi_output_elemental_only_rules = {}
 # Names of jit-wrapped functions (jit_p ``params['name']``) for which graphax has
 # its OWN hand-written Jacobian. When the eliminator meets such a jit it does NOT
 # inline + differentiate the decomposition; it dispatches to the named rule (via
-# multi_output_elemental_only_rules[jit_p]). Populated by primitives/activations.py.
+# multi_output_elemental_only_rules[jit_p]). Populated by primitives/custom.py.
 jit_name_rules = set()
 
 

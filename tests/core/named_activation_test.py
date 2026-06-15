@@ -2,7 +2,7 @@
 
 ``jax.nn`` activations like elu/selu/celu/leaky_relu/hard_tanh/sparse_plus/
 sparse_sigmoid are ``@jit``-wrapped with no custom_jvp. graphax dispatches them
-by their ``jit_p`` name (``primitives/activations.py``) to its own diagonal
+by their ``jit_p`` name (``primitives/custom.py``) to its own diagonal
 Jacobian — the exact analytic subgradient — instead of differentiating the
 select_n/max/min decomposition. Plain ``jax.nn.*`` is used directly (no wrapper).
 """
@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import jax.nn as jnn
 
-import graphax.primitives.activations as act
+import graphax.primitives.custom as act
 from graphax import jacve, tree_allclose
 
 _NAMED = ["elu", "selu", "celu", "leaky_relu", "hard_tanh",

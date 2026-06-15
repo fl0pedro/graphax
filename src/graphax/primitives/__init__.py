@@ -22,8 +22,9 @@ from . import structural
 # primitives are added to the registry.
 from . import auto
 
-# Named-jit Jacobians (jax.nn activations dispatched by jit_p params['name']).
-from . import activations
-from .activations import jit_named_elemental_only
+# User-supplied-derivative honoring: custom_vjp/custom_jvp call rules + named-jit
+# (jax.nn activation) Jacobians dispatched by jit_p params['name'].
+from . import custom
+from .custom import jit_named_elemental_only
 
 from .transforms import JacobianTransform
