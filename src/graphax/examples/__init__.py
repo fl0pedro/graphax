@@ -6,4 +6,6 @@ from .differential_kinematics import RobotArm_6DOF
 from .deep_learning import Perceptron, Encoder, EncoderDecoder
 from .roe import RoeFlux_1d, RoeFlux_3d
 from .economics import BlackScholes, BlackScholes_Jacobian
-from .minpack import PropaneCombustion, HumanHeartDipole                     
+from .minpack import PropaneCombustion, HumanHeartDipole
+from .vision import (ViT, ConvNet, MoE, vit_weights, conv_weights, moe_weights,
+                     patchify)
