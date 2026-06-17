@@ -10,90 +10,30 @@ from ..sparse.tensor import (
     _swap_back_axes,
 )
 from .base import elemental_rules, get_ndim, get_shape
-from .transforms import (
-    JacobianTransform,
-    _identity_post_over,
-    _is_scalar_identity_post,
-)
-
-
-def make_slice_transform(start_indices, limit_indices, out_shape):
-    def slice_transform(pre):
-        s_idx = list(start_indices)
-        l_idx = list(limit_indices)
-        full_val = pre.dense()
-        new_out_dims = []
-        new_primal_dims = []
-        counter = 0
-
-        for s in out_shape:
-            new_out_dims.append(DenseIndex(counter, s, counter))
-            counter += 1
-
-        for d in pre.primal_dims:
-            new_primal_dims.append(DenseIndex(counter, d.size, counter))
-            s_idx.append(0)
-            l_idx.append(d.size)
-            counter += 1
-
-        new_val = lax.slice(full_val, s_idx, l_idx)
-        return SparseTensor(new_out_dims, new_primal_dims, new_val)
-
-    return slice_transform
-
-
-def make_inverse_slice_transform(start_indices, limit_indices, primal0_shape,
-                                 out_shape, out_dtype=None):
-    # out_dtype=None -> JAX's default float dtype (float32, or float64 under
-    # jax_enable_x64) — i.e. whatever jnp.array(0.0) would produce.
-    seed_dtype = jnp.result_type(float) if out_dtype is None else out_dtype
-
-    def inverse_slice_transform(post):
-        # Terminal-output 'fwd'/'rev' draining hands this the bare identity
-        # output-seed (no dims, val=None); re-expand it to the explicit identity
-        # over the dynamic_slice OUTPUT shape so the embedding below runs (same
-        # guard as _slice_elementals). jnp.array(post) on that seed crashed
-        # ("Could not convert object to sequence").
-        if _is_scalar_identity_post(post):
-            post = _identity_post_over(post, out_shape, seed_dtype)
-        full_val = post.dense()
-        new_out_dims = []
-        new_primal_dims = []
-        counter = 0
-
-        for d in post.out_dims:
-            new_out_dims.append(DenseIndex(counter, d.size, counter))
-            counter += 1
-
-        for s in primal0_shape:
-            new_primal_dims.append(DenseIndex(counter, s, counter))
-            counter += 1
-
-        new_shape = [d.size for d in new_out_dims] + [d.size for d in new_primal_dims]
-        zeros = jnp.zeros(new_shape, dtype=full_val.dtype)
-        start_indices_full = [0] * len(post.out_dims) + list(start_indices)
-        new_val = lax.dynamic_update_slice(zeros, full_val, start_indices_full)
-
-        return SparseTensor(new_out_dims, new_primal_dims, new_val)
-
-    return inverse_slice_transform
+from .transforms import _slice_elementals
 
 
 def dynamic_slice_elemental_rule(primals, **params):
+    # dynamic_slice with CONCRETIZED start indices is exactly a static lax.slice
+    # over [start, start+size). Route through ``_slice_elementals`` to reuse its
+    # structure-preserving forward path (a diagonal through a dense-axis slice
+    # stays O(n) instead of densifying), interior-pad inverse, dense fallback,
+    # and terminal-output identity-seed guard — no duplicated slice logic.
     val_out = lax.dynamic_slice_p.bind(*primals, **params)
     operand = primals[0]
-    start_indices = primals[1:]
+    start_list = [int(s) for s in primals[1:]]
     slice_sizes = params["slice_sizes"]
-
-    start_list = [int(s) for s in start_indices]
     limit_list = [s + sz for s, sz in zip(start_list, slice_sizes)]
 
-    transform = JacobianTransform(
-        make_slice_transform(start_list, limit_list, val_out.shape),
-        make_inverse_slice_transform(start_list, limit_list, operand.shape,
-                                     val_out.shape, val_out.dtype),
+    # ``_slice_elementals`` returns one elemental for its single primal
+    # (``[operand]``); the start-index invars carry no gradient (positions past
+    # the returned list are skipped by ``_build_graph``).
+    return val_out, _slice_elementals(
+        [operand], val_out,
+        start_indices=tuple(start_list),
+        limit_indices=tuple(limit_list),
+        strides=None,
     )
-    return val_out, [SparseTensor([], [], None, pre_transforms=[transform])]
 
 
 elemental_rules[lax.dynamic_slice_p] = dynamic_slice_elemental_rule
