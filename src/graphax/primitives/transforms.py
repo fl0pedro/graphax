@@ -157,7 +157,13 @@ def _transpose_elementals(primals, val_out, **params):
         new_primal_dims = []
         counter = len(post.out_dims)
 
-        # This implementation is faulty!
+        # Mirror of transpose_transform on the PRIMAL side: transpose-out axis i
+        # came from transpose-in axis permutation[i], so the inverse maps primal
+        # dims back by the INVERSE permutation and re-links each diagonal pair's
+        # partner (other_id). Out-dim ids are 0..l-1 (== list index), so the
+        # partner is indexed directly. Verified against jax.jacrev across all 3D
+        # permutations / dense+diagonal inputs / fwd|rev|cross-country orders
+        # (the old 'faulty' note predated those fixes and is no longer true).
         inv_permutation = _inverse_permutation(permutation)
         for p in inv_permutation:
             new_primal_dims.append(post.primal_dims[p])

@@ -43,7 +43,11 @@ def make_slice_transform(start_indices, limit_indices, out_shape):
 
 
 def make_inverse_slice_transform(start_indices, limit_indices, primal0_shape,
-                                 out_shape, out_dtype=jnp.float32):
+                                 out_shape, out_dtype=None):
+    # out_dtype=None -> JAX's default float dtype (float32, or float64 under
+    # jax_enable_x64) — i.e. whatever jnp.array(0.0) would produce.
+    seed_dtype = jnp.result_type(float) if out_dtype is None else out_dtype
+
     def inverse_slice_transform(post):
         # Terminal-output 'fwd'/'rev' draining hands this the bare identity
         # output-seed (no dims, val=None); re-expand it to the explicit identity
@@ -51,7 +55,7 @@ def make_inverse_slice_transform(start_indices, limit_indices, primal0_shape,
         # guard as _slice_elementals). jnp.array(post) on that seed crashed
         # ("Could not convert object to sequence").
         if _is_scalar_identity_post(post):
-            post = _identity_post_over(post, out_shape, out_dtype)
+            post = _identity_post_over(post, out_shape, seed_dtype)
         full_val = post.dense()
         new_out_dims = []
         new_primal_dims = []

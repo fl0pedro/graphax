@@ -759,8 +759,10 @@ def _eliminate_vertex(
                     len(_pre_transforms) > 0
                     and pre_val.val is not None
                     and post_val.val is not None
-                    and _has_sparse_dim(pre_val)
+                    # cheap attribute check first: short-circuits the dim scan
+                    # for the common non-relabel transforms (slice/concat/...).
                     and all(getattr(t, "pure_relabel", False) for t in _pre_transforms)
+                    and _has_sparse_dim(pre_val)
                 ):
                     for _t in _pre_transforms[::-1]:
                         _post_val = _t.apply_inverse(_post_val)
