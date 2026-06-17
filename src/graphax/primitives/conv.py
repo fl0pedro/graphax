@@ -13,7 +13,7 @@ from ..sparse.indexes import (
     TOEPLITZ_IN,
     TOEPLITZ_TAP,
 )
-from .base import elemental_rules, get_ndim, get_shape
+from .base import elemental_rules, elemental_only_rules, get_ndim, get_shape
 
 
 def _build_windowed_jacobian_1d(out_s, in_s, wd, ws, pad_lo, bd=1, wid=1):
@@ -167,56 +167,73 @@ def conv_general_dilated_elemental_rule(primals, **params):
 elemental_rules[lax.conv_general_dilated_p] = conv_general_dilated_elemental_rule
 
 
+def _pad_operand_transform(primals, val_out, **params):
+    """``pad`` w.r.t. the OPERAND as a SEED-DRAINABLE deferred transform. pad is a
+    linear EMBEDDING (``out[lo + j*(interior+1)] = x[j]``); its adjoint is the
+    CROP (a strided slice of the unpadded positions), so ``post @ pad(pre) ==
+    crop(post) @ pre``: in reverse the elimination drains it onto the cotangent
+    VECTOR (one strided slice, O(n)) instead of materialising the n_out×n_in
+    embedding. The forward / non-drainable path densifies."""
+    from .transforms import (
+        JacobianTransform, _dense_grid,
+        _is_scalar_identity_post, _identity_post_over,
+    )
+    padding_config = params["padding_config"]
+    x_shape = get_shape(primals[0])
+
+    def pad_transform(pre):                      # embed: pad the OUT axes
+        full = pre.dense()
+        cfg = list(padding_config) + [(0, 0, 0)] * (full.ndim - len(padding_config))
+        full = lax.pad(full, jnp.array(0.0, dtype=full.dtype), cfg)
+        new_out, new_primal = _dense_grid(get_shape(val_out), pre.primal_shape)
+        return SparseTensor(new_out, new_primal, full,
+                            scalar_mult=pre.scalar_mult, fill_value=pre.fill_value)
+
+    def inverse_pad_transform(post):             # adjoint: gather the embedded pos
+        if _is_scalar_identity_post(post):
+            post = _identity_post_over(post, val_out.shape, val_out.dtype)
+        full = post.dense()
+        n_out = len(post.out_dims)
+        out_shape = get_shape(val_out)
+        # The adjoint of pad is a bounds-masked gather: input position j came from
+        # output position ``lo + j*(interior+1)``; positions out of [0, out_s)
+        # (negative-padding CROP, or interior overhang) contribute zero. This is
+        # O(in) and handles pad / crop / dilation uniformly (the slice form broke
+        # on negative padding).
+        for i, (lo, hi, interior) in enumerate(padding_config):
+            in_s, out_s, stride, ax = x_shape[i], out_shape[i], interior + 1, n_out + i
+            if lo >= 0 and lo + (in_s - 1) * stride + 1 <= out_s:
+                # pure embed on this axis (no crop / overhang): a cheap strided
+                # slice extracts the in_s embedded positions.
+                full = lax.slice_in_dim(
+                    full, lo, lo + (in_s - 1) * stride + 1, stride=stride, axis=ax)
+            else:
+                # crop (negative pad) or overhang: bounds-masked gather.
+                pos = lo + jnp.arange(in_s) * stride
+                valid = (pos >= 0) & (pos < out_s)
+                full = jnp.take(full, jnp.where(valid, pos, 0), axis=ax)
+                full = full * valid.astype(full.dtype).reshape(
+                    [in_s if a == ax else 1 for a in range(full.ndim)])
+        new_out, new_primal = _dense_grid(post.out_shape, x_shape)
+        return SparseTensor(new_out, new_primal, full,
+                            scalar_mult=post.scalar_mult, fill_value=post.fill_value)
+
+    transform = JacobianTransform(pad_transform, inverse_pad_transform,
+                                  seed_drainable=True)
+    return SparseTensor([], [], None, pre_transforms=[transform])
+
+
 def pad_elemental_rule(primals, **params):
     val_out = lax.pad_p.bind(*primals, **params)
     x, padding_value = primals
     padding_config = params["padding_config"]
-
     x_shape = get_shape(x)
     out_shape = get_shape(val_out)
-    x_ndim = get_ndim(x)
-    out_ndim = get_ndim(val_out)
 
-    new_out_dims = []
-    new_primal_dims = []
-    axis_count = 0
-    padded_axes = []
+    tensors_out = [_pad_operand_transform(primals, val_out, **params)]
 
-    for i, (lo, hi, interior) in enumerate(padding_config):
-        is_identity = lo == 0 and hi == 0 and interior == 0
-        if is_identity:
-            ll = len(new_out_dims)
-            new_out_dims.append(DiagonalIndex(ll, x_shape[i], None, out_ndim + i))
-            new_primal_dims.append(DiagonalIndex(out_ndim + i, x_shape[i], None, ll))
-        else:
-            out_vd = axis_count
-            new_out_dims.append(DenseIndex(len(new_out_dims), out_shape[i], out_vd))
-            axis_count += 1
-            primal_vd = axis_count
-            new_primal_dims.append(DenseIndex(out_ndim + i, x_shape[i], primal_vd))
-            axis_count += 1
-            padded_axes.append((i, out_shape[i], x_shape[i], lo, hi, interior))
-
-    if len(padded_axes) == 0:
-        val = jnp.array(1.0, dtype=jnp.float32)
-    else:
-        jac_matrices = []
-        for _, out_s, in_s, lo, hi, interior in padded_axes:
-            stride = interior + 1
-            J = jnp.zeros((out_s, in_s), dtype=jnp.float32)
-            cols = jnp.arange(in_s)
-            rows = lo + cols * stride
-            valid = (rows >= 0) & (rows < out_s)
-            safe_rows = jnp.where(valid, rows, 0)
-            J = J.at[safe_rows, cols].add(jnp.where(valid, 1.0, 0.0))
-            jac_matrices.append(J)
-        val = jac_matrices[0]
-        for j in range(1, len(jac_matrices)):
-            val = val[..., None, None] * jac_matrices[j][None, None, ...]
-
-    x_tensor = _swap_back_axes(SparseTensor(new_out_dims, new_primal_dims, val))
-    tensors_out = [x_tensor]
-
+    # Gradient w.r.t. a non-constant ``padding_value`` (rare): the pad cells get
+    # +1, the embedded operand cells 0 — a value-independent mask, materialized.
     if not isinstance(padding_value, (float, int, complex)):
         pad_mask = jnp.ones_like(val_out)
         slices_obj = tuple(
@@ -230,7 +247,15 @@ def pad_elemental_rule(primals, **params):
     return val_out, tensors_out
 
 
+def pad_elemental_only(primal_out, primals, **params):
+    # Operand-only deferred transform (the padding_value branch needs the bound
+    # primal, which the elemental_only path does not re-bind); the common
+    # constant-padding_value case — the gradient case — is fully covered.
+    return [_pad_operand_transform(primals, primal_out, **params)]
+
+
 elemental_rules[lax.pad_p] = pad_elemental_rule
+elemental_only_rules[lax.pad_p] = pad_elemental_only
 
 
 def reduce_window_sum_elemental_rule(primals, **params):

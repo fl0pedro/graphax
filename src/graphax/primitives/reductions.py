@@ -241,38 +241,51 @@ def reduce_prod_elemental_rule(primals, **params):
 elemental_rules[lax.reduce_prod_p] = reduce_prod_elemental_rule
 
 
-def cumsum_elemental_rule(primals, **params):
-    """Cumulative sum: ``out[i] = sum_{j<=i} x[j]`` along ``axis`` (``j>=i`` when
-    ``reverse``). The Jacobian on the scan axis is a triangular ones matrix; all
-    other axes are independent (DiagonalIndex). The triangular block is
-    position-invariant, so it lives in a small ``(n, n)`` val and the other axes
-    broadcast (axis=None)."""
-    val_out = lax.cumsum_p.bind(*primals, **params)
-    x = primals[0]
+def _cumsum_elementals(primals, val_out, **params):
+    """Cumulative sum (``out[i] = sum_{j<=i} x[j]``) as a SEED-DRAINABLE deferred
+    transform. cumsum is LINEAR with a triangular Jacobian ``L`` whose adjoint
+    ``Lᵀ`` is the REVERSE-direction cumsum, so ``post @ cumsum(pre) ==
+    rev_cumsum(post) @ pre``: in reverse the elimination drains it onto the
+    cotangent VECTOR (one reverse-cumsum, O(n)) instead of materialising the full
+    n×n triangular block. The forward / non-drainable path densifies."""
+    from .transforms import (
+        JacobianTransform, _dense_grid,
+        _is_scalar_identity_post, _identity_post_over,
+    )
     axis = params["axis"]
     reverse = params.get("reverse", False)
-    shape = get_shape(x)
-    N = len(shape)
-    n = shape[axis]
 
-    new_out_dims, new_primal_dims = [], []
-    for i, size in enumerate(shape):
-        if i == axis:                                  # scan axis: dense (out, in) pair
-            new_out_dims.append(DenseIndex(i, size, 0))
-            new_primal_dims.append(DenseIndex(N + i, size, 1))
-        else:                                          # independent axis: diagonal
-            new_out_dims.append(DiagonalIndex(i, size, None, N + i))
-            new_primal_dims.append(DiagonalIndex(N + i, size, None, i))
+    def cumsum_transform(pre):                   # forward: cumsum along the OUT axis
+        full = lax.cumsum(pre.dense(), axis=axis, reverse=reverse)
+        new_out, new_primal = _dense_grid(pre.out_shape, pre.primal_shape)
+        return SparseTensor(new_out, new_primal, full,
+                            scalar_mult=pre.scalar_mult, fill_value=pre.fill_value)
 
-    idx = jnp.arange(n)
-    # val[i, j] = d out[i] / d x[j]; axis0=out i, axis1=in j.
-    L = (idx[None, :] >= idx[:, None]) if reverse else (idx[None, :] <= idx[:, None])
-    return val_out, [
-        _swap_back_axes(SparseTensor(new_out_dims, new_primal_dims, L.astype(jnp.float32)))
-    ]
+    def inverse_cumsum_transform(post):          # adjoint: REVERSE-cumsum, PRIMAL axis
+        if _is_scalar_identity_post(post):
+            post = _identity_post_over(post, val_out.shape, val_out.dtype)
+        n_out = len(post.out_dims)
+        full = lax.cumsum(post.dense(), axis=n_out + axis, reverse=not reverse)
+        new_out, new_primal = _dense_grid(post.out_shape, post.primal_shape)
+        return SparseTensor(new_out, new_primal, full,
+                            scalar_mult=post.scalar_mult, fill_value=post.fill_value)
+
+    transform = JacobianTransform(cumsum_transform, inverse_cumsum_transform,
+                                  seed_drainable=True)
+    return [SparseTensor([], [], None, pre_transforms=[transform])]
+
+
+def cumsum_elemental_rule(primals, **params):
+    val_out = lax.cumsum_p.bind(*primals, **params)
+    return val_out, _cumsum_elementals(primals, val_out, **params)
+
+
+def cumsum_elemental_only(primal_out, primals, **params):
+    return _cumsum_elementals(primals, primal_out, **params)
 
 
 elemental_rules[lax.cumsum_p] = cumsum_elemental_rule
+elemental_only_rules[lax.cumsum_p] = cumsum_elemental_only
 
 
 def sort_elemental_rule(primals, **params):
@@ -314,41 +327,53 @@ def sort_elemental_rule(primals, **params):
 elemental_rules[lax.sort_p] = sort_elemental_rule
 
 
-def rev_elemental_rule(primals, **params):
-    """``rev`` (``jnp.flip``): each flipped axis is a reverse permutation
-    (``out[i] = x[n-1-i]``, Jacobian ``R[i,j] = (j == n-1-i)``); unflipped axes
-    are independent (DiagonalIndex). The reverse indicator is value-independent,
-    so flipped axes get a small dense (out,in) pair and the others broadcast."""
-    val_out = lax.rev_p.bind(*primals, **params)
-    x = primals[0]
+def _rev_elementals(primals, val_out, **params):
+    """``rev`` (``jnp.flip``) as a SEED-DRAINABLE deferred transform. flip is a
+    reverse permutation (``out[i] = x[n-1-i]``) and is SELF-ADJOINT (R = Rᵀ), so
+    ``post @ flip(pre) == flip(post) @ pre``: in reverse the elimination drains it
+    onto the cotangent VECTOR (flip the vector, O(n)) instead of materialising the
+    full n×n anti-diagonal R. The forward / non-drainable path densifies."""
+    from .transforms import (
+        JacobianTransform, _dense_grid,
+        _is_scalar_identity_post, _identity_post_over,
+    )
     dims = params["dimensions"]
-    shape = get_shape(x)
-    N = len(shape)
 
-    new_out_dims, new_primal_dims, Rs, vax = [], [], [], 0
-    for i, size in enumerate(shape):
-        if i in dims:
-            new_out_dims.append(DenseIndex(i, size, vax))
-            new_primal_dims.append(DenseIndex(N + i, size, vax + 1))
-            idx = jnp.arange(size)
-            Rs.append((idx[None, :] == (size - 1 - idx[:, None])).astype(jnp.float32))
-            vax += 2
-        else:
-            new_out_dims.append(DiagonalIndex(i, size, None, N + i))
-            new_primal_dims.append(DiagonalIndex(N + i, size, None, i))
+    def rev_transform(pre):
+        full = pre.dense()                       # (out..., primal...) in dim order
+        for ax in dims:                          # flip the OUT axes (0..n_out-1)
+            full = jnp.flip(full, axis=ax)
+        new_out, new_primal = _dense_grid(pre.out_shape, pre.primal_shape)
+        return SparseTensor(new_out, new_primal, full,
+                            scalar_mult=pre.scalar_mult, fill_value=pre.fill_value)
 
-    if not Rs:
-        val = jnp.array(1.0, dtype=jnp.float32)
-    else:
-        val = Rs[0]
-        for R in Rs[1:]:                               # outer product over flipped axes
-            val = val[..., None, None] * R[None, None, ...]
-    return val_out, [
-        _swap_back_axes(SparseTensor(new_out_dims, new_primal_dims, val))
-    ]
+    def inverse_rev_transform(post):
+        if _is_scalar_identity_post(post):
+            post = _identity_post_over(post, val_out.shape, val_out.dtype)
+        full = post.dense()
+        n_out = len(post.out_dims)
+        for ax in dims:                          # self-adjoint: flip the PRIMAL axes
+            full = jnp.flip(full, axis=n_out + ax)
+        new_out, new_primal = _dense_grid(post.out_shape, post.primal_shape)
+        return SparseTensor(new_out, new_primal, full,
+                            scalar_mult=post.scalar_mult, fill_value=post.fill_value)
+
+    transform = JacobianTransform(rev_transform, inverse_rev_transform,
+                                  seed_drainable=True)
+    return [SparseTensor([], [], None, pre_transforms=[transform])]
+
+
+def rev_elemental_rule(primals, **params):
+    val_out = lax.rev_p.bind(*primals, **params)
+    return val_out, _rev_elementals(primals, val_out, **params)
+
+
+def rev_elemental_only(primal_out, primals, **params):
+    return _rev_elementals(primals, primal_out, **params)
 
 
 elemental_rules[lax.rev_p] = rev_elemental_rule
+elemental_only_rules[lax.rev_p] = rev_elemental_only
 
 
 def _cumulative_dims(shape, axis, N):
