@@ -10,14 +10,18 @@ from ..sparse.tensor import (
     _swap_back_axes,
 )
 from .base import elemental_rules, get_ndim, get_shape
-from .transforms import JacobianTransform
+from .transforms import (
+    JacobianTransform,
+    _identity_post_over,
+    _is_scalar_identity_post,
+)
 
 
 def make_slice_transform(start_indices, limit_indices, out_shape):
     def slice_transform(pre):
         s_idx = list(start_indices)
         l_idx = list(limit_indices)
-        full_val = jnp.array(pre)
+        full_val = pre.dense()
         new_out_dims = []
         new_primal_dims = []
         counter = 0
@@ -38,9 +42,17 @@ def make_slice_transform(start_indices, limit_indices, out_shape):
     return slice_transform
 
 
-def make_inverse_slice_transform(start_indices, limit_indices, primal0_shape):
+def make_inverse_slice_transform(start_indices, limit_indices, primal0_shape,
+                                 out_shape, out_dtype=jnp.float32):
     def inverse_slice_transform(post):
-        full_val = jnp.array(post)
+        # Terminal-output 'fwd'/'rev' draining hands this the bare identity
+        # output-seed (no dims, val=None); re-expand it to the explicit identity
+        # over the dynamic_slice OUTPUT shape so the embedding below runs (same
+        # guard as _slice_elementals). jnp.array(post) on that seed crashed
+        # ("Could not convert object to sequence").
+        if _is_scalar_identity_post(post):
+            post = _identity_post_over(post, out_shape, out_dtype)
+        full_val = post.dense()
         new_out_dims = []
         new_primal_dims = []
         counter = 0
@@ -74,7 +86,8 @@ def dynamic_slice_elemental_rule(primals, **params):
 
     transform = JacobianTransform(
         make_slice_transform(start_list, limit_list, val_out.shape),
-        make_inverse_slice_transform(start_list, limit_list, operand.shape),
+        make_inverse_slice_transform(start_list, limit_list, operand.shape,
+                                     val_out.shape, val_out.dtype),
     )
     return val_out, [SparseTensor([], [], None, pre_transforms=[transform])]
 
