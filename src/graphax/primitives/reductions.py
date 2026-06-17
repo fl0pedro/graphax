@@ -303,25 +303,47 @@ def sort_elemental_rule(primals, **params):
         )
     val_out_list = lax.sort_p.bind(*primals, **params)
     shape = get_shape(operand)
-    n = len(shape)
-    S = shape[dim]
 
-    perm = jnp.argsort(operand, axis=dim)
-    perm_e = jnp.expand_dims(perm, dim + 1)
-    j_idx = jnp.arange(S).reshape([S if k == dim + 1 else 1 for k in range(n + 1)])
-    indicator = (perm_e == j_idx).astype(jnp.float32)  # out[i] picks in[perm[i]]
+    # ``sort`` is a (value-dependent) PERMUTATION ``out[i] = x[perm[i]]`` along
+    # ``dim``; its adjoint is the inverse permutation. So it is SEED-DRAINABLE:
+    # in reverse the elimination gathers the cotangent VECTOR by ``invperm``
+    # (O(n)) instead of materialising the S×S permutation matrix. perm / invperm
+    # are captured from the primal value; the forward path densifies.
+    from .transforms import (
+        JacobianTransform, _dense_grid,
+        _is_scalar_identity_post, _identity_post_over,
+    )
+    perm = jnp.argsort(operand, axis=dim)        # out[i] = x[perm[i]]
+    invperm = jnp.argsort(perm, axis=dim)        # x[j] -> out position invperm[j]
 
-    new_out_dims, new_primal_dims = [], []
-    for i, size in enumerate(shape):
-        if i == dim:
-            new_out_dims.append(DenseIndex(i, size, dim))
-            new_primal_dims.append(DenseIndex(n + i, size, dim + 1))
-        else:
-            vd = i if i < dim else i + 1   # val axis (shifted past the extra in-axis)
-            new_out_dims.append(DiagonalIndex(i, size, vd, n + i))
-            new_primal_dims.append(DiagonalIndex(n + i, size, vd, i))
-    st = _swap_back_axes(SparseTensor(new_out_dims, new_primal_dims, indicator))
-    return val_out_list, [st]
+    def _gather(full, idx, op_block_start):
+        # ``idx`` (shape == operand shape) occupies axes ``[op_block_start,
+        # op_block_start+len(shape))`` of ``full``; pad size-1 on the other side
+        # (the permutation is constant there) and gather along the sort axis.
+        new_shape = [1] * full.ndim
+        for a, s in enumerate(shape):
+            new_shape[op_block_start + a] = s
+        idx_b = jnp.broadcast_to(idx.reshape(new_shape), full.shape)
+        return jnp.take_along_axis(full, idx_b, axis=op_block_start + dim)
+
+    def sort_transform(pre):                     # forward: gather OUT axis by perm
+        full = _gather(pre.dense(), perm, 0)
+        new_out, new_primal = _dense_grid(pre.out_shape, pre.primal_shape)
+        return SparseTensor(new_out, new_primal, full,
+                            scalar_mult=pre.scalar_mult, fill_value=pre.fill_value)
+
+    def inverse_sort_transform(post):            # adjoint: gather PRIMAL by invperm
+        if _is_scalar_identity_post(post):
+            post = _identity_post_over(post, get_shape(operand), operand.dtype)
+        n_out = len(post.out_dims)
+        full = _gather(post.dense(), invperm, n_out)
+        new_out, new_primal = _dense_grid(post.out_shape, shape)
+        return SparseTensor(new_out, new_primal, full,
+                            scalar_mult=post.scalar_mult, fill_value=post.fill_value)
+
+    transform = JacobianTransform(sort_transform, inverse_sort_transform,
+                                  seed_drainable=True)
+    return val_out_list, [SparseTensor([], [], None, pre_transforms=[transform])]
 
 
 elemental_rules[lax.sort_p] = sort_elemental_rule
