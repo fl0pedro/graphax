@@ -190,37 +190,139 @@ elemental_only_rules[lax.transpose_p] = transpose_elemental_only
 # ---------- reshape ----------
 
 
+def _factor_match(in_sizes, out_sizes):
+    """Map output axes to input axes for a reshape that ONLY inserts/removes
+    size-1 axes (a 1:1 alignment of the non-1 axes). Returns ``assign`` where
+    ``assign[k]`` is the input-axis index that output axis ``k`` came from, or
+    ``None`` for a freshly-inserted size-1 output axis. Returns ``None`` (caller
+    must dense-fallback) when a non-1 axis is split or merged across the reshape,
+    i.e. when the ordered non-1 sizes differ — the only regime in which each
+    input dim survives as a single equal-size output dim, so any structure
+    (diagonal pairing) attached to an input dim carries through untouched."""
+    in_nontriv = [(i, s) for i, s in enumerate(in_sizes) if s != 1]
+    out_nontriv = [(k, s) for k, s in enumerate(out_sizes) if s != 1]
+    if [s for _, s in in_nontriv] != [s for _, s in out_nontriv]:
+        return None
+    assign = [None] * len(out_sizes)
+    for (i, _), (k, _) in zip(in_nontriv, out_nontriv):
+        assign[k] = i
+    return assign
+
+
 def _reshape_elementals(primals, val_out, **params):
-    # TODO: dimensional collapse is not covered here!
-    # Implement sparsity-aware version for significant speedup!
+    # Structure-preserving reshape: reshape only relabels the side it acts on
+    # (OUTPUT for the forward transform, PRIMAL for the inverse); the opposite
+    # side — where a diagonal pairing's partner lives — is untouched. When the
+    # reshape merely inserts/removes size-1 axes and aligns the non-1 axes 1:1
+    # (``_factor_match``), every dim — INCLUDING a diagonal pair — maps to a
+    # single equal-size axis and is carried through with NO densification (val
+    # stays O(n) for an incoming diagonal; cf. ``transpose_transform``). Any
+    # split/merge of a non-1 axis, or a block-diagonal dim, falls back to the
+    # dense path below, which is always correct.
+    def _structural(in_dims, in_is_out, new_sizes, val, scalar_mult, fill_value,
+                    other_dims):
+        in_sizes = [d.logical_size for d in in_dims]
+        new_sizes = [int(s) for s in new_sizes]
+        assign = _factor_match(in_sizes, new_sizes)
+        if assign is None:
+            return None
+
+        assigned_in = [a for a in assign if a is not None]
+        assigned_set = set(assigned_in)
+        # A split would reuse one input axis for several output axes.
+        if len(assigned_in) != len(assigned_set):
+            return None
+        # A sparse (diagonal) in-dim must map 1:1 to a single equal-size output
+        # axis and carry no block factor (logical_size folds a block into the
+        # axis — splitting it is unsafe). Reject if any sparse in-dim is dropped.
+        for i, d in enumerate(in_dims):
+            if d.is_sparse:
+                if d.block_size is not None:
+                    return None
+                if i not in assigned_set:
+                    return None
+
+        # ids: out_dims occupy [0, n_out); primal follow.
+        if in_is_out:
+            in_id_base, other_id_base = 0, len(new_sizes)
+        else:
+            in_id_base, other_id_base = len(other_dims), 0
+
+        old_in_id_to_new = {}
+        new_in_dims = []
+        for k, src in enumerate(assign):
+            new_id = in_id_base + k
+            size = new_sizes[k]
+            if src is None:
+                # inserted size-1 axis — not stored in val (axis=None)
+                new_in_dims.append(DenseIndex(new_id, size, None))
+            else:
+                d = in_dims[src]
+                old_in_id_to_new[d.id] = new_id
+                new_in_dims.append(replace(d, id=new_id))
+
+        old_other_id_to_new = {d.id: other_id_base + j
+                               for j, d in enumerate(other_dims)}
+        new_other_dims = []
+        for j, d in enumerate(other_dims):
+            upd = {"id": other_id_base + j}
+            if d.is_sparse:
+                if d.other_id not in old_in_id_to_new:
+                    return None
+                upd["other_id"] = old_in_id_to_new[d.other_id]
+            new_other_dims.append(replace(d, **upd))
+        for idx, d in enumerate(new_in_dims):
+            if d.is_sparse:
+                if d.other_id not in old_other_id_to_new:
+                    return None
+                new_in_dims[idx] = replace(
+                    d, other_id=old_other_id_to_new[d.other_id]
+                )
+
+        if in_is_out:
+            out_dims, primal_dims = new_in_dims, new_other_dims
+        else:
+            out_dims, primal_dims = new_other_dims, new_in_dims
+
+        return _swap_back_axes(
+            SparseTensor(
+                out_dims, primal_dims, val,
+                scalar_mult=scalar_mult, fill_value=fill_value,
+                check_consistency=False,
+            )
+        )
 
     def reshape_transform(pre):
-        # NOTE array is not correctly materialized sometimes!
+        res = _structural(
+            list(pre.out_dims), True, val_out.shape, pre.val,
+            pre.scalar_mult, pre.fill_value, list(pre.primal_dims),
+        )
+        if res is not None:
+            return res
+        # Dense fallback: densify then reshape the OUTPUT side.
         full_val = pre.dense()
-        new_shape = []
-        new_out_dims = []
-        new_primal_dims = []
-        counter = 0
-
+        new_shape, new_out_dims, new_primal_dims, counter = [], [], [], 0
         for s in val_out.shape:
             new_out_dims.append(DenseIndex(counter, s, counter))
             new_shape.append(s)
             counter += 1
-
         for d in pre.primal_dims:
             new_primal_dims.append(DenseIndex(counter, d.size, counter))
             new_shape.append(d.size)
             counter += 1
-
-        full_val = full_val.reshape(new_shape)
-        return SparseTensor(new_out_dims, new_primal_dims, full_val)
+        return SparseTensor(new_out_dims, new_primal_dims,
+                            full_val.reshape(new_shape))
 
     def inverse_reshape_transform(post):
+        res = _structural(
+            list(post.primal_dims), False, primals[0].shape, post.val,
+            post.scalar_mult, post.fill_value, list(post.out_dims),
+        )
+        if res is not None:
+            return res
+        # Dense fallback: densify then reshape the PRIMAL side.
         full_val = post.dense()
-        new_shape = []
-        new_out_dims = []
-        new_primal_dims = []
-        counter = 0
+        new_shape, new_out_dims, new_primal_dims, counter = [], [], [], 0
         for d in post.out_dims:
             new_out_dims.append(DenseIndex(counter, d.size, counter))
             new_shape.append(d.size)
@@ -229,8 +331,8 @@ def _reshape_elementals(primals, val_out, **params):
             new_primal_dims.append(DenseIndex(counter, s, counter))
             new_shape.append(s)
             counter += 1
-        full_val = full_val.reshape(new_shape)
-        return SparseTensor(new_out_dims, new_primal_dims, full_val)
+        return SparseTensor(new_out_dims, new_primal_dims,
+                            full_val.reshape(new_shape))
 
     transform = JacobianTransform(reshape_transform, inverse_reshape_transform)
     return [SparseTensor([], [], None, pre_transforms=[transform])]
@@ -253,39 +355,81 @@ elemental_only_rules[lax.reshape_p] = reshape_elemental_only
 
 
 def _slice_elementals(primals, val_out, **params):
-    # The slice primitive is written in such a way that it just densifies the
-    # Jacobian and then slices it. This is not efficient and there might be ways
-    # to make this more efficient by checking if sparse dimensions are untouched
-    # how this changes the Jacobian.
+    # slice selects a sub-range of the OUTPUT axes only (primal dims are never
+    # sliced). When every sliced OUTPUT axis is a plain DenseIndex (not a
+    # DiagonalIndex partner, not compressed) the slice acts on the val axis (or,
+    # when that dim is implicit, only on the dim metadata) and the primal-side
+    # diagonal structure is untouched and carried through WITHOUT materializing.
+    # Only when a sliced axis is a sparse/compressed dim (slicing breaks the
+    # square Kronecker structure) do we fall back to densify-then-slice. The
+    # inverse (transpose-of-slice) genuinely restructures out<->primal, so it has
+    # no safe in-place shortcut and always densifies.
+    start_indices = list(params["start_indices"])
+    limit_indices = list(params["limit_indices"])
+    _strides = params.get("strides")
+    strides = [1] * len(start_indices) if _strides is None else list(_strides)
+
+    # An output axis is "actually sliced" iff its range is not the trivial
+    # full-axis stride-1 selection.
+    def _is_sliced(ax, full):
+        return not (start_indices[ax] == 0 and limit_indices[ax] == full
+                    and strides[ax] == 1)
 
     def slice_transform(pre):
-        start_indices = list(params["start_indices"])
-        limit_indices = list(params["limit_indices"])
-        strides = params.get("strides")
-        strides = [1] * len(start_indices) if strides is None else list(strides)
+        # Structure-preserving fast path: every sliced output dim is a plain
+        # DenseIndex (not sparse / not compressed).
+        preservable = True
+        for ax, d in enumerate(pre.out_dims):
+            if _is_sliced(ax, d.size) and (d.is_sparse or d.is_compressed):
+                preservable = False
+                break
+
+        if preservable:
+            new_out_dims = []
+            val = pre.val
+            for ax, d in enumerate(pre.out_dims):
+                if _is_sliced(ax, d.size):
+                    # Plain dense dim: slice its val axis if materialized,
+                    # otherwise just shrink the metadata (constant along it).
+                    n = (limit_indices[ax] - 1 - start_indices[ax]) // strides[ax] + 1
+                    if d.axis is not None and val is not None:
+                        val = lax.slice_in_dim(
+                            val, start_indices[ax], limit_indices[ax],
+                            stride=strides[ax], axis=d.axis,
+                        )
+                    new_out_dims.append(replace(d, size=n))
+                else:
+                    new_out_dims.append(d)
+            return SparseTensor(
+                new_out_dims,
+                list(pre.primal_dims),
+                val,
+                scalar_mult=pre.scalar_mult,
+                fill_value=pre.fill_value,
+            )
+
+        # Dense fallback (a sliced axis is a diagonal partner / compressed):
+        # densify, then slice. primal dims are appended as full-range, stride-1.
+        s_idx = list(start_indices)
+        l_idx = list(limit_indices)
+        s_strides = list(strides)
         full_val = pre.dense()
         new_out_dims = []
         new_primal_dims = []
         counter = 0
-
         for s in val_out.shape:
             new_out_dims.append(DenseIndex(counter, s, counter))
             counter += 1
-
         for d in pre.primal_dims:
             new_primal_dims.append(DenseIndex(counter, d.size, counter))
-            start_indices.append(0)
-            limit_indices.append(d.size)
-            strides.append(1)  # primal dims are not sliced
+            s_idx.append(0)
+            l_idx.append(d.size)
+            s_strides.append(1)  # primal dims are not sliced
             counter += 1
-
-        new_val = lax.slice(full_val, start_indices, limit_indices, strides)
+        new_val = lax.slice(full_val, s_idx, l_idx, s_strides)
         return SparseTensor(new_out_dims, new_primal_dims, new_val)
 
     def inverse_slice_transform(post):
-        start_indices = list(params["start_indices"])
-        strides = params.get("strides")
-        strides = [1] * len(start_indices) if strides is None else list(strides)
         # In 'fwd' elimination order this inverse can be drained against the bare
         # identity output-seed (no out/primal dims, val=None). Re-expand that seed
         # into the explicit identity Jacobian over the slice's OUTPUT shape so the
