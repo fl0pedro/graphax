@@ -1173,6 +1173,39 @@ def _build_graph(
             if isinstance(invar, core.Var) and is_active(invar)
         ]
 
+        # Group differentiable positions by invar. When the SAME Var feeds
+        # MULTIPLE input positions of one eqn (e.g. ``x * x``, ``x + x``), its
+        # edge to the outvar is the SUM of the per-position elementals — writing
+        # them one-per-position would overwrite ``graph[invar][outvar]`` (keeping
+        # only the last) and silently HALVE the gradient (``d(x*x)/dx`` = 2x, not
+        # x). For the common distinct-operand case each invar has one position,
+        # so the sum is a no-op. Insertion order is preserved for determinism.
+        pos_by_invar = defaultdict(list)
+        for pos, invar in var_positions:
+            pos_by_invar[invar].append(pos)
+
+        def _sum_elementals(elemental_list, positions):
+            """Sum the elementals at ``positions`` (skipping out-of-range / None);
+            returns the combined SparseTensor or None if every position is empty.
+
+            Distinct per-position elementals are summed (``x*x`` -> ``arg1 + arg0``
+            = 2x). A rule that ALREADY combines its repeated-operand contributions
+            and returns the SAME object at several positions (e.g. concatenate's
+            same-primal slot grouping) is counted ONCE — identity-dedup avoids
+            double counting and never ``+``-s the deferred transform-only tensors
+            those rules emit (which don't support add)."""
+            acc = None
+            seen = []
+            for pos in positions:
+                if pos >= len(elemental_list):
+                    continue
+                e = elemental_list[pos]
+                if e is None or any(e is s for s in seen):
+                    continue
+                seen.append(e)
+                acc = e if acc is None else (acc + e)
+            return acc
+
         # If none of the eqn's invars are active, this eqn produces no edges
         # and its outvars stay non-active. Skip the elemental computation
         # entirely — but still bind the primitive so `env` carries the primal
@@ -1204,10 +1237,8 @@ def _build_graph(
             for outvar, elementals_for_outvar in zip(
                 eqn.outvars, elementals_per_output
             ):
-                for pos, invar in var_positions:
-                    if pos >= len(elementals_for_outvar):
-                        continue
-                    elemental = elementals_for_outvar[pos]
+                for invar, positions in pos_by_invar.items():
+                    elemental = _sum_elementals(elementals_for_outvar, positions)
                     if elemental is None:
                         continue  # no dependency: zero Jacobian, omit edge
                     _assert_sparse_tensor_consistency(elemental)
@@ -1238,15 +1269,16 @@ def _build_graph(
                     _cache.append(_fn(_pout, _snap, **_params))
                 return _cache[0]
 
-            for pos, invar in var_positions:
+            for invar, positions in pos_by_invar.items():
 
-                def _make_thunk(pos=pos, _get=_get_elementals):
+                def _make_thunk(positions=tuple(positions), _get=_get_elementals):
                     def thunk():
                         res = _get()
-                        # Return None when no elemental exists for this invar
+                        # SUM over all positions this invar feeds (x*x etc.).
+                        # Returns None when no elemental exists for any of them
                         # (e.g. stop_gradient, iota, device_put return []).
                         # _eliminate_vertex guards against None values.
-                        return res[pos] if pos < len(res) else None
+                        return _sum_elementals(res, positions)
 
                     return thunk
 
@@ -1264,10 +1296,8 @@ def _build_graph(
             else:
                 safe_map(write, eqn.outvars, [primal_outvals])
 
-            for pos, invar in var_positions:
-                if pos >= len(elemental_outvals):
-                    continue
-                elemental = elemental_outvals[pos]
+            for invar, positions in pos_by_invar.items():
+                elemental = _sum_elementals(elemental_outvals, positions)
                 if elemental is None:
                     continue
                 _assert_sparse_tensor_consistency(elemental)
