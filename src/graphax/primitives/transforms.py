@@ -362,8 +362,10 @@ def _slice_elementals(primals, val_out, **params):
     # diagonal structure is untouched and carried through WITHOUT materializing.
     # Only when a sliced axis is a sparse/compressed dim (slicing breaks the
     # square Kronecker structure) do we fall back to densify-then-slice. The
-    # inverse (transpose-of-slice) genuinely restructures out<->primal, so it has
-    # no safe in-place shortcut and always densifies.
+    # inverse (transpose-of-slice = interior-pad embedding) is likewise
+    # structure-preserving when every slice-output primal dim is plain dense
+    # (pad its own axis in place, n -> L); a diagonal-partner / compressed /
+    # implicit primal dim falls back to densify-then-pad (_inverse_dense).
     start_indices = list(params["start_indices"])
     limit_indices = list(params["limit_indices"])
     _strides = params.get("strides")
@@ -429,24 +431,17 @@ def _slice_elementals(primals, val_out, **params):
         new_val = lax.slice(full_val, s_idx, l_idx, s_strides)
         return SparseTensor(new_out_dims, new_primal_dims, new_val)
 
-    def inverse_slice_transform(post):
-        # In 'fwd' elimination order this inverse can be drained against the bare
-        # identity output-seed (no out/primal dims, val=None). Re-expand that seed
-        # into the explicit identity Jacobian over the slice's OUTPUT shape so the
-        # embedding below — which assumes post.dense() is (out..., slice_out...)
-        # with the slice-output dims trailing — runs exactly as in 'rev' order.
-        if _is_scalar_identity_post(post):
-            post = _identity_post_over(post, val_out.shape, val_out.dtype)
+    def _inverse_dense(post):
+        # The always-correct transpose-of-slice = interior-pad embedding on a
+        # freshly-densified (out..., slice_out...) grid. Out axes 0..K-1 then the
+        # rebuilt input (primal) axes follow, each padded low=start,
+        # interior=stride-1, high=L-start-(n-1)*stride-1. (The old version used a
+        # contiguous scatter that ignored ``strides`` AND hardcoded the input
+        # dtype via jnp.zeros, mis-placing strided slices and crashing on f64.)
         full_val = post.dense()
         new_out_dims = []
         new_primal_dims = []
         counter = 0
-
-        # The transpose of a (possibly strided) slice is a pad: each slice-output
-        # element gradient lands at input position ``start + k*stride``, i.e. low
-        # pad = start and interior pad = stride-1. (The old version used a
-        # contiguous scatter that ignored ``strides`` AND hardcoded the input
-        # dtype via jnp.zeros, mis-placing strided slices and crashing on f64.)
         pad_config = []
         for d in post.out_dims:
             new_out_dims.append(DenseIndex(counter, d.size, counter))
@@ -467,6 +462,83 @@ def _slice_elementals(primals, val_out, **params):
             full_val, jnp.array(0.0, dtype=full_val.dtype), pad_config
         )
         return SparseTensor(new_out_dims, new_primal_dims, new_val)
+
+    def inverse_slice_transform(post):
+        # In 'fwd' elimination order this inverse can be drained against the bare
+        # identity output-seed (no out/primal dims, val=None). Re-expand that seed
+        # into the explicit identity Jacobian over the slice's OUTPUT shape so the
+        # embedding below runs exactly as in 'rev' order.
+        if _is_scalar_identity_post(post):
+            post = _identity_post_over(post, val_out.shape, val_out.dtype)
+
+        in_shape = primals[0].shape
+
+        # Structure-preserving fast path: each primal (slice-output) dim is a
+        # plain DenseIndex carried on a distinct physical val axis. The pad
+        # embedding grows that axis in place (n -> L); the out-side dims keep
+        # their own distinct axes and structure verbatim, so no axis collides.
+        # A sparse (DiagonalIndex partner) / compressed / implicit (axis is None)
+        # primal dim, or a primal-rank mismatch, routes to the dense fallback:
+        # padding a diagonal partner's axis would break the equal-size pair
+        # invariant (out size n != padded input size L), which the index
+        # vocabulary cannot represent.
+        preservable = (
+            post.val is not None
+            and len(post.primal_dims) == len(in_shape)
+        )
+        if preservable:
+            for d in post.primal_dims:
+                if d.is_sparse or d.is_compressed or d.axis is None:
+                    preservable = False
+                    break
+
+        if not preservable:
+            return _inverse_dense(post)
+
+        # Renumber ids: out_dims occupy [0, K), primal follow [K, K+rank). The
+        # out-side dims are carried with their structure intact (a diagonal pair
+        # living entirely within out_dims is relinked); the rebuilt primal dims
+        # are fresh DenseIndex on the SAME (now grown) physical axis. We build the
+        # dims by hand and let _swap_back_axes restore the canonical layout
+        # (check_consistency=False, exactly the reshape structural discipline).
+        K = len(post.out_dims)
+        old_to_new = {}
+        for i, d in enumerate(post.out_dims):
+            old_to_new[d.id] = i
+        for i, d in enumerate(post.primal_dims):
+            old_to_new[d.id] = K + i
+
+        new_out_dims = []
+        for i, d in enumerate(post.out_dims):
+            nd = replace(d, id=i)
+            if nd.is_sparse:
+                nd = replace(nd, other_id=old_to_new[d.other_id])
+            new_out_dims.append(nd)
+
+        val = post.val
+        new_primal_dims = []
+        for ax, d in enumerate(post.primal_dims):
+            L = in_shape[ax]
+            n = d.size
+            st, stride = start_indices[ax], strides[ax]
+            high = L - st - (n - 1) * stride - 1
+            val = lax.pad(
+                val, jnp.array(0.0, dtype=val.dtype),
+                [(st, high, stride - 1) if a == d.axis else (0, 0, 0)
+                 for a in range(val.ndim)],
+            )
+            new_primal_dims.append(DenseIndex(K + ax, L, d.axis))
+
+        return _swap_back_axes(
+            SparseTensor(
+                new_out_dims,
+                new_primal_dims,
+                val,
+                scalar_mult=post.scalar_mult,
+                fill_value=post.fill_value,
+                check_consistency=False,
+            )
+        )
 
     transform = JacobianTransform(slice_transform, inverse_slice_transform)
     return [SparseTensor([], [], None, pre_transforms=[transform])]
@@ -682,11 +754,9 @@ elemental_only_rules[lax.squeeze_p] = squeeze_elemental_only
 
 
 def _concatenate_elementals(primals, val_out, **params):
-    # This gradient transformation is designed to take an post edge and
-    # decompose it into the pre edges. This is done by densifying the post along
-    # the respective axes and then use jnp.split to split the tensor.
-    # TODO DynamicJaxprTracer is now a unhashable type, so we can no longer use
-    # it as a key in the dict. We need to find another way of doing this.
+    # This gradient transformation takes a post edge and decomposes it into the
+    # pre edges (forward), or vice versa (inverse). ``dim`` is the concat axis;
+    # ``slices[i]`` is the [start, end) span of slot ``i`` along that axis.
     dim = params["dimension"]
 
     offset = primals[0].shape[dim]
@@ -696,22 +766,23 @@ def _concatenate_elementals(primals, val_out, **params):
         offset += val.shape[dim]
 
     def concatenate_transform(primal_idx, pre):
+        # ``pre.out_dims`` spans the concat OUTPUT shape (the ``dim``-th out dim
+        # is this slot's concat axis). The transform embeds this slot's Jacobian
+        # block into the full concat-output axis, zero-padding the other slots.
         new_out_dims = list(copy.deepcopy(pre.out_dims))
         new_primal_dims = list(copy.deepcopy(pre.primal_dims))
-        l = len(pre.out_dims)
-
         d = new_out_dims[dim]
-        dim_id = d.id
         idx, _idx = slices[primal_idx]
 
         if not d.is_sparse:
             if d.axis is not None:
+                # Plain materialized output axis: concat zeros | block | zeros.
                 lshape = list(pre.val.shape)
                 rshape = list(pre.val.shape)
                 lshape[d.axis] = idx
                 rshape[d.axis] = val_out.shape[dim] - _idx
-                lcat_zeros = jnp.zeros(lshape)
-                rcat_zeros = jnp.zeros(rshape)
+                lcat_zeros = jnp.zeros(lshape, dtype=pre.val.dtype)
+                rcat_zeros = jnp.zeros(rshape, dtype=pre.val.dtype)
 
                 new_val = jnp.concatenate(
                     [lcat_zeros, pre.val, rcat_zeros], axis=d.axis
@@ -721,9 +792,9 @@ def _concatenate_elementals(primals, val_out, **params):
                     new_out_dims[dim], size=new_val.shape[d.axis]
                 )
             else:
-                # axis=None: this output dimension is a Kronecker factor not stored in val.
-                # Materialize it: broadcast pre.val to the primal's slice size (zero-copy),
-                # then pad with zeros in a single lax.pad pass.
+                # axis=None: this output dimension is a Kronecker factor not
+                # stored in val. Materialize it: broadcast pre.val to the slot
+                # size (zero-copy), then pad to the full concat axis.
                 val_size = _idx - idx
                 new_axis = sum(1 for dd in new_out_dims[:dim] if dd.axis is not None)
 
@@ -739,7 +810,7 @@ def _concatenate_elementals(primals, val_out, **params):
                     new_val, jnp.zeros((), dtype=new_val.dtype), pad_config
                 )
 
-                # Inserting a new axis shifts all subsequent val_axes up by 1
+                # Inserting a new axis shifts all subsequent val_axes up by 1.
                 for j in range(dim + 1, len(new_out_dims)):
                     _dim = new_out_dims[j]
                     if _dim.axis is not None:
@@ -751,130 +822,40 @@ def _concatenate_elementals(primals, val_out, **params):
                 new_out_dims[dim] = replace(
                     new_out_dims[dim], axis=new_axis, size=val_out.shape[dim]
                 )
-        else:
-            other_id = d.other_id
-            if d.axis is not None:
-                _d = new_primal_dims[other_id - l]
+            return SparseTensor(
+                new_out_dims,
+                new_primal_dims,
+                new_val,
+                scalar_mult=pre.scalar_mult,
+                fill_value=pre.fill_value,
+            )
 
-                # Calculate the new axis of the primal dimension
-                axis = sum(1 for dd in new_out_dims if dd.axis is not None)
-                axis += sum(
-                    1
-                    for dd in new_primal_dims[: other_id - l]
-                    if dd.axis is not None and not dd.is_sparse
-                )
+        # SPARSE concat axis (DiagonalIndex). The structured scatter path mis-
+        # shapes the embedding band whenever the concat axis is not val-axis 0
+        # and the incoming Jacobian carries extra dense axes (e.g. from a
+        # preceding matmul): a square DiagonalIndex cannot carry concat's
+        # offset/rectangular selection band, so the val-axis bookkeeping breaks.
+        # Robust route: densify, embed the slot's dense block into the full
+        # concat-output axis with zero padding, and return a fully-dense tensor.
+        full = pre.dense()  # (out_shape..., primal_shape...) in dim order
+        pad_config = [(0, 0, 0)] * full.ndim
+        pad_config[dim] = (idx, val_out.shape[dim] - _idx, 0)
+        new_val = lax.pad(full, jnp.array(0.0, dtype=full.dtype), pad_config)
 
-                # Update the axis of all following dimensions
-                for j in range(dim + 1, len(new_primal_dims)):
-                    _dim = new_primal_dims[j]
-                    if not _dim.is_sparse and _dim.axis is not None:
-                        new_primal_dims[j] = replace(_dim, axis=_dim.axis + 1)
-
-                # Materialize the sparse dimensions related to the concatenation dimension
-                new_val = _materialize_indexes(pre, [d.id])
-
-                sub_iota = jnp.eye(d.size, dtype=new_val.dtype)
-
-                shape = [1 for _ in range(pre.val.ndim)]
-                shape[_d.axis] = _d.size
-                shape.insert(axis, d.size)
-                sub_iota = sub_iota.reshape(shape)
-
-                new_val = new_val * sub_iota
-
-                # Make zeros for insertion (match new_val's dtype: the scatter below
-                # requires identical operand/update dtypes — was hardcoded float32,
-                # crashing under jax_enable_x64 / non-float32 Jacobian vals).
-                _size = val_out.shape[dim]
-                _shape = list(new_val.shape)
-                _shape[d.axis] = _size
-                _shape[axis] = d.size
-                zeros = jnp.zeros(_shape, dtype=new_val.dtype)
-
-                # scatter_indices: where in `zeros` to place `new_val`
-                scatter_indices = [0 for _ in _shape]
-                scatter_indices[d.axis] = idx
-                scatter_indices[axis] = 0
-
-                update_window_dims = tuple(range(len(_shape)))
-                scatter_dims_to_operand_dims = tuple(range(len(_shape)))
-
-                scatter_dims = lax.ScatterDimensionNumbers(
-                    update_window_dims, (), scatter_dims_to_operand_dims
-                )
-                new_val = lax.scatter(
-                    zeros,
-                    jnp.array(scatter_indices),
-                    new_val,
-                    scatter_dims,
-                    indices_are_sorted=True,
-                    unique_indices=True,
-                )
-
-                new_out_dims[dim_id] = DenseIndex(dim_id, val_out.shape[dim], d.axis)
-                new_primal_dims[other_id - l] = DenseIndex(other_id, d.size, axis)
-            else:
-                _d = new_primal_dims[other_id - l]
-                _size = val_out.shape[dim]
-
-                # Calculate the new axis of the out dimension
-                out_axis = sum(1 for dd in new_out_dims[:dim] if dd.axis is not None)
-
-                # Calculate the new axis of the primal dimension
-                primal_axis = sum(1 for dd in new_out_dims if dd.axis is not None)
-                primal_axis += sum(
-                    1
-                    for dd in new_primal_dims[: other_id - l]
-                    if dd.axis is not None and not dd.is_sparse
-                )
-                primal_axis = max(1, primal_axis)
-
-                # Update the axis of all following dimensions
-                for j in range(dim + 1, len(new_primal_dims)):
-                    _dim = new_primal_dims[j]
-                    if not _dim.is_sparse and _dim.axis is not None:
-                        new_primal_dims[j] = replace(_dim, axis=_dim.axis + 1)
-
-                # Materialize the sparse dimensions related to the concatenation dimension
-                if pre.val.shape != ():
-                    new_val = _materialize_indexes(pre, [d.id, d.other_id])
-                else:
-                    new_val = pre.val
-
-                sub_iota = jnp.eye(d.size, dtype=new_val.dtype)
-
-                shape = [1 for _ in range(pre.val.ndim)]
-                shape.insert(out_axis, _d.size)
-                shape.insert(primal_axis, d.size)
-
-                new_val = new_val * sub_iota
-
-                # Make zeros for insertion (dtype must match new_val for the scatter)
-                _shape = list(pre.val.shape)
-                _shape.insert(out_axis, _size)
-                _shape.insert(primal_axis, _d.size)
-                zeros = jnp.zeros(_shape, dtype=new_val.dtype)
-
-                scatter_dims = lax.ScatterDimensionNumbers(
-                    (out_axis, primal_axis), (), (out_axis, primal_axis)
-                )
-                new_val = lax.scatter(
-                    zeros,
-                    jnp.array([idx, 0]),
-                    new_val,
-                    scatter_dims,
-                    indices_are_sorted=True,
-                    unique_indices=True,
-                )
-
-                new_out_dims[dim_id] = DenseIndex(dim_id, val_out.shape[dim], out_axis)
-                new_primal_dims[other_id - l] = DenseIndex(
-                    other_id, d.size, primal_axis
-                )
-
+        counter = 0
+        new_out = []
+        new_primal = []
+        out_shape = list(pre.out_shape)
+        out_shape[dim] = val_out.shape[dim]
+        for s in out_shape:
+            new_out.append(DenseIndex(counter, s, counter))
+            counter += 1
+        for s in pre.primal_shape:
+            new_primal.append(DenseIndex(counter, s, counter))
+            counter += 1
         return SparseTensor(
-            new_out_dims,
-            new_primal_dims,
+            new_out,
+            new_primal,
             new_val,
             scalar_mult=pre.scalar_mult,
             fill_value=pre.fill_value,
@@ -882,12 +863,9 @@ def _concatenate_elementals(primals, val_out, **params):
 
     def inverse_concatenate_transform(primal_idx, post):
         # In 'fwd' elimination order this inverse can be drained against the bare
-        # identity output-seed (no out/primal dims, val=None). The seed has lost
-        # the embedding structure (which concat slot maps to which output rows),
-        # so re-expand it into the explicit identity Jacobian over the concat
-        # OUTPUT shape. Then post.primal_dims[dim] is the concat-axis dimension and
-        # the regular slicing branch extracts this slot's embedding block exactly
-        # as in 'rev' order, instead of returning the structureless scalar.
+        # identity output-seed (no out/primal dims, val=None). Re-expand it into
+        # the explicit identity Jacobian over the concat OUTPUT shape so the
+        # slicing below extracts this slot's block exactly as in 'rev' order.
         if _is_scalar_identity_post(post):
             post = _identity_post_over(post, val_out.shape, val_out.dtype)
         new_out_dims = list(copy.deepcopy(post.out_dims))
@@ -898,132 +876,64 @@ def _concatenate_elementals(primals, val_out, **params):
             d = new_primal_dims[dim]
         if d is None:
             # post is a pure transform with no primal dims; nothing to slice.
-            new_val = post.val
-        elif not d.is_sparse:
+            return SparseTensor(
+                new_out_dims,
+                new_primal_dims,
+                post.val,
+                scalar_mult=post.scalar_mult,
+                fill_value=post.fill_value,
+            )
+
+        if not d.is_sparse:
             if d.axis is not None:
                 new_val = lax.slice_in_dim(post.val, *slices[primal_idx], axis=d.axis)
                 new_primal_dims[dim] = replace(d, size=new_val.shape[d.axis])
             else:
-                # axis=None: the primal dimension is a Kronecker factor not stored in val.
-                # There is no axis to slice — just narrow the size to this primal's contribution.
+                # axis=None: the primal dimension is a Kronecker factor not stored
+                # in val. There is no axis to slice — narrow the size only.
                 new_primal_dims[dim] = replace(
                     d, size=slices[primal_idx][1] - slices[primal_idx][0]
                 )
                 new_val = post.val
-        else:
-            _d = new_out_dims[d.other_id]
-            if d.axis is not None:
-                new_out_dims[d.other_id] = DenseIndex(_d.id, _d.size, _d.axis)
-                size = slices[primal_idx][1] - slices[primal_idx][0]
+            return SparseTensor(
+                new_out_dims,
+                new_primal_dims,
+                new_val,
+                scalar_mult=post.scalar_mult,
+                fill_value=post.fill_value,
+            )
 
-                # Calculate the new axis of the primal dimension
-                axis = sum(1 for dd in new_out_dims if dd.axis is not None)
-                axis += sum(
-                    1
-                    for dd in new_primal_dims[:dim]
-                    if dd.axis is not None and not dd.is_sparse
-                )
-                new_primal_dims[dim] = DenseIndex(_d.other_id, size, axis)
+        # SPARSE concat axis (DiagonalIndex). Same intrinsic limitation as the
+        # forward sparse branch (a square DiagonalIndex cannot represent concat's
+        # rectangular selection slice). Robust route: densify, slice the primal
+        # concat axis to this slot's span, return a fully-dense tensor.
+        full = post.dense()  # (out_shape..., primal_shape...) in dim order
+        concat_ax = len(post.out_dims) + dim
+        new_val = lax.slice_in_dim(full, *slices[primal_idx], axis=concat_ax)
 
-                # Update the axis of all following dimensions
-                for j in range(dim + 1, len(new_primal_dims)):
-                    _dim = new_primal_dims[j]
-                    if not _dim.is_sparse and _dim.axis is not None:
-                        new_primal_dims[j] = replace(_dim, axis=_dim.axis + 1)
-
-                # Materialize the sparse dimensions related to the concatenation dimension
-                new_val = _materialize_indexes(post, [d.id])
-
-                sub_iota = jnp.eye(d.size, dtype=new_val.dtype)
-
-                shape = [1 for _ in range(post.val.ndim)]
-                shape[_d.axis] = _d.size
-                shape.insert(axis, d.size)
-                sub_iota = sub_iota.reshape(shape)
-
-                new_val = new_val * sub_iota
-
-                new_val = lax.slice_in_dim(new_val, *slices[primal_idx], axis=axis)
-                # d and _d were already replaced in the lists above; the prior
-                # d.size/_d.size mutations targeted orphaned objects (no-op).
-            else:
-                # d is DiagonalIndex with axis=None:
-                # Both d and its partner _d are implicit Kronecker factors not stored
-                # in val. Slicing the primal axis at [s, e] yields columns [s:e] of
-                # the implicit identity, which in general is not a square Kronecker
-                # block (e.g. for a single-element slot of a multi-element output).
-                # We must materialize: build the full identity slice as new val and
-                # convert both indices to DenseIndex.
-                s, e = slices[primal_idx]
-                size = e - s
-
-                # Position to insert the new out axis: among existing val-axis-
-                # bearing dims, before the partner _d's position in out_dims.
-                out_axis = sum(
-                    1 for dd in new_out_dims[: d.other_id] if dd.axis is not None
-                )
-                # Position to insert the new primal axis: after all out val-axes
-                # (including the one we are inserting) plus DenseIndex primal val-axes
-                # before our position.
-                primal_axis = sum(1 for dd in new_out_dims if dd.axis is not None) + 1
-                primal_axis += sum(
-                    1
-                    for dd in new_primal_dims[:dim]
-                    if not dd.is_sparse and dd.axis is not None
-                )
-
-                # Shift val_axes of all existing val-axis-bearing dims for the two
-                # axis insertions (out then primal).
-                def _shifted_axis(axis):
-                    if axis is None:
-                        return None
-                    if axis >= out_axis:
-                        axis += 1
-                    if axis >= primal_axis:
-                        axis += 1
-                    return axis
-
-                for j, _dim in enumerate(new_out_dims):
-                    if _dim.axis is not None:
-                        new_out_dims[j] = replace(_dim, axis=_shifted_axis(_dim.axis))
-                for j, _dim in enumerate(new_primal_dims):
-                    if not _dim.is_sparse and _dim.axis is not None:
-                        new_primal_dims[j] = replace(
-                            _dim, axis=_shifted_axis(_dim.axis)
-                        )
-
-                # Build the column slice of identity: shape (_d.size, size).
-                _dt = post.val.dtype if post.val is not None else jnp.float32
-                sub_iota = jnp.eye(_d.size, dtype=_dt)
-                sub_iota = lax.slice_in_dim(sub_iota, s, e, axis=1)
-
-                base_val = (
-                    post.val
-                    if post.val is not None
-                    else jnp.array(1.0, dtype=_dt)
-                )
-                new_val = jnp.expand_dims(base_val, axis=out_axis)
-                new_val = jnp.expand_dims(new_val, axis=primal_axis)
-
-                iota_shape = [1] * new_val.ndim
-                iota_shape[out_axis] = _d.size
-                iota_shape[primal_axis] = size
-                new_val = new_val * sub_iota.reshape(iota_shape)
-
-                new_out_dims[d.other_id] = DenseIndex(_d.id, _d.size, out_axis)
-                new_primal_dims[dim] = DenseIndex(d.id, size, primal_axis)
+        counter = 0
+        new_out = []
+        new_primal = []
+        for s in post.out_shape:
+            new_out.append(DenseIndex(counter, s, counter))
+            counter += 1
+        primal_shape = list(post.primal_shape)
+        primal_shape[dim] = slices[primal_idx][1] - slices[primal_idx][0]
+        for s in primal_shape:
+            new_primal.append(DenseIndex(counter, s, counter))
+            counter += 1
         return SparseTensor(
-            new_out_dims,
-            new_primal_dims,
+            new_out,
+            new_primal,
             new_val,
             scalar_mult=post.scalar_mult,
             fill_value=post.fill_value,
         )
 
     # Group primal slot indices by primal identity. When the same primal feeds
-    # multiple slots of one concatenate (e.g. concat([pl, pl, pl])), the
-    # graph stores a single edge per (invar, outvar) pair, so the elemental
-    # for that invar must represent the sum of all slot contributions.
+    # multiple slots of one concatenate (e.g. concat([pl, pl, pl])), the graph
+    # stores a single edge per (invar, outvar) pair, so the elemental for that
+    # invar must represent the sum of all slot contributions.
     groups = {}
     for i, p in enumerate(primals):
         groups.setdefault(id(p), []).append(i)
