@@ -617,6 +617,14 @@ def _is_scalar_st(t) -> bool:
     return not t.out_dims and not t.primal_dims
 
 
+def _has_sparse_dim(t) -> bool:
+    """Whether the tensor carries a sparse (diagonal) dim that a forward
+    relabel transform would densify. Used by seed-aware draining."""
+    return any(d.is_sparse for d in t.out_dims) or any(
+        d.is_sparse for d in t.primal_dims
+    )
+
+
 def _acts_as_identity(t) -> bool:
     """Whether a structural (``val is None``) edge Jacobian is the PURE-DIAGONAL
     IDENTITY — up to its ``scalar_mult`` — so that ``t @ pre`` is a pass-through
@@ -738,7 +746,27 @@ def _eliminate_vertex(
                 else:
                     _post_val = post_val.copy()
 
-                if len(post_val.pre_transforms) > 0 and pre_val.val is not None:
+                # Seed-aware draining: a pure-relabel pre_transform (reshape /
+                # transpose / squeeze) on ``post_val`` relabels the CONTRACTED
+                # dimension. Applying it forward onto a sparse ``pre_val`` (a
+                # diagonal) densifies it — the O(n^2) blow-up behind the conv
+                # head's gelu-diagonal-through-reshape(-1,1). Since the relabel is
+                # bijective, ``post @ apply(pre) == apply_inverse(post) @ pre``, so
+                # we instead apply the INVERSE relabel to ``_post_val`` (relabeling
+                # the cotangent VECTOR — free) and keep ``pre_val`` diagonal.
+                _pre_transforms = post_val.pre_transforms
+                if (
+                    len(_pre_transforms) > 0
+                    and pre_val.val is not None
+                    and post_val.val is not None
+                    and _has_sparse_dim(pre_val)
+                    and all(getattr(t, "pure_relabel", False) for t in _pre_transforms)
+                ):
+                    for _t in _pre_transforms[::-1]:
+                        _post_val = _t.apply_inverse(_post_val)
+                    _assert_sparse_tensor_consistency(_post_val)
+                    _pre_val = pre_val.copy()
+                elif len(_pre_transforms) > 0 and pre_val.val is not None:
                     _pre_val = unload_pre_transforms(post_val, pre_val)
                 else:
                     _pre_val = pre_val.copy()

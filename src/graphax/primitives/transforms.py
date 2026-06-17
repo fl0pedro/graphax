@@ -26,12 +26,22 @@ Transform = Callable[[SparseTensor], SparseTensor]
 class JacobianTransform:
     transform: Transform
     inverse_transform: Transform
+    pure_relabel: bool
 
     def __init__(
-        self, transform: Transform, inverse_transform: Transform = None
+        self, transform: Transform, inverse_transform: Transform = None,
+        pure_relabel: bool = False,
     ) -> None:
         self.transform = transform
         self.inverse_transform = inverse_transform
+        # ``pure_relabel`` marks a transform that is a bijective index relabel of
+        # the contracted dimension (reshape / transpose / squeeze) — i.e.
+        # ``post @ apply(pre) == apply_inverse(post) @ pre`` exactly. The
+        # elimination core uses this to drain the transform onto whichever
+        # adjacent edge is cheaper (the cotangent VECTOR) instead of densifying a
+        # partner diagonal (seed-aware draining). NOT set for slice (selection),
+        # broadcast / concatenate (size change), which are not bijective relabels.
+        self.pure_relabel = pure_relabel
 
     def __repr__(self) -> str:
         return (
@@ -334,7 +344,8 @@ def _reshape_elementals(primals, val_out, **params):
         return SparseTensor(new_out_dims, new_primal_dims,
                             full_val.reshape(new_shape))
 
-    transform = JacobianTransform(reshape_transform, inverse_reshape_transform)
+    transform = JacobianTransform(reshape_transform, inverse_reshape_transform,
+                                  pure_relabel=True)
     return [SparseTensor([], [], None, pre_transforms=[transform])]
 
 
