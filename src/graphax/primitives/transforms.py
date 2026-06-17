@@ -200,7 +200,12 @@ def _transpose_elementals(primals, val_out, **params):
             )
         )
 
-    transform = JacobianTransform(transpose_transform, inverse_transpose_transform)
+    # Bijective axis relabel -> seed_drainable: alone it already preserves
+    # structure, but marking it lets seed-aware draining CHAIN through a
+    # transpose that sits between a drainable op (reshape/slice/...) and the
+    # cotangent (e.g. reshape(...).T), which otherwise blocks the all(...) gate.
+    transform = JacobianTransform(transpose_transform, inverse_transpose_transform,
+                                  seed_drainable=True)
     return [SparseTensor([], [], None, pre_transforms=[transform])]
 
 
@@ -733,7 +738,9 @@ def _squeeze_elementals(primals, val_out, **params):
             scalar_mult=post.scalar_mult, fill_value=post.fill_value,
         ))
 
-    transform = JacobianTransform(squeeze_transform, inverse_squeeze_transform)
+    # Bijective size-1 relabel -> seed_drainable (chains like transpose).
+    transform = JacobianTransform(squeeze_transform, inverse_squeeze_transform,
+                                  seed_drainable=True)
     return [SparseTensor([], [], None, pre_transforms=[transform])]
 
 
