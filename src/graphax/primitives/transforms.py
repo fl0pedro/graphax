@@ -67,6 +67,19 @@ def _inverse_permutation(permutation):
     return inverse
 
 
+def _dense_grid(out_sizes, primal_sizes):
+    """Canonical fully-dense ``(out_dims, primal_dims)`` over the given sizes,
+    with contiguous ids == val axes ``0 .. len(out)+len(primal)-1``. This is the
+    layout every densify-then-rebuild fallback (reshape / slice / concatenate)
+    pairs with a ``tensor.dense()`` block; keeping it in one place means the
+    canonical dense layout has a single source of truth."""
+    all_dims = [
+        DenseIndex(k, int(s), k)
+        for k, s in enumerate([*out_sizes, *primal_sizes])
+    ]
+    return all_dims[: len(out_sizes)], all_dims[len(out_sizes):]
+
+
 def _is_scalar_identity_post(post) -> bool:
     """A post edge that is the bare identity seed: no out/primal dims and no
     stored ``val`` (the structure is the all-ones identity up to
@@ -316,18 +329,11 @@ def _reshape_elementals(primals, val_out, **params):
         if res is not None:
             return res
         # Dense fallback: densify then reshape the OUTPUT side.
-        full_val = pre.dense()
-        new_shape, new_out_dims, new_primal_dims, counter = [], [], [], 0
-        for s in val_out.shape:
-            new_out_dims.append(DenseIndex(counter, s, counter))
-            new_shape.append(s)
-            counter += 1
-        for d in pre.primal_dims:
-            new_primal_dims.append(DenseIndex(counter, d.size, counter))
-            new_shape.append(d.size)
-            counter += 1
+        out_sizes = list(val_out.shape)
+        primal_sizes = [d.size for d in pre.primal_dims]
+        new_out_dims, new_primal_dims = _dense_grid(out_sizes, primal_sizes)
         return SparseTensor(new_out_dims, new_primal_dims,
-                            full_val.reshape(new_shape))
+                            pre.dense().reshape([*out_sizes, *primal_sizes]))
 
     def inverse_reshape_transform(post):
         res = _structural(
@@ -337,18 +343,11 @@ def _reshape_elementals(primals, val_out, **params):
         if res is not None:
             return res
         # Dense fallback: densify then reshape the PRIMAL side.
-        full_val = post.dense()
-        new_shape, new_out_dims, new_primal_dims, counter = [], [], [], 0
-        for d in post.out_dims:
-            new_out_dims.append(DenseIndex(counter, d.size, counter))
-            new_shape.append(d.size)
-            counter += 1
-        for s in primals[0].shape:
-            new_primal_dims.append(DenseIndex(counter, s, counter))
-            new_shape.append(s)
-            counter += 1
+        out_sizes = [d.size for d in post.out_dims]
+        primal_sizes = list(primals[0].shape)
+        new_out_dims, new_primal_dims = _dense_grid(out_sizes, primal_sizes)
         return SparseTensor(new_out_dims, new_primal_dims,
-                            full_val.reshape(new_shape))
+                            post.dense().reshape([*out_sizes, *primal_sizes]))
 
     transform = JacobianTransform(reshape_transform, inverse_reshape_transform,
                                   pure_relabel=True)
@@ -429,23 +428,12 @@ def _slice_elementals(primals, val_out, **params):
 
         # Dense fallback (a sliced axis is a diagonal partner / compressed):
         # densify, then slice. primal dims are appended as full-range, stride-1.
-        s_idx = list(start_indices)
-        l_idx = list(limit_indices)
-        s_strides = list(strides)
-        full_val = pre.dense()
-        new_out_dims = []
-        new_primal_dims = []
-        counter = 0
-        for s in val_out.shape:
-            new_out_dims.append(DenseIndex(counter, s, counter))
-            counter += 1
-        for d in pre.primal_dims:
-            new_primal_dims.append(DenseIndex(counter, d.size, counter))
-            s_idx.append(0)
-            l_idx.append(d.size)
-            s_strides.append(1)  # primal dims are not sliced
-            counter += 1
-        new_val = lax.slice(full_val, s_idx, l_idx, s_strides)
+        primal_sizes = [d.size for d in pre.primal_dims]
+        new_out_dims, new_primal_dims = _dense_grid(val_out.shape, primal_sizes)
+        s_idx = list(start_indices) + [0] * len(primal_sizes)
+        l_idx = list(limit_indices) + list(primal_sizes)
+        s_strides = list(strides) + [1] * len(primal_sizes)  # primal not sliced
+        new_val = lax.slice(pre.dense(), s_idx, l_idx, s_strides)
         return SparseTensor(new_out_dims, new_primal_dims, new_val)
 
     def _inverse_dense(post):
@@ -456,24 +444,16 @@ def _slice_elementals(primals, val_out, **params):
         # contiguous scatter that ignored ``strides`` AND hardcoded the input
         # dtype via jnp.zeros, mis-placing strided slices and crashing on f64.)
         full_val = post.dense()
-        new_out_dims = []
-        new_primal_dims = []
-        counter = 0
-        pad_config = []
-        for d in post.out_dims:
-            new_out_dims.append(DenseIndex(counter, d.size, counter))
-            pad_config.append((0, 0, 0))
-            counter += 1
-
         in_shape = primals[0].shape
+        out_sizes = [d.size for d in post.out_dims]
+        new_out_dims, new_primal_dims = _dense_grid(out_sizes, in_shape)
+
         slice_out_sizes = full_val.shape[len(post.out_dims):]
+        pad_config = [(0, 0, 0)] * len(out_sizes)
         for ax, L in enumerate(in_shape):
-            new_primal_dims.append(DenseIndex(counter, L, counter))
             n = slice_out_sizes[ax]
             st, stride = start_indices[ax], strides[ax]
-            high = L - st - (n - 1) * stride - 1
-            pad_config.append((st, high, stride - 1))
-            counter += 1
+            pad_config.append((st, L - st - (n - 1) * stride - 1, stride - 1))
 
         new_val = lax.pad(
             full_val, jnp.array(0.0, dtype=full_val.dtype), pad_config
@@ -859,17 +839,9 @@ def _concatenate_elementals(primals, val_out, **params):
         pad_config[dim] = (idx, val_out.shape[dim] - _idx, 0)
         new_val = lax.pad(full, jnp.array(0.0, dtype=full.dtype), pad_config)
 
-        counter = 0
-        new_out = []
-        new_primal = []
         out_shape = list(pre.out_shape)
         out_shape[dim] = val_out.shape[dim]
-        for s in out_shape:
-            new_out.append(DenseIndex(counter, s, counter))
-            counter += 1
-        for s in pre.primal_shape:
-            new_primal.append(DenseIndex(counter, s, counter))
-            counter += 1
+        new_out, new_primal = _dense_grid(out_shape, pre.primal_shape)
         return SparseTensor(
             new_out,
             new_primal,
@@ -928,17 +900,9 @@ def _concatenate_elementals(primals, val_out, **params):
         concat_ax = len(post.out_dims) + dim
         new_val = lax.slice_in_dim(full, *slices[primal_idx], axis=concat_ax)
 
-        counter = 0
-        new_out = []
-        new_primal = []
-        for s in post.out_shape:
-            new_out.append(DenseIndex(counter, s, counter))
-            counter += 1
         primal_shape = list(post.primal_shape)
         primal_shape[dim] = slices[primal_idx][1] - slices[primal_idx][0]
-        for s in primal_shape:
-            new_primal.append(DenseIndex(counter, s, counter))
-            counter += 1
+        new_out, new_primal = _dense_grid(post.out_shape, primal_shape)
         return SparseTensor(
             new_out,
             new_primal,
