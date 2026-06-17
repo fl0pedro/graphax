@@ -761,7 +761,7 @@ def _eliminate_vertex(
                     and post_val.val is not None
                     # cheap attribute check first: short-circuits the dim scan
                     # for the common non-relabel transforms (slice/concat/...).
-                    and all(getattr(t, "pure_relabel", False) for t in _pre_transforms)
+                    and all(getattr(t, "seed_drainable", False) for t in _pre_transforms)
                     and _has_sparse_dim(pre_val)
                 ):
                     for _t in _pre_transforms[::-1]:

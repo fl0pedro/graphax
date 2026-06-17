@@ -26,22 +26,24 @@ Transform = Callable[[SparseTensor], SparseTensor]
 class JacobianTransform:
     transform: Transform
     inverse_transform: Transform
-    pure_relabel: bool
+    seed_drainable: bool
 
     def __init__(
         self, transform: Transform, inverse_transform: Transform = None,
-        pure_relabel: bool = False,
+        seed_drainable: bool = False,
     ) -> None:
         self.transform = transform
         self.inverse_transform = inverse_transform
-        # ``pure_relabel`` marks a transform that is a bijective index relabel of
-        # the contracted dimension (reshape / transpose / squeeze) — i.e.
-        # ``post @ apply(pre) == apply_inverse(post) @ pre`` exactly. The
-        # elimination core uses this to drain the transform onto whichever
-        # adjacent edge is cheaper (the cotangent VECTOR) instead of densifying a
-        # partner diagonal (seed-aware draining). NOT set for slice (selection),
-        # broadcast / concatenate (size change), which are not bijective relabels.
-        self.pure_relabel = pure_relabel
+        # ``seed_drainable`` marks a LINEAR transform whose ``apply_inverse`` is
+        # its ADJOINT, so the seed-aware identity ``post @ apply(pre) ==
+        # apply_inverse(post) @ pre`` holds EXACTLY. The elimination core uses
+        # this to drain the transform onto whichever adjacent edge is cheaper —
+        # the cotangent VECTOR (a free relabel / scatter) — instead of densifying
+        # a partner diagonal. Holds for a bijective relabel (reshape) AND for a
+        # selection whose adjoint is the embedding (slice: select <-> pad). NOT
+        # set for transpose/squeeze (already structure-preserving, no benefit) or
+        # broadcast (its adjoint is a reduce, a different cost profile).
+        self.seed_drainable = seed_drainable
 
     def __repr__(self) -> str:
         return (
@@ -350,7 +352,7 @@ def _reshape_elementals(primals, val_out, **params):
                             post.dense().reshape([*out_sizes, *primal_sizes]))
 
     transform = JacobianTransform(reshape_transform, inverse_reshape_transform,
-                                  pure_relabel=True)
+                                  seed_drainable=True)
     return [SparseTensor([], [], None, pre_transforms=[transform])]
 
 
@@ -537,7 +539,8 @@ def _slice_elementals(primals, val_out, **params):
             )
         )
 
-    transform = JacobianTransform(slice_transform, inverse_slice_transform)
+    transform = JacobianTransform(slice_transform, inverse_slice_transform,
+                                  seed_drainable=True)
     return [SparseTensor([], [], None, pre_transforms=[transform])]
 
 
@@ -920,11 +923,17 @@ def _concatenate_elementals(primals, val_out, **params):
         groups.setdefault(id(p), []).append(i)
 
     def _make_elemental(slot_indices):
+        # concatenate embeds a slot's block at an offset; its adjoint is slicing
+        # that slot back out (inverse_concatenate_transform). So the seed-aware
+        # identity holds and concat is seed_drainable — draining it onto a
+        # cotangent VECTOR (slice the relevant slot) is O(n) instead of densifying
+        # a partner diagonal to the full concat-output block.
         if len(slot_indices) == 1:
             (i,) = slot_indices
             transform = JacobianTransform(
                 partial(concatenate_transform, i),
                 partial(inverse_concatenate_transform, i),
+                seed_drainable=True,
             )
         else:
 
@@ -942,7 +951,10 @@ def _concatenate_elementals(primals, val_out, **params):
                     acc = r if acc is None else acc + r
                 return acc
 
-            transform = JacobianTransform(combined_fwd, combined_inv)
+            # Same primal feeding multiple slots: the adjoint is the SUM of the
+            # per-slot slices (combined_inv), still seed-drainable.
+            transform = JacobianTransform(combined_fwd, combined_inv,
+                                          seed_drainable=True)
         return SparseTensor([], [], None, pre_transforms=[transform])
 
     elementals_per_slot = [None] * len(primals)
