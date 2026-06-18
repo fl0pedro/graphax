@@ -329,24 +329,32 @@ def _resolve_broadcast_topos(lhs_topos, rhs_topos, offset):
 def _align_contract_dims(lhs_primal, rhs_out):
     """Right-align ``lhs.primal_dims`` with ``rhs.out_dims`` into contraction
     pairs of EQUAL logical size. The two lists describe the same contracted
-    vertex axes, but one side may carry an extra SIZE-1 axis the other lacks
-    (e.g. a ``(C, 1)`` bias / ``reshape(-1, 1)`` head under vmap): a blind
-    ``zip(lhs[-n:], rhs[-n:])`` then pairs the wrong axes (batch vs class). A
-    lone size-1 dim contracts to the identity, so skip it here — it falls
-    through to ``_resolve_broadcast_topos`` as a free/broadcast dim. Equal
-    lengths with no stray size-1 reproduce the old positional pairing exactly."""
+    vertex axes, but one side may carry an extra IMPLICIT-BLOCK size-1 axis the
+    other lacks (e.g. a ``(C, 1)`` bias / ``reshape(-1, 1)`` head under vmap): a
+    blind ``zip(lhs[-n:], rhs[-n:])`` then pairs the wrong axes (batch vs class).
+    Such a stray axis carries NO physical axis (``_is_implicit_block_dim``) and
+    contracts to the identity, so skip it here — it falls through to
+    ``_resolve_broadcast_topos`` as a free/broadcast dim. A size-1 dim that DOES
+    carry a physical axis is a genuine contracting axis: it is NOT skipped, so a
+    real ``1 vs N`` mismatch still raises in ``_resolve_contract_pair`` rather
+    than being silently dropped. Equal lengths with no stray implicit-block dim
+    reproduce the old positional pairing exactly."""
     i, j = len(lhs_primal) - 1, len(rhs_out) - 1
     out = []
     while i >= 0 and j >= 0:
         lp, ro = lhs_primal[i], rhs_out[j]
         if lp.logical_size == ro.logical_size:
-            out.append((lp, ro)); i -= 1; j -= 1
-        elif lp.logical_size == 1:
-            i -= 1                       # stray size-1 on lhs -> free dim
-        elif ro.logical_size == 1:
-            j -= 1                       # stray size-1 on rhs -> free dim
+            out.append((lp, ro))
+            i -= 1
+            j -= 1
+        elif _is_implicit_block_dim(lp):
+            i -= 1                       # stray broadcast size-1 on lhs -> free dim
+        elif _is_implicit_block_dim(ro):
+            j -= 1                       # stray broadcast size-1 on rhs -> free dim
         else:
-            out.append((lp, ro)); i -= 1; j -= 1  # genuine mismatch -> raise downstream
+            out.append((lp, ro))         # genuine mismatch -> raise in _resolve_contract_pair
+            i -= 1
+            j -= 1
     return out[::-1]
 
 
