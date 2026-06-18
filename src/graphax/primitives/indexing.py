@@ -33,6 +33,16 @@ from .transforms import (
 # ---------------------------------------------------------------------------
 
 
+def _jac_dtype(x):
+    """Float dtype for a Jacobian coefficient carrying ``x``'s values: ``x``'s
+    own float dtype, promoted to at least float32 (so an integer/array-less
+    operand still yields float32). Keeps float64 operands' Jacobians in float64
+    — both for the jacrev dtype contract and to avoid precision loss / false
+    ties when the coefficient stores actual operand/update VALUES (mul, min/max
+    winner comparison) rather than a 0/1 structural mask."""
+    return jnp.result_type(getattr(x, "dtype", jnp.float32), jnp.float32)
+
+
 def _apply_over_leading(arr, lead_ndim, fn):
     """Apply ``fn`` (a single-array op on the LEADING ``lead_ndim`` axes) to
     ``arr`` while vmapping over the TRAILING axes as a flat batch. Returns the
@@ -258,8 +268,7 @@ def gather_elemental_rule(primals, **params):
     op_shape = get_shape(operand)
     out_ndim = len(out_shape)
     op_ndim = len(op_shape)
-    dtype = jnp.result_type(operand.dtype if hasattr(operand, "dtype") else jnp.float32,
-                            jnp.float32)
+    dtype = _jac_dtype(operand)
 
     dn = params["dimension_numbers"]
     gather_slice_sizes = params["slice_sizes"]
@@ -348,8 +357,7 @@ def _scatter_update_transform(val_out, operand, updates, indices, params,
     up_shape = get_shape(updates)
     out_ndim = len(out_shape)
     up_ndim = len(up_shape)
-    dtype = jnp.result_type(
-        operand.dtype if hasattr(operand, "dtype") else jnp.float32, jnp.float32)
+    dtype = _jac_dtype(operand)
     dn = params["dimension_numbers"]
 
     coeff = up_value_fn()                          # (up_shape...) jit-safe array
@@ -495,15 +503,16 @@ def scatter_mul_elemental_rule(primals, **params):
     # updates value. Scatter-set the per-target updates value into a ones grid.
     out_shape = get_shape(val_out)
     dn = params["dimension_numbers"]
-    ones_grid = jnp.ones(out_shape, dtype=jnp.float32)
-    up_f32 = updates.astype(jnp.float32)
-    op_coeff = _do_scatter_set(ones_grid, indices, up_f32, dn, params)
+    # value-carrying coeffs -> keep the operand's float dtype (float64 precision).
+    jdt = _jac_dtype(operand)
+    ones_grid = jnp.ones(out_shape, dtype=jdt)
+    op_coeff = _do_scatter_set(ones_grid, indices, updates.astype(jdt), dn, params)
     op_tensor = _scatter_op_coeff_tensors(val_out, operand, updates, params, op_coeff)
 
     # d/d(updates) coeff = operand value at each update's target.
     op_at_target = _scatter_gather_at_targets(
         val_out, operand, updates, indices, params,
-        operand.astype(jnp.float32),
+        operand.astype(jdt),
     )
     up_tensor = _scatter_update_transform(
         val_out, operand, updates, indices, params,
@@ -515,17 +524,6 @@ def scatter_mul_elemental_rule(primals, **params):
 elemental_rules[lax.scatter_mul_p] = scatter_mul_elemental_rule
 
 
-def _tie_split(a, b, greater):
-    """Balanced subgradient weight (jit-safe, array-valued): 1 where a strictly
-    wins, 0.5 on a tie, 0 where b wins. ``greater`` selects max (a wins when
-    a>b) vs min (a wins when a<b)."""
-    a = a.astype(jnp.float32)
-    b = b.astype(jnp.float32)
-    strict = (a > b) if greater else (a < b)
-    tie = (a == b)
-    return jnp.where(strict, 1.0, jnp.where(tie, 0.5, 0.0)).astype(jnp.float32)
-
-
 def _scatter_minmax_rule(prim, greater):
     def rule(primals, **params):
         val_out = prim.bind(*primals, **params)
@@ -533,27 +531,35 @@ def _scatter_minmax_rule(prim, greater):
         out_shape = get_shape(val_out)
         dn = params["dimension_numbers"]
 
-        # operand value at each update target, and update value broadcast onto
-        # the output grid — both via the structural gather/scatter (jit-safe).
-        op_at_target = _scatter_gather_at_targets(
-            val_out, operand, updates, indices, params, operand.astype(jnp.float32)
+        # The min/max winner at each output cell is whatever equals the REALISED
+        # output ``val_out`` (which already folds operand + ALL updates to that
+        # cell, repeated indices included) — NOT the bare operand. Comparing to
+        # the operand mis-credited every update that merely beats the operand
+        # (e.g. cell <- max(op, u0, u1): the loser u1 wrongly got a gradient).
+        # jax splits a tie EQUALLY: each of the C winners at a cell gets 1/C, so
+        # normalise by the per-cell winner count. (``greater`` is implicit now —
+        # val_out already encodes min vs max via the bound primitive.)
+        # Compare in the operand's own dtype: casting to float32 first would
+        # collapse float64 values that differ only in the low bits into a FALSE
+        # tie (wrong winner / wrong split). Weights are float for the contraction.
+        jdt = _jac_dtype(operand)
+        vout_at_target = _scatter_gather_at_targets(
+            val_out, operand, updates, indices, params, val_out.astype(jdt)
         )
+        up_win = (updates.astype(jdt) == vout_at_target).astype(jdt)
+        op_win = (operand.astype(jdt) == val_out.astype(jdt)).astype(jdt)  # (out_shape)
+        # winners per cell = operand-winner + sum of update-winners scattered in.
+        count = op_win + _do_scatter_add(
+            jnp.zeros(out_shape, dtype=jdt), indices, up_win, dn, params)
+        count = jnp.maximum(count, 1.0)                       # val_out is attained => >=1
 
-        # d/d(operand): identity weight everywhere, replaced at scattered
-        # targets by the operand-side tie weight. Build the operand-side weight
-        # on the OUTPUT grid: scatter the per-update operand-tie weight (operand
-        # wins => 1 - update_side_weight at that target) over an identity grid.
-        op_side_w = _tie_split(op_at_target, updates, greater)   # (up_shape)
-        # where multiple updates hit one cell jax composes them sequentially;
-        # for distinct indices (the common case) this scatter-set is exact.
-        ones_grid = jnp.ones(out_shape, dtype=jnp.float32)
-        op_coeff = _do_scatter_set(ones_grid, indices, op_side_w, dn, params)
         op_tensor = _scatter_op_coeff_tensors(
-            val_out, operand, updates, params, op_coeff
+            val_out, operand, updates, params, op_win / count
         )
-
-        # d/d(updates): update-side tie weight (update wins).
-        up_side_w = _tie_split(updates, op_at_target, greater)   # (up_shape)
+        count_at_target = _scatter_gather_at_targets(
+            val_out, operand, updates, indices, params, count
+        )
+        up_side_w = up_win / count_at_target                 # (up_shape)
         up_tensor = _scatter_update_transform(
             val_out, operand, updates, indices, params,
             lambda: up_side_w,

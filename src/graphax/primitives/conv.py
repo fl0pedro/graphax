@@ -223,18 +223,19 @@ def _pad_operand_transform(primals, val_out, **params):
     return SparseTensor([], [], None, pre_transforms=[transform])
 
 
-def pad_elemental_rule(primals, **params):
-    val_out = lax.pad_p.bind(*primals, **params)
+def _pad_elementals(primals, val_out, **params):
+    """Both pad elementals: the operand deferred transform, plus — for a
+    non-constant ``padding_value`` — the value-independent pad-cell mask (pad
+    cells +1, embedded operand cells 0). Shared by the eager and elemental_only
+    paths so BOTH differentiate ``padding_value`` (the elemental_only path used
+    to silently drop it; it is the preferred dispatch, so the gradient vanished)."""
     x, padding_value = primals
     padding_config = params["padding_config"]
-    x_shape = get_shape(x)
-    out_shape = get_shape(val_out)
-
     tensors_out = [_pad_operand_transform(primals, val_out, **params)]
 
-    # Gradient w.r.t. a non-constant ``padding_value`` (rare): the pad cells get
-    # +1, the embedded operand cells 0 — a value-independent mask, materialized.
     if not isinstance(padding_value, (float, int, complex)):
+        x_shape = get_shape(x)
+        out_shape = get_shape(val_out)
         pad_mask = jnp.ones_like(val_out)
         slices_obj = tuple(
             slice(lo, lo + (x_shape[i] - 1) * (interior + 1) + 1, interior + 1)
@@ -244,14 +245,16 @@ def pad_elemental_rule(primals, **params):
         p_out_dims = [DenseIndex(i, s, i) for i, s in enumerate(out_shape)]
         tensors_out.append(SparseTensor(p_out_dims, [], pad_mask))
 
-    return val_out, tensors_out
+    return tensors_out
+
+
+def pad_elemental_rule(primals, **params):
+    val_out = lax.pad_p.bind(*primals, **params)
+    return val_out, _pad_elementals(primals, val_out, **params)
 
 
 def pad_elemental_only(primal_out, primals, **params):
-    # Operand-only deferred transform (the padding_value branch needs the bound
-    # primal, which the elemental_only path does not re-bind); the common
-    # constant-padding_value case — the gradient case — is fully covered.
-    return [_pad_operand_transform(primals, primal_out, **params)]
+    return _pad_elementals(primals, primal_out, **params)
 
 
 elemental_rules[lax.pad_p] = pad_elemental_rule

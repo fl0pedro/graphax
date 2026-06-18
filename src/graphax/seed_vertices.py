@@ -78,6 +78,11 @@ def with_tangent_seed(fun, tangent):
 def seed_vjp(fun, adjoint, order="rev", argnums=0):
     """VJP ``adjointᵀ J`` via an adjoint seed vertex, with a chosen elimination
     ``order`` (a learned alphagrad order is just passed here)."""
+    # jacve keys differentiation off ``i in argnums``, so a bare int (the
+    # default) must be wrapped — otherwise the default call path raises
+    # ``TypeError: argument of type 'int' is not iterable``.
+    if isinstance(argnums, int):
+        argnums = (argnums,)
     return jacve(with_adjoint_seed(fun, adjoint), order, argnums=argnums)
 
 
