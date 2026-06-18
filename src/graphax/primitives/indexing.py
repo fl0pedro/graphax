@@ -524,7 +524,7 @@ def scatter_mul_elemental_rule(primals, **params):
 elemental_rules[lax.scatter_mul_p] = scatter_mul_elemental_rule
 
 
-def _scatter_minmax_rule(prim, greater):
+def _scatter_minmax_rule(prim):
     def rule(primals, **params):
         val_out = prim.bind(*primals, **params)
         operand, indices, updates = primals[0], primals[1], primals[2]
@@ -543,11 +543,12 @@ def _scatter_minmax_rule(prim, greater):
         # collapse float64 values that differ only in the low bits into a FALSE
         # tie (wrong winner / wrong split). Weights are float for the contraction.
         jdt = _jac_dtype(operand)
+        vout = val_out.astype(jdt)
         vout_at_target = _scatter_gather_at_targets(
-            val_out, operand, updates, indices, params, val_out.astype(jdt)
+            val_out, operand, updates, indices, params, vout
         )
         up_win = (updates.astype(jdt) == vout_at_target).astype(jdt)
-        op_win = (operand.astype(jdt) == val_out.astype(jdt)).astype(jdt)  # (out_shape)
+        op_win = (operand.astype(jdt) == vout).astype(jdt)               # (out_shape)
         # winners per cell = operand-winner + sum of update-winners scattered in.
         count = op_win + _do_scatter_add(
             jnp.zeros(out_shape, dtype=jdt), indices, up_win, dn, params)
@@ -568,8 +569,8 @@ def _scatter_minmax_rule(prim, greater):
     return rule
 
 
-scatter_min_elemental_rule = _scatter_minmax_rule(lax.scatter_min_p, greater=False)
-scatter_max_elemental_rule = _scatter_minmax_rule(lax.scatter_max_p, greater=True)
+scatter_min_elemental_rule = _scatter_minmax_rule(lax.scatter_min_p)
+scatter_max_elemental_rule = _scatter_minmax_rule(lax.scatter_max_p)
 
 elemental_rules[lax.scatter_min_p] = scatter_min_elemental_rule
 elemental_rules[lax.scatter_max_p] = scatter_max_elemental_rule

@@ -17,6 +17,7 @@ from ..sparse.tensor import (
     SparseTensor,
     _swap_back_axes,
 )
+from .transforms import make_drainable_transform
 
 
 # ---------- select_n ----------
@@ -248,7 +249,6 @@ def _cumsum_elementals(primals, val_out, **params):
     rev_cumsum(post) @ pre``: in reverse the elimination drains it onto the
     cotangent VECTOR (one reverse-cumsum, O(n)) instead of materialising the full
     n×n triangular block. The forward / non-drainable path densifies."""
-    from .transforms import make_drainable_transform
     axis = params["axis"]
     reverse = params.get("reverse", False)
 
@@ -296,7 +296,6 @@ def sort_elemental_rule(primals, **params):
     # in reverse the elimination gathers the cotangent VECTOR by ``invperm``
     # (O(n)) instead of materialising the S×S permutation matrix. perm / invperm
     # are captured from the primal value; the forward path densifies.
-    from .transforms import make_drainable_transform
     perm = jnp.argsort(operand, axis=dim)        # out[i] = x[perm[i]]
     invperm = jnp.argsort(perm, axis=dim)        # x[j] -> out position invperm[j]
 
@@ -329,7 +328,6 @@ def _rev_elementals(primals, val_out, **params):
     ``post @ flip(pre) == flip(post) @ pre``: in reverse the elimination drains it
     onto the cotangent VECTOR (flip the vector, O(n)) instead of materialising the
     full n×n anti-diagonal R. The forward / non-drainable path densifies."""
-    from .transforms import make_drainable_transform
     dims = params["dimensions"]
 
     def _flip(full, base):                       # flip the block of axes at ``base``
@@ -399,10 +397,6 @@ def _cumprod_elementals(primals, val_out, **params):
     onto the cotangent VECTOR (O(n)) instead of materialising the triangular
     block. (The naive ``out[i]/x[j]`` was a 0/0 at zeros — wrong for masked /
     post-ReLU activations; the zero branch is preserved here.)"""
-    from .transforms import (
-        JacobianTransform, _dense_grid,
-        _is_scalar_identity_post, _identity_post_over,
-    )
     x = primals[0]
     axis = params["axis"]
     reverse = params.get("reverse", False)
@@ -416,7 +410,6 @@ def _cumprod_elementals(primals, val_out, **params):
     x_safe = jnp.where(x != 0, x, 1.0)
     uniq_zero = (nz_count == 1).astype(jnp.float32)
 
-    from .transforms import make_drainable_transform
 
     def _b(q, full, op_start):                            # broadcast per-pos q -> full
         ns = [1] * full.ndim

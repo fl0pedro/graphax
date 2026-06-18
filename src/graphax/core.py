@@ -582,6 +582,39 @@ def unload_pre_transforms(post, pre):
     return new_pre
 
 
+def _drain_or_unload_pre(post_val, pre_val, _post_val):
+    """Resolve ``post_val``'s pre_transforms against ``pre_val``; returns the
+    updated ``(_post_val, _pre_val)``. SEED-AWARE DRAINING: a pure-relabel
+    pre_transform (reshape / transpose / squeeze / slice / ...) on ``post_val``
+    relabels the CONTRACTED dimension; applying it FORWARD onto a sparse
+    ``pre_val`` diagonal densifies it (the O(n^2) conv-head blow-up). When every
+    transform is seed_drainable and ``pre_val`` is a sparse diagonal, the
+    bijective identity ``post @ apply(pre) == apply_inverse(post) @ pre`` lets us
+    instead apply the INVERSE relabel to the cotangent VECTOR ``_post_val`` (free)
+    and keep ``pre_val`` diagonal; otherwise densify via ``apply`` (unload), or
+    pass ``pre_val`` through. Shared by ``_eliminate_vertex`` and
+    ``_accumulate_edge_triplet`` so the two contraction paths cannot diverge."""
+    _pre_transforms = post_val.pre_transforms
+    if (
+        len(_pre_transforms) > 0
+        and pre_val.val is not None
+        and post_val.val is not None
+        # cheap attribute check first: short-circuits the dim scan for the
+        # common non-relabel transforms (slice/concat/...).
+        and all(getattr(t, "seed_drainable", False) for t in _pre_transforms)
+        and _has_sparse_dim(pre_val)
+    ):
+        for _t in _pre_transforms[::-1]:
+            _post_val = _t.apply_inverse(_post_val)
+        _assert_sparse_tensor_consistency(_post_val)
+        _pre_val = pre_val.copy()
+    elif len(_pre_transforms) > 0 and pre_val.val is not None:
+        _pre_val = unload_pre_transforms(post_val, pre_val)
+    else:
+        _pre_val = pre_val.copy()
+    return _post_val, _pre_val
+
+
 def prepend_post_transforms(post, out):
     transforms = post.post_transforms + out.post_transforms
     out.post_transforms = transforms
@@ -746,32 +779,9 @@ def _eliminate_vertex(
                 else:
                     _post_val = post_val.copy()
 
-                # Seed-aware draining: a pure-relabel pre_transform (reshape /
-                # transpose / squeeze) on ``post_val`` relabels the CONTRACTED
-                # dimension. Applying it forward onto a sparse ``pre_val`` (a
-                # diagonal) densifies it — the O(n^2) blow-up behind the conv
-                # head's gelu-diagonal-through-reshape(-1,1). Since the relabel is
-                # bijective, ``post @ apply(pre) == apply_inverse(post) @ pre``, so
-                # we instead apply the INVERSE relabel to ``_post_val`` (relabeling
-                # the cotangent VECTOR — free) and keep ``pre_val`` diagonal.
-                _pre_transforms = post_val.pre_transforms
-                if (
-                    len(_pre_transforms) > 0
-                    and pre_val.val is not None
-                    and post_val.val is not None
-                    # cheap attribute check first: short-circuits the dim scan
-                    # for the common non-relabel transforms (slice/concat/...).
-                    and all(getattr(t, "seed_drainable", False) for t in _pre_transforms)
-                    and _has_sparse_dim(pre_val)
-                ):
-                    for _t in _pre_transforms[::-1]:
-                        _post_val = _t.apply_inverse(_post_val)
-                    _assert_sparse_tensor_consistency(_post_val)
-                    _pre_val = pre_val.copy()
-                elif len(_pre_transforms) > 0 and pre_val.val is not None:
-                    _pre_val = unload_pre_transforms(post_val, pre_val)
-                else:
-                    _pre_val = pre_val.copy()
+                # Seed-aware draining (shared with the triplet path).
+                _post_val, _pre_val = _drain_or_unload_pre(
+                    post_val, pre_val, _post_val)
 
                 # Multiply the two values of the edges if applicable. The real
                 # contraction runs whenever both edges carry values OR a
@@ -1993,26 +2003,11 @@ def _accumulate_edge_triplet(
     if len(pre_val.post_transforms) > 0 and post_val.val is not None:
         _post_val = unload_post_transforms(post_val, pre_val)
 
-    # Seed-aware draining — MUST match _eliminate_vertex (do not let the two
-    # contraction paths diverge): when post carries only seed_drainable
-    # transforms and pre is a sparse diagonal, drain the (adjoint) transform onto
-    # the cotangent VECTOR instead of densifying the diagonal via apply(). Absent
-    # this, the cross-country / triplet schedule (the alphagrad order-optimiser's
-    # path) would re-introduce the O(n^2) densification this machinery removes.
-    _pre_transforms = post_val.pre_transforms
-    if (
-        len(_pre_transforms) > 0
-        and pre_val.val is not None
-        and post_val.val is not None
-        and all(getattr(t, "seed_drainable", False) for t in _pre_transforms)
-        and _has_sparse_dim(pre_val)
-    ):
-        for _t in _pre_transforms[::-1]:
-            _post_val = _t.apply_inverse(_post_val)
-        _assert_sparse_tensor_consistency(_post_val)
-        _pre_val = pre_val.copy()
-    elif len(_pre_transforms) > 0 and pre_val.val is not None:
-        _pre_val = unload_pre_transforms(post_val, pre_val)
+    # Seed-aware draining — shared with _eliminate_vertex so the two contraction
+    # paths cannot diverge (the cross-country / triplet schedule that an
+    # alphagrad order-optimiser drives must NOT re-introduce the O(n^2)
+    # densification the draining removes).
+    _post_val, _pre_val = _drain_or_unload_pre(post_val, pre_val, _post_val)
 
     # Mirror _eliminate_vertex: a val=None operand only acts as a pure-diagonal
     # identity pass-through when _acts_as_identity holds (else it's a non-identity
