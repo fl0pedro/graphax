@@ -326,15 +326,36 @@ def _resolve_broadcast_topos(lhs_topos, rhs_topos, offset):
     return pairs
 
 
+def _align_contract_dims(lhs_primal, rhs_out):
+    """Right-align ``lhs.primal_dims`` with ``rhs.out_dims`` into contraction
+    pairs of EQUAL logical size. The two lists describe the same contracted
+    vertex axes, but one side may carry an extra SIZE-1 axis the other lacks
+    (e.g. a ``(C, 1)`` bias / ``reshape(-1, 1)`` head under vmap): a blind
+    ``zip(lhs[-n:], rhs[-n:])`` then pairs the wrong axes (batch vs class). A
+    lone size-1 dim contracts to the identity, so skip it here — it falls
+    through to ``_resolve_broadcast_topos`` as a free/broadcast dim. Equal
+    lengths with no stray size-1 reproduce the old positional pairing exactly."""
+    i, j = len(lhs_primal) - 1, len(rhs_out) - 1
+    out = []
+    while i >= 0 and j >= 0:
+        lp, ro = lhs_primal[i], rhs_out[j]
+        if lp.logical_size == ro.logical_size:
+            out.append((lp, ro)); i -= 1; j -= 1
+        elif lp.logical_size == 1:
+            i -= 1                       # stray size-1 on lhs -> free dim
+        elif ro.logical_size == 1:
+            j -= 1                       # stray size-1 on rhs -> free dim
+        else:
+            out.append((lp, ro)); i -= 1; j -= 1  # genuine mismatch -> raise downstream
+    return out[::-1]
+
+
 def _build_matmul_topology(lhs, rhs_out_dims, rhs_primal_dims, rhs_id_offset):
     lhs_out_map = {d.id: d for d in lhs.out_dims}
     rhs_primal_map = {d.id: d for d in rhs_primal_dims}
     rhs_dims = rhs_out_dims + rhs_primal_dims
-    n_contract = min(len(lhs.primal_dims), len(rhs_out_dims))
-    lhs_contract = list(lhs.primal_dims[-n_contract:] if n_contract > 0 else [])
-    rhs_contract = list(rhs_out_dims[-n_contract:] if n_contract > 0 else [])
     pairs, processed_l, processed_r = [], set(), set()
-    for lp, ro in zip(lhs_contract, rhs_contract):
+    for lp, ro in _align_contract_dims(lhs.primal_dims, rhs_out_dims):
         meta, lhs_ids, rhs_ids = _resolve_contract_pair(
             lp, ro, lhs_out_map, rhs_primal_map
         )
