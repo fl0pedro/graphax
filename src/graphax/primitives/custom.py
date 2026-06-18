@@ -23,7 +23,7 @@ import jax._src.core as core
 import jax.numpy as jnp
 import numpy as np
 
-from ..sparse.tensor import DenseIndex, SparseTensor
+from ..sparse.tensor import DenseIndex, DiagonalIndex, SparseTensor
 from .base import (
     multi_output_elemental_only_rules,
     make_parallel_jacobian,
@@ -199,6 +199,42 @@ multi_output_elemental_only_rules[_custom_vjp_call_p] = custom_vjp_elemental_onl
 from jax.custom_derivatives import custom_jvp_call_p as _custom_jvp_call_p
 
 
+# Position-preserving elementwise lax primitives a (linear) tangent may flow
+# through and still yield a DIAGONAL Jacobian. Conservative on purpose: any
+# tangent-touching eqn outside this set (reduce / dot / gather / broadcast / a
+# shape change) makes the op non-diagonal and routes it to the dense path.
+_ELEMENTWISE_TANGENT_PRIMS = frozenset(
+    {"add", "sub", "mul", "div", "neg", "select_n", "convert_element_type",
+     "copy", "real", "imag", "conj", "reduce_precision"}
+)
+
+
+def _input_tangent_kind(jvp_jaxpr, tan, out_tan) -> str:
+    """STATIC (jit-safe) classification of how input tangent ``tan`` reaches the
+    output tangent ``out_tan``: ``"diagonal"`` (only through position-preserving
+    elementwise ops, shape preserved end to end), ``"zero"`` (never reaches the
+    output — no edge), or ``"dense"`` (reaches through a shape-changing / non-
+    elementwise op — must fall back to the dense Jacobian). Forward dependency
+    trace over the jaxpr equations."""
+    tan_shape = tan.aval.shape
+    if not isinstance(out_tan, core.Var):
+        return "dense"
+    dep = {tan}
+    for eqn in jvp_jaxpr.eqns:
+        if not any(v in dep for v in eqn.invars if isinstance(v, core.Var)):
+            continue
+        if eqn.primitive.name not in _ELEMENTWISE_TANGENT_PRIMS:
+            return "dense"
+        for ov in eqn.outvars:
+            if isinstance(ov, core.Var):
+                if ov.aval.shape != tan_shape:
+                    return "dense"
+                dep.add(ov)
+    if out_tan not in dep:
+        return "zero"
+    return "diagonal" if out_tan.aval.shape == tan_shape else "dense"
+
+
 def _custom_jvp_dense_jacobians(primals, **params):
     """Build the exact Jacobian of a ``custom_jvp`` call by HONORING the user's
     jvp rule instead of structurally differentiating the primal (which would
@@ -221,6 +257,36 @@ def _custom_jvp_dense_jacobians(primals, **params):
     in_shapes = [get_shape(a) for a in args_only]
     in_sizes = [int(np.prod(s)) if s else 1 for s in in_shapes]
 
+    # DIAGONAL fast path (single output): an elementwise custom_jvp (softplus,
+    # relu, mish, hard_sigmoid, ...) has a DIAGONAL Jacobian per input. Classify
+    # each input's tangent path STATICALLY (jit-safe) and emit PER INPUT: a
+    # diagonal input is read in ONE probe (ones on it, zeros elsewhere -> f'(x))
+    # as a DiagonalIndex — O(n); a non-contributing input gets no edge; only a
+    # genuinely dense input falls back to the N one-hot probes below. (Some
+    # activations carry a residual-threaded 2nd arg classified "dense" whose
+    # gradient isn't the one being computed — emitting it dense is fine, the real
+    # input stays O(n).)
+    diag_kinds = None
+    if n_out == 1 and not out_zeros[0] and jvp_jaxpr.outvars[n_out:]:
+        out_tan = jvp_jaxpr.outvars[n_out]
+        diag_kinds = [_input_tangent_kind(jvp_jaxpr, jvp_jaxpr.invars[n_args + ai], out_tan)
+                      for ai in range(n_args)]
+        if all(k != "diagonal" for k in diag_kinds):
+            diag_kinds = None                         # nothing to gain — plain dense
+
+    def _diagonal_for(ai):
+        sh = in_shapes[ai]
+        tangents = [jnp.zeros(s, dtype=getattr(a, "dtype", jnp.float32))
+                    for s, a in zip(in_shapes, args_only)]
+        tangents[ai] = jnp.ones(sh, dtype=tangents[ai].dtype)
+        out = core.eval_jaxpr(jvp_jaxpr, jvp_consts, *args_only, *tangents)
+        diag = out[n_out:][0]                         # this input's f'(x), shape == sh
+        ndim = len(sh)
+        axis_fn = (lambda _: None) if ndim == 0 else (lambda j: j)
+        out_dims = [DiagonalIndex(j, s, axis_fn(j), ndim + j) for j, s in enumerate(sh)]
+        primal_dims = [DiagonalIndex(ndim + j, s, axis_fn(j), j) for j, s in enumerate(sh)]
+        return SparseTensor(out_dims, primal_dims, diag)
+
     def _jvp_columns(ai):
         """For input ``ai``, one out-tangent list (per output) per input element:
         the response to a one-hot tangent IS that column of the Jacobian."""
@@ -242,20 +308,34 @@ def _custom_jvp_dense_jacobians(primals, **params):
             cols.append(out_tangents)
         return cols
 
-    per_input_cols = [_jvp_columns(ai) for ai in range(n_args)]
     if n_args == 0:                                  # all inputs are constants
         return [[None] * len(primals) for _ in range(n_out)]
-    # Output shapes = shapes of the probed out-tangents (one per output).
-    out_shapes = [get_shape(per_input_cols[0][0][li]) for li in range(n_out)]
+
+    # Only the inputs NOT handled by the diagonal fast path need the dense
+    # N-probe (diag_kinds is None => every input is dense, the original path).
+    def _is_dense(ai):
+        return diag_kinds is None or diag_kinds[ai] == "dense"
+
+    per_input_cols = {ai: _jvp_columns(ai) for ai in range(n_args) if _is_dense(ai)}
+    out_shapes = (
+        [get_shape(per_input_cols[next(iter(per_input_cols))][0][li])
+         for li in range(n_out)]
+        if per_input_cols else None                  # all diagonal/zero: not needed
+    )
 
     elementals = []
     for li in range(n_out):
-        out_shape = out_shapes[li]
-        out_size = len(out_shape)
         per_invar = [None] * len(primals)
         for ai in range(n_args):
+            if diag_kinds is not None and diag_kinds[ai] == "diagonal":
+                per_invar[num_consts + ai] = _diagonal_for(ai)   # O(n), 1 probe
+                continue
+            if diag_kinds is not None and diag_kinds[ai] == "zero":
+                continue                             # tangent never reaches output
+            # Dense column-stacked Jacobian for this input.
+            out_shape = out_shapes[li]
+            out_size = len(out_shape)
             cols = [per_input_cols[ai][j][li] for j in range(in_sizes[ai])]
-            # Each column has out_shape; stack along a trailing input axis.
             J = jnp.stack(
                 [jnp.asarray(c).reshape(-1) for c in cols], axis=-1
             ).reshape(tuple(out_shape) + tuple(in_shapes[ai]))
