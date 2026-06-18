@@ -326,36 +326,60 @@ def _resolve_broadcast_topos(lhs_topos, rhs_topos, offset):
     return pairs
 
 
-def _align_contract_dims(lhs_primal, rhs_out):
+def _align_contract_indices(lhs_primal, rhs_out):
     """Right-align ``lhs.primal_dims`` with ``rhs.out_dims`` into contraction
-    pairs of EQUAL logical size. The two lists describe the same contracted
-    vertex axes, but one side may carry an extra IMPLICIT-BLOCK size-1 axis the
-    other lacks (e.g. a ``(C, 1)`` bias / ``reshape(-1, 1)`` head under vmap): a
-    blind ``zip(lhs[-n:], rhs[-n:])`` then pairs the wrong axes (batch vs class).
-    Such a stray axis carries NO physical axis (``_is_implicit_block_dim``) and
-    contracts to the identity, so skip it here — it falls through to
-    ``_resolve_broadcast_topos`` as a free/broadcast dim. A size-1 dim that DOES
-    carry a physical axis is a genuine contracting axis: it is NOT skipped, so a
-    real ``1 vs N`` mismatch still raises in ``_resolve_contract_pair`` rather
-    than being silently dropped. Equal lengths with no stray implicit-block dim
-    reproduce the old positional pairing exactly."""
+    INDEX pairs ``(li, rj)``. The two lists describe the same contracted vertex
+    axes, but one side may carry an extra size-1 axis the other lacks, so a
+    blind ``zip(lhs[-n:], rhs[-n:])`` pairs the wrong axes (batch vs class).
+    Three dim kinds, distinguished by size and the ``_is_implicit_block_dim``
+    metadata (size-1 with NO physical axis):
+
+    * EQUAL logical size -> a direct contraction pair.
+    * METADATA EMBED: an implicit-block size-1 against a size-N partner that has
+      NO equal-size partner of its own -> a contraction pair the densify path
+      zero-pads up to N (the ``val=None`` single-block embed). NOT skipped.
+    * STRAY implicit-block size-1: its size-N counterpart DOES have an
+      equal-size partner elsewhere, so the size-1 is the extra one -> skipped, a
+      free/broadcast dim (the trailing axis of a ``(C, 1)`` bias /
+      ``reshape(-1, 1)`` head under vmap).
+
+    A size-1 dim that carries a physical axis is never implicit-block, so a
+    genuine ``1 vs N`` mismatch still pairs through and raises in
+    ``_resolve_contract_pair``. Equal-length lists with no stray implicit-block
+    dim reproduce the old positional ``[-n:]`` pairing exactly. This single
+    alignment is the one source of truth for which axes contract — the tiled
+    topology, the densify path, the densify-safety gate, the implicit-block
+    detector and the FLOP-depth counter all consume it, so they cannot diverge."""
+
+    def _has_equal(size, dims, upto):
+        return any(int(dims[k].logical_size) == size for k in range(upto))
+
     i, j = len(lhs_primal) - 1, len(rhs_out) - 1
     out = []
     while i >= 0 and j >= 0:
         lp, ro = lhs_primal[i], rhs_out[j]
-        if lp.logical_size == ro.logical_size:
-            out.append((lp, ro))
+        ls, rs = int(lp.logical_size), int(ro.logical_size)
+        if ls == rs:
+            out.append((i, j))
             i -= 1
             j -= 1
-        elif _is_implicit_block_dim(lp):
+        elif _is_implicit_block_dim(lp) and _has_equal(rs, lhs_primal, i):
             i -= 1                       # stray broadcast size-1 on lhs -> free dim
-        elif _is_implicit_block_dim(ro):
+        elif _is_implicit_block_dim(ro) and _has_equal(ls, rhs_out, j):
             j -= 1                       # stray broadcast size-1 on rhs -> free dim
         else:
-            out.append((lp, ro))         # genuine mismatch -> raise in _resolve_contract_pair
+            out.append((i, j))           # equal-or-embed pair, or genuine mismatch
             i -= 1
             j -= 1
     return out[::-1]
+
+
+def _align_contract_dims(lhs_primal, rhs_out):
+    """Dim-pair view of :func:`_align_contract_indices` (see its docstring)."""
+    return [
+        (lhs_primal[i], rhs_out[j])
+        for i, j in _align_contract_indices(lhs_primal, rhs_out)
+    ]
 
 
 def _build_matmul_topology(lhs, rhs_out_dims, rhs_primal_dims, rhs_id_offset):
@@ -1567,12 +1591,9 @@ def _has_implicit_block_contraction(lhs, rhs) -> bool:
     genuine mismatches keep falling through to the tiled path's strict error."""
     if not (hasattr(lhs, "primal_dims") and hasattr(rhs, "out_dims")):
         return False
-    n = min(len(lhs.primal_dims), len(rhs.out_dims))
-    if n == 0:
-        return False
     return any(
         int(l.logical_size) != int(r.logical_size) and _contract_pair_compatible(l, r)
-        for l, r in zip(lhs.primal_dims[-n:], rhs.out_dims[-n:])
+        for l, r in _align_contract_dims(lhs.primal_dims, rhs.out_dims)
     )
 
 
@@ -1604,28 +1625,25 @@ def _matmul_via_densify(lhs, rhs):
     """
     from graphax.sparse.tensor import SparseTensor
 
-    n_contract = min(len(lhs.primal_dims), len(rhs.out_dims))
     n_lhs_dims = len(lhs.dims)
     n_lhs_out = len(lhs.out_dims)
     n_rhs_out = len(rhs.out_dims)
 
     lhs_dense, rhs_dense = dense_for_matmul(lhs), dense_for_matmul(rhs)
 
-    # Contraction axes: pair the last ``n_contract`` of ``lhs.primal_dims``
-    # with the last ``n_contract`` of ``rhs.out_dims`` positionally — same
-    # convention as the tiled path's ``_resolve_contract_pair``. The
-    # dispatcher's ``_densify_is_safe`` gate has already verified the paired
-    # sizes match, so ``dot_general`` accepts this directly. We deliberately
-    # don't try id-based pairing across operands here: lhs and rhs use
-    # independent id spaces at this point (``_align_tensor_ids`` only runs
-    # on the tiled path), so matching by raw id is meaningless and can pair
-    # mismatched-size dims together.
-    lhs_contract: list[int] = []
-    rhs_contract: list[int] = []
-    if n_contract > 0:
-        n_lhs_pri = len(lhs.primal_dims)
-        lhs_contract = [n_lhs_out + p for p in range(n_lhs_pri - n_contract, n_lhs_pri)]
-        rhs_contract = list(range(n_rhs_out - n_contract, n_rhs_out))
+    # Contraction axes: the size-1-aware alignment (``_align_contract_indices``)
+    # decides which ``lhs.primal`` axis pairs with which ``rhs.out`` axis — the
+    # SAME source of truth as the tiled path's ``_build_matmul_topology`` and the
+    # ``_densify_is_safe`` gate, so the three never disagree. A blind positional
+    # ``[-n:]`` zip would mispair when a stray ``(C, 1)``-style size-1 axis
+    # offsets the alignment (contracting batch against class). A skipped stray
+    # size-1 simply becomes a kept (free) output axis below, like on the tiled
+    # path. We deliberately don't id-match across operands: lhs and rhs use
+    # independent id spaces here (``_align_tensor_ids`` only runs on the tiled
+    # path), so raw-id matching is meaningless.
+    contract_idx = _align_contract_indices(lhs.primal_dims, rhs.out_dims)
+    lhs_contract: list[int] = [n_lhs_out + li for li, _ in contract_idx]
+    rhs_contract: list[int] = [rj for _, rj in contract_idx]
 
     # Batch axes: dims with the same id on both sides (excluding contract
     # axes). Batching collapses two same-id dims into one output dim, so we
@@ -1659,17 +1677,15 @@ def _matmul_via_densify(lhs, rhs):
     # at index 0, ``fill_value`` elsewhere) — gated strictly on the metadata
     # (``_is_implicit_block_dim``) so a genuine size-1 is never silently padded
     # (it reaches dot_general mismatched and raises, as before).
-    if n_contract > 0:
-        lhs_pri = lhs.primal_dims[-n_contract:]
-        rhs_out = rhs.out_dims[-n_contract:]
-        for la, ra, ld, rd in zip(lhs_contract, rhs_contract, lhs_pri, rhs_out):
-            ls, rs = lhs_dense.shape[la], rhs_dense.shape[ra]
-            if ls == rs:
-                continue
-            if ls == 1 and _is_implicit_block_dim(ld):
-                lhs_dense = _pad_axis_to(lhs_dense, la, rs, _scaled_fill(lhs))
-            elif rs == 1 and _is_implicit_block_dim(rd):
-                rhs_dense = _pad_axis_to(rhs_dense, ra, ls, _scaled_fill(rhs))
+    for la, ra, (li, rj) in zip(lhs_contract, rhs_contract, contract_idx):
+        ld, rd = lhs.primal_dims[li], rhs.out_dims[rj]
+        ls, rs = lhs_dense.shape[la], rhs_dense.shape[ra]
+        if ls == rs:
+            continue
+        if ls == 1 and _is_implicit_block_dim(ld):
+            lhs_dense = _pad_axis_to(lhs_dense, la, rs, _scaled_fill(lhs))
+        elif rs == 1 and _is_implicit_block_dim(rd):
+            rhs_dense = _pad_axis_to(rhs_dense, ra, ls, _scaled_fill(rhs))
 
     result = jax.lax.dot_general(
         lhs_dense,
@@ -1889,23 +1905,17 @@ def matmul(lhs, rhs, count: bool = False):
 
 
 def _densify_is_safe(lhs, rhs) -> bool:
-    """``_matmul_via_densify`` pairs contracting dims positionally (last
-    n_contract of lhs.primal ↔ last n_contract of rhs.out) — that's all
-    ``dot_general`` accepts directly. Graphax's AD pipeline can produce
-    operands whose dim *orders* don't match (a transposed Jacobian feeds a
-    sub-elimination), so positional pairing yields a shape mismatch and
-    blows up. Detect that ahead of time and let the caller fall through to
-    the tiled path, which permutes dims by id through ``_align_tensor_ids``.
+    """``_matmul_via_densify`` contracts the size-1-aware aligned pairs
+    (``_align_contract_dims``): equal sizes pair directly and a metadata embed
+    (size-1 side, no physical axis) is zero-padded up to its partner before
+    ``dot_general``. Safe iff every aligned pair is so contractible. A genuine
+    size mismatch — e.g. a transposed Jacobian whose dim *order* doesn't line up
+    — yields a non-compatible pair, so we return False and let the caller fall
+    through to the tiled path, which permutes dims by id via ``_align_tensor_ids``.
     """
-    n_contract = min(len(lhs.primal_dims), len(rhs.out_dims))
-    if n_contract == 0:
-        return True
-    lhs_pri = lhs.primal_dims[-n_contract:]
-    rhs_out = rhs.out_dims[-n_contract:]
-    # Equal sizes pair directly; a metadata-stated broadcast (size-1 side with
-    # no physical axis) is expanded in ``_matmul_via_densify`` before dot_general.
     return all(
-        _contract_pair_compatible(l, r) for l, r in zip(lhs_pri, rhs_out)
+        _contract_pair_compatible(l, r)
+        for l, r in _align_contract_dims(lhs.primal_dims, rhs.out_dims)
     )
 
 
@@ -1923,21 +1933,19 @@ def _logical_size(t) -> int:
 def _matmul_contraction_depth(lhs, rhs) -> int:
     """Length of the dot-product reduction (``K`` in ``(M,K) @ (K,N)``).
 
-    For sparse operands the contracting dims are the last ``min(len(lhs.primal),
-    len(rhs.out))`` of each side; depth is the product of their *logical*
-    sizes (a ``DiagonalIndex`` of size N with block_size B contributes ``N*B``,
-    matching what ``dot_general`` actually contracts over after densification).
+    The contracting dims are the size-1-aware aligned pairs
+    (``_align_contract_dims`` — the same set the kernel actually contracts, so
+    the FLOP count can't drift from the topology); depth is the product of their
+    *logical* sizes (a ``DiagonalIndex`` of size N with block_size B contributes
+    ``N*B``, matching what ``dot_general`` reduces over after densification).
     """
     if hasattr(lhs, "primal_dims") and hasattr(rhs, "out_dims"):
-        n_contract = min(len(lhs.primal_dims), len(rhs.out_dims))
         K = 1
-        for i in range(n_contract):
+        for l, r in _align_contract_dims(lhs.primal_dims, rhs.out_dims):
             # The contraction runs over the broadcast (max) size: a
-            # metadata-stated size-1 broadcast against a size-N partner
-            # reduces over N, not 1.
-            ls = int(lhs.primal_dims[-1 - i].logical_size)
-            rs = int(rhs.out_dims[-1 - i].logical_size)
-            K *= max(ls, rs)
+            # metadata-stated size-1 embed against a size-N partner reduces over
+            # N, not 1. A stray size-1 is already dropped by the alignment.
+            K *= max(int(l.logical_size), int(r.logical_size))
         return K
     # Both inputs are plain arrays (the dense_dense path).
     if hasattr(lhs, "shape") and hasattr(rhs, "shape"):
