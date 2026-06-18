@@ -374,6 +374,13 @@ def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
         st.val.astype(target),
         scalar_mult=st.scalar_mult,
         fill_value=st.fill_value,
+        # The cast is shape-preserving, so any deferred Jacobian transform queued
+        # on this edge (a reshape/slice/concatenate relabel awaiting drain) must
+        # ride along — dropping it leaves ``val`` at its pre-drain shape and later
+        # desyncs the contraction size / shape assert (jit-latent under canonical
+        # orders, surfaced by non-canonical elimination orders).
+        pre_transforms=st.pre_transforms,
+        post_transforms=st.post_transforms,
         check_consistency=False,
     )
 
