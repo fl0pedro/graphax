@@ -147,6 +147,34 @@ def _identity_post_over(post, out_shape, dtype=jnp.float32):
     )
 
 
+def make_drainable_transform(forward_op, adjoint_op, identity_shape,
+                             identity_dtype=jnp.float32):
+    """Build a ``seed_drainable`` :class:`JacobianTransform` for a SHAPE-
+    PRESERVING op (cumsum / flip / sort / cumprod — out shape == in shape),
+    folding the skeleton those rules otherwise copy verbatim: densify, run the
+    op on the right block, rebuild the canonical dense grid, propagate
+    ``scalar_mult`` / ``fill_value``, and (on the adjoint) the identity-seed
+    guard. ``forward_op(dense)`` acts on the OUT block (leading axes);
+    ``adjoint_op(dense, n_out)`` is its EXACT ADJOINT acting on the PRIMAL block
+    (axes ``>= n_out``) — see the JacobianTransform contract. ``identity_shape``
+    / ``identity_dtype`` re-expand the bare seed in forward-order elimination."""
+    def fwd(pre):
+        full = forward_op(pre.dense())
+        new_out, new_primal = _dense_grid(pre.out_shape, pre.primal_shape)
+        return SparseTensor(new_out, new_primal, full,
+                            scalar_mult=pre.scalar_mult, fill_value=pre.fill_value)
+
+    def inv(post):
+        if _is_scalar_identity_post(post):
+            post = _identity_post_over(post, identity_shape, identity_dtype)
+        full = adjoint_op(post.dense(), len(post.out_dims))
+        new_out, new_primal = _dense_grid(post.out_shape, post.primal_shape)
+        return SparseTensor(new_out, new_primal, full,
+                            scalar_mult=post.scalar_mult, fill_value=post.fill_value)
+
+    return JacobianTransform(fwd, inv, seed_drainable=True)
+
+
 # ---------- transpose ----------
 
 

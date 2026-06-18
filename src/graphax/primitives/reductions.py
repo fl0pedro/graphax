@@ -248,30 +248,17 @@ def _cumsum_elementals(primals, val_out, **params):
     rev_cumsum(post) @ pre``: in reverse the elimination drains it onto the
     cotangent VECTOR (one reverse-cumsum, O(n)) instead of materialising the full
     n×n triangular block. The forward / non-drainable path densifies."""
-    from .transforms import (
-        JacobianTransform, _dense_grid,
-        _is_scalar_identity_post, _identity_post_over,
-    )
+    from .transforms import make_drainable_transform
     axis = params["axis"]
     reverse = params.get("reverse", False)
 
-    def cumsum_transform(pre):                   # forward: cumsum along the OUT axis
-        full = lax.cumsum(pre.dense(), axis=axis, reverse=reverse)
-        new_out, new_primal = _dense_grid(pre.out_shape, pre.primal_shape)
-        return SparseTensor(new_out, new_primal, full,
-                            scalar_mult=pre.scalar_mult, fill_value=pre.fill_value)
-
-    def inverse_cumsum_transform(post):          # adjoint: REVERSE-cumsum, PRIMAL axis
-        if _is_scalar_identity_post(post):
-            post = _identity_post_over(post, val_out.shape, val_out.dtype)
-        n_out = len(post.out_dims)
-        full = lax.cumsum(post.dense(), axis=n_out + axis, reverse=not reverse)
-        new_out, new_primal = _dense_grid(post.out_shape, post.primal_shape)
-        return SparseTensor(new_out, new_primal, full,
-                            scalar_mult=post.scalar_mult, fill_value=post.fill_value)
-
-    transform = JacobianTransform(cumsum_transform, inverse_cumsum_transform,
-                                  seed_drainable=True)
+    # forward: cumsum along the OUT axis; adjoint: REVERSE-cumsum along the
+    # PRIMAL axis (Lᵀ of the triangular L).
+    transform = make_drainable_transform(
+        lambda full: lax.cumsum(full, axis=axis, reverse=reverse),
+        lambda full, n_out: lax.cumsum(full, axis=n_out + axis, reverse=not reverse),
+        val_out.shape, val_out.dtype,
+    )
     return [SparseTensor([], [], None, pre_transforms=[transform])]
 
 
@@ -309,10 +296,7 @@ def sort_elemental_rule(primals, **params):
     # in reverse the elimination gathers the cotangent VECTOR by ``invperm``
     # (O(n)) instead of materialising the S×S permutation matrix. perm / invperm
     # are captured from the primal value; the forward path densifies.
-    from .transforms import (
-        JacobianTransform, _dense_grid,
-        _is_scalar_identity_post, _identity_post_over,
-    )
+    from .transforms import make_drainable_transform
     perm = jnp.argsort(operand, axis=dim)        # out[i] = x[perm[i]]
     invperm = jnp.argsort(perm, axis=dim)        # x[j] -> out position invperm[j]
 
@@ -326,23 +310,13 @@ def sort_elemental_rule(primals, **params):
         idx_b = jnp.broadcast_to(idx.reshape(new_shape), full.shape)
         return jnp.take_along_axis(full, idx_b, axis=op_block_start + dim)
 
-    def sort_transform(pre):                     # forward: gather OUT axis by perm
-        full = _gather(pre.dense(), perm, 0)
-        new_out, new_primal = _dense_grid(pre.out_shape, pre.primal_shape)
-        return SparseTensor(new_out, new_primal, full,
-                            scalar_mult=pre.scalar_mult, fill_value=pre.fill_value)
-
-    def inverse_sort_transform(post):            # adjoint: gather PRIMAL by invperm
-        if _is_scalar_identity_post(post):
-            post = _identity_post_over(post, get_shape(operand), operand.dtype)
-        n_out = len(post.out_dims)
-        full = _gather(post.dense(), invperm, n_out)
-        new_out, new_primal = _dense_grid(post.out_shape, shape)
-        return SparseTensor(new_out, new_primal, full,
-                            scalar_mult=post.scalar_mult, fill_value=post.fill_value)
-
-    transform = JacobianTransform(sort_transform, inverse_sort_transform,
-                                  seed_drainable=True)
+    # forward: gather the OUT axis by perm; adjoint: gather the PRIMAL axis by
+    # invperm (the inverse permutation, i.e. the transpose of the selection).
+    transform = make_drainable_transform(
+        lambda full: _gather(full, perm, 0),
+        lambda full, n_out: _gather(full, invperm, n_out),
+        get_shape(operand), operand.dtype,
+    )
     return val_out_list, [SparseTensor([], [], None, pre_transforms=[transform])]
 
 
@@ -355,33 +329,21 @@ def _rev_elementals(primals, val_out, **params):
     ``post @ flip(pre) == flip(post) @ pre``: in reverse the elimination drains it
     onto the cotangent VECTOR (flip the vector, O(n)) instead of materialising the
     full n×n anti-diagonal R. The forward / non-drainable path densifies."""
-    from .transforms import (
-        JacobianTransform, _dense_grid,
-        _is_scalar_identity_post, _identity_post_over,
-    )
+    from .transforms import make_drainable_transform
     dims = params["dimensions"]
 
-    def rev_transform(pre):
-        full = pre.dense()                       # (out..., primal...) in dim order
-        for ax in dims:                          # flip the OUT axes (0..n_out-1)
-            full = jnp.flip(full, axis=ax)
-        new_out, new_primal = _dense_grid(pre.out_shape, pre.primal_shape)
-        return SparseTensor(new_out, new_primal, full,
-                            scalar_mult=pre.scalar_mult, fill_value=pre.fill_value)
+    def _flip(full, base):                       # flip the block of axes at ``base``
+        for ax in dims:
+            full = jnp.flip(full, axis=base + ax)
+        return full
 
-    def inverse_rev_transform(post):
-        if _is_scalar_identity_post(post):
-            post = _identity_post_over(post, val_out.shape, val_out.dtype)
-        full = post.dense()
-        n_out = len(post.out_dims)
-        for ax in dims:                          # self-adjoint: flip the PRIMAL axes
-            full = jnp.flip(full, axis=n_out + ax)
-        new_out, new_primal = _dense_grid(post.out_shape, post.primal_shape)
-        return SparseTensor(new_out, new_primal, full,
-                            scalar_mult=post.scalar_mult, fill_value=post.fill_value)
-
-    transform = JacobianTransform(rev_transform, inverse_rev_transform,
-                                  seed_drainable=True)
+    # flip is SELF-ADJOINT (R = Rᵀ): flip the OUT axes forward, the PRIMAL axes
+    # in the adjoint.
+    transform = make_drainable_transform(
+        lambda full: _flip(full, 0),
+        lambda full, n_out: _flip(full, n_out),
+        val_out.shape, val_out.dtype,
+    )
     return [SparseTensor([], [], None, pre_transforms=[transform])]
 
 
@@ -454,40 +416,30 @@ def _cumprod_elementals(primals, val_out, **params):
     x_safe = jnp.where(x != 0, x, 1.0)
     uniq_zero = (nz_count == 1).astype(jnp.float32)
 
+    from .transforms import make_drainable_transform
+
     def _b(q, full, op_start):                            # broadcast per-pos q -> full
         ns = [1] * full.ndim
         for a, s in enumerate(shape):
             ns[op_start + a] = s
         return jnp.broadcast_to(q.reshape(ns), full.shape)
 
-    def cumprod_transform(pre):                           # forward: J @ pre (O(n))
-        full = pre.dense()
+    def _fwd(full):                                       # J @ pre (O(n)), OUT block
         nz = _b(nz_count, full, 0)
         cs_nz = lax.cumsum(full / _b(x_safe, full, 0), axis=axis, reverse=reverse)
         cs_z = lax.cumsum(full * _b(is_zero, full, 0), axis=axis, reverse=reverse)
-        res = jnp.where(nz == 0, _b(out, full, 0) * cs_nz,
-                        jnp.where(nz == 1, _b(prod_nz, full, 0) * cs_z, 0.0))
-        new_out, new_primal = _dense_grid(pre.out_shape, pre.primal_shape)
-        return SparseTensor(new_out, new_primal, res,
-                            scalar_mult=pre.scalar_mult, fill_value=pre.fill_value)
+        return jnp.where(nz == 0, _b(out, full, 0) * cs_nz,
+                         jnp.where(nz == 1, _b(prod_nz, full, 0) * cs_z, 0.0))
 
-    def inverse_cumprod_transform(post):                  # adjoint: Jᵀ @ post (O(n))
-        if _is_scalar_identity_post(post):
-            post = _identity_post_over(post, val_out.shape, val_out.dtype)
-        full = post.dense()
-        n_out = len(post.out_dims)
+    def _adj(full, n_out):                                # Jᵀ @ post (O(n)), PRIMAL block
         sa = n_out + axis
         adj_rev = not reverse
         A = lax.cumsum(full * _b(out, full, n_out), axis=sa, reverse=adj_rev)
         B = lax.cumsum(full * _b(uniq_zero, full, n_out) * _b(prod_nz, full, n_out),
                        axis=sa, reverse=adj_rev)
-        res = jnp.where(_b(x, full, n_out) != 0, A / _b(x_safe, full, n_out), B)
-        new_out, new_primal = _dense_grid(post.out_shape, shape)
-        return SparseTensor(new_out, new_primal, res,
-                            scalar_mult=post.scalar_mult, fill_value=post.fill_value)
+        return jnp.where(_b(x, full, n_out) != 0, A / _b(x_safe, full, n_out), B)
 
-    transform = JacobianTransform(cumprod_transform, inverse_cumprod_transform,
-                                  seed_drainable=True)
+    transform = make_drainable_transform(_fwd, _adj, val_out.shape, val_out.dtype)
     return [SparseTensor([], [], None, pre_transforms=[transform])]
 
 
