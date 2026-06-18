@@ -326,30 +326,30 @@ def _resolve_broadcast_topos(lhs_topos, rhs_topos, offset):
     return pairs
 
 
-def _align_contract_indices(lhs_primal, rhs_out):
+def _align_contract_indices(lhs_primal, rhs_out, *, embed):
     """Right-align ``lhs.primal_dims`` with ``rhs.out_dims`` into contraction
     INDEX pairs ``(li, rj)``. The two lists describe the same contracted vertex
     axes, but one side may carry an extra size-1 axis the other lacks, so a
     blind ``zip(lhs[-n:], rhs[-n:])`` pairs the wrong axes (batch vs class).
-    Three dim kinds, distinguished by size and the ``_is_implicit_block_dim``
-    metadata (size-1 with NO physical axis):
 
-    * EQUAL logical size -> a direct contraction pair.
-    * METADATA EMBED: an implicit-block size-1 against a size-N partner that has
-      NO equal-size partner of its own -> a contraction pair the densify path
-      zero-pads up to N (the ``val=None`` single-block embed). NOT skipped.
-    * STRAY implicit-block size-1: its size-N counterpart DOES have an
-      equal-size partner elsewhere, so the size-1 is the extra one -> skipped, a
-      free/broadcast dim (the trailing axis of a ``(C, 1)`` bias /
-      ``reshape(-1, 1)`` head under vmap).
+    The two consuming paths need DIFFERENT handling of an implicit-block size-1
+    dim (size-1 with no physical axis), so the behaviour is selected by ``embed``:
 
-    A size-1 dim that carries a physical axis is never implicit-block, so a
-    genuine ``1 vs N`` mismatch still pairs through and raises in
+    * ``embed=False`` (TILED path): skip EVERY implicit-block size-1 — the tiled
+      kernel contracts neither a stray broadcast NOR a metadata embed (a real
+      embed is routed to the densify path *before* it reaches the tiled builder;
+      were it paired here the kernel would contract ``1`` against ``N`` and read
+      past the val buffer). A skipped dim becomes a free/broadcast output axis.
+    * ``embed=True`` (DENSIFY path / dispatch gates / FLOP depth): skip only a
+      STRAY size-1 (its size-N counterpart has an equal-size partner elsewhere,
+      so the size-1 is the extra one — a ``(C, 1)`` bias / ``reshape(-1, 1)``
+      head under vmap); a METADATA EMBED (size-1 with no equal-size partner) is
+      kept as a contraction pair that ``_matmul_via_densify`` zero-pads up to N.
+
+    Either way a size-1 dim that carries a physical axis is never implicit-block,
+    so a genuine ``1 vs N`` mismatch still pairs through and raises in
     ``_resolve_contract_pair``. Equal-length lists with no stray implicit-block
-    dim reproduce the old positional ``[-n:]`` pairing exactly. This single
-    alignment is the one source of truth for which axes contract — the tiled
-    topology, the densify path, the densify-safety gate, the implicit-block
-    detector and the FLOP-depth counter all consume it, so they cannot diverge."""
+    dim reproduce the old positional ``[-n:]`` pairing exactly."""
 
     def _has_equal(size, dims, upto):
         return any(int(dims[k].logical_size) == size for k in range(upto))
@@ -363,22 +363,22 @@ def _align_contract_indices(lhs_primal, rhs_out):
             out.append((i, j))
             i -= 1
             j -= 1
-        elif _is_implicit_block_dim(lp) and _has_equal(rs, lhs_primal, i):
-            i -= 1                       # stray broadcast size-1 on lhs -> free dim
-        elif _is_implicit_block_dim(ro) and _has_equal(ls, rhs_out, j):
-            j -= 1                       # stray broadcast size-1 on rhs -> free dim
+        elif _is_implicit_block_dim(lp) and (not embed or _has_equal(rs, lhs_primal, i)):
+            i -= 1                       # implicit-block / stray size-1 on lhs -> free dim
+        elif _is_implicit_block_dim(ro) and (not embed or _has_equal(ls, rhs_out, j)):
+            j -= 1                       # implicit-block / stray size-1 on rhs -> free dim
         else:
-            out.append((i, j))           # equal-or-embed pair, or genuine mismatch
+            out.append((i, j))           # equal, kept embed (embed=True), or genuine mismatch
             i -= 1
             j -= 1
     return out[::-1]
 
 
-def _align_contract_dims(lhs_primal, rhs_out):
+def _align_contract_dims(lhs_primal, rhs_out, *, embed):
     """Dim-pair view of :func:`_align_contract_indices` (see its docstring)."""
     return [
         (lhs_primal[i], rhs_out[j])
-        for i, j in _align_contract_indices(lhs_primal, rhs_out)
+        for i, j in _align_contract_indices(lhs_primal, rhs_out, embed=embed)
     ]
 
 
@@ -387,7 +387,7 @@ def _build_matmul_topology(lhs, rhs_out_dims, rhs_primal_dims, rhs_id_offset):
     rhs_primal_map = {d.id: d for d in rhs_primal_dims}
     rhs_dims = rhs_out_dims + rhs_primal_dims
     pairs, processed_l, processed_r = [], set(), set()
-    for lp, ro in _align_contract_dims(lhs.primal_dims, rhs_out_dims):
+    for lp, ro in _align_contract_dims(lhs.primal_dims, rhs_out_dims, embed=False):
         meta, lhs_ids, rhs_ids = _resolve_contract_pair(
             lp, ro, lhs_out_map, rhs_primal_map
         )
@@ -1593,7 +1593,7 @@ def _has_implicit_block_contraction(lhs, rhs) -> bool:
         return False
     return any(
         int(l.logical_size) != int(r.logical_size) and _contract_pair_compatible(l, r)
-        for l, r in _align_contract_dims(lhs.primal_dims, rhs.out_dims)
+        for l, r in _align_contract_dims(lhs.primal_dims, rhs.out_dims, embed=True)
     )
 
 
@@ -1641,7 +1641,7 @@ def _matmul_via_densify(lhs, rhs):
     # path. We deliberately don't id-match across operands: lhs and rhs use
     # independent id spaces here (``_align_tensor_ids`` only runs on the tiled
     # path), so raw-id matching is meaningless.
-    contract_idx = _align_contract_indices(lhs.primal_dims, rhs.out_dims)
+    contract_idx = _align_contract_indices(lhs.primal_dims, rhs.out_dims, embed=True)
     lhs_contract: list[int] = [n_lhs_out + li for li, _ in contract_idx]
     rhs_contract: list[int] = [rj for _, rj in contract_idx]
 
@@ -1915,7 +1915,7 @@ def _densify_is_safe(lhs, rhs) -> bool:
     """
     return all(
         _contract_pair_compatible(l, r)
-        for l, r in _align_contract_dims(lhs.primal_dims, rhs.out_dims)
+        for l, r in _align_contract_dims(lhs.primal_dims, rhs.out_dims, embed=True)
     )
 
 
@@ -1941,7 +1941,7 @@ def _matmul_contraction_depth(lhs, rhs) -> int:
     """
     if hasattr(lhs, "primal_dims") and hasattr(rhs, "out_dims"):
         K = 1
-        for l, r in _align_contract_dims(lhs.primal_dims, rhs.out_dims):
+        for l, r in _align_contract_dims(lhs.primal_dims, rhs.out_dims, embed=True):
             # The contraction runs over the broadcast (max) size: a
             # metadata-stated size-1 embed against a size-N partner reduces over
             # N, not 1. A stray size-1 is already dropped by the alignment.
