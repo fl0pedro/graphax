@@ -425,39 +425,83 @@ def _cumulative_mask(n, axis, N, reverse):
     return m.astype(jnp.float32).reshape(mshape)
 
 
-def cumprod_elemental_rule(primals, **params):
-    """``out[i] = prod_{j<=i} x[j]``; d out[i]/d x[j] (for j<=i) = product of the
-    OTHER factors up to ``i``. For ``x[j] != 0`` that is ``out[i]/x[j]``; for
-    ``x[j] == 0`` it is the cumulative product of the non-zeros up to ``i`` when
-    ``x[j]`` is the UNIQUE zero in that window, else 0 (a second zero ≤ i makes
-    every partial-product-of-others vanish). The naive ``out[i]/x[j]`` was a 0/0
-    at zeros and dropped that contribution — wrong for any input with a zero
-    (e.g. a masked / post-ReLU activation)."""
-    val_out = lax.cumprod_p.bind(*primals, **params)
-    x = primals[0]; axis = params["axis"]; reverse = params.get("reverse", False)
-    shape = get_shape(x); N = len(shape)
-    out_dims, primal_dims = _cumulative_dims(shape, axis, N)
-    mask = _cumulative_mask(shape[axis], axis, N, reverse)
-    out_e = jnp.expand_dims(val_out, axis + 1)         # out[i] at scan-out axis
-    x_e = jnp.expand_dims(x, axis)                      # x[j] at scan-in axis
-    # Cumulative (same direction as the op) zero-count and non-zero product up to i.
-    is_zero = (x == 0).astype(jnp.float32)
-    nz_count = lax.cumsum(is_zero, axis=axis, reverse=reverse)
-    prod_nz = lax.cumprod(jnp.where(x == 0, 1.0, x).astype(jnp.float32),
-                          axis=axis, reverse=reverse)
-    nz_count_i = jnp.expand_dims(nz_count, axis + 1)    # zeros up to i
-    prod_nz_i = jnp.expand_dims(prod_nz, axis + 1)      # prod of non-zeros up to i
-    safe = jnp.where(x_e != 0, x_e, 1.0)
-    deriv = jnp.where(
-        x_e != 0,
-        out_e / safe,                                  # 0 if another zero <= i
-        jnp.where(nz_count_i == 1, prod_nz_i, 0.0),    # x[j] is the unique zero
+def _cumprod_elementals(primals, val_out, **params):
+    """``out[i] = prod_{j<=i} x[j]`` as a SEED-DRAINABLE deferred transform.
+
+    The Jacobian ``d out[i]/d x[j]`` (j<=i) is ``out[i]/x[j]`` where ``x[j]!=0``
+    (and 0 if another zero <= i), or — where ``x[j]==0`` — the product of the
+    non-zeros up to ``i`` IF ``x[j]`` is the UNIQUE zero in that window, else 0.
+    Both the forward map ``J @ pre`` and its adjoint ``Jᵀ @ post`` have O(n)
+    closed forms (one cumsum each, zero-handled), verified == the materialised
+    n×n Jacobian incl. multiple-zero inputs. So reverse-order elimination drains
+    onto the cotangent VECTOR (O(n)) instead of materialising the triangular
+    block. (The naive ``out[i]/x[j]`` was a 0/0 at zeros — wrong for masked /
+    post-ReLU activations; the zero branch is preserved here.)"""
+    from .transforms import (
+        JacobianTransform, _dense_grid,
+        _is_scalar_identity_post, _identity_post_over,
     )
-    V = (mask * deriv).astype(jnp.float32)
-    return val_out, [_swap_back_axes(SparseTensor(out_dims, primal_dims, V))]
+    x = primals[0]
+    axis = params["axis"]
+    reverse = params.get("reverse", False)
+    shape = get_shape(x)
+
+    out = val_out                                          # prod up to i
+    is_zero = (x == 0).astype(jnp.float32)
+    nz_count = lax.cumsum(is_zero, axis=axis, reverse=reverse)      # zeros up to i
+    prod_nz = lax.cumprod(jnp.where(x == 0, 1.0, x).astype(jnp.float32),
+                          axis=axis, reverse=reverse)              # prod of non-zeros
+    x_safe = jnp.where(x != 0, x, 1.0)
+    uniq_zero = (nz_count == 1).astype(jnp.float32)
+
+    def _b(q, full, op_start):                            # broadcast per-pos q -> full
+        ns = [1] * full.ndim
+        for a, s in enumerate(shape):
+            ns[op_start + a] = s
+        return jnp.broadcast_to(q.reshape(ns), full.shape)
+
+    def cumprod_transform(pre):                           # forward: J @ pre (O(n))
+        full = pre.dense()
+        nz = _b(nz_count, full, 0)
+        cs_nz = lax.cumsum(full / _b(x_safe, full, 0), axis=axis, reverse=reverse)
+        cs_z = lax.cumsum(full * _b(is_zero, full, 0), axis=axis, reverse=reverse)
+        res = jnp.where(nz == 0, _b(out, full, 0) * cs_nz,
+                        jnp.where(nz == 1, _b(prod_nz, full, 0) * cs_z, 0.0))
+        new_out, new_primal = _dense_grid(pre.out_shape, pre.primal_shape)
+        return SparseTensor(new_out, new_primal, res,
+                            scalar_mult=pre.scalar_mult, fill_value=pre.fill_value)
+
+    def inverse_cumprod_transform(post):                  # adjoint: Jᵀ @ post (O(n))
+        if _is_scalar_identity_post(post):
+            post = _identity_post_over(post, val_out.shape, val_out.dtype)
+        full = post.dense()
+        n_out = len(post.out_dims)
+        sa = n_out + axis
+        adj_rev = not reverse
+        A = lax.cumsum(full * _b(out, full, n_out), axis=sa, reverse=adj_rev)
+        B = lax.cumsum(full * _b(uniq_zero, full, n_out) * _b(prod_nz, full, n_out),
+                       axis=sa, reverse=adj_rev)
+        res = jnp.where(_b(x, full, n_out) != 0, A / _b(x_safe, full, n_out), B)
+        new_out, new_primal = _dense_grid(post.out_shape, shape)
+        return SparseTensor(new_out, new_primal, res,
+                            scalar_mult=post.scalar_mult, fill_value=post.fill_value)
+
+    transform = JacobianTransform(cumprod_transform, inverse_cumprod_transform,
+                                  seed_drainable=True)
+    return [SparseTensor([], [], None, pre_transforms=[transform])]
+
+
+def cumprod_elemental_rule(primals, **params):
+    val_out = lax.cumprod_p.bind(*primals, **params)
+    return val_out, _cumprod_elementals(primals, val_out, **params)
+
+
+def cumprod_elemental_only(primal_out, primals, **params):
+    return _cumprod_elementals(primals, primal_out, **params)
 
 
 elemental_rules[lax.cumprod_p] = cumprod_elemental_rule
+elemental_only_rules[lax.cumprod_p] = cumprod_elemental_only
 
 
 def cumlogsumexp_elemental_rule(primals, **params):
