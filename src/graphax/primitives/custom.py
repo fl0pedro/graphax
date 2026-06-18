@@ -199,10 +199,18 @@ multi_output_elemental_only_rules[_custom_vjp_call_p] = custom_vjp_elemental_onl
 from jax.custom_derivatives import custom_jvp_call_p as _custom_jvp_call_p
 
 
-# Position-preserving elementwise lax primitives a (linear) tangent may flow
-# through and still yield a DIAGONAL Jacobian. Conservative on purpose: any
-# tangent-touching eqn outside this set (reduce / dot / gather / broadcast / a
-# shape change) makes the op non-diagonal and routes it to the dense path.
+# Position-preserving elementwise lax primitives a tangent may flow through and
+# still yield a DIAGONAL Jacobian. This list is COMPLETE, not a guess: a jvp is
+# LINEAR in the tangent, so the tangent can only ever reach the output through
+# LINEAR shape-preserving ops (add/sub/mul/div/neg/select_n + dtype/identity
+# casts) — every NON-linear factor (sigmoid, tanh, exp, integer_pow, erf, ...)
+# is computed from the PRIMALS and meets the tangent only as the other operand
+# of a `mul`. (Audited: softplus/sigmoid/gelu/elu/swish/mish/hard_sigmoid/
+# hard_swish/relu/celu/selu/logaddexp route the tangent through only
+# {add, mul, select_n}.) And the classification is FAIL-SAFE regardless: a
+# tangent-touching eqn outside this set (or any shape change — reduce / dot /
+# gather / broadcast) returns "dense", which is correct, just the slower N-probe
+# — never a wrong gradient. So an unforeseen prim costs speed, not correctness.
 _ELEMENTWISE_TANGENT_PRIMS = frozenset(
     {"add", "sub", "mul", "div", "neg", "select_n", "convert_element_type",
      "copy", "real", "imag", "conj", "reduce_precision"}
@@ -275,6 +283,12 @@ def _custom_jvp_dense_jacobians(primals, **params):
             diag_kinds = None                         # nothing to gain — plain dense
 
     def _diagonal_for(ai):
+        # ONE probe per diagonal input — not combinable across inputs: the jvp is
+        # linear in the tangent, so a single all-inputs-ones probe returns
+        # sum_i f'_i(x) (the diagonals ADDED), with no way to separate them. The
+        # ones-on-ai / zeros-elsewhere probe isolates input ai's diagonal. (Cost
+        # is O(#diagonal inputs) probes, ~1 for a normal activation — vs the N
+        # one-hot probes the dense path would take for the SAME input.)
         sh = in_shapes[ai]
         tangents = [jnp.zeros(s, dtype=getattr(a, "dtype", jnp.float32))
                     for s, a in zip(in_shapes, args_only)]
