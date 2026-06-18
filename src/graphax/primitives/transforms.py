@@ -159,18 +159,21 @@ def make_drainable_transform(forward_op, adjoint_op, identity_shape,
     (axes ``>= n_out``) — see the JacobianTransform contract. ``identity_shape``
     / ``identity_dtype`` re-expand the bare seed in forward-order elimination."""
     def fwd(pre):
+        # ``pre.dense()`` already FOLDS scalar_mult (and fill) into the array, so
+        # the rebuilt tensor must NOT re-carry scalar_mult — doing so DOUBLE-
+        # applies it (silently wrong whenever scalar_mult != 1, e.g. a sub's -1 /
+        # a scalar mul upstream). This holds for every dense()-based transform
+        # branch (here, concat/slice/pad/gather/scatter dense paths).
         full = forward_op(pre.dense())
         new_out, new_primal = _dense_grid(pre.out_shape, pre.primal_shape)
-        return SparseTensor(new_out, new_primal, full,
-                            scalar_mult=pre.scalar_mult, fill_value=pre.fill_value)
+        return SparseTensor(new_out, new_primal, full)
 
     def inv(post):
         if _is_scalar_identity_post(post):
             post = _identity_post_over(post, identity_shape, identity_dtype)
         full = adjoint_op(post.dense(), len(post.out_dims))
         new_out, new_primal = _dense_grid(post.out_shape, post.primal_shape)
-        return SparseTensor(new_out, new_primal, full,
-                            scalar_mult=post.scalar_mult, fill_value=post.fill_value)
+        return SparseTensor(new_out, new_primal, full)
 
     return JacobianTransform(fwd, inv, seed_drainable=True)
 
@@ -360,6 +363,39 @@ def _reshape_elementals(primals, val_out, **params):
         else:
             out_dims, primal_dims = new_other_dims, new_in_dims
 
+        # A reshape that DROPS a size-1 input axis leaves no surviving dim for it.
+        # If that axis was MATERIALIZED in ``val`` (a prior transform left it
+        # physical), its val axis is now claimed by no dim — a stale size-1
+        # orphan. ``_swap_back_axes`` only PERMUTES val (appends unclaimed axes at
+        # the tail), so the orphan survives and breaks ``dense()``'s
+        # ``broadcast_to`` (which assumes ``val.ndim == len(dims)``). Squeeze every
+        # unclaimed physical axis (a dropped axis is necessarily size-1, so this is
+        # value-preserving) and renumber the survivors contiguously.
+        if val is not None:
+            claimed = set()
+            for d in (*out_dims, *primal_dims):
+                if d.axis is not None:
+                    claimed.add(d.axis)
+                if getattr(d, "block_axis", None) is not None:
+                    claimed.add(d.block_axis)
+            orphans = [ax for ax in range(val.ndim) if ax not in claimed]
+            if orphans:
+                if any(val.shape[ax] != 1 for ax in orphans):
+                    return None  # non-1 orphan can't be dropped -> dense fallback
+                val = jnp.squeeze(val, axis=tuple(orphans))
+                remap = {old: new for new, old in enumerate(sorted(claimed))}
+
+                def _renumber(d):
+                    upd = {}
+                    if d.axis is not None:
+                        upd["axis"] = remap[d.axis]
+                    if getattr(d, "block_axis", None) is not None:
+                        upd["block_axis"] = remap[d.block_axis]
+                    return replace(d, **upd) if upd else d
+
+                out_dims = [_renumber(d) for d in out_dims]
+                primal_dims = [_renumber(d) for d in primal_dims]
+
         return _swap_back_axes(
             SparseTensor(
                 out_dims, primal_dims, val,
@@ -375,9 +411,11 @@ def _reshape_elementals(primals, val_out, **params):
         )
         if res is not None:
             return res
-        # Dense fallback: densify then reshape the OUTPUT side.
+        # Dense fallback: densify then reshape the OUTPUT side. PRIMAL block at
+        # its DENSE extent (logical_size: a block-diagonal pair folds the block
+        # into block_size, so size UNDER-counts vs pre.dense()).
         out_sizes = list(val_out.shape)
-        primal_sizes = [d.size for d in pre.primal_dims]
+        primal_sizes = [d.logical_size for d in pre.primal_dims]
         new_out_dims, new_primal_dims = _dense_grid(out_sizes, primal_sizes)
         return SparseTensor(new_out_dims, new_primal_dims,
                             pre.dense().reshape([*out_sizes, *primal_sizes]))
@@ -389,8 +427,9 @@ def _reshape_elementals(primals, val_out, **params):
         )
         if res is not None:
             return res
-        # Dense fallback: densify then reshape the PRIMAL side.
-        out_sizes = [d.size for d in post.out_dims]
+        # Dense fallback: densify then reshape the PRIMAL side. OUT block at its
+        # dense extent (logical_size; see forward).
+        out_sizes = [d.logical_size for d in post.out_dims]
         primal_sizes = list(primals[0].shape)
         new_out_dims, new_primal_dims = _dense_grid(out_sizes, primal_sizes)
         return SparseTensor(new_out_dims, new_primal_dims,
@@ -445,7 +484,7 @@ def _slice_elementals(primals, val_out, **params):
         # DenseIndex (not sparse / not compressed).
         preservable = True
         for ax, d in enumerate(pre.out_dims):
-            if _is_sliced(ax, d.size) and (d.is_sparse or d.is_compressed):
+            if _is_sliced(ax, d.logical_size) and (d.is_sparse or d.is_compressed):
                 preservable = False
                 break
 
@@ -453,7 +492,7 @@ def _slice_elementals(primals, val_out, **params):
             new_out_dims = []
             val = pre.val
             for ax, d in enumerate(pre.out_dims):
-                if _is_sliced(ax, d.size):
+                if _is_sliced(ax, d.logical_size):
                     # Plain dense dim: slice its val axis if materialized,
                     # otherwise just shrink the metadata (constant along it).
                     n = (limit_indices[ax] - 1 - start_indices[ax]) // strides[ax] + 1
@@ -474,8 +513,9 @@ def _slice_elementals(primals, val_out, **params):
             )
 
         # Dense fallback (a sliced axis is a diagonal partner / compressed):
-        # densify, then slice. primal dims are appended as full-range, stride-1.
-        primal_sizes = [d.size for d in pre.primal_dims]
+        # densify, then slice. primal dims appended full-range, stride-1, at their
+        # DENSE extent (logical_size; pre.dense() materialises that).
+        primal_sizes = [d.logical_size for d in pre.primal_dims]
         new_out_dims, new_primal_dims = _dense_grid(val_out.shape, primal_sizes)
         s_idx = list(start_indices) + [0] * len(primal_sizes)
         l_idx = list(limit_indices) + list(primal_sizes)
@@ -492,7 +532,7 @@ def _slice_elementals(primals, val_out, **params):
         # dtype via jnp.zeros, mis-placing strided slices and crashing on f64.)
         full_val = post.dense()
         in_shape = primals[0].shape
-        out_sizes = [d.size for d in post.out_dims]
+        out_sizes = [d.logical_size for d in post.out_dims]
         new_out_dims, new_primal_dims = _dense_grid(out_sizes, in_shape)
 
         slice_out_sizes = full_val.shape[len(post.out_dims):]
@@ -892,13 +932,9 @@ def _concatenate_elementals(primals, val_out, **params):
         out_shape = list(pre.out_shape)
         out_shape[dim] = val_out.shape[dim]
         new_out, new_primal = _dense_grid(out_shape, pre.primal_shape)
-        return SparseTensor(
-            new_out,
-            new_primal,
-            new_val,
-            scalar_mult=pre.scalar_mult,
-            fill_value=pre.fill_value,
-        )
+        # ``pre.dense()`` already folded scalar_mult/fill into ``full``; do NOT
+        # re-carry them or they double-apply (the RoeFlux -0.5 sub-coefficient bug).
+        return SparseTensor(new_out, new_primal, new_val)
 
     def inverse_concatenate_transform(primal_idx, post):
         # In 'fwd' elimination order this inverse can be drained against the bare
@@ -953,13 +989,8 @@ def _concatenate_elementals(primals, val_out, **params):
         primal_shape = list(post.primal_shape)
         primal_shape[dim] = slices[primal_idx][1] - slices[primal_idx][0]
         new_out, new_primal = _dense_grid(post.out_shape, primal_shape)
-        return SparseTensor(
-            new_out,
-            new_primal,
-            new_val,
-            scalar_mult=post.scalar_mult,
-            fill_value=post.fill_value,
-        )
+        # ``post.dense()`` already folded scalar_mult/fill; do NOT re-carry them.
+        return SparseTensor(new_out, new_primal, new_val)
 
     # Group primal slot indices by primal identity. When the same primal feeds
     # multiple slots of one concatenate (e.g. concat([pl, pl, pl])), the graph

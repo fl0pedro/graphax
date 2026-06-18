@@ -186,8 +186,8 @@ def _pad_operand_transform(primals, val_out, **params):
         cfg = list(padding_config) + [(0, 0, 0)] * (full.ndim - len(padding_config))
         full = lax.pad(full, jnp.array(0.0, dtype=full.dtype), cfg)
         new_out, new_primal = _dense_grid(get_shape(val_out), pre.primal_shape)
-        return SparseTensor(new_out, new_primal, full,
-                            scalar_mult=pre.scalar_mult, fill_value=pre.fill_value)
+        # pre.dense() already folded scalar_mult/fill; do NOT re-carry (double-apply).
+        return SparseTensor(new_out, new_primal, full)
 
     def inverse_pad_transform(post):             # adjoint: gather the embedded pos
         if _is_scalar_identity_post(post):
@@ -215,8 +215,8 @@ def _pad_operand_transform(primals, val_out, **params):
                 full = full * valid.astype(full.dtype).reshape(
                     [in_s if a == ax else 1 for a in range(full.ndim)])
         new_out, new_primal = _dense_grid(post.out_shape, x_shape)
-        return SparseTensor(new_out, new_primal, full,
-                            scalar_mult=post.scalar_mult, fill_value=post.fill_value)
+        # post.dense() already folded scalar_mult/fill; do NOT re-carry (double-apply).
+        return SparseTensor(new_out, new_primal, full)
 
     transform = JacobianTransform(pad_transform, inverse_pad_transform,
                                   seed_drainable=True)

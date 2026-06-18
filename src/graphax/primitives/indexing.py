@@ -196,8 +196,7 @@ def _dus_update_elementals(operand, update, val_out, start_list):
         pad_config += [(0, 0, 0)] * (full.ndim - ndim)
         new_val = lax.pad(full, jnp.array(0.0, dtype=full.dtype), pad_config)
         new_out, new_primal = _dense_grid(out_shape, pre.primal_shape)
-        return SparseTensor(new_out, new_primal, new_val,
-                            scalar_mult=pre.scalar_mult, fill_value=pre.fill_value)
+        return SparseTensor(new_out, new_primal, new_val)
 
     def up_inverse(post):
         if _is_scalar_identity_post(post):
@@ -209,8 +208,7 @@ def _dus_update_elementals(operand, update, val_out, start_list):
             sl[K + ax] = slice(start_list[ax], start_list[ax] + up_shape[ax])
         new_val = full[tuple(sl)]
         new_out, new_primal = _dense_grid(post.out_shape, up_shape)
-        return SparseTensor(new_out, new_primal, new_val,
-                            scalar_mult=post.scalar_mult, fill_value=post.fill_value)
+        return SparseTensor(new_out, new_primal, new_val)
 
     transform = JacobianTransform(up_forward, up_inverse, seed_drainable=True)
     return SparseTensor([], [], None, pre_transforms=[transform])
@@ -287,8 +285,7 @@ def gather_elemental_rule(primals, **params):
 
         new_val = _apply_over_leading(full, op_ndim, g)
         new_out, new_primal = _dense_grid(out_shape, pre.primal_shape)
-        return SparseTensor(new_out, new_primal, new_val,
-                            scalar_mult=pre.scalar_mult, fill_value=pre.fill_value)
+        return SparseTensor(new_out, new_primal, new_val)
 
     def gather_inverse(post):
         if _is_scalar_identity_post(post):
@@ -312,8 +309,7 @@ def gather_elemental_rule(primals, **params):
         perm2 = list(range(op_ndim, op_ndim + nb)) + list(range(op_ndim))
         new_val = jnp.transpose(scattered, perm2)         # (out_dims..., op_shape...)
         new_out, new_primal = _dense_grid(post.out_shape, op_shape)
-        return SparseTensor(new_out, new_primal, new_val,
-                            scalar_mult=post.scalar_mult, fill_value=post.fill_value)
+        return SparseTensor(new_out, new_primal, new_val)
 
     transform = JacobianTransform(gather_forward, gather_inverse, seed_drainable=True)
     return val_out, [SparseTensor([], [], None, pre_transforms=[transform])]
@@ -380,8 +376,7 @@ def _scatter_update_transform(val_out, operand, updates, indices, params,
 
         new_val = _apply_over_leading(full, up_ndim, s)
         new_out, new_primal = _dense_grid(out_shape, pre.primal_shape)
-        return SparseTensor(new_out, new_primal, new_val,
-                            scalar_mult=pre.scalar_mult, fill_value=pre.fill_value)
+        return SparseTensor(new_out, new_primal, new_val)
 
     def up_inverse(post):
         if _is_scalar_identity_post(post):
@@ -403,8 +398,7 @@ def _scatter_update_transform(val_out, operand, updates, indices, params,
         perm2 = list(range(up_ndim, up_ndim + nb)) + list(range(up_ndim))
         new_val = jnp.transpose(gathered, perm2)         # (out_dims..., up_shape...)
         new_out, new_primal = _dense_grid(post.out_shape, up_shape)
-        return SparseTensor(new_out, new_primal, new_val,
-                            scalar_mult=post.scalar_mult, fill_value=post.fill_value)
+        return SparseTensor(new_out, new_primal, new_val)
 
     transform = JacobianTransform(up_forward, up_inverse, seed_drainable=True)
     return SparseTensor([], [], None, pre_transforms=[transform])
