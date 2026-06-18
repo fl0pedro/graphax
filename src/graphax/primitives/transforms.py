@@ -43,6 +43,18 @@ class JacobianTransform:
         # selection whose adjoint is the embedding (slice: select <-> pad). NOT
         # set for transpose/squeeze (already structure-preserving, no benefit) or
         # broadcast (its adjoint is a reduce, a different cost profile).
+        #
+        # CONTRACT — read before setting this True. ``inverse_transform`` MUST be
+        # the ADJOINT (transpose) of ``transform``, NOT merely its functional
+        # inverse: for a non-orthogonal linear map (any scaling / non-unitary
+        # relabel) inverse != transpose and the two differ. ``core._eliminate_vertex``
+        # TRUSTS this flag blindly (it cannot afford a runtime adjoint check on the
+        # hot path) and substitutes ``apply_inverse`` for the contraction. Getting
+        # it wrong is SILENT: the drain branch only fires when this transform meets
+        # a sparse-diagonal partner, so a wrong adjoint produces a wrong gradient
+        # that canonical dense-input / forward-order tests will NOT catch — verify
+        # a new drainable transform against ``jax.jacrev`` in REVERSE order with a
+        # diagonal partner (e.g. ``op(tanh(x))``).
         self.seed_drainable = seed_drainable
 
     def __repr__(self) -> str:

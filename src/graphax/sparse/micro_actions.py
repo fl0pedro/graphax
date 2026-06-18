@@ -343,6 +343,15 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
         new_primal,
         new_val,
         scalar_mult=st.scalar_mult,
+        fill_value=st.fill_value,
+        # Forward the deferred-transform queues (the bare constructor defaults
+        # them to ()): dropping them silently erases pending reshape/slice/...
+        # relabels — the same defect fixed in apply_quant. Compress only changes
+        # the at-rest val STORAGE (drops size-1/compressed axes); the transforms
+        # act on the .dense() form, whose logical shape is unchanged, so they
+        # ride through correctly.
+        pre_transforms=st.pre_transforms,
+        post_transforms=st.post_transforms,
         check_consistency=False,
     )
 

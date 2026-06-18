@@ -1993,7 +1993,25 @@ def _accumulate_edge_triplet(
     if len(pre_val.post_transforms) > 0 and post_val.val is not None:
         _post_val = unload_post_transforms(post_val, pre_val)
 
-    if len(post_val.pre_transforms) > 0 and pre_val.val is not None:
+    # Seed-aware draining — MUST match _eliminate_vertex (do not let the two
+    # contraction paths diverge): when post carries only seed_drainable
+    # transforms and pre is a sparse diagonal, drain the (adjoint) transform onto
+    # the cotangent VECTOR instead of densifying the diagonal via apply(). Absent
+    # this, the cross-country / triplet schedule (the alphagrad order-optimiser's
+    # path) would re-introduce the O(n^2) densification this machinery removes.
+    _pre_transforms = post_val.pre_transforms
+    if (
+        len(_pre_transforms) > 0
+        and pre_val.val is not None
+        and post_val.val is not None
+        and all(getattr(t, "seed_drainable", False) for t in _pre_transforms)
+        and _has_sparse_dim(pre_val)
+    ):
+        for _t in _pre_transforms[::-1]:
+            _post_val = _t.apply_inverse(_post_val)
+        _assert_sparse_tensor_consistency(_post_val)
+        _pre_val = pre_val.copy()
+    elif len(_pre_transforms) > 0 and pre_val.val is not None:
         _pre_val = unload_pre_transforms(post_val, pre_val)
 
     # Mirror _eliminate_vertex: a val=None operand only acts as a pure-diagonal
