@@ -1796,6 +1796,11 @@ def _normalize_inputs(lhs, rhs):
     from .utils import _materialize_for_op
     lhs = _materialize_for_op(lhs)
     rhs = _materialize_for_op(rhs)
+    # Mixed-precision upcast: a narrow (Quant) val and a float val have no
+    # implicit promotion path, so dot_general would raise; combine both at
+    # their highest common compute dtype. No-op when dtypes already match.
+    from graphax.sparse.dtype_compute import _unify_operand_dtypes
+    lhs, rhs = _unify_operand_dtypes(lhs, rhs)
     return lhs, rhs
 
 

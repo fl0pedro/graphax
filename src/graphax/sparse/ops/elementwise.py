@@ -23,6 +23,7 @@ from .utils import (
     _apply_scalar_mult, _scaled_fill,
 )
 from .layout import generate_block_permutation
+from graphax.sparse.dtype_compute import _unify_operand_dtypes
 from graphax.sparse.indexes import DiagonalIndex, DenseIndex
 
 if TYPE_CHECKING:
@@ -86,6 +87,10 @@ def _normalize_inputs(lhs, rhs):
     # branching on traced shapes).
     if lhs.shape != rhs.shape:
         raise ValueError(f"Shape mismatch: {lhs.shape} != {rhs.shape}")
+    # Mixed-precision upcast: combine a narrow (Quant) operand with a
+    # float one at their highest common compute dtype so the downstream
+    # op() never hits JAX no-promotion guard. No-op when dtypes match.
+    lhs, rhs = _unify_operand_dtypes(lhs, rhs)
     return lhs, rhs
 
 

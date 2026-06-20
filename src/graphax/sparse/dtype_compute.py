@@ -87,3 +87,63 @@ def _scaled_mul(value, scalar_mult):
         return value * scalar_mult
     cdt = _compute_dtype(vdt, sdt)
     return value.astype(cdt) * scalar_mult.astype(cdt)
+
+
+def _unify_operand_dtypes(lhs, rhs):
+    """Upcast two ``SparseTensor`` operands to their highest common compute
+    dtype so downstream arithmetic (``op(promote_l, promote_r)`` in
+    elementwise, ``dot_general`` in matmul) never combines a narrow Quant'd
+    ``val`` with a float ``val`` -- JAX gives those pairs no implicit promotion
+    path and raises ``TypePromotionError`` / ``lax.add same-dtype`` BEFORE any
+    output conversion can help.
+
+    Mixed-precision design: ``val`` is stored narrow at rest (the Quant
+    precision-loss signal) but operands are combined at the HIGHEST COMMON
+    dtype. We cast each operand's ``val`` / ``scalar_mult`` / ``fill_value`` to
+    ``_compute_dtype(lhs.dtype, rhs.dtype)`` (which maps each narrow dtype to
+    the smallest standard dtype that contains it only when JAX itself cannot
+    promote, so float64 / complex / float16 are respected -- never a blanket
+    upcast to float32).
+
+    No-op fast path: when both operands already share the common dtype (the
+    overwhelmingly common case -- no Quant in the chain) the originals are
+    returned unchanged, so jit-tracing / bool tensors / the statically-zero
+    ``fill_value=None`` marker are untouched.
+    """
+    ldt = jnp.dtype(lhs.dtype)
+    rdt = jnp.dtype(rhs.dtype)
+    if ldt == rdt:
+        # Same at-rest dtype on both sides -- no cross-operand promotion needed.
+        # (Two same-narrow operands also take the native path; the op runs in
+        # that narrow dtype, matching the stored precision.)
+        return lhs, rhs
+    cdt = _compute_dtype(ldt, rdt)
+    return _cast_operand(lhs, cdt), _cast_operand(rhs, cdt)
+
+
+def _cast_operand(t, cdt):
+    """Return ``t`` with ``val`` / ``scalar_mult`` / ``fill_value`` cast to
+    ``cdt``. ``val=None`` (pure structure) and ``fill_value=None`` (statically
+    zero) markers are preserved; ``scalar_mult`` always exists. Avoids a rebuild
+    when nothing changes."""
+    new_val = (
+        t.val.astype(cdt)
+        if t.val is not None and jnp.dtype(t.val.dtype) != cdt
+        else t.val
+    )
+    new_sm = (
+        t.scalar_mult.astype(cdt)
+        if getattr(t.scalar_mult, "dtype", None) is not None
+        and jnp.dtype(t.scalar_mult.dtype) != cdt
+        else t.scalar_mult
+    )
+    new_fill = (
+        t.fill_value.astype(cdt)
+        if t.fill_value is not None
+        and getattr(t.fill_value, "dtype", None) is not None
+        and jnp.dtype(t.fill_value.dtype) != cdt
+        else t.fill_value
+    )
+    if new_val is t.val and new_sm is t.scalar_mult and new_fill is t.fill_value:
+        return t
+    return t.copy(val=new_val, scalar_mult=new_sm, fill_value=new_fill)
