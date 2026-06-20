@@ -41,7 +41,7 @@ from typing import Callable, Sequence, Union
 
 import jax.numpy as jnp
 
-from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
+from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex, CompressedIndex
 from graphax.sparse.tensor import SparseTensor, _apply_block_diagonal
 
 
@@ -313,6 +313,35 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
             raise ValueError(
                 f"Compress.axes entry {a} out of range for val.ndim = {val_ndim}."
             )
+
+    # COMPRESS may only reduce FREE physical axes. A *structural* axis — the
+    # block_axis of a sparse (Diagonal) dim, or ANY axis of a still-compressed
+    # Banded/Set/Toeplitz band buffer — encodes block/band geometry that the
+    # densify kernels read positionally, while `logical_size` is derived from
+    # `size * block_size`. Dropping such an axis via `jnp.mean` shifts the
+    # buffer layout AND leaves `logical_size` stale, producing the core.py
+    # edge-shape AssertionError and the matmul.py "Contraction size mismatch"
+    # (16 vs 4 / 16 vs 10) on high-rank edges (ViT attention, MoE experts).
+    # Raise ValueError so the elimination loop's best-effort handler skips this
+    # COMPRESS on this edge (leaving it exact) instead of corrupting it.
+    # DenseIndex axes (NN/ConvNet) are unaffected: not sparse, no block_axis,
+    # not a CompressedIndex.
+    if any(isinstance(d, CompressedIndex) for d in (*st.out_dims, *st.primal_dims)):
+        raise ValueError(
+            "Cannot COMPRESS a tensor with compressed (Banded/Set/Toeplitz) "
+            "dims; its band-buffer axes are structural — materialize first."
+        )
+    _structural_axes = {
+        d.block_axis
+        for d in (*st.out_dims, *st.primal_dims)
+        if d.is_sparse and d.block_axis is not None
+    }
+    _bad_axes = _structural_axes & set(action.axes)
+    if _bad_axes:
+        raise ValueError(
+            f"Compress.axes {sorted(_bad_axes)} target structural block axes "
+            "of a sparse dim; only free physical axes may be compressed."
+        )
 
     drops = sorted(set(action.axes))
     new_val = _reduce_along_axes(st.val, tuple(drops), action.kind)
