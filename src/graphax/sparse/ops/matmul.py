@@ -371,7 +371,20 @@ def _align_contract_indices(lhs_primal, rhs_out, *, embed):
             out.append((i, j))           # equal, kept embed (embed=True), or genuine mismatch
             i -= 1
             j -= 1
-    return out[::-1]
+    out = out[::-1]
+    # size-aware re-pair only when positional alignment left a size mismatch
+    if all(int(lhs_primal[a].logical_size) == int(rhs_out[b].logical_size) for a, b in out):
+        return out
+    lhs_idxs = [a for a, _ in out]; rhs_idxs = [b for _, b in out]
+    used = set(); repaired = []
+    for b in rhs_idxs:
+        rs = int(rhs_out[b].logical_size)
+        for a in lhs_idxs:
+            if a not in used and int(lhs_primal[a].logical_size) == rs:
+                used.add(a); repaired.append((a, b)); break
+    if len(repaired) == len(out):
+        repaired.sort(); return repaired
+    return out
 
 
 def _align_contract_dims(lhs_primal, rhs_out, *, embed):
