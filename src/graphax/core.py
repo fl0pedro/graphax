@@ -745,6 +745,26 @@ def _eliminate_vertex(
     eqn = jaxpr.eqns[vertex - 1]
     adds = muls = fmas = mem = 0
 
+    # Approximation placement (env-toggled A/B). DEFAULT: every transform acts
+    # on the OUTPUT edge (``edge_outval``) after the contraction — only the
+    # result edge is approximated, so the matmul itself runs full size /
+    # precision. With ``GRAPHAX_APPROX_MATMUL=1``: Diag/Compress shrink the
+    # matmul INPUT (``pre_val``) and Quant casts the matmul operands, so the
+    # approximation targets the contraction's own cost. Callables always stay
+    # on ``edge_outval`` (the user escape hatch).
+    _approx_matmul = os.getenv("GRAPHAX_APPROX_MATMUL") == "1"
+    if _approx_matmul:
+        _matmul_diag_compress = [
+            t for t in transforms if isinstance(t, (Diag, Compress))
+        ]
+        _matmul_quant = [t for t in transforms if isinstance(t, Quant)]
+        _edge_transforms = [
+            t for t in transforms if not isinstance(t, (Diag, Compress, Quant))
+        ]
+    else:
+        _matmul_diag_compress = _matmul_quant = ()
+        _edge_transforms = transforms
+
     for central_var in eqn.outvars:
         if central_var not in graph:
             continue  # dead or already-eliminated vertex
@@ -795,6 +815,23 @@ def _eliminate_vertex(
                     or (pre_val.val is None and not _acts_as_identity(_pre_val))
                 )
                 if _need_contract:
+                    if _approx_matmul:
+                        # Diag/Compress shrink the matmul INPUT (pre_val); Quant
+                        # casts BOTH operands so the contraction runs at the
+                        # quantized precision. A transform that doesn't fit the
+                        # current edge geometry is skipped (same best-effort
+                        # contract as the edge_outval path).
+                        for _t in _matmul_diag_compress:
+                            try:
+                                if isinstance(_t, Diag):
+                                    _pre_val = apply_diag(_pre_val, _t)
+                                else:
+                                    _pre_val = apply_compress(_pre_val, _t)
+                            except ValueError:
+                                continue
+                        for _t in _matmul_quant:
+                            _post_val = apply_quant(_post_val, _t)
+                            _pre_val = apply_quant(_pre_val, _t)
                     # A scalar × scalar contraction is an elementwise multiply:
                     # ``sparse_matmul`` rejects 0-rank operands, so it must NEVER
                     # be routed through matmul — on either the count or non-count
@@ -919,7 +956,7 @@ def _eliminate_vertex(
                 # alternative is to push the full edge geometry up to the
                 # caller so it can pre-filter, which couples the typed
                 # transform API to internal sparse representations.
-                for _t in transforms:
+                for _t in _edge_transforms:
                     try:
                         if isinstance(_t, Diag):
                             edge_outval = apply_diag(edge_outval, _t)
