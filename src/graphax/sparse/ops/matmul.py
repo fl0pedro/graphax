@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import builtins
 import math
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias
 
@@ -1780,6 +1781,124 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+# --- Approximation: decouple a contracted block-diagonal from a survivor ---
+def _decouple_contracted_block_diagonals(lhs, rhs):
+    """APPROXIMATION-ONLY (env ``GRAPHAX_APPROX_POS`` set) rewrite that removes
+    the ``block × surviving-primal`` cross-materialization a contracted
+    ``DiagonalIndex`` triggers at the ``matmul_pre`` / ``matmul_out`` positions.
+
+    The pathology: a ``Diag(i, j, factor)`` transform at ``matmul_pre``
+    block-diagonalises the contraction's RIGHT operand so the CONTRACTED out
+    axis is a ``DiagonalIndex(size=N, block_size=B)`` whose ``other_id`` partner
+    is a SURVIVING primal ``DiagonalIndex(size=N, block_size=B)`` (it lives
+    through the contraction). Both blocks are UNMATERIALISED (the diagonal value
+    is an implicit ones-broadcast; ``val`` carries only the spatial survivor).
+    The tiled kernel keeps the ``N`` meta-slots as a ``dot_general`` batch dim
+    but carries the survivor's *block* (``B``) as a FREE output axis alongside
+    the spatial survivor — materialising ``B × surviving_primal`` (the
+    ``f32[2,24,1536]`` blow-up, 1536 = 24·64) and contracting the redundant
+    ``B × B`` per slot. But the pair is a *diagonal*: the survivor block-index
+    equals the contracted block-index, so only the ``B`` diagonal of that
+    ``B × B`` is kept — the kernel does ``B×`` redundant work.
+
+    Fix (value-IRRELEVANT — approximate learning rules are intentionally lossy;
+    we only preserve the output SHAPE so the elimination continues): FOLD the
+    unmaterialised block into the meta count on BOTH paired dims —
+    ``DiagonalIndex(size=N, block_size=B) -> DiagonalIndex(size=N*B,
+    block_size=None)``. The diagonal coupling is kept (``other_id`` intact), so
+    the survivor index stays locked to the contracted index — the kernel now
+    batches the full ``N*B`` diagonal in ``dot_general`` instead of forming the
+    ``B × B`` cross. Output logical sizes (hence shape) are unchanged; the cost
+    drops from ``output · B`` to ``output · 1`` — tracking the cheap
+    ``matmul_post`` layout. Value-safe because the folded block was an implicit
+    ones-broadcast the ``val`` buffer never referenced.
+
+    Gated structurally: it only fires for a contracted ``DiagonalIndex`` (with
+    an unmaterialised block) whose partner is on the SURVIVING side — which the
+    exact (no-transform) path does not produce (an exact block-diagonal Jacobian
+    is self-contained: both its paired axes are on the same side of the
+    contraction, as the ``matmul_post`` layout shows). Combined with the env
+    gate in the dispatcher, the default bit-exact path is never touched.
+    """
+    def _foldable_contracted_diag(d):
+        # A meta-block-diagonal pair (``DiagonalIndex``) on the CONTRACTED side
+        # whose physical block is UNMATERIALISED (``block_axis is None`` — the
+        # diagonal value is an implicit ones-broadcast). A contracted diagonal
+        # that DOES carry a physical block (``block_axis`` set) is a genuine
+        # block-diagonal contraction the kernel already batches — left untouched.
+        return (
+            d.is_sparse
+            and not d.is_compressed
+            and d.block_size is not None
+            and d.block_axis is None
+        )
+
+    def rewrite(t, contracted_dims, surviving_dims):
+        contracted_ids = {d.id for d in contracted_dims}
+        surviving_ids = {d.id for d in surviving_dims}
+        # Contracted block-diagonal dims (unmaterialised block) whose partner
+        # survives the contraction.
+        to_fold = {
+            d.id
+            for d in contracted_dims
+            if _foldable_contracted_diag(d)
+            and d.other_id in surviving_ids
+            and d.other_id not in contracted_ids
+        }
+        # Their surviving partners — folded too so the meta counts still match
+        # (a DiagonalIndex pair must share the same ``size``). Only fold a
+        # partner whose block is itself unmaterialised (no ``block_axis``); a
+        # partner that physically carries its block can't be flattened without
+        # touching ``val``, so skip the whole pair in that (rare) case.
+        partner_ids = set()
+        skip = set()
+        smap = {d.id: d for d in (*contracted_dims, *surviving_dims)}
+        for cid in to_fold:
+            pid = smap[cid].other_id
+            partner = smap.get(pid)
+            if partner is not None and partner.block_axis is None:
+                partner_ids.add(pid)
+            else:
+                skip.add(cid)  # partner materialised — leave pair intact
+        to_fold -= skip
+        if not to_fold and not partner_ids:
+            return t
+
+        def fold(d):
+            if not d.is_sparse:
+                return d
+            if d.id in to_fold or d.id in partner_ids:
+                # Fold the unmaterialised block into the meta count, keep the
+                # diagonal coupling (``other_id``) and the outer ``axis``. The
+                # block axis was None (implicit ones), so no ``val`` change.
+                return DiagonalIndex(
+                    id=d.id,
+                    size=d.logical_size,
+                    axis=d.axis,
+                    other_id=d.other_id,
+                    block_size=None,
+                    block_axis=None,
+                )
+            return d
+
+        from graphax.sparse.tensor import SparseTensor
+
+        return SparseTensor(
+            tuple(fold(d) for d in t.out_dims),
+            tuple(fold(d) for d in t.primal_dims),
+            t.val,
+            scalar_mult=t.scalar_mult,
+            fill_value=t.fill_value,
+            check_consistency=False,
+        )
+
+    # rhs contracts over its out_dims; survivors are its primal_dims.
+    rhs = rewrite(rhs, rhs.out_dims, rhs.primal_dims)
+    # lhs contracts over its primal_dims; survivors are its out_dims.
+    lhs = rewrite(lhs, lhs.primal_dims, lhs.out_dims)
+    return lhs, rhs
+
+
 # --- Main dispatcher ------------------------------------------------------
 def _normalize_inputs(lhs, rhs):
     """Convert array operands to ``SparseTensor`` and pre-densify any
@@ -1869,6 +1988,15 @@ def matmul(lhs, rhs, count: bool = False):
             return out, _compute_matmul_count(lhs, rhs, out)
         return out
     lhs, rhs = _normalize_inputs(lhs, rhs)
+    # APPROXIMATION-ONLY (env-gated): when an approximation transform is being
+    # placed at a matmul position, a contracted block-diagonal whose partner
+    # survives the contraction otherwise materialises ``block × survivor``
+    # (the Diag matmul_pre blow-up). Sever the coupling so the block stays a
+    # batched ``dot_general`` dim — shape-preserving, value-lossy (which is the
+    # whole point of the approximation). The default (no-approx) path leaves
+    # ``GRAPHAX_APPROX_POS`` unset, so this is a strict no-op there.
+    if os.getenv("GRAPHAX_APPROX_POS"):
+        lhs, rhs = _decouple_contracted_block_diagonals(lhs, rhs)
     # Scalar @ scalar is no longer supported — callers must use ``*``
     # (elementwise). Vertex elimination in core.py guards this for the
     # Jacobian chain rule.
