@@ -45,20 +45,26 @@ def bench(name, fn, argnums, args, order, seqs):
     ref = jax.jacrev(fn, argnums)(*args)
     print(f"#### {name}  (nv={nv}, order={order})")
     bf, bp, _, berr = variant(False, fn, order, argnums, (), args, ref)
-    print(f"   baseline (no approx)   flops={bf:>12.0f}  peak={bp:>10d} B")
+    print(f"   BASELINE (no approx)        flops={bf:>12.0f}              peak={bp:>10d} B")
+
+    def red(base, v):  # % reduction vs baseline (+ = better/less)
+        return (base - v) / base * 100 if base else 0.0
+
     for label, seq in seqs:
         tr = [(v, list(seq)) for v in range(1, nv + 1)]
         of, op, oc, oerr = variant(False, fn, order, argnums, tr, args, ref)
         nf, npk, nc, nerr = variant(True, fn, order, argnums, tr, args, ref)
-        if oerr or nerr:
-            print(f"   [{label}] OLD={'ERR '+oerr if oerr else 'ok'} | "
-                  f"NEW={'ERR '+nerr if nerr else 'ok'}")
-            continue
-        df = (of - nf) / of * 100 if of else 0.0
-        dp = (op - npk) / op * 100 if op else 0.0
-        print(f"   [{label:16}] OLD flops={of:>11.0f} peak={op:>9d}  | "
-              f"NEW flops={nf:>11.0f} peak={npk:>9d}  | "
-              f"Δflops {df:+6.1f}% Δpeak {dp:+6.1f}%  cos={nc:.3f}")
+        print(f"   [{label}]")
+        if oerr:
+            print(f"      OLD edge     ERR {oerr}")
+        else:
+            print(f"      OLD edge     flops={of:>12.0f} (vs base {red(bf,of):+6.1f}%)  "
+                  f"peak={op:>10d} ({red(bp,op):+6.1f}%)  cos={oc:.3f}")
+        if nerr:
+            print(f"      NEW matmul   ERR {nerr}")
+        else:
+            print(f"      NEW matmul   flops={nf:>12.0f} (vs base {red(bf,nf):+6.1f}%)  "
+                  f"peak={npk:>10d} ({red(bp,npk):+6.1f}%)  cos={nc:.3f}")
     print()
 
 
