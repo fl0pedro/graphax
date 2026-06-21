@@ -774,6 +774,29 @@ def _eliminate_vertex(
                 continue
         return _st
 
+    def _contract(_pst, _pr):
+        # The scalar×scalar / sparse_matmul / ``@`` dispatch, factored so an
+        # approximated contraction can be retried exact on a geometry miss.
+        # Returns (edge_outval, adds, muls, fmas, mem_delta).
+        _a2 = _m2 = _f2 = _mm2 = 0
+        if _is_scalar_st(_pst) and _is_scalar_st(_pr):
+            _ev = _pst * _pr
+            _m2 = 1
+        elif count_ops:
+            _ev, (_a2, _m2, _f2) = sparse_matmul(_pst, _pr, count=True)
+        else:
+            _ev = _pst @ _pr
+        if count_ops:
+            _ps = _pst.val.size if _pst.val is not None else 0
+            _prz = _pr.val.size if _pr.val is not None else 0
+            _os = _ev.val.size if _ev.val is not None else 0
+            _mm2 = max(
+                _ps * _pst.dtype.itemsize,
+                _prz * _pr.dtype.itemsize,
+                _os * _ev.dtype.itemsize,
+            )
+        return _ev, int(_a2), int(_m2), int(_f2), _mm2
+
     for central_var in eqn.outvars:
         if central_var not in graph:
             continue  # dead or already-eliminated vertex
@@ -824,42 +847,46 @@ def _eliminate_vertex(
                     or (pre_val.val is None and not _acts_as_identity(_pre_val))
                 )
                 if _need_contract:
-                    if _pos == "matmul_pre":
-                        _pre_val = _apply_seq(_pre_val)
-                    if _pos == "matmul_post":
-                        _post_val = _apply_seq(_post_val)
-                    # A scalar × scalar contraction is an elementwise multiply:
-                    # ``sparse_matmul`` rejects 0-rank operands, so it must NEVER
-                    # be routed through matmul — on either the count or non-count
-                    # path (the count path used to crash here).
-                    if _is_scalar_st(_post_val) and _is_scalar_st(_pre_val):
-                        edge_outval = _post_val * _pre_val
-                        if count_ops:
-                            muls += 1
-                    elif count_ops:
-                        edge_outval, (_a, _m, _f) = sparse_matmul(
-                            _post_val, _pre_val, count=True
+                    # Approximate a matmul operand, but if the resulting
+                    # contraction is geometry-incompatible (a high-rank ViT/MoE
+                    # edge where Diag/Compress changes a contracted dim's size →
+                    # "Contraction size mismatch"), fall back to the EXACT operand
+                    # for this edge instead of crashing — the same best-effort
+                    # skip apply_diag/apply_compress use when a transform doesn't
+                    # fit. So the approximation fires where it helps and is
+                    # silently skipped where it would break the elimination.
+                    if _pos in ("matmul_pre", "matmul_post"):
+                        # A correct Diag/Compress at a matmul operand preserves the
+                        # edge's LOGICAL shape (only the block representation
+                        # changes), so the approximated contraction must still
+                        # yield the nominal edge shape. If it doesn't (or raises) —
+                        # a high-rank ViT/MoE geometry the transform mishandles —
+                        # discard it and contract EXACT for this edge. This keeps
+                        # every stored edge nominal-shaped, so the corruption never
+                        # propagates into a downstream contraction.
+                        _nominal = tuple(
+                            list(out_edge.aval.shape) + list(in_edge.aval.shape)
                         )
-                        adds += int(_a)
-                        muls += int(_m)
-                        fmas += int(_f)
+                        _approx = _pre_val if _pos == "matmul_pre" else _post_val
+                        _approx = _apply_seq(_approx)
+                        try:
+                            if _pos == "matmul_pre":
+                                edge_outval, _a, _m, _f, _mm = _contract(_post_val, _approx)
+                            else:
+                                edge_outval, _a, _m, _f, _mm = _contract(_approx, _pre_val)
+                            if edge_outval.shape != _nominal:
+                                raise ValueError("approx changed the edge's logical shape")
+                        except (ValueError, TypeError):
+                            # ValueError = contraction size mismatch; TypeError =
+                            # reshape failure (high-rank MoE band buffers). Either
+                            # way, skip the approximation on this edge.
+                            edge_outval, _a, _m, _f, _mm = _contract(_post_val, _pre_val)
                     else:
-                        edge_outval = _post_val @ _pre_val
-                    if count_ops:
-                        post_size = (
-                            _post_val.val.size if _post_val.val is not None else 0
-                        )
-                        pre_size = _pre_val.val.size if _pre_val.val is not None else 0
-                        out_size = (
-                            edge_outval.val.size
-                            if edge_outval.val is not None
-                            else 0
-                        )
-                        mem += max(
-                            post_size * _post_val.dtype.itemsize,
-                            pre_size * _pre_val.dtype.itemsize,
-                            out_size * edge_outval.dtype.itemsize,
-                        )
+                        edge_outval, _a, _m, _f, _mm = _contract(_post_val, _pre_val)
+                    adds += _a
+                    muls += _m
+                    fmas += _f
+                    mem += _mm
 
                 elif pre_val.val is not None:
                     # post is a pure-diagonal identity up to its scalar_mult:
