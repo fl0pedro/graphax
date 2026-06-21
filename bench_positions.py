@@ -46,7 +46,10 @@ def variant(pos, fn, order, argnums, tr, args, ref):
     if err:
         return None, None, None, err
     try:
-        c = cos(g(*args), ref)
+        # JIT the eval (not eager): jit bypasses the content-digest eliminator
+        # cache, which otherwise returns a stale result from a previous position
+        # (the GRAPHAX_APPROX_POS env is not part of the cache key).
+        c = cos(jax.jit(g)(*args), ref)
     except Exception:
         c = float("nan")
     return fl, pk, c, None
@@ -66,6 +69,17 @@ def model_mlp():
             (0, 1, 2, 3, 4), (xi, W1, b1, W2, b2), "rev")
 
 
+def model_residual():
+    # W@x fans out to two paths that reconverge at the sum -> the elimination
+    # creates a MERGE (an add of two edges) on the way back to x/W, so the
+    # add_* positions actually fire here.
+    k = jr.PRNGKey(0)
+    x = jr.normal(k, (32,)); W = jr.normal(k, (32, 32))
+    A = jr.normal(k, (16, 32)); B = jr.normal(k, (16, 32))
+    return ((lambda x, W, A, B: A @ jnp.tanh(W @ x) + B @ (W @ x)),
+            (0, 1, 2, 3), (x, W, A, B), "rev")
+
+
 def _vision(nm):
     from graphax.examples import vision
     k = jr.PRNGKey(0); bs = 8
@@ -81,6 +95,7 @@ def _vision(nm):
 MODELS = {
     "matmul-chain": model_matmul_chain,
     "MLP": model_mlp,
+    "residual": model_residual,
     "ConvNet": lambda: _vision("ConvNet"),
     "MoE": lambda: _vision("MoE"),
     "ViT": lambda: _vision("ViT"),
