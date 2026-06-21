@@ -946,11 +946,34 @@ def _concatenate_elementals(primals, val_out, **params):
         new_out_dims = list(copy.deepcopy(post.out_dims))
         new_primal_dims = list(copy.deepcopy(post.primal_dims))
 
-        d = None
-        if len(new_primal_dims) > 0:
-            d = new_primal_dims[dim]
+        # Select the primal dim that is the IMAGE of the concat axis. In the
+        # canonical (identity-seed) layout this is ``primal_dims[dim]``, but an
+        # upstream matmul can PERMUTE/RELABEL the primal-dim list (see
+        # ``_matmul_via_densify`` / ``_align_contract_indices``), so raw
+        # list-position ``dim`` is wrong on non-canonical elimination orders:
+        # it may point at a physically-smaller axis (e.g. heads=16 vs seq=17),
+        # making the slot slice ``[start, limit)`` overrun the operand. Identify
+        # the concat-axis dim by its logical size (== the concat OUTPUT size
+        # along ``dim``), mirroring matmul's id/size-based dim matching. On a
+        # size collision (e.g. seq==heads) prefer list-position ``dim`` when it
+        # already matches, then fall back to the first unmatched size hit.
+        concat_size = val_out.shape[dim]
+
+        def _pick_concat_dim(dims):
+            if not dims:
+                return None
+            if dim < len(dims) and dims[dim].logical_size == concat_size:
+                return dim
+            for j, dd in enumerate(dims):
+                if dd.logical_size == concat_size:
+                    return j
+            return None
+
+        cidx = _pick_concat_dim(new_primal_dims)
+        d = new_primal_dims[cidx] if cidx is not None else None
         if d is None:
-            # post is a pure transform with no primal dims; nothing to slice.
+            # post is a pure transform with no primal dims (or the concat axis is
+            # not a primal dim of this post); nothing to slice on the primal side.
             return SparseTensor(
                 new_out_dims,
                 new_primal_dims,
@@ -962,11 +985,11 @@ def _concatenate_elementals(primals, val_out, **params):
         if not d.is_sparse:
             if d.axis is not None:
                 new_val = lax.slice_in_dim(post.val, *slices[primal_idx], axis=d.axis)
-                new_primal_dims[dim] = replace(d, size=new_val.shape[d.axis])
+                new_primal_dims[cidx] = replace(d, size=new_val.shape[d.axis])
             else:
                 # axis=None: the primal dimension is a Kronecker factor not stored
                 # in val. There is no axis to slice — narrow the size only.
-                new_primal_dims[dim] = replace(
+                new_primal_dims[cidx] = replace(
                     d, size=slices[primal_idx][1] - slices[primal_idx][0]
                 )
                 new_val = post.val
@@ -983,11 +1006,11 @@ def _concatenate_elementals(primals, val_out, **params):
         # rectangular selection slice). Robust route: densify, slice the primal
         # concat axis to this slot's span, return a fully-dense tensor.
         full = post.dense()  # (out_shape..., primal_shape...) in dim order
-        concat_ax = len(post.out_dims) + dim
+        concat_ax = len(post.out_dims) + cidx
         new_val = lax.slice_in_dim(full, *slices[primal_idx], axis=concat_ax)
 
         primal_shape = list(post.primal_shape)
-        primal_shape[dim] = slices[primal_idx][1] - slices[primal_idx][0]
+        primal_shape[cidx] = slices[primal_idx][1] - slices[primal_idx][0]
         new_out, new_primal = _dense_grid(post.out_shape, primal_shape)
         # ``post.dense()`` already folded scalar_mult/fill; do NOT re-carry them.
         return SparseTensor(new_out, new_primal, new_val)
