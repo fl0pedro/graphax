@@ -1882,6 +1882,18 @@ def matmul(lhs, rhs, count: bool = False):
             "matmul of two 0-rank SparseTensors is not supported; "
             "use ``lhs * rhs`` (elementwise) instead"
         )
+    # Elemental fast path (Phase: bridge-cse): route a STRUCTURED contraction
+    # (block-diagonal / implicit / compressed contracted dims) through the
+    # composed elemental kernels. Returns None for a pure-dense contraction, so
+    # the EXACT-AD (transforms=()) edge never enters here and stays byte-
+    # identical. Built with the canonical output-id convention so a downstream
+    # multi-edge / all-vertices contraction aligns by id.
+    from graphax.sparse.elemental.dispatch import try_elemental_matmul
+
+    _elem = try_elemental_matmul(lhs, rhs, count=count)
+    if _elem is not None:
+        _record_path("elemental")
+        return _elem
     # Densify path: handles non-zero ``fill_value`` correctly (the tiled
     # path's contraction assumes implicit positions are zero, which is wrong
     # for non-zero fills). Only safe when contracting dim sizes pair up

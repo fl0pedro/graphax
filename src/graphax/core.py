@@ -27,7 +27,9 @@ from .primitives import (
 )
 from .sparse.ops import add_w_counts
 from .sparse.ops.matmul import matmul as sparse_matmul
-from .sparse.ops.utils import _compressed_dims, _materialize_for_op
+from .sparse.ops.utils import (
+    _compressed_dims, _materialize_for_op, _is_approx,
+)
 from .sparse.tensor import _assert_sparse_tensor_consistency
 from .sparse.micro_actions import (
     Compress, Diag, Quant, apply_compress, apply_diag, apply_quant,
@@ -646,6 +648,39 @@ def _drain_transforms(tensor, post_first: bool = True):
     return _pre(_post(tensor)) if post_first else _post(_pre(tensor))
 
 
+def _normalize_approx_edge(edge, out_aval_shape, in_aval_shape):
+    """Reconcile an approximation-bearing edge to its TRUE dense form at the
+    NOMINAL logical shape ``out_aval + in_aval``.
+
+    A contraction / per-vertex Diag/Compress can leave an approx edge with its
+    surviving free dims in a NON-nominal order (an upstream reshape/transpose
+    transform permutes the operands' free dims) or with a residual rectangular-
+    Diag / implicit-Compress structure. Vertex elimination compares the edge to
+    the nominal ``out.aval + in.aval`` and the multi-edge ``+`` merge adds two
+    edges that must share a layout, so we normalize an approx edge to its nominal
+    dense form here.
+
+    Queued ``pre`` / ``post`` transforms are DRAINED into the dense value and NOT
+    re-attached — re-attaching them (the old band-aid) let a queued transpose
+    re-permute the already-nominal edge, mis-aligning the merge. ``dense()``
+    materializes every approx axis at its nominal logical size and lays the array
+    out in nominal ``(out..., primal...)`` order, so it is a drop-in for the
+    un-approximated edge with canonical ``range(0, n)`` ids.
+    """
+    from .sparse.ops.utils import _arr2st
+
+    nominal = tuple(out_aval_shape) + tuple(in_aval_shape)
+    drained = _drain_transforms(edge)
+    if tuple(drained.shape) == nominal and not _is_approx(drained):
+        # Already nominal-shaped plain-dense — nothing to reconcile (avoid a
+        # needless densify on the clean fast path).
+        return drained
+    d = drained.dense()
+    if tuple(d.shape) != nominal:
+        d = d.reshape(nominal)
+    return _arr2st(d, out_ndim=len(out_aval_shape))
+
+
 def _is_scalar_st(t) -> bool:
     return not t.out_dims and not t.primal_dims
 
@@ -861,6 +896,21 @@ def _eliminate_vertex(
                 if _compressed_dims(edge_outval):
                     edge_outval = _materialize_for_op(edge_outval)
 
+                # Pre-merge approx-edge normalization (gated on Diag/Compress).
+                # The multi-edge ``+`` merge below adds two edges and asserts the
+                # nominal shape, so an approx edge whose contraction surfaced a
+                # non-nominal free-dim order must be reconciled to nominal FIRST.
+                # Statically unreachable on the EXACT-AD path (``transforms == ()``
+                # ⇒ ``any([]) == False``), so the no-approximation edge is byte-
+                # identical.
+                _is_approx_cfg = any(
+                    isinstance(_t, (Diag, Compress)) for _t in transforms
+                )
+                if _is_approx_cfg and graph.get(in_edge).get(out_edge) is not None:
+                    edge_outval = _normalize_approx_edge(
+                        edge_outval, out_edge.aval.shape, in_edge.aval.shape
+                    )
+
                 _assert_sparse_tensor_consistency(edge_outval)
                 # If there is already an edge between the two vertices, add the new
                 # edge to the existing one
@@ -943,6 +993,31 @@ def _eliminate_vertex(
                         # programming error, not a per-edge geometry miss.
                         continue
                     _assert_sparse_tensor_consistency(edge_outval)
+
+                # Post-transform approx-edge normalization: a freshly Diag-split
+                # (rectangular) / Compress-implicit edge is reconciled to its
+                # nominal dense form so the NEXT vertex's contraction and any
+                # later multi-edge merge consume a clean, nominal-ordered edge.
+                # This is the legitimate "the approximation is a dense factor of
+                # nominal shape" reconciliation (the same semantics the dense
+                # oracle uses), with transforms drained so a queued transpose
+                # can't re-permute it. Gated on Diag/Compress, so EXACT-AD is
+                # untouched.
+                if _is_approx_cfg and _is_approx(edge_outval):
+                    edge_outval = _normalize_approx_edge(
+                        edge_outval, out_edge.aval.shape, in_edge.aval.shape
+                    )
+                    _assert_sparse_tensor_consistency(edge_outval)
+
+                # NOTE: the previous KNOWN-INCOMPLETE "densify approx edge to
+                # nominal" band-aid that lived here was removed — the structured
+                # rectangular-Diag / implicit-Compress contractions it papered
+                # over are now handled at the op boundary by the elemental
+                # composition layer (graphax.sparse.elemental.dispatch), wired as
+                # the first fast path in matmul() / elementwise(). The band-aid's
+                # fresh-id rebuild mis-aligned downstream multi-edge contractions
+                # (permuted edge_outval → merge shape-assert), which the kernels'
+                # canonical output-id convention now avoids.
 
                 # print("Edge_outval:", edge_outval)
                 _set_inner(graph, in_edge, out_edge, edge_outval)

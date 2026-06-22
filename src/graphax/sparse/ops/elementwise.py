@@ -670,6 +670,18 @@ def elementwise(
     """
     _record_path(None)
     lhs, rhs = _normalize_inputs(lhs, rhs)
+    # Elemental fast path (Phase: bridge-cse): route a STRUCTURED elementwise op
+    # (block-diagonal / implicit dims) through the elemental kernels. Returns
+    # None for a pure-dense op so the existing general path stays byte-identical
+    # on the EXACT-AD edge.
+    from graphax.sparse.elemental.dispatch import try_elemental_elementwise
+
+    _elem = try_elemental_elementwise(
+        lhs, rhs, op, is_intersection=is_intersection, count=count
+    )
+    if _elem is not None:
+        _record_path("elemental")
+        return _elem
     if count:
         n = _ew_op_count(lhs, rhs, is_intersection)
 

@@ -328,6 +328,24 @@ def _densify_compressed_dims(tensor, compact: bool = False):
     )
 
 
+def _is_approx(st) -> bool:
+    """True iff ``st`` carries an approximation structure that the downstream
+    sparse contraction / drain cannot consume directly — a ``Diag`` block (a
+    sparse dim with ``block_size > 1``) or a ``Compress`` implicit dim (a
+    non-sparse logical dim with no physical axis and ``logical_size > 1``).
+
+    This is the exact structure the rectangular-Diag / implicit-Compress gaps
+    choke on. A pure-diagonal Diag (``block_size in {None, 1}``) and a plain
+    dense edge both return False, so the cleanly-contractible fast path is
+    preserved and the no-approximation EXACT-AD edge is never touched."""
+    for d in (*st.out_dims, *st.primal_dims):
+        if d.is_sparse and (getattr(d, "block_size", None) or 1) > 1:
+            return True
+        if (not d.is_sparse) and d.axis is None and int(d.logical_size) > 1:
+            return True
+    return False
+
+
 def _materialize_for_op(tensor):
     """Pre-densify a tensor's compressed Index dims to ``DiagonalIndex`` /
     ``DenseIndex`` so matmul / elementwise — which consume only those — never
