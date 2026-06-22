@@ -1727,9 +1727,22 @@ def vertex_elimination_jaxpr(
     else:
         eliminator = _get_eliminator(jaxpr, args, consts, tuple(argnums))
     order = _checkify_order(order, jaxpr, vo_vertices)
-    graph, _, adds, muls, fmas, mem, counts = eliminator.eliminate(
-        order, jaxpr, transforms, vo_vertices, count_ops
+    # Flag whether this elimination carries a Diag/Compress approximation. The
+    # elemental sparse dispatch is a hard no-op unless this is set, so plain
+    # exact AD never routes through it (see dispatch.set_approx_active).
+    from .sparse.elemental.dispatch import set_approx_active
+    _approx_on = any(
+        isinstance(_t, (Diag, Compress))
+        for _spec in (transforms or ())
+        for _t in (_spec[1] if isinstance(_spec, (tuple, list)) and len(_spec) == 2 else ())
     )
+    set_approx_active(_approx_on)
+    try:
+        graph, _, adds, muls, fmas, mem, counts = eliminator.eliminate(
+            order, jaxpr, transforms, vo_vertices, count_ops
+        )
+    finally:
+        set_approx_active(False)
 
     # Offloading all remaining Jacobian transforms to the output variables
     # before densification! Mutate via a single .mutate() proxy on the outer

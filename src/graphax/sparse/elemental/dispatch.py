@@ -53,6 +53,7 @@ SCOPE / FALLBACK POLICY
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING, Callable
 
 import jax
@@ -62,6 +63,31 @@ from graphax.sparse.ops.utils import _is_zero_fill
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
+
+
+# --------------------------------------------------------------------------- #
+# Approximation-active gate.
+#
+# DESIGN INVARIANT: with NO approximation (``Diag``/``Compress``) active, reverse
+# (and forward) vertex elimination must be EXACT and byte-identical to the
+# pre-elemental path — the existing matmul/elementwise already exploit block-
+# diagonal / zero-fill structure correctly there. The elemental kernels exist
+# only to make the APPROXIMATION edges (rectangular Diag blocks, Compress implicit
+# dims) contract legally; firing them on the intrinsic-diagonal edges that arise
+# in plain exact AD restructures those edges and breaks a downstream contraction
+# (e.g. a broadcast-bias Jacobian -> ``size mismatch 1 vs N``). So the dispatch is
+# a hard no-op unless ``core`` has flagged that this elimination carries a
+# Diag/Compress transform. Thread-local so concurrent traces don't race.
+# --------------------------------------------------------------------------- #
+_approx_state = threading.local()
+
+
+def set_approx_active(active: bool) -> None:
+    _approx_state.active = bool(active)
+
+
+def approx_active() -> bool:
+    return getattr(_approx_state, "active", False)
 
 
 # --------------------------------------------------------------------------- #
@@ -204,6 +230,13 @@ def try_elemental_matmul(lhs: "SparseTensor", rhs: "SparseTensor", count: bool =
     ``count=True``, ``(result, (adds, muls, fmas))``) built with the canonical
     output-id convention so downstream contractions align.
     """
+    # EXACT-AD GUARD: no approximation active -> defer entirely to the existing
+    # (block-diagonal/zero-fill-efficient) path so reverse/forward stay exact and
+    # byte-identical. The elemental kernels only handle approximation edges.
+    if not approx_active():
+        _bump("matmul_pure_dense_skip")
+        return None
+
     # Operands with a non-zero fill: the structured kernels assume zero fill (the
     # canonical Jacobian case). Let the existing densify path own non-zero fills.
     if not (_is_zero_fill(lhs) and _is_zero_fill(rhs)):
@@ -362,6 +395,10 @@ def try_elemental_elementwise(
     shape is outside the pairwise kernels' 2-D core (the general tiled path then
     owns it).
     """
+    # EXACT-AD GUARD (see try_elemental_matmul): no-op unless approximation active.
+    if not approx_active():
+        _bump("elementwise_pure_dense_skip")
+        return None
     if not (_is_zero_fill(lhs) and _is_zero_fill(rhs)):
         _bump("elementwise_nonzero_fill_skip")
         return None
