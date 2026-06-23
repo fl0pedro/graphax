@@ -666,6 +666,13 @@ def _normalize_approx_edge(edge, out_aval_shape, in_aval_shape):
     materializes every approx axis at its nominal logical size and lays the array
     out in nominal ``(out..., primal...)`` order, so it is a drop-in for the
     un-approximated edge with canonical ``range(0, n)`` ids.
+
+    The regroup is a flat ``reshape``, which only RE-GROUPS axes — it cannot fix a
+    free-dim PERMUTATION. The drain puts each side's dims in nominal order, so no
+    within-side permutation survives; what a flat reshape *could* silently
+    scramble is a cross-boundary mismatch (out-side and primal-side extents not
+    lining up with ``out_aval`` / ``in_aval``). We guard that explicitly and fail
+    loudly rather than mis-lay-out the Jacobian.
     """
     from .sparse.ops.utils import _arr2st
 
@@ -677,6 +684,22 @@ def _normalize_approx_edge(edge, out_aval_shape, in_aval_shape):
         return drained
     d = drained.dense()
     if tuple(d.shape) != nominal:
+        # ``dense()`` lays the array out out-side-first, so the reshape regroups
+        # the out side into ``out_aval`` and the primal side into ``in_aval`` iff
+        # the per-side logical extents already match. If they don't, a flat
+        # reshape would re-lay-out ACROSS the out/primal boundary (silent scramble)
+        # — surface it instead.
+        out_log = int(np.prod([int(x.logical_size) for x in drained.out_dims]))
+        in_log = int(np.prod([int(x.logical_size) for x in drained.primal_dims]))
+        if out_log != int(np.prod(out_aval_shape)) or in_log != int(
+            np.prod(in_aval_shape)
+        ):
+            raise ValueError(
+                "_normalize_approx_edge: per-side logical-extent mismatch — edge "
+                f"(out {out_log} | primal {in_log}) cannot regroup to nominal "
+                f"(out {tuple(out_aval_shape)} | primal {tuple(in_aval_shape)}) "
+                "without scrambling across the out/primal boundary."
+            )
         d = d.reshape(nominal)
     return _arr2st(d, out_ndim=len(out_aval_shape))
 
