@@ -99,6 +99,7 @@ DISPATCH_STATS: dict[str, int] = {
     "matmul_kernel_B_B": 0,             # contract_B_B
     "matmul_kernel_implicit": 0,        # contract_implicit
     "matmul_kernel_multi_D_B": 0,       # contract_dense_multi_block_diagonal
+    "matmul_kernel_multi_struct": 0,    # contract_multi_structured (B@B-multi)
     "matmul_kernel_fallback": 0,        # kernel precondition miss → composed-dense
     "matmul_composed_dense": 0,         # multi-structured → dot_general compose
     "matmul_nonzero_fill_skip": 0,      # let existing densify path handle fills
@@ -318,6 +319,19 @@ def _dispatch_matmul(lhs, rhs, pairs, kinds):
         _bump("matmul_kernel_multi_D_B")
         return multiB
 
+    # ---- BOTH operands block-diagonal on the contracted side (B@B-multi) ----- #
+    # The measured ViT / attention multi-structured signatures (('B','B','B','B'),
+    # ('D','B','D','B'), ...): each operand carries >=1 block-diagonal contracted
+    # pair, so the Dense (x) N-block kernel above declines (neither operand is
+    # fully dense). Contract block-wise via a single batched einsum over the
+    # shared meta axes — staying block-diagonal in the result — instead of
+    # densifying BOTH operands. Returns None for out-of-scope geometry (mismatched
+    # meta, free ride-through diagonal pairs), keeping the composed-dense fallback.
+    multiS = _try_multi_structured(lhs, rhs, pairs, kinds)
+    if multiS is not None:
+        _bump("matmul_kernel_multi_struct")
+        return multiS
+
     # ---- composed contraction (multi-structured / extra dims) --------------- #
     # MULTIPLE structured contracted pairs (e.g. two block-diagonal pairs + a
     # dense pair) are beyond any single pairwise kernel. We compose by expanding
@@ -358,6 +372,26 @@ def _try_multi_block_diagonal(lhs, rhs, kinds):
         return contract_dense_multi_block_diagonal(lhs, rhs)
     except (ValueError, NotImplementedError):
         # Precondition miss -> composed-dense fallback (correct), never abort.
+        _bump("matmul_kernel_fallback")
+        return None
+
+
+def _try_multi_structured(lhs, rhs, pairs, kinds):
+    """Attempt the B@B-multi kernel (BOTH operands block-diagonal on the
+    contracted side, over >=1 contracted pair, possibly with plain-dense pairs /
+    free dims).
+
+    Only worth attempting when there is >=1 genuine ``B_B`` contracted pair (the
+    case ``_try_multi_block_diagonal`` declines because neither operand is fully
+    dense). Returns the contracted SparseTensor or ``None`` for out-of-scope
+    geometry — the composed-dense fallback then owns it (always correct)."""
+    if not any(k == "B_B" for k in kinds):
+        return None
+    from graphax.sparse.elemental.contract_multi import contract_multi_structured
+
+    try:
+        return contract_multi_structured(lhs, rhs, pairs, kinds)
+    except (ValueError, NotImplementedError):
         _bump("matmul_kernel_fallback")
         return None
 

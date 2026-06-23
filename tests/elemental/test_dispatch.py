@@ -105,9 +105,15 @@ def test_single_B_B_routes_to_kernel():
 
 
 # --------------------------------------------------------------------------- #
-# (c) multiple structured pairs → composed dense, correct + canonical ids
+# (c) multiple structured pairs → B@B-multi kernel, correct + canonical ids
+#
+# BOTH operands carry two block-diagonal contracted pairs (the measured ViT
+# ('B','B','B','B') signature). This now routes to the dedicated
+# ``contract_multi_structured`` kernel (block-wise, stays sparse) instead of the
+# densifying composed-dense fallback — the result is still correct and carries
+# the canonical output ids, and ``matmul_composed_dense`` no longer fires.
 # --------------------------------------------------------------------------- #
-def test_multi_structured_pair_composes_correctly():
+def test_multi_structured_pair_routes_to_multi_kernel():
     DSP.reset_stats()
     # lhs: two diagonal pairs on the contracted side + a dense out dim.
     rng = np.random.default_rng(3)
@@ -138,7 +144,9 @@ def test_multi_structured_pair_composes_correctly():
     assert [d.id for d in out.primal_dims] == list(
         range(n_out, n_out + len(out.primal_dims))
     )
-    assert DSP.DISPATCH_STATS["matmul_composed_dense"] >= 1
+    # The dedicated B@B-multi kernel fires; the densifying fallback does not.
+    assert DSP.DISPATCH_STATS["matmul_kernel_multi_struct"] >= 1
+    assert DSP.DISPATCH_STATS["matmul_composed_dense"] == 0
 
 
 # --------------------------------------------------------------------------- #
