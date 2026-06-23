@@ -365,10 +365,13 @@ def _try_multi_block_diagonal(lhs, rhs, kinds):
 def _route_single_kernel(lhs, rhs, ld, rd, kind):
     """Route a single-structured-pair 2-D-core contraction to its kernel.
 
-    A kernel raises ``ValueError`` when its precondition isn't met (e.g. its own
-    pair-finding disagrees with the dispatcher's classification, or ``contract_B_B``
-    can't resolve the ``other_id`` partner). That must NOT abort the whole
-    gradient: catch it and return ``None`` so ``_dispatch_matmul`` composes via the
+    All three kernels are handed the dispatcher's already-resolved ``(ld, rd)``
+    contracted pair (from ``_align_contract_dims``) so they don't re-derive it with
+    their own positional heuristic — which could pick a DIFFERENT pair than the
+    dispatcher classified and yield a wrong/transposed result. A kernel still
+    raises ``ValueError`` if a precondition isn't met (e.g. ``contract_B_B`` can't
+    resolve the ``other_id`` partner); that must NOT abort the whole gradient, so
+    catch it and return ``None`` for ``_dispatch_matmul`` to compose via the
     (always-correct) dense fallback. ``_bump`` only on success so telemetry counts
     real kernel use; the ``matmul_kernel_fallback`` counter records the misses.
     """
@@ -376,7 +379,7 @@ def _route_single_kernel(lhs, rhs, ld, rd, kind):
         if kind == "implicit":
             from graphax.sparse.elemental.produce_compress import contract_implicit
 
-            out = contract_implicit(lhs, rhs)
+            out = contract_implicit(lhs, rhs, ld, rd)
             _bump("matmul_kernel_implicit")
             return out
         if kind == "B_B":
@@ -390,7 +393,7 @@ def _route_single_kernel(lhs, rhs, ld, rd, kind):
                 contract_dense_block_diagonal,
             )
 
-            out = contract_dense_block_diagonal(lhs, rhs)
+            out = contract_dense_block_diagonal(lhs, rhs, ld, rd)
             _bump("matmul_kernel_D_B")
             return out
     except (ValueError, NotImplementedError):

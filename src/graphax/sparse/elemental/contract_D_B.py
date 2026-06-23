@@ -241,7 +241,7 @@ def _free_partner(st: "SparseTensor", contract_dim: Index) -> Index:
 # Kernel
 # --------------------------------------------------------------------------- #
 def contract_dense_block_diagonal(
-    lhs: "SparseTensor", rhs: "SparseTensor"
+    lhs: "SparseTensor", rhs: "SparseTensor", lc: Index = None, rc: Index = None
 ) -> "SparseTensor":
     """Contract ``lhs @ rhs`` where exactly ONE operand's contracted dim is a
     ``DiagonalIndex`` (block-diagonal) and the other's is a plain ``DenseIndex``.
@@ -250,13 +250,22 @@ def contract_dense_block_diagonal(
     fully-dense ``SparseTensor`` (the closed form), computed by a single batched
     ``dot_general`` over the meta-diagonal — cost ~ ``nnz`` not ``N**2``.
 
+    ``lc`` / ``rc`` are the contracted (lhs-primal, rhs-out) dims. When the caller
+    has already resolved them — the dispatcher passes its authoritative
+    ``_align_contract_dims`` pair — they are used directly; otherwise the single
+    pair is resolved locally via the positional ``_find_contract_pair``. The dims
+    are consumed by IDENTITY (``other_id`` / ``axis``), never by position, so the
+    dispatcher's embed-aware pair is a drop-in (and avoids the local heuristic
+    disagreeing with the dispatcher's alignment).
+
     Requires zero-fill operands (the common vertex-elim case).  A non-zero fill
     on either operand falls back to the dense oracle (``lhs.dense() @
     rhs.dense()``) so correctness is never compromised.
     """
     from graphax.sparse.ops.utils import _is_zero_fill
 
-    lc, rc = _find_contract_pair(lhs, rhs)
+    if lc is None or rc is None:
+        lc, rc = _find_contract_pair(lhs, rhs)
 
     lhs_is_diag = lc.is_sparse
     rhs_is_diag = rc.is_sparse

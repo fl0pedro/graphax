@@ -231,7 +231,9 @@ def _find_contract_pair(lhs: "SparseTensor", rhs: "SparseTensor"):
 # --------------------------------------------------------------------------- #
 # Contraction kernel
 # --------------------------------------------------------------------------- #
-def contract_implicit(lhs: "SparseTensor", rhs: "SparseTensor") -> "SparseTensor":
+def contract_implicit(
+    lhs: "SparseTensor", rhs: "SparseTensor", lc=None, rc=None
+) -> "SparseTensor":
     r"""Contract ``lhs @ rhs`` where the single contracted pair has at least one
     IMPLICIT (compressed-away, ``axis=None`` Dense) side.
 
@@ -246,8 +248,13 @@ def contract_implicit(lhs: "SparseTensor", rhs: "SparseTensor") -> "SparseTensor
     ``c_lhs * c_rhs * N`` (each constant times the length, summed): both pull out
     and the ``Σ_n 1 = N`` factor remains.  Non-zero fills fall back to the dense
     oracle.
+
+    ``lc`` / ``rc`` are the contracted (lhs-primal, rhs-out) dims; when the caller
+    has resolved them (the dispatcher's authoritative pair) they are used directly,
+    else resolved locally. They are consumed by IDENTITY, never by position.
     """
-    lc, rc = _find_contract_pair(lhs, rhs)
+    if lc is None or rc is None:
+        lc, rc = _find_contract_pair(lhs, rhs)
 
     l_impl = _is_implicit(lc)
     r_impl = _is_implicit(rc)
