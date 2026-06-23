@@ -110,7 +110,7 @@ from typing import TYPE_CHECKING, Callable
 import jax.numpy as jnp
 
 from graphax.sparse.dtype_compute import _scaled_mul
-from graphax.sparse.elemental._common import emit_dense_result
+from graphax.sparse.elemental._common import dense_op_fallback, emit_dense_result
 from graphax.sparse.indexes import DenseIndex, Index
 from graphax.sparse.ops.utils import _compute_dtype, _is_zero_fill
 
@@ -268,10 +268,7 @@ def contract_implicit(
     # Non-zero fill: the c*sum factorization assumes the implicit constant is the
     # WHOLE edge value along N (zero fill off it). Fall back to the dense oracle.
     if not (_is_zero_fill(lhs) and _is_zero_fill(rhs)):
-        from graphax.sparse.ops.utils import _arr2st
-
-        out = lhs.dense() @ rhs.dense()
-        return _arr2st(out, out_ndim=len(lhs.out_dims))
+        return dense_op_fallback(lhs, rhs, jnp.matmul)
 
     out_dtype = _compute_dtype(lhs.dtype, rhs.dtype)
     N = lc.logical_size

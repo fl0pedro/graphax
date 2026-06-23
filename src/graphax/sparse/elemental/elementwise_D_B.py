@@ -124,7 +124,11 @@ from typing import TYPE_CHECKING, Callable
 
 import jax.numpy as jnp
 
-from graphax.sparse.elemental._common import canonical_block_buffer, emit_dense_result
+from graphax.sparse.elemental._common import (
+    canonical_block_buffer,
+    dense_op_fallback,
+    emit_dense_result,
+)
 from graphax.sparse.indexes import DiagonalIndex, Index
 from graphax.sparse.ops.utils import _compute_dtype, _is_zero_fill
 
@@ -328,10 +332,7 @@ def _grids_match(a_out, a_pri, b_out, b_pri) -> bool:
 def _dense_fallback(lhs, rhs, op, out_dtype) -> "SparseTensor":
     """Materialize both operands and run the plain dense op — the always-correct
     oracle, used for non-zero fills and mismatched B/B grids."""
-    from graphax.sparse.ops.utils import _arr2st
-
-    out = op(lhs.dense(), rhs.dense()).astype(out_dtype)
-    return _arr2st(out, out_ndim=len(lhs.out_dims))
+    return dense_op_fallback(lhs, rhs, op, dtype=out_dtype)
 
 
 def _emit_block_diagonal(blocks, N, B_o, B_i, dtype) -> "SparseTensor":

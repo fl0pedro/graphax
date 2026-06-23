@@ -121,6 +121,23 @@ def test_D_at_B(P, N, B_c, B_f):
     _assert_oracle(lhs, rhs)
 
 
+def test_nonzero_fill_fallback():
+    # A non-zero fill breaks the zero-fill fast path, so the kernel falls back to
+    # the dense oracle. Regression guard: that fallback used to pass the primal
+    # ndim as _arr2st's `dtype` argument -> "Cannot interpret '1' as a data type".
+    k1, k2 = jax.random.split(jax.random.PRNGKey(7))
+    P, N, B_c, B_f = 4, 3, 2, 2
+    K = N * B_c
+    lhs = SparseTensor(
+        (DenseIndex(0, P, 0),),
+        (DenseIndex(1, K, 1),),
+        _rand((P, K), k1),
+        fill_value=jnp.asarray(1.5, dtype=jnp.float32),
+    )
+    rhs = _diag(0, 1, N, B_c, B_f, _rand((N, B_c, B_f), k2))
+    _assert_oracle(lhs, rhs)
+
+
 # --------------------------------------------------------------------------- #
 # B @ D  (block-diagonal on the left / contracted primal-side)
 # --------------------------------------------------------------------------- #

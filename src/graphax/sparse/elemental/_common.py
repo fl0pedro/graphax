@@ -159,3 +159,18 @@ def is_block_diagonal(d) -> bool:
     plain ``DenseIndex`` or a ``CompressedIndex``. (``is_compressed`` lives on the
     ``Index`` base class, so plain attribute access is total over all dims.)"""
     return d.is_sparse and not d.is_compressed
+
+
+def dense_op_fallback(lhs, rhs, op, *, dtype=None):
+    """Materialize both operands and run the plain dense ``op(lhs, rhs)`` — the
+    always-correct oracle a kernel falls back to when its structured fast path
+    doesn't apply (a non-zero fill, a mismatched B/B grid). ``op`` is the dense
+    binary op (``jnp.matmul`` for a contraction, an elementwise op otherwise); the
+    result's out-ndim is ``len(lhs.out_dims)`` (the op preserves or contracts to
+    lhs's out side)."""
+    from graphax.sparse.ops.utils import _arr2st
+
+    out = op(lhs.dense(), rhs.dense())
+    if dtype is not None:
+        out = out.astype(dtype)
+    return _arr2st(out, out_ndim=len(lhs.out_dims))

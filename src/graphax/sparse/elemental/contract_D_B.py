@@ -107,6 +107,7 @@ import jax.numpy as jnp
 from graphax.sparse.dtype_compute import _scaled_mul
 from graphax.sparse.elemental._common import (
     canonical_block_buffer,
+    dense_op_fallback,
     emit_dense_result,
     is_block_diagonal,
 )
@@ -279,10 +280,7 @@ def contract_dense_block_diagonal(
 
     # Non-zero fill: fall back to the dense oracle (correctness over speed).
     if not (_is_zero_fill(lhs) and _is_zero_fill(rhs)):
-        out = lhs.dense() @ rhs.dense()
-        from graphax.sparse.ops.utils import _arr2st
-
-        return _arr2st(out, len(lhs.out_dims), out.ndim - len(lhs.out_dims))
+        return dense_op_fallback(lhs, rhs, jnp.matmul)
 
     out_dtype = _compute_dtype(lhs.dtype, rhs.dtype)
     scalar = (lhs.scalar_mult * rhs.scalar_mult).astype(out_dtype)
