@@ -121,11 +121,10 @@ def _bump(key: str) -> None:
 # --------------------------------------------------------------------------- #
 # Structural predicates
 # --------------------------------------------------------------------------- #
-def _is_block_diagonal(d) -> bool:
-    """A genuine meta-block-diagonal (Diagonal) contracted dim — sparse, not
-    compressed.  ``block_size in {None, 1}`` is a *plain* diagonal (a permutation
-    / scaled-identity factor); a ``block_size > 1`` is a rectangular block."""
-    return d.is_sparse and not d.is_compressed
+# A genuine meta-block-diagonal (Diagonal) dim — sparse, not compressed.
+# ``block_size in {None, 1}`` is a *plain* diagonal (a permutation / scaled-
+# identity factor); ``block_size > 1`` is a rectangular block.
+from graphax.sparse.elemental._common import is_block_diagonal as _is_block_diagonal
 
 
 def _is_implicit(d) -> bool:
@@ -294,20 +293,15 @@ def _dispatch_matmul(lhs, rhs, pairs, kinds):
         n_dense = len(kinds) - 1
 
         # The pairwise kernels own the 2-D-per-operand core (one out + one primal
-        # dim each), i.e. a single contracted pair and NO other contracted dims.
-        # When extra dense pairs coexist, or the operands are higher-rank than the
-        # kernel rides through, compose via the canonical dense contraction.
+        # dim each): a single contracted pair and NO other contracted dims.
+        # contract_implicit additionally rides through arbitrary free dims (its
+        # _emit handles multi-dim operands), so an implicit pair routes directly
+        # whenever it is the sole structured contracted pair (n_dense == 0). When
+        # neither applies (extra dense pairs / higher-rank), compose below.
         single_pair_core = (
             n_dense == 0 and _is_2d_core(lhs) and _is_2d_core(rhs)
         )
-        if single_pair_core:
-            out = _route_single_kernel(lhs, rhs, ld, rd, kind)
-            if out is not None:
-                return out
-        # contract_implicit rides through arbitrary free dims (its _emit handles
-        # multi-dim operands), so route it directly even with extra dense pairs —
-        # but ONLY when the implicit dim is the sole structured contracted pair.
-        if kind == "implicit" and n_dense == 0:
+        if single_pair_core or (kind == "implicit" and n_dense == 0):
             out = _route_single_kernel(lhs, rhs, ld, rd, kind)
             if out is not None:
                 return out

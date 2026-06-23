@@ -151,3 +151,11 @@ def emit_dense_result(
         fill_value=None,
         check_consistency=False,
     )
+
+
+def is_block_diagonal(d) -> bool:
+    """True iff ``d`` is a (non-compressed) block-diagonal ``DiagonalIndex`` dim —
+    a meta-block-diagonal factor the elemental kernels operate on, as opposed to a
+    plain ``DenseIndex`` or a ``CompressedIndex``. (``is_compressed`` lives on the
+    ``Index`` base class, so plain attribute access is total over all dims.)"""
+    return d.is_sparse and not d.is_compressed

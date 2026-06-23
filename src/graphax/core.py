@@ -803,6 +803,12 @@ def _eliminate_vertex(
     eqn = jaxpr.eqns[vertex - 1]
     adds = muls = fmas = mem = 0
 
+    # Whether this vertex carries a Diag/Compress approximation — invariant over
+    # every edge, so compute it ONCE here rather than per (in_edge, out_edge).
+    # Gates the approx-edge normalization below; ``transforms == ()`` (the EXACT
+    # AD path) gives ``any([]) == False`` so that path stays byte-identical.
+    _is_approx_cfg = any(isinstance(_t, (Diag, Compress)) for _t in transforms)
+
     for central_var in eqn.outvars:
         if central_var not in graph:
             continue  # dead or already-eliminated vertex
@@ -923,12 +929,8 @@ def _eliminate_vertex(
                 # The multi-edge ``+`` merge below adds two edges and asserts the
                 # nominal shape, so an approx edge whose contraction surfaced a
                 # non-nominal free-dim order must be reconciled to nominal FIRST.
-                # Statically unreachable on the EXACT-AD path (``transforms == ()``
-                # ⇒ ``any([]) == False``), so the no-approximation edge is byte-
-                # identical.
-                _is_approx_cfg = any(
-                    isinstance(_t, (Diag, Compress)) for _t in transforms
-                )
+                # ``_is_approx_cfg`` is statically False on the EXACT-AD path, so
+                # the no-approximation edge is byte-identical.
                 if _is_approx_cfg and graph.get(in_edge).get(out_edge) is not None:
                     edge_outval = _normalize_approx_edge(
                         edge_outval, out_edge.aval.shape, in_edge.aval.shape

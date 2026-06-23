@@ -105,7 +105,11 @@ from typing import TYPE_CHECKING
 import jax.numpy as jnp
 
 from graphax.sparse.dtype_compute import _scaled_mul
-from graphax.sparse.elemental._common import canonical_block_buffer, emit_dense_result
+from graphax.sparse.elemental._common import (
+    canonical_block_buffer,
+    emit_dense_result,
+    is_block_diagonal,
+)
 from graphax.sparse.indexes import DenseIndex, DiagonalIndex, Index
 from graphax.sparse.ops.utils import _compute_dtype
 
@@ -489,8 +493,7 @@ def _structured_operand(lhs, rhs):
     return None
 
 
-def _is_block_diag(d) -> bool:
-    return d.is_sparse and not getattr(d, "is_compressed", False)
+_is_block_diag = is_block_diagonal
 
 
 def _diag_pairs(st: "SparseTensor"):

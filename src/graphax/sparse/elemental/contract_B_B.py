@@ -120,7 +120,10 @@ from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
 
-from graphax.sparse.elemental._common import canonical_block_buffer
+from graphax.sparse.elemental._common import (
+    canonical_block_buffer,
+    is_block_diagonal,
+)
 from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
 
 if TYPE_CHECKING:
@@ -191,9 +194,9 @@ def contract_B_B(
       * each operand has exactly one out and one primal dim, paired with the
         contracted dim (the canonical 2-D ``B @ B`` shape).
     """
-    if not (lhs_contract.is_sparse and not lhs_contract.is_compressed):
+    if not is_block_diagonal(lhs_contract):
         raise ValueError("contract_B_B: lhs_contract must be a DiagonalIndex (B).")
-    if not (rhs_contract.is_sparse and not rhs_contract.is_compressed):
+    if not is_block_diagonal(rhs_contract):
         raise ValueError("contract_B_B: rhs_contract must be a DiagonalIndex (B).")
     if lhs_contract.logical_size != rhs_contract.logical_size:
         raise ValueError(
