@@ -273,7 +273,11 @@ def try_elemental_matmul(lhs: "SparseTensor", rhs: "SparseTensor", count: bool =
     if count:
         from graphax.sparse.ops.matmul import _compute_matmul_count
 
-        return result, _compute_matmul_count(lhs, rhs, result)
+        # Count from the operands ACTUALLY contracted (post-materialization):
+        # for a compressed operand, lhs/rhs have a different shape/topology than
+        # the expanded lhs_m/rhs_m the kernel ran on, so the un-materialized
+        # operands give a wrong op count.
+        return result, _compute_matmul_count(lhs_m, rhs_m, result)
     return result
 
 

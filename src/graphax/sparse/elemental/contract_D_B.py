@@ -806,11 +806,6 @@ def _pack_struct_factor(struct_st, pair_syms, dctr_syms, sfree_syms, out_dtype):
     The struct ``val`` is a SINGLE buffer coupling all pairs + dense axes (it is
     NOT per-pair concatenable), so we read it directly and place every axis —
     never materializing the full ``prod_p N_p`` dense matrix."""
-    """Canonicalize the single ``struct_st.val`` buffer into the packed axis
-    order ``([g_p i_p j_p]*, [k_c]*, [free]*)`` using each dim's ``axis`` /
-    ``block_axis`` for indirection (the val physical layout is
-    implementation-defined).  Returns ``(array, subscript)`` or ``(None, None)``
-    when an axis can't be located (out of scope)."""
     val = struct_st.val
 
     # Build the ordered list of (physical_axis_or_None, size, sym) we want, in
