@@ -982,7 +982,18 @@ def _apply_block_diagonal(
     other_shift_threshold: int | None = None
 
     if v1 is None and v2 is None:
-        pass
+        # Neither paired dim has a physical val axis to carve the ``factor``
+        # blocks from. A PURE-DIAGONAL implicit pair (its own block-diagonal) is
+        # intercepted upstream in ``apply_diag`` as a no-op; reaching here with
+        # ``size > 1`` means an UNrepresentable block split (block_size>1,
+        # block_axis=None ⇒ a malformed, un-densifiable dim). Signal it as a
+        # per-edge geometry miss so the caller's best-effort loop skips this
+        # transform instead of fabricating a corrupt edge.
+        if size > 1 and (b1 > 1 or b2 > 1):
+            raise ValueError(
+                "Diag: cannot block-diagonalise an implicit (axis=None) pair "
+                "that is not a pure diagonal — no physical axis to carve blocks."
+            )
     elif v1 is None or v2 is None:
         v_present = v1 if v1 is not None else v2
         b_present = b1 if v1 is not None else b2

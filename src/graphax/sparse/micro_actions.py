@@ -242,6 +242,26 @@ def apply_diag(st: SparseTensor, action: Diag) -> SparseTensor:
         return st
 
     b1, b2 = N1 // factor, N2 // factor
+
+    # A PURE-DIAGONAL pair (d1.other_id == d2.id) that is ALSO implicit (both
+    # ``axis is None`` — the pair carries no physical val axis, i.e. it is
+    # ``scalar·I`` over this logical index) is its own block-diagonal: the mask
+    # ``floor(i/b1) == floor(j/b2)`` is satisfied for every diagonal entry
+    # ``i == j``, so block-diagonalising it changes no value. ``_apply_block_
+    # diagonal`` would here emit a DiagonalIndex with ``block_size > 1`` but
+    # ``block_axis = None`` — an unrepresentable, un-densifiable dim (the
+    # ``(2,3,1,16,...)`` malformed dense() on the slice/concat multi-head ViT
+    # under reverse / non-canonical orders). Treat it as the no-op it is and keep
+    # the plain diagonal pair untouched.
+    if (
+        d1.is_sparse and d2.is_sparse
+        and getattr(d1, "other_id", None) == d2.id
+        and getattr(d2, "other_id", None) == d1.id
+        and getattr(d1, "axis", None) is None
+        and getattr(d2, "axis", None) is None
+    ):
+        return st
+
     return _apply_block_diagonal(
         st, is_out1, rel_i, is_out2, rel_j, factor, b1, b2,
     )

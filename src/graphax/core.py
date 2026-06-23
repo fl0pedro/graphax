@@ -949,6 +949,34 @@ def _eliminate_vertex(
                     else:
                         edge_outval += _edge
 
+                # Drain queued Jacobian transforms (slice / concatenate / reshape
+                # / transpose relabels awaiting embed) into the edge BEFORE the
+                # per-vertex Diag / Compress. A head-slice edge
+                # (``q[:, h*dh:(h+1)*dh]``) carries a queued embed whose
+                # ``apply_inverse`` grows the head-sliced free axis ``dh`` back to
+                # the full graph-variable size ``D``. Diag must NOT run while that
+                # transform is still queued: the block split mutates the dim list
+                # (ids / axes / pair count), so a later drain of a transpose
+                # relabel indexes a now-stale ``other_id`` (IndexError) and a
+                # slice embed lands on block-structured axes it can't represent
+                # (malformed dense / size mismatch) — both surfaced by Diag on the
+                # slice/concat multi-head ViT under non-canonical orders. Restrict
+                # to a MATERIALIZED, non-scalar edge: a ``val is None`` / 0-rank
+                # structural-identity edge (e.g. a reshape seed) can't be embedded
+                # and its transform is irrelevant to Diag (which ValueError-skips
+                # a non-fitting edge anyway). Gated on the approx config so
+                # EXACT-AD (``transforms == ()``) stays byte-identical.
+                if (
+                    _is_approx_cfg
+                    and (edge_outval.pre_transforms or edge_outval.post_transforms)
+                    and edge_outval.val is not None
+                    and (edge_outval.out_dims or edge_outval.primal_dims)
+                ):
+                    edge_outval = _normalize_approx_edge(
+                        edge_outval, out_edge.aval.shape, in_edge.aval.shape
+                    )
+                    _assert_sparse_tensor_consistency(edge_outval)
+
                 # Apply per-vertex transforms in order. Diag / Compress are
                 # dispatched to the atomic helpers in micro_actions; any
                 # other callable is given the edge_outval directly. The
