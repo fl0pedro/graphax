@@ -1758,19 +1758,25 @@ def vertex_elimination_jaxpr(
     # Flag whether this elimination carries a Diag/Compress approximation. The
     # elemental sparse dispatch is a hard no-op unless this is set, so plain
     # exact AD never routes through it (see dispatch.set_approx_active).
-    from .sparse.elemental.dispatch import set_approx_active
+    # vertex_elimination_jaxpr RECURSES (topology build, jit/cond macro-vertices),
+    # so SAVE+RESTORE the prior value rather than hard-resetting to False — a
+    # nested non-approx elimination must not clear an outer approx elimination's
+    # flag mid-flight (that would silently route the outer's remaining approx
+    # edges onto the existing path).
+    from .sparse.elemental.dispatch import approx_active, set_approx_active
     _approx_on = any(
         isinstance(_t, (Diag, Compress))
         for _spec in (transforms or ())
         for _t in (_spec[1] if isinstance(_spec, (tuple, list)) and len(_spec) == 2 else ())
     )
+    _prev_approx = approx_active()
     set_approx_active(_approx_on)
     try:
         graph, _, adds, muls, fmas, mem, counts = eliminator.eliminate(
             order, jaxpr, transforms, vo_vertices, count_ops
         )
     finally:
-        set_approx_active(False)
+        set_approx_active(_prev_approx)
 
     # Offloading all remaining Jacobian transforms to the output variables
     # before densification! Mutate via a single .mutate() proxy on the outer

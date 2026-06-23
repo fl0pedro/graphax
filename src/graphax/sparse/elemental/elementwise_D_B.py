@@ -308,10 +308,16 @@ def elementwise_dense_block_diagonal(
         # Result stays on B's support (off-diagonal op(D, 0) == 0). Emit B.
         return _emit_block_diagonal(new_blocks, N, B_o, B_i, out_dtype)
 
-    # Union: off-diagonal is op(D, 0) == D (lhs/rhs order respected by the dense
-    # grid itself, which already holds D's values). Scatter the new diagonal
-    # blocks back onto D's grid -> Dense result.
-    out = _scatter_blocks_onto_grid(d_grid, new_blocks, N, B_o, B_i)
+    # Union: off the meta-block-diagonal B is implicitly ZERO, so each off-diagonal
+    # cell is ``op`` applied with that zero on B's side — and ``op`` may be
+    # NON-COMMUTATIVE (subtract / divide), so the operand order matters: op(D, 0)
+    # when D is the lhs, op(0, D) when B is the lhs. (Scattering D's raw grid, as
+    # before, is only correct for D-as-lhs add/subtract; B-as-lhs ``B - D`` /
+    # ``B / D`` need ``-D`` / ``0`` off-diagonal.) The diagonal cells carry the
+    # real per-block op (new_blocks).
+    zero = jnp.zeros_like(d_grid)
+    off_grid = op(zero, d_grid) if l_is_b else op(d_grid, zero)
+    out = _scatter_blocks_onto_grid(off_grid, new_blocks, N, B_o, B_i)
     out = out.astype(out_dtype)
     return _emit_dense(out, N * B_o, N * B_i, out_dtype)
 

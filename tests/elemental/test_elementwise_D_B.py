@@ -137,6 +137,32 @@ def test_D_sub_B(N, B_o, B_i):
     _assert_oracle(lhs, rhs, jnp.subtract)
 
 
+# B as the LHS of a NON-COMMUTATIVE union op: off the block-diagonal B is zero,
+# so the result is op(0, D) — subtract -> -D, divide -> 0/D == 0 — NOT D. (A
+# regression guard: the kernel previously scattered D's raw grid, giving op(D, 0)
+# regardless of operand order, so B - D wrongly yielded +D and B / D yielded D.)
+@pytest.mark.parametrize("N,B_o,B_i", [(3, 2, 3), (4, 2, 2), (3, 3, 1), (3, 1, 1)])
+def test_B_sub_D(N, B_o, B_i):
+    k = jax.random.PRNGKey(hash((N, B_o, B_i, "bsubd")) % (2**31))
+    k1, k2 = jax.random.split(k)
+    R, C = N * B_o, N * B_i
+    lhs = _diag(0, 1, N, B_o, B_i, _rand((N, B_o, B_i), k1))
+    rhs = _dense(R, C, _rand((R, C), k2))
+    _assert_oracle(lhs, rhs, jnp.subtract)
+
+
+@pytest.mark.parametrize("N,B_o,B_i", [(3, 2, 3), (4, 2, 2), (3, 1, 1)])
+def test_B_div_D(N, B_o, B_i):
+    # divisor D is dense (no zeros after the +1 offset below), so off-diagonal
+    # 0 / D == 0 stays finite.
+    k = jax.random.PRNGKey(hash((N, B_o, B_i, "bdivd")) % (2**31))
+    k1, k2 = jax.random.split(k)
+    R, C = N * B_o, N * B_i
+    lhs = _diag(0, 1, N, B_o, B_i, _rand((N, B_o, B_i), k1))
+    rhs = _dense(R, C, _rand((R, C), k2) + 2.0)  # bias away from 0 divisors
+    _assert_oracle(lhs, rhs, jnp.divide)
+
+
 # --------------------------------------------------------------------------- #
 # D op B  /  B op D  : intersection (multiply) -> Block-diagonal
 # --------------------------------------------------------------------------- #

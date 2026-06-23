@@ -99,6 +99,7 @@ DISPATCH_STATS: dict[str, int] = {
     "matmul_kernel_B_B": 0,             # contract_B_B
     "matmul_kernel_implicit": 0,        # contract_implicit
     "matmul_kernel_multi_D_B": 0,       # contract_dense_multi_block_diagonal
+    "matmul_kernel_fallback": 0,        # kernel precondition miss → composed-dense
     "matmul_composed_dense": 0,         # multi-structured → dot_general compose
     "matmul_nonzero_fill_skip": 0,      # let existing densify path handle fills
     "elementwise_pure_dense_skip": 0,
@@ -355,28 +356,48 @@ def _try_multi_block_diagonal(lhs, rhs, kinds):
         contract_dense_multi_block_diagonal,
     )
 
-    return contract_dense_multi_block_diagonal(lhs, rhs)
+    try:
+        return contract_dense_multi_block_diagonal(lhs, rhs)
+    except (ValueError, NotImplementedError):
+        # Precondition miss -> composed-dense fallback (correct), never abort.
+        _bump("matmul_kernel_fallback")
+        return None
 
 
 def _route_single_kernel(lhs, rhs, ld, rd, kind):
-    """Route a single-structured-pair 2-D-core contraction to its kernel."""
-    if kind == "implicit":
-        from graphax.sparse.elemental.produce_compress import contract_implicit
+    """Route a single-structured-pair 2-D-core contraction to its kernel.
 
-        _bump("matmul_kernel_implicit")
-        return contract_implicit(lhs, rhs)
-    if kind == "B_B":
-        from graphax.sparse.elemental.contract_B_B import contract_B_B
+    A kernel raises ``ValueError`` when its precondition isn't met (e.g. its own
+    pair-finding disagrees with the dispatcher's classification, or ``contract_B_B``
+    can't resolve the ``other_id`` partner). That must NOT abort the whole
+    gradient: catch it and return ``None`` so ``_dispatch_matmul`` composes via the
+    (always-correct) dense fallback. ``_bump`` only on success so telemetry counts
+    real kernel use; the ``matmul_kernel_fallback`` counter records the misses.
+    """
+    try:
+        if kind == "implicit":
+            from graphax.sparse.elemental.produce_compress import contract_implicit
 
-        _bump("matmul_kernel_B_B")
-        return contract_B_B(lhs, rhs, ld, rd)
-    if kind == "D_B":
-        from graphax.sparse.elemental.contract_D_B import (
-            contract_dense_block_diagonal,
-        )
+            out = contract_implicit(lhs, rhs)
+            _bump("matmul_kernel_implicit")
+            return out
+        if kind == "B_B":
+            from graphax.sparse.elemental.contract_B_B import contract_B_B
 
-        _bump("matmul_kernel_D_B")
-        return contract_dense_block_diagonal(lhs, rhs)
+            out = contract_B_B(lhs, rhs, ld, rd)
+            _bump("matmul_kernel_B_B")
+            return out
+        if kind == "D_B":
+            from graphax.sparse.elemental.contract_D_B import (
+                contract_dense_block_diagonal,
+            )
+
+            out = contract_dense_block_diagonal(lhs, rhs)
+            _bump("matmul_kernel_D_B")
+            return out
+    except (ValueError, NotImplementedError):
+        _bump("matmul_kernel_fallback")
+        return None
     return None
 
 
