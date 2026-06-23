@@ -120,6 +120,7 @@ from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
 
+from graphax.sparse.elemental._common import canonical_block_buffer
 from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
 
 if TYPE_CHECKING:
@@ -134,42 +135,20 @@ def _block_buffer(st: "SparseTensor", dim: Index, other: Index) -> jnp.ndarray:
     Reads ``.axis`` (meta) and ``.block_axis`` (per-meta block) for indirection
     — the physical ``val`` axis order is implementation-defined, so we never
     assume positions.  ``val is None`` densifies to an all-ones buffer (matching
-    ``dense()`` / matmul's ``val=None`` convention)."""
+    ``dense()`` / matmul's ``val=None`` convention).
+
+    Uses the STRICT present-axis check (an axis counts only if in range with the
+    expected length) — historically tighter than its ``contract_D_B`` /
+    ``elementwise_D_B`` siblings; preserved via ``strict_present=True``.
+    """
     N = dim.size
     Br = dim.block_size or 1
     Bc = other.block_size or 1
-    if st.val is None:
-        return jnp.ones((N, Br, Bc), dtype=st.dtype)
-
-    val = st.val
     meta_ax = dim.axis if dim.axis is not None else other.axis
-    row_ax = dim.block_axis
-    col_ax = other.block_axis
-
-    # Canonical order (meta, row, col). For each slot record the physical axis if
-    # present with the expected length, else mark it absent (insert a singleton
-    # and broadcast up — a size-1 block / implicit meta carries no physical axis).
-    slots = [(meta_ax, N), (row_ax, Br), (col_ax, Bc)]
-    present = [
-        ax for ax, length in slots
-        if ax is not None and ax < val.ndim and val.shape[ax] == length
-    ]
-    leftover = [a for a in range(val.ndim) if a not in present]
-    v = jnp.transpose(val, present + leftover) if (present + leftover) != list(range(val.ndim)) else val
-
-    # Walk canonical slots: consume the transposed present axes in order, insert
-    # a singleton for each absent slot. Any leftover physical axes (none for a
-    # clean 2-D pair) collapse into the trailing product, then broadcast to shape.
-    final: list[int] = []
-    ptr = 0
-    for ax, length in slots:
-        if ax in present:
-            final.append(v.shape[ptr])
-            ptr += 1
-        else:
-            final.append(1)
-    v = v.reshape(tuple(final))
-    return jnp.broadcast_to(v, (N, Br, Bc))
+    slots = [(meta_ax, N), (dim.block_axis, Br), (other.block_axis, Bc)]
+    return canonical_block_buffer(
+        st.val, slots, dtype=st.dtype, strict_present=True
+    )
 
 
 def _scatter_block_diag(blocks: jnp.ndarray) -> jnp.ndarray:

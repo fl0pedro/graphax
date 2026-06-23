@@ -110,6 +110,7 @@ from typing import TYPE_CHECKING, Callable
 import jax.numpy as jnp
 
 from graphax.sparse.dtype_compute import _scaled_mul
+from graphax.sparse.elemental._common import emit_dense_result
 from graphax.sparse.indexes import DenseIndex, Index
 from graphax.sparse.ops.utils import _compute_dtype, _is_zero_fill
 
@@ -347,22 +348,12 @@ def _emit_contract(out, lhs, lc, l_free, rhs, rc, r_free, dtype) -> "SparseTenso
     if perm != list(range(out.ndim)):
         out = jnp.transpose(out, perm)
 
+    # After the transpose the array is laid out (out..., primal...), so the
+    # contiguous physical axes are 0..n_out-1 (out) then n_out.. (primal).
     n_out = len(out_dims)
-    new_out = tuple(
-        DenseIndex(i, d.logical_size, i) for i, d in enumerate(out_dims)
-    )
-    new_primal = tuple(
-        DenseIndex(n_out + i, d.logical_size, n_out + i)
-        for i, d in enumerate(primal_dims)
-    )
-    return SparseTensor(
-        new_out,
-        new_primal,
-        out.astype(dtype),
-        scalar_mult=jnp.array(1, dtype=dtype),
-        fill_value=None,
-        check_consistency=False,
-    )
+    out_specs = [(d.logical_size, i) for i, d in enumerate(out_dims)]
+    primal_specs = [(d.logical_size, n_out + i) for i, d in enumerate(primal_dims)]
+    return emit_dense_result(out, out_specs, primal_specs, dtype=dtype)
 
 
 # --------------------------------------------------------------------------- #

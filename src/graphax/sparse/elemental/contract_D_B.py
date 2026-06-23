@@ -105,6 +105,7 @@ from typing import TYPE_CHECKING
 import jax.numpy as jnp
 
 from graphax.sparse.dtype_compute import _scaled_mul
+from graphax.sparse.elemental._common import canonical_block_buffer, emit_dense_result
 from graphax.sparse.indexes import DenseIndex, DiagonalIndex, Index
 from graphax.sparse.ops.utils import _compute_dtype
 
@@ -131,34 +132,12 @@ def _diag_blocks(st: "SparseTensor", contract_dim: Index, free_dim: Index) -> jn
     B_c = contract_dim.block_size or 1
     B_f = free_dim.block_size or 1
 
-    if st.val is None:
-        # val=None ⇒ all-ones structure (matches dense()); the meta-diagonal
-        # blocks are all ones of the canonical shape.
-        return jnp.ones((N, B_c, B_f), dtype=st.dtype)
-
-    val = st.val
     # The shared meta axis: both sides advertise the same physical ``axis``
     # (the diagonal stores ONE meta axis, not two). Prefer the contracted
     # side's, fall back to the free side's.
     meta_axis = contract_dim.axis if contract_dim.axis is not None else free_dim.axis
-    bc_axis = contract_dim.block_axis
-    bf_axis = free_dim.block_axis
-
-    # Gather the PRESENT canonical axes (meta, B_c, B_f order) to the front,
-    # dropping leftover axes (which are size-1 for a clean diagonal val).
-    target_present = (meta_axis is not None, bc_axis is not None, bf_axis is not None)
-    present = [a for a in (meta_axis, bc_axis, bf_axis) if a is not None]
-    leftover = [a for a in range(val.ndim) if a not in present]
-    perm = present + leftover
-    v = val.transpose(perm) if perm != list(range(val.ndim)) else val
-    # Keep only the present canonical axes (leftover are size-1).
-    present_sizes = tuple(sz for p, sz in zip(target_present, (N, B_c, B_f)) if p)
-    v = v.reshape(present_sizes)
-    # Re-insert singleton axes for the absent canonical axes, then broadcast to
-    # the full (N, B_c, B_f) block layout.
-    expand_shape = tuple(sz if p else 1 for p, sz in zip(target_present, (N, B_c, B_f)))
-    v = v.reshape(expand_shape)
-    return jnp.broadcast_to(v, (N, B_c, B_f))
+    slots = [(meta_axis, N), (contract_dim.block_axis, B_c), (free_dim.block_axis, B_f)]
+    return canonical_block_buffer(st.val, slots, dtype=st.dtype)
 
 
 def _dense_with_contract_last(
@@ -419,21 +398,11 @@ def _emit(values, out_dims, primal_dims, dtype):
     ``scalar_mult`` is already folded into ``values`` upstream, so it is set to
     1.  Primal dims are re-id'd to follow the out dims for id contiguity.
     """
-    from graphax.sparse.tensor import SparseTensor
-
-    n_out = len(out_dims)
-    out_dims = [DenseIndex(i, d.logical_size, d.axis) for i, d in enumerate(out_dims)]
-    primal_dims = [
-        DenseIndex(n_out + i, d.logical_size, d.axis)
-        for i, d in enumerate(primal_dims)
-    ]
-    return SparseTensor(
-        tuple(out_dims),
-        tuple(primal_dims),
-        values.astype(dtype),
-        scalar_mult=jnp.array(1, dtype=dtype),
-        fill_value=None,
-        check_consistency=False,
+    return emit_dense_result(
+        values,
+        [(d.logical_size, d.axis) for d in out_dims],
+        [(d.logical_size, d.axis) for d in primal_dims],
+        dtype=dtype,
     )
 
 

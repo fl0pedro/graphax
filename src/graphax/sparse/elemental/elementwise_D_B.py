@@ -124,8 +124,8 @@ from typing import TYPE_CHECKING, Callable
 
 import jax.numpy as jnp
 
-from graphax.sparse.dtype_compute import _scaled_mul
-from graphax.sparse.indexes import DenseIndex, DiagonalIndex, Index
+from graphax.sparse.elemental._common import canonical_block_buffer, emit_dense_result
+from graphax.sparse.indexes import DiagonalIndex, Index
 from graphax.sparse.ops.utils import _compute_dtype, _is_zero_fill
 
 if TYPE_CHECKING:
@@ -149,27 +149,17 @@ def _diag_grid(st: "SparseTensor", out_dim: Index, primal_dim: Index):
     B_o = out_dim.block_size or 1
     B_i = primal_dim.block_size or 1
 
-    if st.val is None:
-        return jnp.ones((N, B_o, B_i), dtype=st.dtype)
-
-    val = _scaled_mul(st.val, st.scalar_mult)
     meta_axis = out_dim.axis if out_dim.axis is not None else primal_dim.axis
-    bo_axis = out_dim.block_axis
-    bi_axis = primal_dim.block_axis
-
-    present = [a for a in (meta_axis, bo_axis, bi_axis) if a is not None]
-    leftover = [a for a in range(val.ndim) if a not in present]
-    perm = present + leftover
-    v = val.transpose(perm) if perm != list(range(val.ndim)) else val
-
-    # v now leads with the present canonical axes; reshape inserts singleton
-    # slots for any absent (size-1) block axis, then broadcast to the block grid.
-    n_present = len(present)
-    L = v.shape[n_present:]
-    canon_present = (meta_axis is not None, bo_axis is not None, bi_axis is not None)
-    expand = tuple(sz if p else 1 for p, sz in zip(canon_present, (N, B_o, B_i))) + L
-    v = v.reshape(expand)
-    return jnp.broadcast_to(v, (N, B_o, B_i) + L)
+    slots = [(meta_axis, N), (out_dim.block_axis, B_o), (primal_dim.block_axis, B_i)]
+    # Folds scalar_mult into the buffer and keeps leftover/batch axes as a *L
+    # tail — both unique to this elementwise call site (preserved via params).
+    return canonical_block_buffer(
+        st.val,
+        slots,
+        dtype=st.dtype,
+        scalar_mult=st.scalar_mult,
+        keep_leftover_tail=True,
+    )
 
 
 def _dense_grid(st: "SparseTensor", out_dim: Index, primal_dim: Index):
@@ -393,17 +383,6 @@ def _emit_dense(grid, R, C, dtype) -> "SparseTensor":
     """Wrap a dense ``(R, C, *L)`` grid as a fully-Dense SparseTensor (zero fill,
     scalar_mult folded -> 1).  Leftover ``*L`` axes become trailing primal-side
     dense dims."""
-    from graphax.sparse.tensor import SparseTensor
-
-    grid = grid.astype(dtype)
     L = grid.shape[2:]
-    out_dims = (DenseIndex(0, R, 0),)
-    primal_dims = [DenseIndex(1, C, 1)]
-    for k, sz in enumerate(L):
-        primal_dims.append(DenseIndex(2 + k, sz, 2 + k))
-    return SparseTensor(
-        out_dims, tuple(primal_dims), grid,
-        scalar_mult=jnp.array(1, dtype=dtype),
-        fill_value=None,
-        check_consistency=False,
-    )
+    primal_specs = [(C, 1)] + [(sz, 2 + k) for k, sz in enumerate(L)]
+    return emit_dense_result(grid, [(R, 0)], primal_specs, dtype=dtype)
