@@ -20,6 +20,19 @@ from graphax.sparse.ops.matmul import matmul
 from graphax.sparse.tensor import SparseTensor
 
 
+@pytest.fixture(autouse=True)
+def _approx_active():
+    """The dispatch is a hard no-op unless an approximation is active (so plain
+    exact AD stays byte-identical — see dispatch.set_approx_active). These tests
+    exercise the routing itself, i.e. the approximation-active condition, so we
+    flag it on for the duration of each test and reset afterwards."""
+    DSP.set_approx_active(True)
+    try:
+        yield
+    finally:
+        DSP.set_approx_active(False)
+
+
 def _dense_st(seed, out_sizes, primal_sizes):
     rng = np.random.default_rng(seed)
     shape = tuple(out_sizes) + tuple(primal_sizes)
