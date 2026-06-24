@@ -173,6 +173,23 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
             )
         v = tensor.val
         perm = [d.axis for d in tensor.dims if d.axis is not None]
+        # A Diag-split / Compress can leave the physical ``val`` with EXTRA size-1
+        # axes that no dim references (the ``(...,1,1,1)`` tails) while its
+        # referenced axes are PERMUTED relative to the logical (out..., primal...)
+        # order. Reconstruct the logical layout explicitly: pull each dim's physical
+        # axis into dim order, drop the unreferenced size-1 axes, and broadcast the
+        # implicit (``axis is None``) dims up. Without this, ``broadcast_to`` below
+        # sees a higher-rank, mis-ordered array and fails ("Cannot broadcast to
+        # shape with fewer dimensions") — the ViT seq/embed densify case.
+        if perm and len(set(perm)) == len(perm) and len(perm) < v.ndim:
+            extra = [ax for ax in range(v.ndim) if ax not in perm]
+            if all(int(v.shape[ax]) == 1 for ax in extra):
+                v = _scaled_mul(jnp.transpose(v, perm + extra), tensor.scalar_mult)
+                v = v.reshape(v.shape[: len(perm)])  # drop trailing size-1 extras
+                built, v_iter = [], iter(v.shape)
+                for d in tensor.dims:
+                    built.append(next(v_iter) if d.axis is not None else 1)
+                return jnp.broadcast_to(v.reshape(built), tensor.shape)
         if (
             perm
             and len(perm) == v.ndim
