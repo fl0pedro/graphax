@@ -39,7 +39,13 @@ def test_adjoint_seed_is_vjp(order):
     _, vjp_fn = jax.vjp(f, W, X)
     ref = vjp_fn(YBAR)
     got = sv.seed_vjp(f, YBAR, order=order, argnums=(0, 1))(W, X)
-    assert all(bool(jnp.allclose(a, b, atol=1e-5)) for a, b in zip(got, ref))
+    # rtol-based: different elimination orders reassociate the same float32 sum
+    # differently, so a pure atol=1e-5 is too tight for some orders on some BLAS
+    # backends (e.g. `order4` failed only on the pgi15 cluster, passed locally).
+    # rtol=1e-4 tolerates reassociation while still catching a real divergence.
+    assert all(
+        bool(jnp.allclose(a, b, rtol=1e-4, atol=1e-5)) for a, b in zip(got, ref)
+    )
 
 
 @pytest.mark.parametrize("order", ["fwd", "rev"])

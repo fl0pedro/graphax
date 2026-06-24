@@ -478,6 +478,17 @@ def _copy(st: SparseTensor, val: Array | None = None, scalar_mult: Array | None 
 
 
 def _arr2st(arr: Array, out_ndim: int | None = None, dtype: Any = None, **kwargs: Any) -> SparseTensor:
+    """Wrap a dense array as a plain ``DenseIndex`` SparseTensor with FRESH
+    canonical ids ``range(0, ndim)`` (out side ``0..out_ndim-1``, primal the rest).
+
+    ID-CONVENTION FOOTGUN: this assigns NEW ids and is NOT interchangeable with
+    ``dispatch._to_dense_st``, which PRESERVES each dim's id so the id-based
+    contraction resolver pairs the right axes. Use ``_arr2st`` only where the result
+    STARTS a fresh nominal edge (canonical layout, e.g. a reconciled approx edge);
+    use ``_to_dense_st`` inside a contraction where downstream id pairing must hold.
+    Mixing them mis-aligns multi-edge merges (a real past bug — see core.py's
+    removed fresh-id band-aid note).
+    """
     # Surface the bug instead of silently flipping to 0. Callers like
     # ``matmul._normalize_inputs`` compute ``out_ndim`` as
     # ``lhs.ndim - len(rhs.out_dims)`` which can go negative when the

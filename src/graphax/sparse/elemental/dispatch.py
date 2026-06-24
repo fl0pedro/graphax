@@ -110,13 +110,32 @@ DISPATCH_STATS: dict[str, int] = {
 }
 
 
+# Bounded ring buffer of the most recent kernel-fallback REASONS. A kernel raises
+# ValueError / NotImplementedError both for an EXPECTED precondition miss and for a
+# genuine BUG; the broad except can't tell them apart, so rather than absorb every
+# fallback silently into the ``matmul_kernel_fallback`` count we also record the
+# (kernel, exc-type, message) here. Tests / debugging inspect this to confirm a
+# fallback was a precondition miss and not a masked crash. Cleared by reset_stats().
+DISPATCH_FALLBACK_LOG: list[tuple[str, str, str]] = []
+_FALLBACK_LOG_CAP = 64
+
+
 def reset_stats() -> None:
     for k in DISPATCH_STATS:
         DISPATCH_STATS[k] = 0
+    DISPATCH_FALLBACK_LOG.clear()
 
 
 def _bump(key: str) -> None:
     DISPATCH_STATS[key] = DISPATCH_STATS.get(key, 0) + 1
+
+
+def _bump_fallback(kernel: str, exc: BaseException) -> None:
+    """Record a kernel-fallback with its reason (see DISPATCH_FALLBACK_LOG)."""
+    _bump("matmul_kernel_fallback")
+    DISPATCH_FALLBACK_LOG.append((kernel, type(exc).__name__, str(exc)[:200]))
+    if len(DISPATCH_FALLBACK_LOG) > _FALLBACK_LOG_CAP:
+        del DISPATCH_FALLBACK_LOG[: -_FALLBACK_LOG_CAP]
 
 
 # --------------------------------------------------------------------------- #
@@ -370,9 +389,9 @@ def _try_multi_block_diagonal(lhs, rhs, kinds):
 
     try:
         return contract_dense_multi_block_diagonal(lhs, rhs)
-    except (ValueError, NotImplementedError):
+    except (ValueError, NotImplementedError) as _exc:
         # Precondition miss -> composed-dense fallback (correct), never abort.
-        _bump("matmul_kernel_fallback")
+        _bump_fallback("multi_block_diagonal", _exc)
         return None
 
 
@@ -391,8 +410,8 @@ def _try_multi_structured(lhs, rhs, pairs, kinds):
 
     try:
         return contract_multi_structured(lhs, rhs, pairs, kinds)
-    except (ValueError, NotImplementedError):
-        _bump("matmul_kernel_fallback")
+    except (ValueError, NotImplementedError) as _exc:
+        _bump_fallback("multi_structured", _exc)
         return None
 
 
@@ -430,8 +449,8 @@ def _route_single_kernel(lhs, rhs, ld, rd, kind):
             out = contract_dense_block_diagonal(lhs, rhs, ld, rd)
             _bump("matmul_kernel_D_B")
             return out
-    except (ValueError, NotImplementedError):
-        _bump("matmul_kernel_fallback")
+    except (ValueError, NotImplementedError) as _exc:
+        _bump_fallback("single_kernel", _exc)
         return None
     return None
 

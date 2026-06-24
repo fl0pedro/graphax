@@ -673,6 +673,18 @@ def _normalize_approx_edge(edge, out_aval_shape, in_aval_shape):
     scramble is a cross-boundary mismatch (out-side and primal-side extents not
     lining up with ``out_aval`` / ``in_aval``). We guard that explicitly and fail
     loudly rather than mis-lay-out the Jacobian.
+
+    NOTE — this densify is LOAD-BEARING, not just a memory cost. The nominal-dense
+    form is what lets the next vertex's Diag/Compress re-mask the edge uniformly (a
+    block-diagonal edge makes a later Diag's pair conflict → it skips → under-masks;
+    see the densify-dependency note in the per-vertex transform loop). Keeping edges
+    sparse to dodge the N**2 densify was tried TWICE at scale and failed every way:
+    a wrong approximation (cos→0.05 vs the dense oracle), a ``transpose_transform``
+    topology crash, AND higher peak RSS (the sparse + densify-retry overhead exceeds
+    the savings). The per-vertex densify-mask is intrinsic to this approximation;
+    the lever for the random-order OOM is the elimination ORDER (``rev`` is
+    near-minimal fill), not edge sparsity. Don't re-attempt the sparse path without
+    first making transpose/Diag/Compress/merge all structure-invariant.
     """
     from .sparse.ops.utils import _arr2st
 
@@ -1044,6 +1056,17 @@ def _eliminate_vertex(
                         # transform on this edge. The TypeError above is
                         # intentionally NOT caught: it's a structural
                         # programming error, not a per-edge geometry miss.
+                        #
+                        # CORRECTNESS DEPENDENCY (do not break): this skip is sound
+                        # ONLY because _normalize_approx_edge densifies every approx
+                        # edge back to its nominal dense form, so the NEXT vertex's
+                        # transform sees a dense edge that always fits and re-masks
+                        # uniformly. If an edge is kept block-diagonal instead, a
+                        # later Diag's pair CONFLICTS, lands here, and is silently
+                        # skipped → UNDER-MASKED (a different, lighter approximation).
+                        # Two at-scale attempts to keep edges sparse hit exactly this
+                        # (cos→0.05 vs the dense oracle); don't weaken the densify
+                        # without first making every transform structure-invariant.
                         continue
                     _assert_sparse_tensor_consistency(edge_outval)
 
@@ -1072,7 +1095,6 @@ def _eliminate_vertex(
                 # (permuted edge_outval → merge shape-assert), which the kernels'
                 # canonical output-id convention now avoids.
 
-                # print("Edge_outval:", edge_outval)
                 _set_inner(graph, in_edge, out_edge, edge_outval)
                 _set_inner(transpose_graph, out_edge, in_edge, edge_outval)
 
