@@ -384,6 +384,30 @@ def _align_contract_indices(lhs_primal, rhs_out, *, embed):
                 used.add(a); repaired.append((a, b)); break
     if len(repaired) == len(out):
         repaired.sort(); return repaired
+    # The re-pair above only searches the positionally-SELECTED indices, so a dim
+    # the positional walk DROPPED is invisible to it (the ViT seq<->embed swap:
+    # lhs.primal=[8,17,1] vs rhs.out=[1,8,17] drops the size-8 dim, leaving 17
+    # paired against 8). Re-pair by a full UNAMBIGUOUS size-bijection over BOTH
+    # complete lists: a size-N lhs dim contracts the size-N rhs dim regardless of
+    # position. Bail (keep the positional result) if the lists aren't equal-length
+    # or a size repeats within a side — size alone can't disambiguate then, and a
+    # wrong contraction is worse than the loud size-mismatch raise.
+    if len(lhs_primal) == len(rhs_out):
+        used_r, full = set(), []
+        for a in range(len(lhs_primal)):
+            sa = int(lhs_primal[a].logical_size)
+            cand = [
+                k
+                for k in range(len(rhs_out))
+                if k not in used_r and int(rhs_out[k].logical_size) == sa
+            ]
+            if len(cand) != 1:
+                break
+            used_r.add(cand[0])
+            full.append((a, cand[0]))
+        if len(full) == len(lhs_primal):
+            full.sort()
+            return full
     return out
 
 
