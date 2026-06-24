@@ -120,3 +120,37 @@ def test_vit_random_order_matches_oracle(seed):
     ref = O.oracle_jacobian(vit, order, argnums, spec)(*args)
     # The previous (broken) keep-sparse versions gave cos 0.05-0.80 here.
     assert _cos(got, ref) > 0.999, f"ViT seed{seed}: cos={_cos(got, ref)}"
+
+
+# --------------------------------------------------------------------------- #
+# graphax's real ViT model (examples.vision.ViT, vmapped) under a PARTIAL
+# approximation (only some vertices carry Diag) used to crash the host shape
+# algebra: an edge permuted by an upstream approx vertex (the seq<->embed swap)
+# reaches a NON-approx vertex's merge, which the per-vertex gate skipped
+# normalizing -> "Computed edge shape ... does not match expected" AssertionError.
+# Gating the merge reconciliation on the GLOBAL approx flag + a permutation-aware
+# (transpose, not flat-reshape) normalize fixes it. count_ops densifies every
+# approx edge, so this is RAM-guarded like the slice/concat case above.
+# --------------------------------------------------------------------------- #
+@pytest.mark.skipif(
+    _total_ram_gb() < 12.0,
+    reason="graphax ViT count_ops densifies approx edges (~12 GB)",
+)
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_graphax_vit_partial_approx_shape_pass(seed):
+    import jax
+    from graphax.examples.vision import ViT, vit_weights
+
+    d = 8
+    w = vit_weights(jr.PRNGKey(0), d=d)
+    x = jr.normal(jr.PRNGKey(1), (1, 784))
+    yv = jr.normal(jr.PRNGKey(2), (1, 10))
+    vit = jax.vmap(ViT, in_axes=(0, 0) + (None,) * 16)
+    nv = len(jax.make_jaxpr(vit)(x, yv, *w).jaxpr.eqns)
+    rng = np.random.default_rng(seed)
+    # PARTIAL: only ~half the vertices carry an approximation (the policy case).
+    spec = [(v, [Diag(0, 1, 2)]) for v in range(1, nv + 1) if rng.random() < 0.5]
+    # The host shape pass must complete (no edge-shape AssertionError).
+    jacve(vit, "rev", argnums=tuple(range(2, 18)), count_ops=True, transforms=spec)(
+        x, yv, *w
+    )

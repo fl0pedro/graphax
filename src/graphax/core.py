@@ -648,6 +648,42 @@ def _drain_transforms(tensor, post_first: bool = True):
     return _pre(_post(tensor)) if post_first else _post(_pre(tensor))
 
 
+def _match_nominal_axes(d_shape, n_out, out_aval_shape, in_aval_shape):
+    """Axis permutation reordering a densified approx edge — one array axis per
+    logical dim, out dims first then primal dims — back to nominal
+    ``out_aval + in_aval`` order, matching WITHIN each side by logical size.
+
+    A flat reshape only RE-GROUPS axes; it cannot fix a free-dim PERMUTATION (the
+    ViT seq<->embed ``(17, 8)`` swap that surfaces as a transposed merge / a
+    ``17 vs 8`` contraction). When the densified rank matches nominal and each side
+    forms an UNAMBIGUOUS size-bijection with its aval (distinct sizes per side, the
+    ViT case), this returns the transpose that restores nominal order. Returns
+    ``None`` — caller falls back to the reshape/guard — when a side can't be matched
+    (rank/grouping change) or a size repeats within a side (size alone can't
+    disambiguate; risking a wrong transpose would be worse than the reshape)."""
+
+    def _bijection(axis_indices, target_sizes):
+        axes = list(axis_indices)
+        used, perm = set(), []
+        for s in target_sizes:
+            matches = [
+                k for k in axes if k not in used and int(d_shape[k]) == int(s)
+            ]
+            if len(matches) != 1:  # 0 = no axis of this size; >1 = ambiguous
+                return None
+            used.add(matches[0])
+            perm.append(matches[0])
+        return perm
+
+    out_perm = _bijection(range(n_out), out_aval_shape)
+    primal_perm = _bijection(range(n_out, len(d_shape)), in_aval_shape)
+    if out_perm is None or primal_perm is None:
+        return None
+    if len(out_perm) + len(primal_perm) != len(d_shape):
+        return None
+    return tuple(out_perm + primal_perm)
+
+
 def _normalize_approx_edge(edge, out_aval_shape, in_aval_shape):
     """Reconcile an approximation-bearing edge to its TRUE dense form at the
     NOMINAL logical shape ``out_aval + in_aval``.
@@ -695,6 +731,19 @@ def _normalize_approx_edge(edge, out_aval_shape, in_aval_shape):
         # needless densify on the clean fast path).
         return drained
     d = drained.dense()
+    if tuple(d.shape) != nominal:
+        # First restore nominal axis ORDER: dense() lays out one axis per logical
+        # dim (out dims then primal dims), so a free-dim PERMUTATION (the ViT
+        # seq<->embed (17,8) swap) leaves the array transposed relative to nominal.
+        # A flat reshape can only re-group, never reorder, so match each side's
+        # axes to the nominal axes by logical size and TRANSPOSE first; the reshape
+        # below then only has to regroup a residual size-1 split.
+        if d.ndim == len(nominal):
+            perm = _match_nominal_axes(
+                d.shape, len(drained.out_dims), out_aval_shape, in_aval_shape
+            )
+            if perm is not None and list(perm) != list(range(d.ndim)):
+                d = jnp.transpose(d, perm)
     if tuple(d.shape) != nominal:
         # ``dense()`` lays the array out out-side-first, so the reshape regroups
         # the out side into ``out_aval`` and the primal side into ``in_aval`` iff
@@ -820,6 +869,16 @@ def _eliminate_vertex(
     # Gates the approx-edge normalization below; ``transforms == ()`` (the EXACT
     # AD path) gives ``any([]) == False`` so that path stays byte-identical.
     _is_approx_cfg = any(isinstance(_t, (Diag, Compress)) for _t in transforms)
+    # GLOBAL approx flag: True for the whole elimination iff ANY vertex carries an
+    # approximation (set in ``vertex_elimination_jaxpr``). The merge below must
+    # reconcile an edge that was PERMUTED by an upstream approx vertex even when
+    # THIS vertex has no approx of its own (the policy approximates only some
+    # vertices) — so its layout normalization is gated on this global flag, not the
+    # per-vertex ``_is_approx_cfg``. Exact AD (no approx anywhere) leaves it False,
+    # so that path stays byte-identical.
+    from .sparse.elemental.dispatch import approx_active
+
+    _approx_elim = approx_active()
 
     for central_var in eqn.outvars:
         if central_var not in graph:
@@ -943,7 +1002,7 @@ def _eliminate_vertex(
                 # non-nominal free-dim order must be reconciled to nominal FIRST.
                 # ``_is_approx_cfg`` is statically False on the EXACT-AD path, so
                 # the no-approximation edge is byte-identical.
-                if _is_approx_cfg and graph.get(in_edge).get(out_edge) is not None:
+                if _approx_elim and graph.get(in_edge).get(out_edge) is not None:
                     edge_outval = _normalize_approx_edge(
                         edge_outval, out_edge.aval.shape, in_edge.aval.shape
                     )
@@ -960,6 +1019,15 @@ def _eliminate_vertex(
                     _assert_sparse_tensor_consistency(edge_outval)
 
                     _edge = _drain_transforms(_edge)
+                    # The new edge_outval was reconciled to nominal layout above,
+                    # but the EXISTING edge can be in a different (permuted) natural
+                    # order — under an approximation the two contraction paths feed
+                    # the merge in mismatched layouts (the ViT seq/embed swap). Bring
+                    # the existing edge to the same nominal layout so the add aligns.
+                    if _approx_elim:
+                        _edge = _normalize_approx_edge(
+                            _edge, out_edge.aval.shape, in_edge.aval.shape
+                        )
                     _assert_sparse_tensor_consistency(_edge)
 
                     # Check if the computed edge Jacobian shapes actually match
