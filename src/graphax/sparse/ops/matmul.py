@@ -1805,6 +1805,78 @@ def __getattr__(name: str):
 
 
 # --- Main dispatcher ------------------------------------------------------
+def _reconcile_permuted_val(tensor):
+    """Restore the layout invariant ``val.shape[dim.axis] == dim.size`` (and
+    ``val.shape[dim.block_axis] == dim.block_size``) when an upstream
+    Diag / Compress / transpose left a tensor whose dim METADATA disagrees with
+    its physical ``val`` axis order — the ViT seq(17)/embed(32) swap (bug-doc
+    Class 3b: an ``Incompatible types for broadcasting`` raised in the tiled
+    contraction kernel / elemental densify because the kernel lays ``val`` out
+    by ``dim.axis`` yet builds its target shape from ``dim.size``).
+
+    ``dim.id`` / ``dim.size`` are the LOGICAL truth the id-based contraction and
+    the result dims rely on; ``dim.axis`` is only a pointer into ``val``. When a
+    pointer lands on a val axis whose extent != the dim's size, the data the dim
+    OWNS lives at the (unique) val axis whose extent DOES match — a permutation
+    of the materialized axes. We transpose ``val`` so each dim's ``axis`` again
+    holds its own data (matching by extent), keeping every ``dim.axis`` pointer
+    valid so the downstream ``_prepare_physical_array`` gather lines up.
+
+    No-op (returns ``tensor`` unchanged, so byte-identical) whenever the
+    invariant already holds — which is always true on the EXACT-AD path
+    (``transforms=()`` never permutes dims). Bails (returns unchanged) when the
+    mismatched axes' extents are not an UNAMBIGUOUS permutation of the dims'
+    expected extents (a repeated size among the unmatched axes can't be
+    disambiguated by extent alone — better to let the existing strict shape
+    check fire than to risk a mis-laid-out Jacobian)."""
+    val = tensor.val
+    if val is None:
+        return tensor
+    ndim = val.ndim
+    # Desired extent at each materialized val axis, from the dim metadata.
+    want = {}
+    ok = True
+    for d in tensor.dims:
+        if d.axis is not None and d.axis < ndim:
+            want[d.axis] = int(d.size)
+            if int(val.shape[d.axis]) != int(d.size):
+                ok = False
+        if d.is_sparse and d.block_axis is not None and d.block_axis < ndim:
+            bs = int(d.block_size or 1)
+            want[d.block_axis] = bs
+            if int(val.shape[d.block_axis]) != bs:
+                ok = False
+    if ok:
+        return tensor  # invariant already holds — no-op (EXACT path included)
+    # Constrained axes whose extents already match keep their position; the
+    # mismatched ones are re-matched to the source axis carrying their extent.
+    perm = list(range(ndim))
+    used, pending = set(), []
+    for a in want:
+        if int(val.shape[a]) == want[a]:
+            perm[a] = a
+            used.add(a)
+        else:
+            pending.append(a)
+    # A size that repeats among the still-unmatched axes can't be disambiguated
+    # by extent alone — bail rather than risk a wrong (mis-laid-out) transpose.
+    pend_sizes = [want[t] for t in pending]
+    if len(set(pend_sizes)) != len(pend_sizes):
+        return tensor
+    free = [a for a in want if a not in used]
+    for t in pending:
+        match = next(
+            (s for s in free if s not in used and int(val.shape[s]) == want[t]), None
+        )
+        if match is None:
+            return tensor  # not a clean permutation — leave for the strict check
+        perm[t] = match
+        used.add(match)
+    if perm == list(range(ndim)):
+        return tensor
+    return tensor.copy(val=val.transpose(perm))
+
+
 def _normalize_inputs(lhs, rhs):
     """Convert array operands to ``SparseTensor`` and pre-densify any
     compressed Index dims. Pure shape / structure prep — no actual matmul
@@ -1820,6 +1892,13 @@ def _normalize_inputs(lhs, rhs):
     from .utils import _materialize_for_op
     lhs = _materialize_for_op(lhs)
     rhs = _materialize_for_op(rhs)
+    # Class 3b: an approx transform can leave a dim whose physical ``val`` axis
+    # order disagrees with its ``size`` metadata (the ViT seq/embed swap). Both
+    # the tiled kernel and the elemental densify lay ``val`` out by ``dim.axis``
+    # but size it by ``dim.size``, so a swap broadcasts mismatched operands.
+    # Reconcile here, before either path — a strict no-op on the EXACT-AD path.
+    lhs = _reconcile_permuted_val(lhs)
+    rhs = _reconcile_permuted_val(rhs)
     # Mixed-precision upcast: a narrow (Quant) val and a float val have no
     # implicit promotion path, so dot_general would raise; combine both at
     # their highest common compute dtype. No-op when dtypes already match.
