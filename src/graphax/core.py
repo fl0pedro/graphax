@@ -2060,6 +2060,24 @@ def extract_jaxpr(
             # Flatten so the resulting jaxpr has all jacobians as outputs.
             return tuple(jtu.tree_leaves(res))
 
+        # APPEND-ONLY STATE tokenization (opt-in via GRAPHAX_STATE_TOKENS=1):
+        # skip the per-step Jacobian RE-TRACE entirely. The token stream becomes
+        # <original-graph tokens> | <elimination-order prefix>, which is a pure
+        # prefix-extension step to step (incrementally cacheable) and a lossless
+        # encoding of the partial-elimination state (original graph + order are a
+        # sufficient statistic). This also avoids the expensive make_jaxpr trace.
+        import os as _os
+        if _os.environ.get("GRAPHAX_STATE_TOKENS", "0") == "1":
+            # Pass the per-vertex micro-actions (DIAG/COMPRESS/QUANT) too, so
+            # the state stream losslessly encodes the APPROXIMATED state, not
+            # just the exact elimination order. ``_transforms`` is already the
+            # normalised ((vertex, (transform_obj, ...)), ...) structure.
+            ve_jaxpr = VEJaxpr(jaxpr, elim_order=_order, transforms=_transforms)
+            if ENABLE_CACHE:
+                with _topology_lock:
+                    _topology_cache[cache_key] = ve_jaxpr
+            return ve_jaxpr
+
         dummy_args = [
             ShapeDtypeStruct(v.aval.shape, v.aval.dtype)
             for i, v in enumerate(jaxpr.invars)
