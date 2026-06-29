@@ -43,6 +43,7 @@ import jax.numpy as jnp
 
 from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex, CompressedIndex
 from graphax.sparse.tensor import SparseTensor, _apply_block_diagonal
+from graphax.sparse.dtype_compute import _scaled_mul
 
 
 # ---------------------------------------------------------------------------
@@ -387,11 +388,40 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
     new_out = tuple(_remap(d) for d in st.out_dims)
     new_primal = tuple(_remap(d) for d in st.primal_dims)
 
+    new_scalar_mult = st.scalar_mult
+    # FULL-REDUCTION CANONICALIZATION. When the reduction drops EVERY physical
+    # axis the result is a 0-dim ``val`` scalar — the tensor is now uniform
+    # (every logical cell equals that one reduced value). The bare 0-dim-``val``
+    # form is non-canonical: ``.dense()`` would broadcast ``_scaled_mul(val,
+    # scalar_mult)`` up, leaving a dangling rank-0 array where the canonical
+    # "uniform grid" representation is ``val=None`` with the uniform magnitude
+    # carried by ``scalar_mult`` (see ``dense_for_matmul``'s ``val is None``
+    # fast path: it returns ``broadcast_to(scalar_mult * 1.0, shape)``). Fold
+    # the reduced scalar into ``scalar_mult`` and set ``val=None``:
+    #     new_scalar_mult = scalar_mult * reduced_scalar
+    # so ``.dense()`` reconstructs EXACTLY the same uniform tensor the 0-dim
+    # path densified (scalar_mult * reduced_scalar, broadcast) — a clean
+    # canonicalization, not a behaviour change.
+    #
+    # Guard: only fold to ``val=None`` when NO sparse dim remains. ``val=None``
+    # is read by ``_structural_val_size`` / ``dense()`` as an all-ones grid
+    # whose stored size divides out each sparse pair's meta count; a tensor
+    # that still carries a Diagonal pair would mis-densify under that reading.
+    # The COMPRESS guard already forbids dropping a sparse dim's structural
+    # block_axis, so a tensor with sparse dims cannot legitimately reach a
+    # 0-dim val here — but keep the bare scalar val for that case rather than
+    # silently corrupt it.
+    if new_val is not None and new_val.ndim == 0 and not any(
+        d.is_sparse for d in (*new_out, *new_primal)
+    ):
+        new_scalar_mult = _scaled_mul(st.scalar_mult, new_val)
+        new_val = None
+
     return SparseTensor(
         new_out,
         new_primal,
         new_val,
-        scalar_mult=st.scalar_mult,
+        scalar_mult=new_scalar_mult,
         fill_value=st.fill_value,
         # Forward the deferred-transform queues (the bare constructor defaults
         # them to ()): dropping them silently erases pending reshape/slice/...
@@ -431,7 +461,7 @@ def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
         st.primal_dims,
         st.val.astype(target),
         scalar_mult=st.scalar_mult,
-        fill_value=st.fill_value,
+        fill_value=st.fill_value,        fill_value=st.fill_value,
         # The cast is shape-preserving, so any deferred Jacobian transform queued
         # on this edge (a reshape/slice/concatenate relabel awaiting drain) must
         # ride along — dropping it leaves ``val`` at its pre-drain shape and later
