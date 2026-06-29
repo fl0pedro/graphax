@@ -440,6 +440,37 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Scaled-quant dtype helpers
+# ---------------------------------------------------------------------------
+
+# Integer / unsigned / sub-byte targets get SCALED quantization (a per-tensor
+# float scale folded into scalar_mult). Everything else (float8/float4/bf16/
+# fp16/fp32/fp64/complex/bool) keeps a plain astype.
+def _is_scaled_quant_target(target) -> bool:
+    name = jnp.dtype(target).name
+    if name == "bool":
+        return False
+    return name.startswith("int") or name.startswith("uint")
+
+
+def _int_dtype_range(target) -> tuple[int, int]:
+    """(min, max) representable integer values for an int/uint target, including
+    the sub-byte ints (int2/int4/uint2/uint4) which JAX exposes via iinfo even
+    though they are stored in an int8/uint8 container."""
+    ii = jnp.iinfo(jnp.dtype(target))
+    return int(ii.min), int(ii.max)
+
+
+def _int_dtype_max(target) -> float:
+    """Symmetric positive scale denominator: the largest representable
+    magnitude of the target (``iinfo.max``). For signed ints this is the
+    positive arm (e.g. int8 -> 127, int4 -> 7, int2 -> 1); for unsigned it is
+    the full max (uint8 -> 255). Guaranteed >= 1 so the scale is well-defined."""
+    ii = jnp.iinfo(jnp.dtype(target))
+    return float(max(int(ii.max), 1))
+
+
 def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
     """Cast ``st.val`` to ``action.dtype``.
 
@@ -456,12 +487,55 @@ def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
     target = jnp.dtype(action.dtype)
     if st.val.dtype == target:
         return st
+
+    new_val = st.val
+    new_scalar_mult = st.scalar_mult
+    if _is_scaled_quant_target(target):
+        # SCALED PER-TENSOR QUANTIZATION (int / uint / sub-byte targets).
+        # A bare ``val.astype(int8)`` TRUNCATES every fractional Jacobian entry
+        # toward zero — a |J|<1 Jacobian collapses to all-zeros (the cossim-0
+        # degenerate). Instead store a symmetric per-tensor scale ``s`` and the
+        # rounded integer codes, folding ``s`` into ``scalar_mult`` so every
+        # downstream consumer auto-dequantizes (``.dense()`` / matmul /
+        # elementwise all apply ``scalar_mult`` to ``val`` before arithmetic —
+        # verified: no consumer reads ``val`` as a value without scalar_mult):
+        #     s   = max(|val|) / dtype_max(target)        # symmetric scale
+        #     q   = round(val / s).astype(target)         # integer codes
+        #     sm' = scalar_mult * s                        # val*sm' ~= val
+        # All-zero ``val`` -> s would be 0; guard to a plain astype no-op
+        # (the zeros quantize to zeros, scalar_mult unchanged).
+        absmax = jnp.max(jnp.abs(st.val))
+        dmax = _int_dtype_max(target)
+        s = absmax / dmax
+        # When val is all-zero (absmax==0) keep s=1 so we don't divide by 0 and
+        # the codes stay zeros; scalar_mult is then multiplied by 1 (no-op).
+        s_safe = jnp.where(s > 0, s, jnp.ones_like(s))
+        q = jnp.round(st.val.astype(jnp.float32) / s_safe)
+        # Clamp to the representable symmetric range before the narrow cast so a
+        # round-half-away rounding at the extreme can't wrap (e.g. round to +128
+        # for int8). Sub-byte ints are stored in an int8/uint8 container but the
+        # logical range is narrower, so clamp to [-dmax-?, dmax]; use the true
+        # iinfo range of the target's logical dtype.
+        lo, hi = _int_dtype_range(target)
+        # ``q`` is float32; clip with FLOAT bounds. Passing the raw Python ints
+        # (e.g. int64's -9.2e18) as jit args overflows JAX's argument parser
+        # ("OverflowError ... argument path is min"). float() bounds are finite
+        # and exact enough for the clamp (the scale already keeps |q| <= dmax).
+        q = jnp.clip(q, jnp.float32(lo), jnp.float32(hi))
+        new_val = q.astype(target)
+        new_scalar_mult = _scaled_mul(st.scalar_mult, s_safe)
+    else:
+        # Float targets (bfloat16 / float16 / float8_* / float4 / complex) carry
+        # a fraction natively — a plain astype preserves relative magnitudes, so
+        # no scale is needed (and ``bool`` has no meaningful scaled form).
+        new_val = st.val.astype(target)
+
     return SparseTensor(
         st.out_dims,
         st.primal_dims,
-        st.val.astype(target),
-        scalar_mult=st.scalar_mult,
-        fill_value=st.fill_value,        fill_value=st.fill_value,
+        new_val,
+        scalar_mult=new_scalar_mult,
+        fill_value=st.fill_value,
         # The cast is shape-preserving, so any deferred Jacobian transform queued
         # on this edge (a reshape/slice/concatenate relabel awaiting drain) must
         # ride along — dropping it leaves ``val`` at its pre-drain shape and later
