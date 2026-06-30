@@ -171,13 +171,13 @@ def _implicit_constant(
     surviving free dim (logical order), with ``scalar_mult`` folded in.  Any
     OTHER implicit free dim of the operand (also ``axis=None``) is broadcast in
     as a singleton then expanded to its logical size — only the genuinely-present
-    val axes are physical.  ``val is None`` (uniform ones) yields a ones buffer.
+    val axes are physical.  ``val is None`` (uniform) yields a ``scalar_mult * ones`` buffer.
     """
     free_dims = [d for d in st.dims if d.id != implicit_dim.id]
 
     if st.val is None:
         free_sizes = tuple(d.logical_size for d in free_dims)
-        c = jnp.ones(free_sizes, dtype=st.dtype)
+        c = _scaled_mul(jnp.ones(free_sizes, dtype=st.dtype), st.scalar_mult)
         return c, free_dims
 
     val = _scaled_mul(st.val, st.scalar_mult)
