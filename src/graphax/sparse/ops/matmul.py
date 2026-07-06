@@ -1644,6 +1644,78 @@ def _pad_axis_to(arr, axis: int, size: int, fill):
     return jnp.concatenate([arr, pad], axis=axis)
 
 
+# --- Both-implicit contracting-pair analytic fold (GRAPHAX_KEEP_BLOCKDIAG) -----
+import os as _os
+_KEEP_BLOCKDIAG_MM = _os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "1") != "0"
+
+
+def _both_implicit_contract_pairs(lhs, rhs):
+    """Contracting pairs where BOTH dims are IMPLICIT (``axis is None``, no stored
+    physical axis) and share the same logical size N. Contracting a broadcast axis
+    of length N is a reduce of N identical products => a scale-by-N: we drop the
+    pair from the dot_general and fold N into the result ``scalar_mult`` (no op).
+
+    Returns ``(pairs, factor)`` where ``pairs`` is the list of matched
+    ``(lhs_primal_dim, rhs_out_dim)`` and ``factor`` is the product of their Ns."""
+    if not (hasattr(lhs, "primal_dims") and hasattr(rhs, "out_dims")):
+        return [], 1
+    pairs = []
+    factor = 1
+    for l, r in _align_contract_dims(lhs.primal_dims, rhs.out_dims, embed=True):
+        l_impl = getattr(l, "axis", "x") is None and getattr(l, "block_axis", None) is None
+        r_impl = getattr(r, "axis", "x") is None and getattr(r, "block_axis", None) is None
+        n_l, n_r = int(l.logical_size), int(r.logical_size)
+        if l_impl and r_impl and n_l == n_r and n_l > 1 and not getattr(l, "is_sparse", False) and not getattr(r, "is_sparse", False):
+            pairs.append((l, r))
+            factor *= n_l
+    return pairs, factor
+
+
+def _fold_both_implicit(lhs, rhs, count):
+    """Analytic scale-by-N for every BOTH-IMPLICIT contracting pair (no
+    materialization, no dot_general over the broadcast axis). Drop the paired
+    implicit dims from ``lhs.primal`` / ``rhs.out`` and multiply the reduced
+    contraction's result ``scalar_mult`` by the product of their sizes. Composes
+    with any existing (non-unit / quantized) ``scalar_mult`` — it MULTIPLIES.
+
+    Returns the folded result (recurses through ``matmul`` on the reduced
+    operands) or ``None`` when there is no both-implicit pair to fold."""
+    from graphax.sparse.tensor import SparseTensor
+
+    pairs, factor = _both_implicit_contract_pairs(lhs, rhs)
+    if not pairs:
+        return None
+    drop_l = {id(l) for l, _ in pairs}
+    drop_r = {id(r) for _, r in pairs}
+    # Rebuild each operand without the dropped implicit dims. Physical axes are
+    # unaffected (implicit dims carry none), so ``val`` and every remaining dim's
+    # ``axis`` stay valid — only the dim lists shrink.
+    new_lhs = SparseTensor(
+        lhs.out_dims,
+        tuple(d for d in lhs.primal_dims if id(d) not in drop_l),
+        lhs.val,
+        scalar_mult=lhs.scalar_mult,
+        fill_value=lhs.fill_value,
+        check_consistency=False,
+    )
+    new_rhs = SparseTensor(
+        tuple(d for d in rhs.out_dims if id(d) not in drop_r),
+        rhs.primal_dims,
+        rhs.val,
+        scalar_mult=rhs.scalar_mult,
+        fill_value=rhs.fill_value,
+        check_consistency=False,
+    )
+    res = matmul(new_lhs, new_rhs, count=count)
+    if count:
+        out, cnt = res
+    else:
+        out = res
+    fac = jnp.asarray(factor, dtype=out.scalar_mult.dtype)
+    out = out.copy(scalar_mult=out.scalar_mult * fac)
+    return (out, cnt) if count else out
+
+
 # --- Late-densification escape hatch for non-zero fill_value --------------
 def _matmul_via_densify(lhs, rhs):
     """Late-densification matmul for SparseTensors with non-zero ``fill_value``.
@@ -1991,6 +2063,14 @@ def matmul(lhs, rhs, count: bool = False):
     # the EXACT-AD (transforms=()) edge never enters here and stays byte-
     # identical. Built with the canonical output-id convention so a downstream
     # multi-edge / all-vertices contraction aligns by id.
+    # Both-implicit contracting pair -> analytic scale-by-N folded into
+    # scalar_mult (no dot_general over the broadcast axis, no materialization).
+    if _KEEP_BLOCKDIAG_MM:
+        _folded = _fold_both_implicit(lhs, rhs, count)
+        if _folded is not None:
+            _record_path("both_implicit_fold")
+            return _folded
+
     from graphax.sparse.elemental.dispatch import try_elemental_matmul
 
     _elem = try_elemental_matmul(lhs, rhs, count=count)
