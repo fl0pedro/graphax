@@ -114,7 +114,8 @@ if TYPE_CHECKING:
 # elimination contracts through the batched block-diagonal (GEMM) kernels instead
 # of a full N x N dense matmul. Requires the idempotent re-mask below to stay sound.
 import os as _os
-_KEEP_BLOCKDIAG = _os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "0") == "1"
+# Default ON; set GRAPHAX_KEEP_BLOCKDIAG=0 to force the legacy densify path.
+_KEEP_BLOCKDIAG = _os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "1") != "0"
 
 
 # --------------------------------------------------------------------------- #
@@ -172,12 +173,20 @@ def produce_diag(
     # of raising "must be a plain DenseIndex" (which upstream catches and SKIPS,
     # silently under-masking). Only a MATCHING coupled pair short-circuits.
     if _KEEP_BLOCKDIAG and (di.is_sparse or dj.is_sparse):
+        # Short-circuit ONLY when (i, j) is ALREADY exactly the coupled pair this
+        # same produce_diag(factor) would create (cross-linked other_id, meta size
+        # == factor, each side block == N // factor) -> re-masking is a provable
+        # no-op. Any other sparse structure falls through to the raise below.
+        exp_bi = max(di.logical_size // factor, 1) if factor else 0
+        exp_bj = max(dj.logical_size // factor, 1) if factor else 0
         coupled = (
             di.is_sparse and dj.is_sparse
             and getattr(di, "other_id", None) == dj.id
             and getattr(dj, "other_id", None) == di.id
             and getattr(di, "size", None) == factor
             and getattr(dj, "size", None) == factor
+            and (getattr(di, "block_size", None) or 1) == exp_bi
+            and (getattr(dj, "block_size", None) or 1) == exp_bj
         )
         if coupled:
             return st

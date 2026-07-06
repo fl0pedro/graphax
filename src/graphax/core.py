@@ -688,7 +688,9 @@ def _match_nominal_axes(d_shape, n_out, out_aval_shape, in_aval_shape):
 # through the per-vertex reconciliation so its next contraction hits the batched
 # block-diagonal (GEMM) kernel rather than a full N x N densify. Sound only with
 # the idempotent produce_diag re-mask (see produce_diag._KEEP_BLOCKDIAG).
-_KEEP_BLOCKDIAG = os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "0") == "1"
+# Default ON: the sparse block-diagonal (batched-GEMM) path is the default; set
+# GRAPHAX_KEEP_BLOCKDIAG=0 to force the legacy densify path (regression/debug).
+_KEEP_BLOCKDIAG = os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "1") != "0"
 
 
 def _is_pure_blockdiag(edge) -> bool:
@@ -705,6 +707,26 @@ def _is_pure_blockdiag(edge) -> bool:
         if getattr(d, "is_sparse", False):
             has_diag = True
     return has_diag
+
+
+def _blockdiag_addable(a, b) -> bool:
+    """True iff two edges are BOTH pure block-diagonal with a matching dim
+    structure (same id / sparsity / block_size / meta per position) so their
+    SparseTensor ``+`` stays block-sparse — no need to densify the merge."""
+    if not (_is_pure_blockdiag(a) and _is_pure_blockdiag(b)):
+        return False
+    da, db = getattr(a, "dims", None), getattr(b, "dims", None)
+    if da is None or db is None or len(da) != len(db):
+        return False
+    for x, y in zip(da, db):
+        if (
+            getattr(x, "id", None) != getattr(y, "id", None)
+            or bool(getattr(x, "is_sparse", False)) != bool(getattr(y, "is_sparse", False))
+            or (getattr(x, "block_size", None) or 1) != (getattr(y, "block_size", None) or 1)
+            or getattr(x, "size", None) != getattr(y, "size", None)
+        ):
+            return False
+    return True
 
 
 def _normalize_approx_edge(edge, out_aval_shape, in_aval_shape):
@@ -1026,9 +1048,18 @@ def _eliminate_vertex(
                 # ``_is_approx_cfg`` is statically False on the EXACT-AD path, so
                 # the no-approximation edge is byte-identical.
                 if _approx_elim and graph.get(in_edge).get(out_edge) is not None:
-                    edge_outval = _normalize_approx_edge(
-                        edge_outval, out_edge.aval.shape, in_edge.aval.shape
-                    )
+                    # KEEP_BLOCKDIAG: if BOTH the new and existing edge are matching
+                    # pure block-diagonals, their SparseTensor + stays block-sparse
+                    # (verified block-wise add), so skip the merge densify. Otherwise
+                    # normalize to nominal so the + aligns (the load-bearing case).
+                    _existing_bd = _force(transpose_graph[out_edge][in_edge])
+                    if not (
+                        _KEEP_BLOCKDIAG
+                        and _blockdiag_addable(edge_outval, _existing_bd)
+                    ):
+                        edge_outval = _normalize_approx_edge(
+                            edge_outval, out_edge.aval.shape, in_edge.aval.shape
+                        )
 
                 _assert_sparse_tensor_consistency(edge_outval)
                 # If there is already an edge between the two vertices, add the new
@@ -1047,7 +1078,9 @@ def _eliminate_vertex(
                     # order — under an approximation the two contraction paths feed
                     # the merge in mismatched layouts (the ViT seq/embed swap). Bring
                     # the existing edge to the same nominal layout so the add aligns.
-                    if _approx_elim:
+                    if _approx_elim and not (
+                        _KEEP_BLOCKDIAG and _blockdiag_addable(edge_outval, _edge)
+                    ):
                         _edge = _normalize_approx_edge(
                             _edge, out_edge.aval.shape, in_edge.aval.shape
                         )
