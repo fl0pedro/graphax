@@ -173,23 +173,36 @@ def produce_diag(
     # of raising "must be a plain DenseIndex" (which upstream catches and SKIPS,
     # silently under-masking). Only a MATCHING coupled pair short-circuits.
     if _KEEP_BLOCKDIAG and (di.is_sparse or dj.is_sparse):
-        # Short-circuit ONLY when (i, j) is ALREADY exactly the coupled pair this
-        # same produce_diag(factor) would create (cross-linked other_id, meta size
-        # == factor, each side block == N // factor) -> re-masking is a provable
-        # no-op. Any other sparse structure falls through to the raise below.
-        exp_bi = max(di.logical_size // factor, 1) if factor else 0
-        exp_bj = max(dj.logical_size // factor, 1) if factor else 0
-        coupled = (
+        # (i, j) is already a coupled block-diagonal (the keep-sparse re-mask path).
+        # Three sub-cases against the CURRENT meta count ``cur_meta`` (its nblocks):
+        #   * factor == cur_meta            -> identical structure: no-op (return st)
+        #   * factor >  cur_meta, divisor   -> FINER blocks: subdivide each current
+        #       block into (factor // cur_meta) meta-diagonal sub-blocks (keeps the
+        #       block-diagonal sparse, no densify). "divisor" = the new block size
+        #       divides the current block size, i.e. factor is a MULTIPLE of cur_meta
+        #       AND factor | logical_size.
+        #   * anything else (non-multiple / coarser / non-divisor block) falls
+        #       through to the raise (a non-nestable re-mask; correctness over a
+        #       silent wrong structure).
+        cur_meta = getattr(di, "size", None)
+        both_coupled = (
             di.is_sparse and dj.is_sparse
             and getattr(di, "other_id", None) == dj.id
             and getattr(dj, "other_id", None) == di.id
-            and getattr(di, "size", None) == factor
-            and getattr(dj, "size", None) == factor
-            and (getattr(di, "block_size", None) or 1) == exp_bi
-            and (getattr(dj, "block_size", None) or 1) == exp_bj
+            and getattr(dj, "size", None) == cur_meta
         )
-        if coupled:
+        if both_coupled and cur_meta == factor:
             return st
+        if (
+            both_coupled
+            and factor > cur_meta
+            and cur_meta and factor % cur_meta == 0
+            and di.logical_size % factor == 0
+            and dj.logical_size % factor == 0
+        ):
+            return _subdivide_blockdiag(
+                st, is_out_i, rel_i, di, is_out_j, rel_j, dj, factor
+            )
 
     if di.is_sparse or di.is_compressed:
         raise ValueError(
@@ -258,6 +271,108 @@ def produce_diag(
     return _rebuild(
         st, is_out_i, rel_i, is_out_j, rel_j, new_di, new_dj, new_val,
         old_ax_i=ax_i, old_ax_j=ax_j,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Divisor subdivision of an existing coupled block-diagonal (GRAPHAX_KEEP_BLOCKDIAG)
+# --------------------------------------------------------------------------- #
+def _subdivide_blockdiag(st, is_out_i, rel_i, di, is_out_j, rel_j, dj, factor):
+    """Subdivide an ALREADY coupled block-diagonal ``(di, dj)`` pair into ``factor``
+    (a MULTIPLE of the current meta count) finer meta-diagonal blocks.
+
+    Current pair: meta ``N = di.size`` with per-side blocks ``bi`` / ``bj`` stored
+    as a shared meta axis + two block axes. Let ``k = factor // N`` (``k | bi`` and
+    ``k | bj``). Each ``bi x bj`` block is further block-diagonalised into ``k``
+    meta-diagonal ``bi' x bj'`` sub-blocks. New meta axis is ``N * k = factor``.
+    Byte-identical to producing ``factor`` blocks straight from dense.
+
+    ``val is None`` stays ``val is None`` (finer meta-diagonal of ones is still
+    all-ones diagonal blocks). Pure reshape + one ``eye``-einsum on the block axes.
+    """
+    from graphax.sparse.tensor import SparseTensor
+
+    N = di.size
+    k = factor // N
+    bi = di.block_size or 1
+    bj = dj.block_size or 1
+    if bi % k != 0 or bj % k != 0:
+        raise ValueError(
+            f"produce_diag: cannot subdivide block sizes ({bi}, {bj}) by k={k} "
+            f"(factor={factor} over current meta={N}); block must be divisible."
+        )
+    bi2, bj2 = bi // k, bj // k
+
+    if st.val is None:
+        new_di, new_dj = _diag_pair(
+            di, dj, factor, bi2, bj2,
+            axis=di.axis, bi_axis=di.block_axis, bj_axis=dj.block_axis,
+        )
+        return _rebuild_replace_pair(
+            st, is_out_i, rel_i, is_out_j, rel_j, new_di, new_dj, None
+        )
+
+    val = st.val
+    meta_ax = di.axis if di.axis is not None else dj.axis
+    bi_ax = di.block_axis
+    bj_ax = dj.block_axis
+    moved = [a for a in (meta_ax, bi_ax, bj_ax) if a is not None]
+    rest = [a for a in range(val.ndim) if a not in moved]
+    v = jnp.transpose(val, moved + rest)
+    rest_shape = list(v.shape[len(moved):])
+    v = v.reshape([N, k, bi2, k, bj2] + rest_shape)
+    eye = jnp.eye(k, dtype=v.dtype)
+    sub = jnp.einsum("gi,gj,nirjc...->ngrc...", eye, eye, v)
+    new_val = sub.reshape([N * k, bi2, bj2] + rest_shape)
+    new_di, new_dj = _diag_pair(
+        di, dj, factor, bi2, bj2,
+        axis=0, bi_axis=1 if bi2 > 1 else None, bj_axis=2 if bj2 > 1 else None,
+    )
+    return _rebuild_replace_pair(
+        st, is_out_i, rel_i, is_out_j, rel_j, new_di, new_dj, new_val,
+        old_layout_front=(meta_ax, bi_ax, bj_ax),
+    )
+
+
+def _rebuild_replace_pair(st, is_out_i, rel_i, is_out_j, rel_j, new_di, new_dj,
+                          new_val, *, old_layout_front=None):
+    """Rebuild swapping the (i, j) coupled pair for the subdivided pair; when
+    ``new_val`` was re-laid-out (meta, bi, bj to the front) remap every untouched
+    dim's physical axis to its new position (front axes then rest at n_front..)."""
+    from dataclasses import replace as _replace
+    from graphax.sparse.tensor import SparseTensor
+
+    remap = new_val is not None and old_layout_front is not None
+    if remap:
+        meta_ax, bi_ax, bj_ax = old_layout_front
+        moved = [a for a in (meta_ax, bi_ax, bj_ax) if a is not None]
+        n_front = len(moved)
+
+        def _new_axis(p):
+            if p is None:
+                return None
+            n_before = sum(1 for a in range(p) if a not in moved)
+            return n_front + n_before
+
+    def _map(d, slot_is_out, slot_rel):
+        if slot_is_out == is_out_i and slot_rel == rel_i:
+            return new_di
+        if slot_is_out == is_out_j and slot_rel == rel_j:
+            return new_dj
+        if not remap:
+            return d
+        na = _new_axis(getattr(d, "axis", None))
+        if d.is_sparse:
+            nb = _new_axis(getattr(d, "block_axis", None))
+            return _replace(d, axis=na, block_axis=nb)
+        return _replace(d, axis=na)
+
+    new_out = tuple(_map(d, True, p) for p, d in enumerate(st.out_dims))
+    new_primal = tuple(_map(d, False, p) for p, d in enumerate(st.primal_dims))
+    return SparseTensor(
+        new_out, new_primal, new_val,
+        scalar_mult=st.scalar_mult, fill_value=st.fill_value,
+        check_consistency=False,
     )
 
 

@@ -42,8 +42,13 @@ from typing import Callable, Sequence, Union
 import jax.numpy as jnp
 
 from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex, CompressedIndex
-from graphax.sparse.tensor import SparseTensor, _apply_block_diagonal
+from graphax.sparse.tensor import SparseTensor, _apply_block_diagonal, _subdivide_coupled_blockdiag
 from graphax.sparse.dtype_compute import _scaled_mul
+
+import os as _os
+# Default ON; set GRAPHAX_KEEP_BLOCKDIAG=0 to force the legacy densify path.
+_KEEP_BLOCKDIAG = _os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "1") != "0"
+
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +238,54 @@ def apply_diag(st: SparseTensor, action: Diag) -> SparseTensor:
 
     N1, N2 = d1.logical_size, d2.logical_size
     factor = action.factor
+
+    # GRAPHAX_KEEP_BLOCKDIAG: (i, j) may ALREADY be a coupled block-diagonal (the
+    # keep-sparse re-mask path). Re-masking rules against the CURRENT meta count:
+    #   * factor == cur_meta        -> identical structure: no-op.
+    #   * factor  > cur_meta, and factor is a MULTIPLE of cur_meta AND divides both
+    #     logical sizes -> FINER blocks: subdivide each current block into
+    #     (factor // cur_meta) meta-diagonal sub-blocks (stays block-sparse).
+    #   * anything else (coarser / non-multiple / non-divisor block) -> raise
+    #     (a non-nestable re-mask; correctness over a silent wrong structure).
+    if _KEEP_BLOCKDIAG and d1.is_sparse and d2.is_sparse:
+        coupled = (
+            getattr(d1, "other_id", None) == d2.id
+            and getattr(d2, "other_id", None) == d1.id
+            and getattr(d1, "size", None) == getattr(d2, "size", None)
+        )
+        cur_meta = getattr(d1, "size", None)
+        if coupled and cur_meta == factor:
+            return st
+        if (
+            coupled
+            and cur_meta
+            and factor > cur_meta
+            and factor % cur_meta == 0
+            and N1 % factor == 0
+            and N2 % factor == 0
+        ):
+            return _subdivide_coupled_blockdiag(
+                st, is_out1, rel_i, d1, is_out2, rel_j, d2, factor
+            )
+        # Coupled but NOT same-factor and NOT a valid finer subdivision (coarser,
+        # non-multiple, or non-divisor block). This is a non-nestable re-mask: the
+        # legacy path would silently return st unchanged (v1==v2 no-op) => UNDER-mask.
+        # Reject explicitly so the caller drops it rather than applying a wrong
+        # (lighter) approximation. The implicit pure-diagonal pair (axis is None) is
+        # NOT rejected here — it is handled as a genuine no-op just below.
+        if (
+            coupled
+            and factor != cur_meta
+            and getattr(d1, "axis", None) is not None
+            and getattr(d2, "axis", None) is not None
+        ):
+            raise ValueError(
+                f"Diag: cannot re-mask a coupled block-diagonal (meta={cur_meta}) "
+                f"by factor={factor}: not the same factor and not a finer divisor "
+                f"subdivision (factor must be a multiple of the current meta and "
+                f"divide both logical sizes)."
+            )
+
     if N1 % factor != 0 or N2 % factor != 0:
         raise ValueError(
             f"Diag.factor = {factor} does not divide both logical sizes "
