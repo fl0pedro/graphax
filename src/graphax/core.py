@@ -684,6 +684,29 @@ def _match_nominal_axes(d_shape, n_out, out_aval_shape, in_aval_shape):
     return tuple(out_perm + primal_perm)
 
 
+# GRAPHAX_KEEP_BLOCKDIAG=1: keep a pure block-diagonal (Diag) approx edge SPARSE
+# through the per-vertex reconciliation so its next contraction hits the batched
+# block-diagonal (GEMM) kernel rather than a full N x N densify. Sound only with
+# the idempotent produce_diag re-mask (see produce_diag._KEEP_BLOCKDIAG).
+_KEEP_BLOCKDIAG = os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "0") == "1"
+
+
+def _is_pure_blockdiag(edge) -> bool:
+    """True iff edge carries >=1 meta-block-diagonal (Diagonal) dim and NO
+    compressed/implicit dim — a residual structure the batched block-diagonal
+    contraction kernel can consume directly (no densify needed)."""
+    dims = getattr(edge, "dims", None)
+    if dims is None:
+        return False
+    has_diag = False
+    for d in dims:
+        if getattr(d, "is_compressed", False):
+            return False
+        if getattr(d, "is_sparse", False):
+            has_diag = True
+    return has_diag
+
+
 def _normalize_approx_edge(edge, out_aval_shape, in_aval_shape):
     """Reconcile an approximation-bearing edge to its TRUE dense form at the
     NOMINAL logical shape ``out_aval + in_aval``.
@@ -1148,9 +1171,16 @@ def _eliminate_vertex(
                 # can't re-permute it. Gated on Diag/Compress, so EXACT-AD is
                 # untouched.
                 if _is_approx_cfg and _is_approx(edge_outval):
-                    edge_outval = _normalize_approx_edge(
-                        edge_outval, out_edge.aval.shape, in_edge.aval.shape
-                    )
+                    # GRAPHAX_KEEP_BLOCKDIAG: keep a pure block-diagonal edge SPARSE
+                    # so the next contraction routes through the batched block-
+                    # diagonal (GEMM) kernel instead of a full N x N densify. The
+                    # idempotent produce_diag re-mask makes a later uniform Diag on
+                    # this edge a sound no-op, so the load-bearing densify is not
+                    # needed here.
+                    if not (_KEEP_BLOCKDIAG and _is_pure_blockdiag(edge_outval)):
+                        edge_outval = _normalize_approx_edge(
+                            edge_outval, out_edge.aval.shape, in_edge.aval.shape
+                        )
                     _assert_sparse_tensor_consistency(edge_outval)
 
                 # NOTE: the previous KNOWN-INCOMPLETE "densify approx edge to
