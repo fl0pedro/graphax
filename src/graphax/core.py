@@ -710,22 +710,37 @@ def _is_pure_blockdiag(edge) -> bool:
 
 
 def _blockdiag_addable(a, b) -> bool:
-    """True iff two edges are BOTH pure block-diagonal with a matching dim
-    structure (same id / sparsity / block_size / meta per position) so their
-    SparseTensor ``+`` stays block-sparse — no need to densify the merge."""
+    """True iff two edges are BOTH pure block-diagonal and NESTABLE — their
+    SparseTensor ``+`` stays block-sparse (no densify, no zero-padding).
+
+    Per matching-id dim position both must be sparse block-diagonal with the SAME
+    nominal logical size, and their meta counts must NEST: one divides the other
+    (equivalently one block size divides the other). A finer block-diagonal's
+    support is contained in the coarser one's, so the sum is representable at the
+    coarser block structure — which the elementwise add already produces (verified
+    diff 0 vs dense-add for 2-block + 4-block etc.). Identical structures are the
+    degenerate nesting (ratio 1). A non-nestable pair (meta counts not
+    divisor-related, or different nominal size) still densifies (correct)."""
     if not (_is_pure_blockdiag(a) and _is_pure_blockdiag(b)):
         return False
     da, db = getattr(a, "dims", None), getattr(b, "dims", None)
     if da is None or db is None or len(da) != len(db):
         return False
     for x, y in zip(da, db):
-        if (
-            getattr(x, "id", None) != getattr(y, "id", None)
-            or bool(getattr(x, "is_sparse", False)) != bool(getattr(y, "is_sparse", False))
-            or (getattr(x, "block_size", None) or 1) != (getattr(y, "block_size", None) or 1)
-            or getattr(x, "size", None) != getattr(y, "size", None)
-        ):
+        if getattr(x, "id", None) != getattr(y, "id", None):
             return False
+        xs = bool(getattr(x, "is_sparse", False))
+        ys = bool(getattr(y, "is_sparse", False))
+        if xs != ys:
+            return False
+        if getattr(x, "logical_size", None) != getattr(y, "logical_size", None):
+            return False
+        if xs:
+            mx = getattr(x, "size", None) or 1
+            my = getattr(y, "size", None) or 1
+            hi, lo = (mx, my) if mx >= my else (my, mx)
+            if lo == 0 or hi % lo != 0:
+                return False  # meta counts do not nest -> not block-addable
     return True
 
 
