@@ -709,6 +709,33 @@ def _is_pure_blockdiag(edge) -> bool:
     return has_diag
 
 
+def _is_keep_sparse_edge(edge, out_aval_shape, in_aval_shape) -> bool:
+    """Generalisation of ``_is_pure_blockdiag``: an approx edge whose compaction is
+    a block-diagonal AND/OR an IMPLICIT (``axis is None``) dim AND/OR a structural
+    ``val is None`` — i.e. a form the downstream contraction consumes WITHOUT a
+    full densify — provided it is ALREADY at its nominal logical shape (so no
+    re-layout is needed and the merge/next re-mask see a nominal-shaped edge).
+
+    ``val is None`` structural edges and implicit dims broadcast to their nominal
+    logical size in ``.dense()`` for free, so keeping them avoids materialising an
+    N-fold-larger buffer. Requires nominal shape to guarantee the reshape/merge
+    invariants the densify otherwise restores; a non-nominal (permuted / regroup)
+    edge still densifies (correct)."""
+    dims = getattr(edge, "dims", None)
+    if dims is None:
+        return False
+    nominal = tuple(out_aval_shape) + tuple(in_aval_shape)
+    if tuple(getattr(edge, "shape", ())) != nominal:
+        return False
+    has_compact = getattr(edge, "val", "x") is None
+    for d in dims:
+        if getattr(d, "is_sparse", False):
+            has_compact = True
+        if getattr(d, "is_compressed", False) or getattr(d, "axis", "x") is None:
+            has_compact = True
+    return has_compact
+
+
 def _blockdiag_addable(a, b) -> bool:
     """True iff two edges are BOTH pure block-diagonal and NESTABLE — their
     SparseTensor ``+`` stays block-sparse (no densify, no zero-padding).
@@ -1225,7 +1252,16 @@ def _eliminate_vertex(
                     # idempotent produce_diag re-mask makes a later uniform Diag on
                     # this edge a sound no-op, so the load-bearing densify is not
                     # needed here.
-                    if not (_KEEP_BLOCKDIAG and _is_pure_blockdiag(edge_outval)):
+                    # GRAPHAX_KEEP_BLOCKDIAG generalised: keep any block-diagonal
+                    # / implicit (val_dim=None) / structural (val=None) edge SPARSE
+                    # when it is already at nominal shape — the downstream contraction
+                    # consumes it without the full N-fold densify.
+                    if not (
+                        _KEEP_BLOCKDIAG
+                        and _is_keep_sparse_edge(
+                            edge_outval, out_edge.aval.shape, in_edge.aval.shape
+                        )
+                    ):
                         edge_outval = _normalize_approx_edge(
                             edge_outval, out_edge.aval.shape, in_edge.aval.shape
                         )
