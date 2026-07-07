@@ -265,7 +265,7 @@ def contract_multi_structured(lhs, rhs, pairs, kinds):
     eq = f"{lhs_sub},{rhs_sub}->{out_sub}"
     out = jnp.einsum(eq, lhs_factor, rhs_factor)
 
-    scalar = (lhs.scalar_mult * rhs.scalar_mult).astype(out_dtype)
+    scalar = _scaled_mul(lhs.scalar_mult, rhs.scalar_mult).astype(out_dtype)
     out = _scaled_mul(out.astype(out_dtype), scalar)
 
     return spec.wrap(out)

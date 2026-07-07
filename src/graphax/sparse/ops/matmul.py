@@ -1046,9 +1046,18 @@ def _build_output_tensor(ctx, rhs_dims, res):
         d.is_sparse and d.block_axis is not None
         for d in final_out + final_primal
     )
-    final_mult = ctx.lhs.scalar_mult * ctx.rhs.scalar_mult * res.scalar_mult
+    # Combine the three scalar_mults through the narrow-dtype-safe promotion
+    # (_scaled_mul maps float8/int8/etc. to the common compute dtype) so a Quant'd
+    # (float8) operand scalar_mult never trips the JAX implicit-promotion guard
+    # here — the seed-vertex adjoint contraction reaches this tiled path with mixed
+    # float8/float32 scalar_mults (the pre-op _unify only touches the operand val,
+    # not this post-contraction 3-way scalar_mult product).
+    from graphax.sparse.dtype_compute import _scaled_mul as _sm_promote
+    final_mult = _sm_promote(
+        _sm_promote(ctx.lhs.scalar_mult, ctx.rhs.scalar_mult), res.scalar_mult
+    )
     if not has_val and values is not None and values.size == 1:
-        final_mult = final_mult * jnp.squeeze(values)
+        final_mult = _sm_promote(final_mult, jnp.squeeze(values))
         values = None
     # Banded emission: when ``_should_emit_block_banded`` (run upstream in
     # ``_execute_block_sparse_contraction``) finds a band-storage form
@@ -1647,6 +1656,8 @@ def _pad_axis_to(arr, axis: int, size: int, fill):
 # --- Both-implicit contracting-pair analytic fold (GRAPHAX_KEEP_BLOCKDIAG) -----
 import os as _os
 _KEEP_BLOCKDIAG_MM = _os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "1") != "0"
+# Two-scalar matmul -> elementwise multiply (seed-vertex aggregation). Default on.
+_SEED_SCALAR_MM = _os.environ.get("GRAPHAX_SEED_VERTICES_SCALAR_MM", "1") != "0"
 
 
 def _both_implicit_contract_pairs(lhs, rhs):
@@ -1706,11 +1717,25 @@ def _fold_both_implicit(lhs, rhs, count):
         fill_value=rhs.fill_value,
         check_consistency=False,
     )
-    res = matmul(new_lhs, new_rhs, count=count)
-    if count:
-        out, cnt = res
+    # After dropping the both-implicit contracted dims BOTH operands may be
+    # 0-rank scalars (a Compress-reduced seed-vertex edge contracting another
+    # scalar seed): matmul rejects 0-rank@0-rank, so the mathematically-correct
+    # scalar product is an ELEMENTWISE multiply. Route it there instead of
+    # recursing into matmul (which would raise). Non-scalar reduced operands
+    # keep the normal recursive matmul.
+    _both_scalar = (
+        new_lhs.out_dims == () and new_lhs.primal_dims == ()
+        and new_rhs.out_dims == () and new_rhs.primal_dims == ()
+    )
+    if _both_scalar:
+        out = new_lhs * new_rhs
+        cnt = (0, 1, 0)  # one scalar multiply
     else:
-        out = res
+        res = matmul(new_lhs, new_rhs, count=count)
+        if count:
+            out, cnt = res
+        else:
+            out = res
     fac = jnp.asarray(factor, dtype=out.scalar_mult.dtype)
     out = out.copy(scalar_mult=out.scalar_mult * fac)
     return (out, cnt) if count else out
@@ -2044,15 +2069,26 @@ def matmul(lhs, rhs, count: bool = False):
             return out, _compute_matmul_count(lhs, rhs, out)
         return out
     lhs, rhs = _normalize_inputs(lhs, rhs)
-    # Scalar @ scalar is no longer supported — callers must use ``*``
-    # (elementwise). Vertex elimination in core.py guards this for the
-    # Jacobian chain rule.
+    # Two 0-rank (scalar) SparseTensors: the contraction is a scalar product =
+    # an ELEMENTWISE multiply (scalar . X == scale). This is what the AGGREGATION
+    # step needs when a Compress-reduced / seed-vertex scalar edge contracts
+    # another scalar edge (the --seed-vertices sentinel driver). The chain-rule
+    # site in core.py guards this too, but routes that leak through (the folded
+    # both-implicit reduction, a merge of two scalar edges) land here; do the
+    # mathematically-correct multiply rather than raise. Set
+    # GRAPHAX_SEED_VERTICES_SCALAR_MM=0 to restore the legacy raise.
     if (
         getattr(lhs, "out_dims", ()) == ()
         and getattr(lhs, "primal_dims", ()) == ()
         and getattr(rhs, "out_dims", ()) == ()
         and getattr(rhs, "primal_dims", ()) == ()
     ):
+        if _SEED_SCALAR_MM:
+            out = lhs * rhs
+            _record_path("scalar_elementwise")
+            if count:
+                return out, (0, 1, 0)
+            return out
         raise ValueError(
             "matmul of two 0-rank SparseTensors is not supported; "
             "use ``lhs * rhs`` (elementwise) instead"

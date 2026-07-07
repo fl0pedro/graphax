@@ -26,6 +26,7 @@ from .primitives import (
     multi_output_elemental_only_rules,
 )
 from .sparse.ops import add_w_counts
+from .sparse.dtype_compute import _scaled_mul as _scaled_mul_promote
 from .sparse.ops.matmul import matmul as sparse_matmul
 from .sparse.ops.utils import (
     _compressed_dims, _materialize_for_op, _is_approx,
@@ -1056,14 +1057,14 @@ def _eliminate_vertex(
                     # scaled-identity edge multiplies by it; dropping it was the
                     # ``sum(z*sum(z))`` bug — 10·pre became pre).
                     edge_outval = _pre_val.copy(
-                        scalar_mult=_pre_val.scalar_mult * _post_val.scalar_mult
+                        scalar_mult=_scaled_mul_promote(_pre_val.scalar_mult, _post_val.scalar_mult)
                     )
                     if count_ops:
                         muls += 1
                 else:
                     # pre is the identity (up to scalar_mult): pass post through.
                     edge_outval = _post_val.copy(
-                        scalar_mult=_post_val.scalar_mult * _pre_val.scalar_mult
+                        scalar_mult=_scaled_mul_promote(_post_val.scalar_mult, _pre_val.scalar_mult)
                     )
                     if count_ops:
                         muls += 1
@@ -2395,11 +2396,11 @@ def _accumulate_edge_triplet(
             edge_outval = _post_val @ _pre_val
     elif pre_val.val is not None:
         edge_outval = _pre_val.copy(
-            scalar_mult=_pre_val.scalar_mult * _post_val.scalar_mult
+            scalar_mult=_scaled_mul_promote(_pre_val.scalar_mult, _post_val.scalar_mult)
         )
     else:
         edge_outval = _post_val.copy(
-            scalar_mult=_post_val.scalar_mult * _pre_val.scalar_mult
+            scalar_mult=_scaled_mul_promote(_post_val.scalar_mult, _pre_val.scalar_mult)
         )
 
     if len(post_val.post_transforms) > 0:
