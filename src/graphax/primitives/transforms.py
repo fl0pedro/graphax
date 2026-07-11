@@ -14,6 +14,8 @@ from ..sparse.tensor import (
     _materialize_indexes,
     _swap_back_axes,
 )
+from ..sparse.ops.dense import dense as _dense_hard
+
 from .base import (
     elemental_only_rules,
     elemental_rules,
@@ -185,6 +187,17 @@ def _transpose_elementals(primals, val_out, **params):
     permutation = params["permutation"]
 
     def transpose_transform(pre):
+        # AUDIT FIX: the diagonal-pair relink below uses other_id AS A LIST
+        # INDEX (new_primal_dims[other_id - l]); valid only for canonical
+        # contiguous ids. A block-diagonal approx edge can violate that ->
+        # IndexError. If any out sparse dim's partner index is out of range,
+        # densify the sparse pairs (order-preserving) so every dim is dense
+        # (other_id=None) and the transpose is a pure permutation.
+        _lp = len(pre.primal_dims)
+        _lo = len(pre.out_dims)
+        if any(d.is_sparse and not (0 <= (d.other_id - _lo) < _lp)
+               for d in pre.out_dims):
+            pre = _dense_hard(pre, hard=True)
         new_out_dims = []
         new_primal_dims = list(pre.primal_dims)
         counter = 0
@@ -211,6 +224,21 @@ def _transpose_elementals(primals, val_out, **params):
         )
 
     def inverse_transpose_transform(post):
+        # AUDIT FIX: drained against the bare identity output-seed (a transposed
+        # intermediate that is ALSO a function output, e.g. `return x.T, x.T@y`)
+        # post has no dims -> post.primal_dims[p] IndexError. Re-expand the seed
+        # over the transpose's OUTPUT shape first (same guard as slice/concat/
+        # drainable inverse rules).
+        if _is_scalar_identity_post(post):
+            post = _identity_post_over(post, val_out.shape, val_out.dtype)
+        # AUDIT FIX: primal diagonal dim relinks new_out_dims[other_id] as a
+        # list index — invalid for a block-diagonal approx edge with
+        # non-canonical ids. Densify the sparse pairs first when the partner
+        # index is out of range (value-exact; relink then skipped).
+        _lo2 = len(post.out_dims)
+        if any(d.is_sparse and not (0 <= d.other_id < _lo2)
+               for d in post.primal_dims):
+            post = _dense_hard(post, hard=True)
         new_out_dims = list(post.out_dims)
         new_primal_dims = []
         counter = len(post.out_dims)
@@ -421,6 +449,11 @@ def _reshape_elementals(primals, val_out, **params):
                             pre.dense().reshape([*out_sizes, *primal_sizes]))
 
     def inverse_reshape_transform(post):
+        # AUDIT FIX: same bare-identity-seed guard as inverse_slice_transform —
+        # a reshaped intermediate that is also a function output otherwise hits
+        # `post.dense().reshape([2, 3])` on a 0-rank seed (TypeError).
+        if _is_scalar_identity_post(post):
+            post = _identity_post_over(post, val_out.shape, val_out.dtype)
         res = _structural(
             list(post.primal_dims), False, primals[0].shape, post.val,
             post.scalar_mult, post.fill_value, list(post.out_dims),

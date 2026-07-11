@@ -2008,6 +2008,39 @@ def vertex_elimination_jaxpr(
     finally:
         set_approx_active(_prev_approx)
 
+    # --- AUDIT PROTOTYPE: strict full-order guard -------------------------
+    # A numeric order that misses eliminable vertices (e.g. built from the
+    # NON-inlined jaxpr's eqn count while jacve inlined a custom_jvp/pjit body)
+    # leaves live intermediate vertices in the graph. The dense output path
+    # then silently drops every Jacobian path through them (all-zero / partial
+    # Jacobian). Fail loudly instead; GRAPHAX_ALLOW_PARTIAL_ORDER=1 restores
+    # the silent-partial behaviour for staged/triplet elimination callers.
+    if not sparse_representation and os.environ.get(
+        "GRAPHAX_ALLOW_PARTIAL_ORDER", "0"
+    ) == "0":
+        _intermediates = {
+            ov
+            for eqn in jaxpr.eqns
+            for ov in eqn.outvars
+            if isinstance(ov, core.Var)
+        }
+        _live = [
+            v
+            for v in graph.keys()
+            if v in _intermediates and len(graph[v]) > 0
+        ]
+        if _live:
+            raise ValueError(
+                "jacve: the elimination order left "
+                f"{len(_live)} intermediate vertex/vertices with live edges "
+                "un-eliminated — the dense Jacobian would silently drop every "
+                "path through them (this typically means the numeric order was "
+                "built from the non-inlined jaxpr; jacve inlines jit/pjit/"
+                "custom_jvp bodies, which adds equations). Pass a full order "
+                "or set GRAPHAX_ALLOW_PARTIAL_ORDER=1 to accept a partial "
+                "Jacobian."
+            )
+
     # Offloading all remaining Jacobian transforms to the output variables
     # before densification! Mutate via a single .mutate() proxy on the outer
     # immutables.Map so we don't pay the rebuild cost per (invar, outvar).

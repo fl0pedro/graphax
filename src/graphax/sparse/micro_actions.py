@@ -316,6 +316,19 @@ def apply_diag(st: SparseTensor, action: Diag) -> SparseTensor:
     ):
         return st
 
+    # AUDIT FIX: a mixed implicit/physical (or both-implicit non-paired) Diag
+    # cannot be represented by _apply_block_diagonal, which assumes BOTH sides
+    # are materialized val axes. Applying it anyway corrupts the dim list
+    # (physical-axis collision -> downstream transpose/IndexError crash).
+    # Raise ValueError so the per-vertex best-effort handler skips this
+    # transform on this edge (leaves it exact).
+    if getattr(d1, "axis", None) is None or getattr(d2, "axis", None) is None:
+        raise ValueError(
+            "Diag: cannot block-diagonalise a pair involving an implicit "
+            "(axis=None) dim — its physical axis was dropped (e.g. by a prior "
+            "Compress) and _apply_block_diagonal requires materialized axes."
+        )
+
     return _apply_block_diagonal(
         st, is_out1, rel_i, is_out2, rel_j, factor, b1, b2,
     )

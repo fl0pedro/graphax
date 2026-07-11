@@ -52,6 +52,13 @@ def _select_elementals(primals, val_out, **params):
     elementals = [NO_EDGE]
     for k, _ in enumerate(cases):
         mask = (which == k).astype(out_dtype)
+        # AUDIT FIX: `which` may be lower-rank than the output (scalar literal
+        # predicate). _masked_identity's DiagonalIndex dims read axis i of the
+        # mask, so the mask must be materialized at exactly out_shape;
+        # otherwise the tensor's dims reference non-existent val axes
+        # (val=() with axis=0/1) -> IndexError in dense(hard=True).
+        if tuple(jnp.shape(mask)) != tuple(out_shape):
+            mask = jnp.broadcast_to(mask, out_shape)
         elementals.append(_masked_identity(mask))
     return elementals
 

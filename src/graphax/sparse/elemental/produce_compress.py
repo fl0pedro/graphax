@@ -270,6 +270,22 @@ def contract_implicit(
     if not (_is_zero_fill(lhs) and _is_zero_fill(rhs)):
         return dense_op_fallback(lhs, rhs, jnp.matmul)
 
+    # AUDIT FIX: `_implicit_constant` reads the implicit operand's val directly
+    # and drops every leftover physical axis as if size-1. A SPARSE (block-
+    # diagonal) free dim on the implicit operand has a size-B>1 block_axis that
+    # is NOT droppable -> reshape crash. This 2-D-core kernel cannot represent a
+    # sparse free dim on the implicit side; raise so _route_single_kernel routes
+    # the contraction to the (always-correct) composed-dense fallback, which
+    # densifies both operands and re-runs the tiled topology resolver.
+    if l_impl and any(d.is_sparse for d in lhs.dims if d.id != lc.id):
+        raise ValueError(
+            "contract_implicit: implicit lhs has a sparse (block-diagonal) free "
+            "dim its constant-read cannot represent; defer to composed-dense.")
+    if r_impl and any(d.is_sparse for d in rhs.dims if d.id != rc.id):
+        raise ValueError(
+            "contract_implicit: implicit rhs has a sparse (block-diagonal) free "
+            "dim its constant-read cannot represent; defer to composed-dense.")
+
     out_dtype = _compute_dtype(lhs.dtype, rhs.dtype)
     N = lc.logical_size
 
