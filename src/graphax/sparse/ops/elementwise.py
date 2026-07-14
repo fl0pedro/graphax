@@ -23,7 +23,7 @@ from .utils import (
     _apply_scalar_mult, _scaled_fill,
 )
 from .layout import generate_block_permutation
-from graphax.sparse.dtype_compute import _unify_operand_dtypes, _compute_dtype
+from graphax.sparse.dtype_compute import _unify_operand_dtypes
 from graphax.sparse.indexes import DiagonalIndex, DenseIndex
 
 if TYPE_CHECKING:
@@ -731,15 +731,8 @@ def elementwise(
     bus = list(jnp.broadcast_shapes(tuple(ul), tuple(ur)))
     vl = _align_value(vl, lhs, sp, dp, al, bus, True)
     vr = _align_value(vr, rhs, sp, dp, ar, bus, False)
-    _pl = _promote_to_unified(vl, metrics, True, _scaled_fill(lhs))
-    _pr = _promote_to_unified(vr, metrics, False, _scaled_fill(rhs))
-    _pldt = getattr(_pl, "dtype", None)
-    _prdt = getattr(_pr, "dtype", None)
-    if _pldt is not None and _prdt is not None and _pldt != _prdt:
-        _cdt = _compute_dtype(_pldt, _prdt)
-        _pl = _pl.astype(_cdt)
-        _pr = _pr.astype(_cdt)
-    res = op(_pl, _pr)
+    res = op(_promote_to_unified(vl, metrics, True, _scaled_fill(lhs)),
+             _promote_to_unified(vr, metrics, False, _scaled_fill(rhs)))
     # The intersection demote SUMS over the LCM-expansion axis, which is only
     # valid when the off-intersection sub-blocks are zero — i.e. zero fill (for
     # a multiplicative op, fill·data vanishes only when a fill is 0). With a

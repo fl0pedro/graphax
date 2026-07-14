@@ -205,25 +205,11 @@ def test_rejects_out_of_range():
 
 
 def test_rejects_already_sparse_dim():
-    # Run produce_diag once to get a B pair, then feed it back.
-    # With GRAPHAX_KEEP_BLOCKDIAG (default ON) re-masking the SAME coupled pair by
-    # the SAME factor is an idempotent no-op (returns the block-diagonal unchanged)
-    # so the keep-sparse per-vertex re-mask is sound. With it forced OFF the legacy
-    # "reject already-sparse dim" contract holds. A DIFFERENT factor still raises
-    # either way (not the matching-coupled short-circuit).
+    # Run produce_diag once to get a B pair, then feed it back: rejected.
     st = _dense2d(6, 6, _rand((6, 6), jax.random.PRNGKey(5)))
     B = produce_diag(st, 0, 1, 3)
-    import graphax.sparse.elemental.produce_diag as _pd
-
-    if _pd._KEEP_BLOCKDIAG:
-        again = produce_diag(B, 0, 1, 3)
-        assert again is B  # idempotent no-op on the matching coupled pair
-    else:
-        with pytest.raises(ValueError):
-            produce_diag(B, 0, 1, 3)
-    # A non-matching factor is rejected regardless of the flag.
     with pytest.raises(ValueError):
-        produce_diag(B, 0, 1, 2)
+        produce_diag(B, 0, 1, 3)
 
 
 # --------------------------------------------------------------------------- #

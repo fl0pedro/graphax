@@ -57,8 +57,6 @@ class VEJaxpr:
         vocab_size: int = 256,
         vocab_size_fns: int = None,
         digit_base: int = 10,
-        elim_order: Sequence[int] = None,
-        transforms: Sequence = None,
     ):
         self.jaxpr = jaxpr
         self.digit_base = digit_base
@@ -67,21 +65,6 @@ class VEJaxpr:
         self.vocab, self.n_vocab, _ = get_vocab(digit_base)
         self._names = self._assign_names(vocab_size)
         self._tokens = None
-        # Append-only STATE tokenization: when `elim_order` is provided this
-        # VEJaxpr wraps the ORIGINAL (un-eliminated) jaxpr together with the
-        # elimination-order prefix that has been applied. See `tokenized()`.
-        self.elim_order = tuple(int(v) for v in elim_order) if elim_order is not None else None
-        # Append-only per-vertex MICRO-ACTION encoding (DIAG/COMPRESS/QUANT).
-        # ``transforms`` is the normalised graphax typed-transform structure
-        # ``((vertex_id, (transform_obj, ...)), ...)`` -- the same object the
-        # measure path passes to ``vertex_elimination_jaxpr``. Together with
-        # ``elim_order`` this is a LOSSLESS sufficient statistic for the
-        # APPROXIMATED partial-elimination state the policy sees: the order
-        # says WHICH vertices were eliminated and in what sequence, the
-        # transforms say WHAT micro-action(s) were applied at each. Stored
-        # verbatim (already hashable: Diag/Compress/Quant are frozen
-        # dataclasses) and consumed append-only in ``_state_tokenized``.
-        self.elim_transforms = tuple(transforms) if transforms else ()
 
         # Pre-calculate token fragments for hotspots
         self._invar_tokens = self._precalculate_invar_tokens()
@@ -100,37 +83,24 @@ class VEJaxpr:
     def _assign_names(self, vocab_size):
         freq_map_vars: dict[Any, int] = {}
         freq_map_fns: dict[Any, int] = {}
-        # Single linear stream of (kind, key) in TRUE first-appearance order,
-        # used by the stable (append-only) naming scheme. `kind` is "var" or
-        # "fn". Insertion order = position in the linearised jaxpr, which is
-        # PREFIX-STABLE across vertex-elimination steps (each step appends
-        # equations to the end), so the assigned names are append-only.
-        appearance: list[tuple[str, Any]] = []
-
-        def _see_var(v):
-            if v not in freq_map_vars:
-                freq_map_vars[v] = 0
-                appearance.append(("var", v))
-            freq_map_vars[v] += 1
-
-        def _see_fn(key):
-            if key not in freq_map_fns:
-                freq_map_fns[key] = 0
-                appearance.append(("fn", key))
-            freq_map_fns[key] += 1
 
         def scan_jaxpr(j):
             for v in j.constvars:
-                _see_var(v)
+                freq_map_vars.setdefault(v, 0)
+                freq_map_vars[v] += 1
             for v in j.invars:
-                _see_var(v)
+                freq_map_vars.setdefault(v, 0)
+                freq_map_vars[v] += 1
             for eqn in j.eqns:
                 pt = get_params_tuple(eqn, primitive_params)
                 if pt:
-                    _see_fn((eqn.primitive.name, pt))
+                    key = (eqn.primitive.name, pt)
+                    freq_map_fns.setdefault(key, 0)
+                    freq_map_fns[key] += 1
 
                 for v in eqn.outvars:
-                    _see_var(v)
+                    freq_map_vars.setdefault(v, 0)
+                    freq_map_vars[v] += 1
 
                 for p_val in eqn.params.values():
                     if isinstance(p_val, core.Jaxpr):
@@ -153,99 +123,46 @@ class VEJaxpr:
                 f"Increase vocab_size to at least {len(self.vocab) + 1}."
             )
 
-        # ------------------------------------------------------------------ #
-        # Naming scheme selection.
-        #
-        # STABLE (default): assign names by FIRST-APPEARANCE order. A var/fn's
-        # name depends only on its position in the linearised jaxpr, never on
-        # global frequency. Because vertex elimination only ever APPENDS
-        # equations, the appearance prefix is invariant step-to-step, so the
-        # token stream becomes append-only -> incrementally cacheable. This is
-        # the fix for the per-step re-tokenization churn.
-        #
-        # FREQUENCY (GRAPHAX_FREQ_NAMING=1): the original scheme -- most
-        # frequent var/fn gets the shortest token. Better single-shot token
-        # economy, but renames almost everything when an equation is added.
-        # ------------------------------------------------------------------ #
-        import os as _os
-
-        # Default-OFF guarantee: stable (first-appearance) naming is the
-        # naming half of the state-tokenizer fix, so it activates with the
-        # SAME gate (GRAPHAX_STATE_TOKENS=1). When the state-tokenizer is OFF
-        # the legacy FREQUENCY naming is used -> the non-state token path is
-        # byte-identical to pristine core-v2 (e.g. job 50646 is unaffected).
-        # GRAPHAX_FREQ_NAMING=1 forces frequency naming even with the state
-        # path on (escape hatch / A-B knob).
-        _state_on = _os.environ.get("GRAPHAX_STATE_TOKENS", "0") == "1"
-        _freq_forced = _os.environ.get("GRAPHAX_FREQ_NAMING", "0") == "1"
-        stable = _state_on and not _freq_forced
-
         if self.vocab_size_fns is None:
-            # Shared pool: vars and fns draw names from one token range.
-            if stable:
-                # Walk the single appearance stream in order. DropVars were
-                # filtered from freq_map_vars; skip them here too.
-                ordered = [
-                    k
-                    for kind, k in appearance
-                    if kind == "fn" or k in freq_map_vars
-                ]
-            else:
-                freq_map_combined = {**freq_map_vars}
-                for k, v in freq_map_fns.items():
-                    freq_map_combined[k] = freq_map_combined.get(k, 0) + v
-                ordered = [
-                    k
-                    for k, _ in sorted(
-                        freq_map_combined.items(), key=lambda x: x[1], reverse=True
-                    )
-                ]
+            # Shared pool behavior
+            freq_map_combined = {**freq_map_vars}
+            for k, v in freq_map_fns.items():
+                freq_map_combined[k] = freq_map_combined.get(k, 0) + v
 
+            freq_list = sorted(
+                freq_map_combined.items(), key=lambda x: x[1], reverse=True
+            )
             names = {
                 k: n
-                for k, n in zip(
-                    ordered,
+                for (k, _), n in zip(
+                    freq_list,
                     name_gen_python_style(
                         self.digit_base, self.digit_base + num_extra_tokens
                     ),
                 )
             }
         else:
-            # Split pool: fns and vars draw from disjoint token ranges. Each
-            # pool is ordered independently; in stable mode each pool's
-            # appearance order is itself prefix-stable.
-            if stable:
-                ordered_fns = [k for kind, k in appearance if kind == "fn"]
-                ordered_vars = [
-                    k for kind, k in appearance if kind == "var" and k in freq_map_vars
-                ]
-            else:
-                ordered_fns = [
-                    k
-                    for k, _ in sorted(
-                        freq_map_fns.items(), key=lambda x: x[1], reverse=True
-                    )
-                ]
-                ordered_vars = [
-                    k
-                    for k, _ in sorted(
-                        freq_map_vars.items(), key=lambda x: x[1], reverse=True
-                    )
-                ]
+            # Split pool behavior
+            freq_list_fns = sorted(
+                freq_map_fns.items(), key=lambda x: x[1], reverse=True
+            )
+            freq_list_vars = sorted(
+                freq_map_vars.items(), key=lambda x: x[1], reverse=True
+            )
 
             fns_slots = min(self.vocab_size_fns, num_extra_tokens)
 
             names = {}
             # Assign function names
-            for k, n in zip(
-                ordered_fns,
+            for (k, _), n in zip(
+                freq_list_fns,
                 name_gen_python_style(self.digit_base, self.digit_base + fns_slots),
             ):
                 names[k] = n
 
             # Assign variable names
-            for k, n in zip(
-                ordered_vars,
+            for (k, _), n in zip(
+                freq_list_vars,
                 name_gen_python_style(
                     self.digit_base + fns_slots, self.digit_base + num_extra_tokens
                 ),
@@ -353,136 +270,6 @@ class VEJaxpr:
     def __getattr__(self, name: str) -> Any:
         return getattr(self.jaxpr, name)
 
-    def _state_tokenized(
-        self, def_fns: bool, show_params: bool, show_shapes: bool
-    ) -> jnp.ndarray:
-        """Append-only state stream:
-
-            <original-graph tokens> | <order prefix> | <per-vertex micro-actions>
-
-        The original-graph block is produced by the ordinary `tokenized()`
-        path over the SAME (un-eliminated) jaxpr -- invariant across steps --
-        then we append a separator and one token per eliminated vertex id,
-        then a second separator and the per-vertex micro-action (DIAG /
-        COMPRESS / QUANT) encoding. Because vertex elimination only ever
-        appends one vertex (and its micro-actions) per step, BOTH the order
-        suffix and the micro-action suffix grow append-only, so the whole
-        stream is a pure prefix extension of the previous step.
-
-        Losslessness: ``(original graph, order prefix, per-vertex
-        micro-actions)`` is a sufficient statistic for the approximated
-        partial-elimination state, and the encoding below is injective ->
-        distinct ``(order, transforms)`` map to distinct streams.
-        """
-        # Build the invariant original-graph block via the standard emitter.
-        # We temporarily detach `elim_order` to reuse the full equation logic
-        # without recursing back into this method.
-        saved = self.elim_order
-        self.elim_order = None
-        try:
-            base = self.tokenized(def_fns, show_params, show_shapes)
-        finally:
-            self.elim_order = saved
-        # The inner call cached the BASE stream under (def_fns, ...); drop it so
-        # the outer state-mode call's own cache write (the full state stream) is
-        # what persists under that key.
-        self._eqn_tokens_cache.pop((def_fns, show_params, show_shapes), None)
-
-        tokens = [int(t) for t in base]
-
-        _vocab = self.vocab
-        _base = self.digit_base
-
-        def _emit_int(n):
-            # Emit a (possibly negative) integer in the same base/overflow
-            # scheme tokenized values use, so ids stay in the model vocab.
-            for c in int_to_base(int(n), _base):
-                if c in _vocab:
-                    tokens.append(_vocab[c])
-                else:
-                    tokens.append(len(_vocab) + int(c, 16))
-
-        # Lazily import the micro-action types (only needed when transforms
-        # are present); keeps the no-transform path import-free.
-        if self.elim_transforms:
-            from .sparse.micro_actions import (
-                Compress,
-                Diag,
-                Quant,
-                COMPRESS_KIND_INDEX,
-                QUANT_DTYPE_INDEX,
-            )
-            # vertex -> its transform tuple, for O(1) lookup while we walk the
-            # elimination order. (transforms is keyed by vertex id.)
-            _micro_by_v = {int(v): ts for v, ts in self.elim_transforms}
-        else:
-            _micro_by_v = {}
-
-        def _emit_micro(vtransforms):
-            # Encode one vertex's micro-actions. Layout per action:
-            #   "*" i "_" j "_" factor          DIAG    Diag(i, j, factor)
-            #   "_" kind_idx ("_" axis)*        COMPRESS Compress(axes, kind)
-            #   "~" dtype_idx                   QUANT   Quant(dtype)
-            # The leading char is a TYPE TAG, so a DIAG factor is never
-            # confused with a COMPRESS axis -> the encoding is injective.
-            for ti, t in enumerate(vtransforms):
-                if ti:
-                    tokens.append(_vocab[","])
-                if isinstance(t, Diag):
-                    tokens.append(_vocab["*"])
-                    _emit_int(t.i)
-                    tokens.append(_vocab["_"])
-                    _emit_int(t.j)
-                    tokens.append(_vocab["_"])
-                    _emit_int(t.factor)
-                elif isinstance(t, Compress):
-                    tokens.append(_vocab["_"])
-                    _emit_int(COMPRESS_KIND_INDEX[t.kind])
-                    for a in t.axes:
-                        tokens.append(_vocab["_"])
-                        _emit_int(int(a))
-                elif isinstance(t, Quant):
-                    tokens.append(_vocab["~"])
-                    _emit_int(QUANT_DTYPE_INDEX[t.dtype])
-                else:
-                    # Opaque callable transform: encode a stable tag so the
-                    # stream still differs from the no-transform state. (Not
-                    # used by the alphagrad env, which only passes the three
-                    # typed micro-actions above.)
-                    tokens.append(_vocab["<"])
-                    _emit_int(hash(repr(t)) % (10 ** 9))
-                    tokens.append(_vocab[">"])
-
-        # ------------------------------------------------------------------ #
-        # APPEND-ONLY interleaved suffix. After a single "|" separator we walk
-        # the elimination ORDER and emit, per eliminated vertex, one block:
-        #     <vertex-id> [ ":" <micro-actions> ] ";"
-        # The micro-action sub-block is present iff that vertex has transforms.
-        # Crucially the order id and its micro-actions are emitted TOGETHER, so
-        # advancing the elimination by one vertex appends exactly one trailing
-        # block and never shifts an earlier one -> the stream is a pure prefix
-        # extension step-to-step (CACHEABLE). Interleaving (rather than two
-        # separate order/micro segments) is what makes it append-only: a second
-        # segment would be pushed right every time the order grows.
-        #
-        # Losslessness: (original graph, order, per-vertex micro-actions) is a
-        # sufficient statistic for the approximated partial-elimination state,
-        # and this encoding is injective in (order, transforms).
-        # ------------------------------------------------------------------ #
-        tokens.append(_vocab["|"])
-        for vid in self.elim_order:
-            _emit_int(int(vid))
-            vmicro = _micro_by_v.get(int(vid))
-            if vmicro:
-                tokens.append(_vocab[":"])
-                _emit_micro(vmicro)
-            tokens.append(_vocab[";"])
-        if self.elim_order:
-            tokens.pop()  # trailing separator after the last vertex block
-
-        res = jnp.array(tokens, dtype=jnp.int32)
-        return res
-
     def tokenized(
         self,
         def_fns: bool = True,
@@ -496,28 +283,6 @@ class VEJaxpr:
         if cache_key in self._eqn_tokens_cache:
             return self._eqn_tokens_cache[cache_key]
 
-        # ------------------------------------------------------------------ #
-        # APPEND-ONLY STATE tokenization.
-        #
-        # When this VEJaxpr was built over the ORIGINAL (un-eliminated) jaxpr
-        # plus an elimination-order prefix, emit:
-        #     <tokens of the original graph>  |  <elimination order prefix>
-        # The original-graph block is INVARIANT across elimination steps (it
-        # is the same jaxpr every step, named by the prefix-stable scheme), so
-        # the only thing that grows step-to-step is the order suffix -> the
-        # stream is APPEND-ONLY and incrementally cacheable.
-        #
-        # Faithfulness: the partial-eliminated Jacobian graph is a determinis-
-        # tic function of (original graph, order-prefix); this pair is a loss-
-        # less sufficient statistic for the policy state. It is in fact MORE
-        # faithful than the re-traced Jacobian jaxpr, which discards the
-        # vertex-id correspondence the action space is defined over.
-        # ------------------------------------------------------------------ #
-        if self.elim_order is not None:
-            res = self._state_tokenized(def_fns, show_params, show_shapes)
-            self._eqn_tokens_cache[cache_key] = res
-            return res
-
         _vocab = self.vocab
         _len_vocab = len(self.vocab)
         _names = self._names
@@ -525,22 +290,13 @@ class VEJaxpr:
 
         tokens = list(self._invar_tokens)
 
-        # Collect the parameterized-op definitions in a DETERMINISTIC order.
-        # Previously this used a `set`, whose iteration order is hash/identity
-        # dependent and therefore reshuffled the `~ ...` function-definition
-        # block from step to step (a second, independent source of token churn
-        # on graphs with parameterized primitives such as dot_general). We
-        # dedupe while preserving first-appearance order so the block is stable
-        # and append-only as new parameterized ops are introduced.
-        parameterized_ops = []
-        _seen_ops = set()
+        parameterized_ops = set()
         for eqn in self.jaxpr.eqns:
             pt = get_params_tuple(eqn, primitive_params)
             if pt:
-                key = (eqn.primitive.name, pt)
-                if key not in _seen_ops:
-                    _seen_ops.add(key)
-                    parameterized_ops.append((_names[key], eqn.primitive.name, pt))
+                parameterized_ops.add(
+                    (_names[(eqn.primitive.name, pt)], eqn.primitive.name, pt)
+                )
 
         if def_fns and parameterized_ops:
             tokens.append(_vocab["~"])
@@ -648,6 +404,96 @@ class VEJaxpr:
         res = jnp.array(tokens, dtype=jnp.int32)
         self._eqn_tokens_cache[cache_key] = res
         return res
+
+
+
+
+# ===========================================================================
+# Incremental (append-only) elimination-state tokenizer.
+#
+# THE PROBLEM IT SOLVES
+# ---------------------
+# The PPO env re-tokenizes the WHOLE re-traced *fused-Jacobian* jaxpr every
+# elimination step (extract_jaxpr -> VEJaxpr.tokenized). That stream changes
+# GLOBALLY each step: vertex elimination genuinely RESTRUCTURES the fused
+# Jacobian computation (different interleaved mul/add fusion equations occupy
+# the same positions), so step N+1 is NOT a prefix-extension of step N. No
+# variable-naming scheme can fix this — the equation BODIES differ position by
+# position (verified: content-hash naming leaves MATCH_PCT at ~63%).
+#
+# THE FIX
+# -------
+# Tokenize the elimination STATE rather than the derived fused jaxpr. The state
+# is exactly: (the ORIGINAL jaxpr, which is FIXED for the whole episode) +
+# (the ordered list of vertices eliminated so far). This is information-complete
+# and faithful — vertex elimination is deterministic, so original-jaxpr + ordered
+# elimination list UNIQUELY determines the partial-eliminated graph the fused
+# jaxpr would represent. We tokenize the original jaxpr ONCE (cached) and append
+# a tiny per-step suffix encoding the newly-eliminated vertices. The suffix only
+# GROWS, so step N+1 == step N + local suffix: strictly append-only, trivially
+# incrementally cacheable.
+# ===========================================================================
+
+_state_base_cache: "dict" = {}
+
+
+def _encode_int(n: int, vocab: Dict[str, int], base: int, tokens: List[int]):
+    _len_vocab = len(vocab)
+    for c in int_to_base(n, base):
+        if c in vocab:
+            tokens.append(vocab[c])
+        else:
+            tokens.append(_len_vocab + int(c, 16))
+
+
+def tokenize_elimination_state(
+    jaxpr: core.Jaxpr,
+    order: Sequence[int],
+    *,
+    vocab_size: int = 256,
+    vocab_size_fns: int = None,
+    digit_base: int = 10,
+    show_shapes: bool = False,
+) -> List[int]:
+    """Append-only token stream for the partial-elimination state.
+
+    ``jaxpr``  : the ORIGINAL (un-eliminated) jaxpr of the episode — fixed.
+    ``order``  : the vertices eliminated SO FAR, in elimination order (1-based,
+                 matching EnvState valid-vertex indexing).
+
+    Returns ``base_tokens + separator + elimination_suffix`` where ``base_tokens``
+    is the original jaxpr tokenized once (cached by jaxpr identity + options) and
+    the suffix encodes ``order`` as ``[* vid ;]*``. For a fixed episode this is a
+    pure prefix-extension across steps: append-only, CACHEABLE.
+    """
+    cache_key = (id(jaxpr), vocab_size, vocab_size_fns, digit_base, show_shapes)
+    base = _state_base_cache.get(cache_key)
+    if base is None:
+        base_ve = VEJaxpr(
+            jaxpr,
+            vocab_size=vocab_size,
+            vocab_size_fns=vocab_size_fns,
+            digit_base=digit_base,
+        )
+        base = [int(t) for t in base_ve.tokenized(show_shapes=show_shapes)]
+        base_ve_vocab = base_ve.vocab
+        # keep the strong ref to jaxpr alive in the key (id reuse guard): store
+        # vocab + a ref to base_ve so the jaxpr object isn't GC'd under id().
+        _state_base_cache[cache_key] = (base, base_ve_vocab, base_ve)
+    else:
+        base, base_ve_vocab, _ = base
+
+    vocab = base_ve_vocab
+    tokens = list(base)
+    # Section separator + append-only elimination trajectory.
+    tokens.append(vocab["~"])
+    elim_tok = vocab["*"]
+    sep_tok = vocab[";"]
+    for v in order:
+        tokens.append(elim_tok)
+        _encode_int(int(v), vocab, digit_base, tokens)
+        tokens.append(sep_tok)
+    return tokens
 
 
 class VEHlo:

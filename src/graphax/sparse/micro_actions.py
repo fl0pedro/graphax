@@ -42,13 +42,7 @@ from typing import Callable, Sequence, Union
 import jax.numpy as jnp
 
 from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex, CompressedIndex
-from graphax.sparse.tensor import SparseTensor, _apply_block_diagonal, _subdivide_coupled_blockdiag
-from graphax.sparse.dtype_compute import _scaled_mul
-
-import os as _os
-# Default ON; set GRAPHAX_KEEP_BLOCKDIAG=0 to force the legacy densify path.
-_KEEP_BLOCKDIAG = _os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "1") != "0"
-
+from graphax.sparse.tensor import SparseTensor, _apply_block_diagonal
 
 
 # ---------------------------------------------------------------------------
@@ -238,54 +232,6 @@ def apply_diag(st: SparseTensor, action: Diag) -> SparseTensor:
 
     N1, N2 = d1.logical_size, d2.logical_size
     factor = action.factor
-
-    # GRAPHAX_KEEP_BLOCKDIAG: (i, j) may ALREADY be a coupled block-diagonal (the
-    # keep-sparse re-mask path). Re-masking rules against the CURRENT meta count:
-    #   * factor == cur_meta        -> identical structure: no-op.
-    #   * factor  > cur_meta, and factor is a MULTIPLE of cur_meta AND divides both
-    #     logical sizes -> FINER blocks: subdivide each current block into
-    #     (factor // cur_meta) meta-diagonal sub-blocks (stays block-sparse).
-    #   * anything else (coarser / non-multiple / non-divisor block) -> raise
-    #     (a non-nestable re-mask; correctness over a silent wrong structure).
-    if _KEEP_BLOCKDIAG and d1.is_sparse and d2.is_sparse:
-        coupled = (
-            getattr(d1, "other_id", None) == d2.id
-            and getattr(d2, "other_id", None) == d1.id
-            and getattr(d1, "size", None) == getattr(d2, "size", None)
-        )
-        cur_meta = getattr(d1, "size", None)
-        if coupled and cur_meta == factor:
-            return st
-        if (
-            coupled
-            and cur_meta
-            and factor > cur_meta
-            and factor % cur_meta == 0
-            and N1 % factor == 0
-            and N2 % factor == 0
-        ):
-            return _subdivide_coupled_blockdiag(
-                st, is_out1, rel_i, d1, is_out2, rel_j, d2, factor
-            )
-        # Coupled but NOT same-factor and NOT a valid finer subdivision (coarser,
-        # non-multiple, or non-divisor block). This is a non-nestable re-mask: the
-        # legacy path would silently return st unchanged (v1==v2 no-op) => UNDER-mask.
-        # Reject explicitly so the caller drops it rather than applying a wrong
-        # (lighter) approximation. The implicit pure-diagonal pair (axis is None) is
-        # NOT rejected here — it is handled as a genuine no-op just below.
-        if (
-            coupled
-            and factor != cur_meta
-            and getattr(d1, "axis", None) is not None
-            and getattr(d2, "axis", None) is not None
-        ):
-            raise ValueError(
-                f"Diag: cannot re-mask a coupled block-diagonal (meta={cur_meta}) "
-                f"by factor={factor}: not the same factor and not a finer divisor "
-                f"subdivision (factor must be a multiple of the current meta and "
-                f"divide both logical sizes)."
-            )
-
     if N1 % factor != 0 or N2 % factor != 0:
         raise ValueError(
             f"Diag.factor = {factor} does not divide both logical sizes "
@@ -441,40 +387,11 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
     new_out = tuple(_remap(d) for d in st.out_dims)
     new_primal = tuple(_remap(d) for d in st.primal_dims)
 
-    new_scalar_mult = st.scalar_mult
-    # FULL-REDUCTION CANONICALIZATION. When the reduction drops EVERY physical
-    # axis the result is a 0-dim ``val`` scalar — the tensor is now uniform
-    # (every logical cell equals that one reduced value). The bare 0-dim-``val``
-    # form is non-canonical: ``.dense()`` would broadcast ``_scaled_mul(val,
-    # scalar_mult)`` up, leaving a dangling rank-0 array where the canonical
-    # "uniform grid" representation is ``val=None`` with the uniform magnitude
-    # carried by ``scalar_mult`` (see ``dense_for_matmul``'s ``val is None``
-    # fast path: it returns ``broadcast_to(scalar_mult * 1.0, shape)``). Fold
-    # the reduced scalar into ``scalar_mult`` and set ``val=None``:
-    #     new_scalar_mult = scalar_mult * reduced_scalar
-    # so ``.dense()`` reconstructs EXACTLY the same uniform tensor the 0-dim
-    # path densified (scalar_mult * reduced_scalar, broadcast) — a clean
-    # canonicalization, not a behaviour change.
-    #
-    # Guard: only fold to ``val=None`` when NO sparse dim remains. ``val=None``
-    # is read by ``_structural_val_size`` / ``dense()`` as an all-ones grid
-    # whose stored size divides out each sparse pair's meta count; a tensor
-    # that still carries a Diagonal pair would mis-densify under that reading.
-    # The COMPRESS guard already forbids dropping a sparse dim's structural
-    # block_axis, so a tensor with sparse dims cannot legitimately reach a
-    # 0-dim val here — but keep the bare scalar val for that case rather than
-    # silently corrupt it.
-    if new_val is not None and new_val.ndim == 0 and not any(
-        d.is_sparse for d in (*new_out, *new_primal)
-    ):
-        new_scalar_mult = _scaled_mul(st.scalar_mult, new_val)
-        new_val = None
-
     return SparseTensor(
         new_out,
         new_primal,
         new_val,
-        scalar_mult=new_scalar_mult,
+        scalar_mult=st.scalar_mult,
         fill_value=st.fill_value,
         # Forward the deferred-transform queues (the bare constructor defaults
         # them to ()): dropping them silently erases pending reshape/slice/...
@@ -493,37 +410,6 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
 # ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Scaled-quant dtype helpers
-# ---------------------------------------------------------------------------
-
-# Integer / unsigned / sub-byte targets get SCALED quantization (a per-tensor
-# float scale folded into scalar_mult). Everything else (float8/float4/bf16/
-# fp16/fp32/fp64/complex/bool) keeps a plain astype.
-def _is_scaled_quant_target(target) -> bool:
-    name = jnp.dtype(target).name
-    if name == "bool":
-        return False
-    return name.startswith("int") or name.startswith("uint")
-
-
-def _int_dtype_range(target) -> tuple[int, int]:
-    """(min, max) representable integer values for an int/uint target, including
-    the sub-byte ints (int2/int4/uint2/uint4) which JAX exposes via iinfo even
-    though they are stored in an int8/uint8 container."""
-    ii = jnp.iinfo(jnp.dtype(target))
-    return int(ii.min), int(ii.max)
-
-
-def _int_dtype_max(target) -> float:
-    """Symmetric positive scale denominator: the largest representable
-    magnitude of the target (``iinfo.max``). For signed ints this is the
-    positive arm (e.g. int8 -> 127, int4 -> 7, int2 -> 1); for unsigned it is
-    the full max (uint8 -> 255). Guaranteed >= 1 so the scale is well-defined."""
-    ii = jnp.iinfo(jnp.dtype(target))
-    return float(max(int(ii.max), 1))
-
-
 def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
     """Cast ``st.val`` to ``action.dtype``.
 
@@ -540,54 +426,11 @@ def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
     target = jnp.dtype(action.dtype)
     if st.val.dtype == target:
         return st
-
-    new_val = st.val
-    new_scalar_mult = st.scalar_mult
-    if _is_scaled_quant_target(target):
-        # SCALED PER-TENSOR QUANTIZATION (int / uint / sub-byte targets).
-        # A bare ``val.astype(int8)`` TRUNCATES every fractional Jacobian entry
-        # toward zero — a |J|<1 Jacobian collapses to all-zeros (the cossim-0
-        # degenerate). Instead store a symmetric per-tensor scale ``s`` and the
-        # rounded integer codes, folding ``s`` into ``scalar_mult`` so every
-        # downstream consumer auto-dequantizes (``.dense()`` / matmul /
-        # elementwise all apply ``scalar_mult`` to ``val`` before arithmetic —
-        # verified: no consumer reads ``val`` as a value without scalar_mult):
-        #     s   = max(|val|) / dtype_max(target)        # symmetric scale
-        #     q   = round(val / s).astype(target)         # integer codes
-        #     sm' = scalar_mult * s                        # val*sm' ~= val
-        # All-zero ``val`` -> s would be 0; guard to a plain astype no-op
-        # (the zeros quantize to zeros, scalar_mult unchanged).
-        absmax = jnp.max(jnp.abs(st.val))
-        dmax = _int_dtype_max(target)
-        s = absmax / dmax
-        # When val is all-zero (absmax==0) keep s=1 so we don't divide by 0 and
-        # the codes stay zeros; scalar_mult is then multiplied by 1 (no-op).
-        s_safe = jnp.where(s > 0, s, jnp.ones_like(s))
-        q = jnp.round(st.val.astype(jnp.float32) / s_safe)
-        # Clamp to the representable symmetric range before the narrow cast so a
-        # round-half-away rounding at the extreme can't wrap (e.g. round to +128
-        # for int8). Sub-byte ints are stored in an int8/uint8 container but the
-        # logical range is narrower, so clamp to [-dmax-?, dmax]; use the true
-        # iinfo range of the target's logical dtype.
-        lo, hi = _int_dtype_range(target)
-        # ``q`` is float32; clip with FLOAT bounds. Passing the raw Python ints
-        # (e.g. int64's -9.2e18) as jit args overflows JAX's argument parser
-        # ("OverflowError ... argument path is min"). float() bounds are finite
-        # and exact enough for the clamp (the scale already keeps |q| <= dmax).
-        q = jnp.clip(q, jnp.float32(lo), jnp.float32(hi))
-        new_val = q.astype(target)
-        new_scalar_mult = _scaled_mul(st.scalar_mult, s_safe)
-    else:
-        # Float targets (bfloat16 / float16 / float8_* / float4 / complex) carry
-        # a fraction natively — a plain astype preserves relative magnitudes, so
-        # no scale is needed (and ``bool`` has no meaningful scaled form).
-        new_val = st.val.astype(target)
-
     return SparseTensor(
         st.out_dims,
         st.primal_dims,
-        new_val,
-        scalar_mult=new_scalar_mult,
+        st.val.astype(target),
+        scalar_mult=st.scalar_mult,
         fill_value=st.fill_value,
         # The cast is shape-preserving, so any deferred Jacobian transform queued
         # on this edge (a reshape/slice/concatenate relabel awaiting drain) must

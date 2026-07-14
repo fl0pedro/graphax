@@ -1046,18 +1046,9 @@ def _build_output_tensor(ctx, rhs_dims, res):
         d.is_sparse and d.block_axis is not None
         for d in final_out + final_primal
     )
-    # Combine the three scalar_mults through the narrow-dtype-safe promotion
-    # (_scaled_mul maps float8/int8/etc. to the common compute dtype) so a Quant'd
-    # (float8) operand scalar_mult never trips the JAX implicit-promotion guard
-    # here — the seed-vertex adjoint contraction reaches this tiled path with mixed
-    # float8/float32 scalar_mults (the pre-op _unify only touches the operand val,
-    # not this post-contraction 3-way scalar_mult product).
-    from graphax.sparse.dtype_compute import _scaled_mul as _sm_promote
-    final_mult = _sm_promote(
-        _sm_promote(ctx.lhs.scalar_mult, ctx.rhs.scalar_mult), res.scalar_mult
-    )
+    final_mult = ctx.lhs.scalar_mult * ctx.rhs.scalar_mult * res.scalar_mult
     if not has_val and values is not None and values.size == 1:
-        final_mult = _sm_promote(final_mult, jnp.squeeze(values))
+        final_mult = final_mult * jnp.squeeze(values)
         values = None
     # Banded emission: when ``_should_emit_block_banded`` (run upstream in
     # ``_execute_block_sparse_contraction``) finds a band-storage form
@@ -1653,94 +1644,6 @@ def _pad_axis_to(arr, axis: int, size: int, fill):
     return jnp.concatenate([arr, pad], axis=axis)
 
 
-# --- Both-implicit contracting-pair analytic fold (GRAPHAX_KEEP_BLOCKDIAG) -----
-import os as _os
-_KEEP_BLOCKDIAG_MM = _os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "1") != "0"
-# Two-scalar matmul -> elementwise multiply (seed-vertex aggregation). Default on.
-_SEED_SCALAR_MM = _os.environ.get("GRAPHAX_SEED_VERTICES_SCALAR_MM", "1") != "0"
-
-
-def _both_implicit_contract_pairs(lhs, rhs):
-    """Contracting pairs where BOTH dims are IMPLICIT (``axis is None``, no stored
-    physical axis) and share the same logical size N. Contracting a broadcast axis
-    of length N is a reduce of N identical products => a scale-by-N: we drop the
-    pair from the dot_general and fold N into the result ``scalar_mult`` (no op).
-
-    Returns ``(pairs, factor)`` where ``pairs`` is the list of matched
-    ``(lhs_primal_dim, rhs_out_dim)`` and ``factor`` is the product of their Ns."""
-    if not (hasattr(lhs, "primal_dims") and hasattr(rhs, "out_dims")):
-        return [], 1
-    pairs = []
-    factor = 1
-    for l, r in _align_contract_dims(lhs.primal_dims, rhs.out_dims, embed=True):
-        l_impl = getattr(l, "axis", "x") is None and getattr(l, "block_axis", None) is None
-        r_impl = getattr(r, "axis", "x") is None and getattr(r, "block_axis", None) is None
-        n_l, n_r = int(l.logical_size), int(r.logical_size)
-        if l_impl and r_impl and n_l == n_r and n_l > 1 and not getattr(l, "is_sparse", False) and not getattr(r, "is_sparse", False):
-            pairs.append((l, r))
-            factor *= n_l
-    return pairs, factor
-
-
-def _fold_both_implicit(lhs, rhs, count):
-    """Analytic scale-by-N for every BOTH-IMPLICIT contracting pair (no
-    materialization, no dot_general over the broadcast axis). Drop the paired
-    implicit dims from ``lhs.primal`` / ``rhs.out`` and multiply the reduced
-    contraction's result ``scalar_mult`` by the product of their sizes. Composes
-    with any existing (non-unit / quantized) ``scalar_mult`` — it MULTIPLIES.
-
-    Returns the folded result (recurses through ``matmul`` on the reduced
-    operands) or ``None`` when there is no both-implicit pair to fold."""
-    from graphax.sparse.tensor import SparseTensor
-
-    pairs, factor = _both_implicit_contract_pairs(lhs, rhs)
-    if not pairs:
-        return None
-    drop_l = {id(l) for l, _ in pairs}
-    drop_r = {id(r) for _, r in pairs}
-    # Rebuild each operand without the dropped implicit dims. Physical axes are
-    # unaffected (implicit dims carry none), so ``val`` and every remaining dim's
-    # ``axis`` stay valid — only the dim lists shrink.
-    new_lhs = SparseTensor(
-        lhs.out_dims,
-        tuple(d for d in lhs.primal_dims if id(d) not in drop_l),
-        lhs.val,
-        scalar_mult=lhs.scalar_mult,
-        fill_value=lhs.fill_value,
-        check_consistency=False,
-    )
-    new_rhs = SparseTensor(
-        tuple(d for d in rhs.out_dims if id(d) not in drop_r),
-        rhs.primal_dims,
-        rhs.val,
-        scalar_mult=rhs.scalar_mult,
-        fill_value=rhs.fill_value,
-        check_consistency=False,
-    )
-    # After dropping the both-implicit contracted dims BOTH operands may be
-    # 0-rank scalars (a Compress-reduced seed-vertex edge contracting another
-    # scalar seed): matmul rejects 0-rank@0-rank, so the mathematically-correct
-    # scalar product is an ELEMENTWISE multiply. Route it there instead of
-    # recursing into matmul (which would raise). Non-scalar reduced operands
-    # keep the normal recursive matmul.
-    _both_scalar = (
-        new_lhs.out_dims == () and new_lhs.primal_dims == ()
-        and new_rhs.out_dims == () and new_rhs.primal_dims == ()
-    )
-    if _both_scalar:
-        out = new_lhs * new_rhs
-        cnt = (0, 1, 0)  # one scalar multiply
-    else:
-        res = matmul(new_lhs, new_rhs, count=count)
-        if count:
-            out, cnt = res
-        else:
-            out = res
-    fac = jnp.asarray(factor, dtype=out.scalar_mult.dtype)
-    out = out.copy(scalar_mult=out.scalar_mult * fac)
-    return (out, cnt) if count else out
-
-
 # --- Late-densification escape hatch for non-zero fill_value --------------
 def _matmul_via_densify(lhs, rhs):
     """Late-densification matmul for SparseTensors with non-zero ``fill_value``.
@@ -2069,26 +1972,15 @@ def matmul(lhs, rhs, count: bool = False):
             return out, _compute_matmul_count(lhs, rhs, out)
         return out
     lhs, rhs = _normalize_inputs(lhs, rhs)
-    # Two 0-rank (scalar) SparseTensors: the contraction is a scalar product =
-    # an ELEMENTWISE multiply (scalar . X == scale). This is what the AGGREGATION
-    # step needs when a Compress-reduced / seed-vertex scalar edge contracts
-    # another scalar edge (the --seed-vertices sentinel driver). The chain-rule
-    # site in core.py guards this too, but routes that leak through (the folded
-    # both-implicit reduction, a merge of two scalar edges) land here; do the
-    # mathematically-correct multiply rather than raise. Set
-    # GRAPHAX_SEED_VERTICES_SCALAR_MM=0 to restore the legacy raise.
+    # Scalar @ scalar is no longer supported — callers must use ``*``
+    # (elementwise). Vertex elimination in core.py guards this for the
+    # Jacobian chain rule.
     if (
         getattr(lhs, "out_dims", ()) == ()
         and getattr(lhs, "primal_dims", ()) == ()
         and getattr(rhs, "out_dims", ()) == ()
         and getattr(rhs, "primal_dims", ()) == ()
     ):
-        if _SEED_SCALAR_MM:
-            out = lhs * rhs
-            _record_path("scalar_elementwise")
-            if count:
-                return out, (0, 1, 0)
-            return out
         raise ValueError(
             "matmul of two 0-rank SparseTensors is not supported; "
             "use ``lhs * rhs`` (elementwise) instead"
@@ -2099,14 +1991,6 @@ def matmul(lhs, rhs, count: bool = False):
     # the EXACT-AD (transforms=()) edge never enters here and stays byte-
     # identical. Built with the canonical output-id convention so a downstream
     # multi-edge / all-vertices contraction aligns by id.
-    # Both-implicit contracting pair -> analytic scale-by-N folded into
-    # scalar_mult (no dot_general over the broadcast axis, no materialization).
-    if _KEEP_BLOCKDIAG_MM:
-        _folded = _fold_both_implicit(lhs, rhs, count)
-        if _folded is not None:
-            _record_path("both_implicit_fold")
-            return _folded
-
     from graphax.sparse.elemental.dispatch import try_elemental_matmul
 
     _elem = try_elemental_matmul(lhs, rhs, count=count)

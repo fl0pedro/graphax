@@ -26,7 +26,6 @@ from .primitives import (
     multi_output_elemental_only_rules,
 )
 from .sparse.ops import add_w_counts
-from .sparse.dtype_compute import _scaled_mul as _scaled_mul_promote
 from .sparse.ops.matmul import matmul as sparse_matmul
 from .sparse.ops.utils import (
     _compressed_dims, _materialize_for_op, _is_approx,
@@ -685,93 +684,6 @@ def _match_nominal_axes(d_shape, n_out, out_aval_shape, in_aval_shape):
     return tuple(out_perm + primal_perm)
 
 
-# GRAPHAX_KEEP_BLOCKDIAG=1: keep a pure block-diagonal (Diag) approx edge SPARSE
-# through the per-vertex reconciliation so its next contraction hits the batched
-# block-diagonal (GEMM) kernel rather than a full N x N densify. Sound only with
-# the idempotent produce_diag re-mask (see produce_diag._KEEP_BLOCKDIAG).
-# Default ON: the sparse block-diagonal (batched-GEMM) path is the default; set
-# GRAPHAX_KEEP_BLOCKDIAG=0 to force the legacy densify path (regression/debug).
-_KEEP_BLOCKDIAG = os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "1") != "0"
-
-
-def _is_pure_blockdiag(edge) -> bool:
-    """True iff edge carries >=1 meta-block-diagonal (Diagonal) dim and NO
-    compressed/implicit dim — a residual structure the batched block-diagonal
-    contraction kernel can consume directly (no densify needed)."""
-    dims = getattr(edge, "dims", None)
-    if dims is None:
-        return False
-    has_diag = False
-    for d in dims:
-        if getattr(d, "is_compressed", False):
-            return False
-        if getattr(d, "is_sparse", False):
-            has_diag = True
-    return has_diag
-
-
-def _is_keep_sparse_edge(edge, out_aval_shape, in_aval_shape) -> bool:
-    """Generalisation of ``_is_pure_blockdiag``: an approx edge whose compaction is
-    a block-diagonal AND/OR an IMPLICIT (``axis is None``) dim AND/OR a structural
-    ``val is None`` — i.e. a form the downstream contraction consumes WITHOUT a
-    full densify — provided it is ALREADY at its nominal logical shape (so no
-    re-layout is needed and the merge/next re-mask see a nominal-shaped edge).
-
-    ``val is None`` structural edges and implicit dims broadcast to their nominal
-    logical size in ``.dense()`` for free, so keeping them avoids materialising an
-    N-fold-larger buffer. Requires nominal shape to guarantee the reshape/merge
-    invariants the densify otherwise restores; a non-nominal (permuted / regroup)
-    edge still densifies (correct)."""
-    dims = getattr(edge, "dims", None)
-    if dims is None:
-        return False
-    nominal = tuple(out_aval_shape) + tuple(in_aval_shape)
-    if tuple(getattr(edge, "shape", ())) != nominal:
-        return False
-    has_compact = getattr(edge, "val", "x") is None
-    for d in dims:
-        if getattr(d, "is_sparse", False):
-            has_compact = True
-        if getattr(d, "is_compressed", False) or getattr(d, "axis", "x") is None:
-            has_compact = True
-    return has_compact
-
-
-def _blockdiag_addable(a, b) -> bool:
-    """True iff two edges are BOTH pure block-diagonal and NESTABLE — their
-    SparseTensor ``+`` stays block-sparse (no densify, no zero-padding).
-
-    Per matching-id dim position both must be sparse block-diagonal with the SAME
-    nominal logical size, and their meta counts must NEST: one divides the other
-    (equivalently one block size divides the other). A finer block-diagonal's
-    support is contained in the coarser one's, so the sum is representable at the
-    coarser block structure — which the elementwise add already produces (verified
-    diff 0 vs dense-add for 2-block + 4-block etc.). Identical structures are the
-    degenerate nesting (ratio 1). A non-nestable pair (meta counts not
-    divisor-related, or different nominal size) still densifies (correct)."""
-    if not (_is_pure_blockdiag(a) and _is_pure_blockdiag(b)):
-        return False
-    da, db = getattr(a, "dims", None), getattr(b, "dims", None)
-    if da is None or db is None or len(da) != len(db):
-        return False
-    for x, y in zip(da, db):
-        if getattr(x, "id", None) != getattr(y, "id", None):
-            return False
-        xs = bool(getattr(x, "is_sparse", False))
-        ys = bool(getattr(y, "is_sparse", False))
-        if xs != ys:
-            return False
-        if getattr(x, "logical_size", None) != getattr(y, "logical_size", None):
-            return False
-        if xs:
-            mx = getattr(x, "size", None) or 1
-            my = getattr(y, "size", None) or 1
-            hi, lo = (mx, my) if mx >= my else (my, mx)
-            if lo == 0 or hi % lo != 0:
-                return False  # meta counts do not nest -> not block-addable
-    return True
-
-
 def _normalize_approx_edge(edge, out_aval_shape, in_aval_shape):
     """Reconcile an approximation-bearing edge to its TRUE dense form at the
     NOMINAL logical shape ``out_aval + in_aval``.
@@ -1057,14 +969,14 @@ def _eliminate_vertex(
                     # scaled-identity edge multiplies by it; dropping it was the
                     # ``sum(z*sum(z))`` bug — 10·pre became pre).
                     edge_outval = _pre_val.copy(
-                        scalar_mult=_scaled_mul_promote(_pre_val.scalar_mult, _post_val.scalar_mult)
+                        scalar_mult=_pre_val.scalar_mult * _post_val.scalar_mult
                     )
                     if count_ops:
                         muls += 1
                 else:
                     # pre is the identity (up to scalar_mult): pass post through.
                     edge_outval = _post_val.copy(
-                        scalar_mult=_scaled_mul_promote(_post_val.scalar_mult, _pre_val.scalar_mult)
+                        scalar_mult=_post_val.scalar_mult * _pre_val.scalar_mult
                     )
                     if count_ops:
                         muls += 1
@@ -1091,18 +1003,9 @@ def _eliminate_vertex(
                 # ``_is_approx_cfg`` is statically False on the EXACT-AD path, so
                 # the no-approximation edge is byte-identical.
                 if _approx_elim and graph.get(in_edge).get(out_edge) is not None:
-                    # KEEP_BLOCKDIAG: if BOTH the new and existing edge are matching
-                    # pure block-diagonals, their SparseTensor + stays block-sparse
-                    # (verified block-wise add), so skip the merge densify. Otherwise
-                    # normalize to nominal so the + aligns (the load-bearing case).
-                    _existing_bd = _force(transpose_graph[out_edge][in_edge])
-                    if not (
-                        _KEEP_BLOCKDIAG
-                        and _blockdiag_addable(edge_outval, _existing_bd)
-                    ):
-                        edge_outval = _normalize_approx_edge(
-                            edge_outval, out_edge.aval.shape, in_edge.aval.shape
-                        )
+                    edge_outval = _normalize_approx_edge(
+                        edge_outval, out_edge.aval.shape, in_edge.aval.shape
+                    )
 
                 _assert_sparse_tensor_consistency(edge_outval)
                 # If there is already an edge between the two vertices, add the new
@@ -1121,9 +1024,7 @@ def _eliminate_vertex(
                     # order — under an approximation the two contraction paths feed
                     # the merge in mismatched layouts (the ViT seq/embed swap). Bring
                     # the existing edge to the same nominal layout so the add aligns.
-                    if _approx_elim and not (
-                        _KEEP_BLOCKDIAG and _blockdiag_addable(edge_outval, _edge)
-                    ):
+                    if _approx_elim:
                         _edge = _normalize_approx_edge(
                             _edge, out_edge.aval.shape, in_edge.aval.shape
                         )
@@ -1247,25 +1148,9 @@ def _eliminate_vertex(
                 # can't re-permute it. Gated on Diag/Compress, so EXACT-AD is
                 # untouched.
                 if _is_approx_cfg and _is_approx(edge_outval):
-                    # GRAPHAX_KEEP_BLOCKDIAG: keep a pure block-diagonal edge SPARSE
-                    # so the next contraction routes through the batched block-
-                    # diagonal (GEMM) kernel instead of a full N x N densify. The
-                    # idempotent produce_diag re-mask makes a later uniform Diag on
-                    # this edge a sound no-op, so the load-bearing densify is not
-                    # needed here.
-                    # GRAPHAX_KEEP_BLOCKDIAG generalised: keep any block-diagonal
-                    # / implicit (val_dim=None) / structural (val=None) edge SPARSE
-                    # when it is already at nominal shape — the downstream contraction
-                    # consumes it without the full N-fold densify.
-                    if not (
-                        _KEEP_BLOCKDIAG
-                        and _is_keep_sparse_edge(
-                            edge_outval, out_edge.aval.shape, in_edge.aval.shape
-                        )
-                    ):
-                        edge_outval = _normalize_approx_edge(
-                            edge_outval, out_edge.aval.shape, in_edge.aval.shape
-                        )
+                    edge_outval = _normalize_approx_edge(
+                        edge_outval, out_edge.aval.shape, in_edge.aval.shape
+                    )
                     _assert_sparse_tensor_consistency(edge_outval)
 
                 # NOTE: the previous KNOWN-INCOMPLETE "densify approx edge to
@@ -2175,24 +2060,6 @@ def extract_jaxpr(
             # Flatten so the resulting jaxpr has all jacobians as outputs.
             return tuple(jtu.tree_leaves(res))
 
-        # APPEND-ONLY STATE tokenization (opt-in via GRAPHAX_STATE_TOKENS=1):
-        # skip the per-step Jacobian RE-TRACE entirely. The token stream becomes
-        # <original-graph tokens> | <elimination-order prefix>, which is a pure
-        # prefix-extension step to step (incrementally cacheable) and a lossless
-        # encoding of the partial-elimination state (original graph + order are a
-        # sufficient statistic). This also avoids the expensive make_jaxpr trace.
-        import os as _os
-        if _os.environ.get("GRAPHAX_STATE_TOKENS", "0") == "1":
-            # Pass the per-vertex micro-actions (DIAG/COMPRESS/QUANT) too, so
-            # the state stream losslessly encodes the APPROXIMATED state, not
-            # just the exact elimination order. ``_transforms`` is already the
-            # normalised ((vertex, (transform_obj, ...)), ...) structure.
-            ve_jaxpr = VEJaxpr(jaxpr, elim_order=_order, transforms=_transforms)
-            if ENABLE_CACHE:
-                with _topology_lock:
-                    _topology_cache[cache_key] = ve_jaxpr
-            return ve_jaxpr
-
         dummy_args = [
             ShapeDtypeStruct(v.aval.shape, v.aval.dtype)
             for i, v in enumerate(jaxpr.invars)
@@ -2396,11 +2263,11 @@ def _accumulate_edge_triplet(
             edge_outval = _post_val @ _pre_val
     elif pre_val.val is not None:
         edge_outval = _pre_val.copy(
-            scalar_mult=_scaled_mul_promote(_pre_val.scalar_mult, _post_val.scalar_mult)
+            scalar_mult=_pre_val.scalar_mult * _post_val.scalar_mult
         )
     else:
         edge_outval = _post_val.copy(
-            scalar_mult=_scaled_mul_promote(_post_val.scalar_mult, _pre_val.scalar_mult)
+            scalar_mult=_post_val.scalar_mult * _pre_val.scalar_mult
         )
 
     if len(post_val.post_transforms) > 0:
