@@ -31,6 +31,16 @@ def lif(U, I, S, a, b, threshold):
     return U_next, I_next, S_next
 
 
+def lif_cb(U, I, S, a, b, threshold):
+    """Current-based LIF step: input current reaches the membrane the SAME step
+    (I_next computed first, then U_next from I_next), so the weight gradient is
+    non-zero even in a single-step (online) window. Same surrogate as ``lif``."""
+    I_next = b * I + (1. - b) * S
+    U_next = a * U + (1. - a) * I_next
+    S_next = surrogate(U_next - threshold)
+    return U_next, I_next, S_next
+
+
 # From Bellec et al. e-prop paper
 def ada_lif(U, a, S, alpha, beta, rho, threshold):
     U_next = alpha*U + S    
@@ -61,4 +71,36 @@ def ADALIF_SNN(S_in, S_target, U1, U2, U3, a1, a2, a3, W1, W2, W3, alpha, beta, 
     i3 = W3 @ s2
     U3, a3, s3 = ada_lif(U3, a3, i3, alpha, beta, rho, thresh)
     return .5*(s3 - S_target)**2, U1, U2, U3, a1, a2, a3
-        
+
+import os as _os
+def _snn_trunc():
+    """ALPHAGRAD_SNN_TRUNC: unset->None (full BPTT unroll over all T);
+    0 (or <0)->online (single step in the graph, recurrent carry is a leaf);
+    N>0->truncated window of N steps unrolled into the grad/Jacobian graph."""
+    v = _os.environ.get("ALPHAGRAD_SNN_TRUNC", None)
+    if v is None or v == "":
+        return None
+    return int(v)
+
+
+def LIF_SNN_SHD(S_in_seq, S_target, U1, U2, U3, I1, I2, I3,
+                W1, W2, W3, alpha, beta, thresh):
+    """Temporal 3-layer LIF over a spike WINDOW ``S_in_seq`` of shape (N, n_in).
+    N is the REVERSE/Jacobian truncation window (set by the args builder from
+    ALPHAGRAD_SNN_TRUNC). The recurrent carry ENTERING the window (U*, I*) is
+    precomputed by a FULL forward pass over the earlier T-N timesteps (detached),
+    so forward activations reflect the whole sequence while ONLY these N steps are
+    differentiated. The elimination graph graphax sees is therefore a constant
+    base + N * per-step block (truncated BPTT): online (N=1) is smallest, full
+    (N=T) largest. Returns the scalar mean readout loss (differentiate W @ 8,9,10)."""
+    N = int(S_in_seq.shape[0])
+    loss = 0.0
+    for t in range(N):
+        i1 = W1 @ S_in_seq[t]
+        U1, I1, s1 = lif_cb(U1, I1, i1, alpha, beta, thresh)
+        i2 = W2 @ s1
+        U2, I2, s2 = lif_cb(U2, I2, i2, alpha, beta, thresh)
+        i3 = W3 @ s2
+        U3, I3, s3 = lif_cb(U3, I3, i3, alpha, beta, thresh)
+        loss = loss + jnp.mean(0.5 * (s3 - S_target) ** 2)
+    return loss / N
