@@ -109,6 +109,14 @@ if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
 
 
+# GRAPHAX_KEEP_BLOCKDIAG=1 keeps a per-vertex Diag edge block-diagonal (sparse)
+# instead of re-densifying it in core._normalize_approx_edge, so a uniform-Diag
+# elimination contracts through the batched block-diagonal (GEMM) kernels instead
+# of a full N×N dense matmul. Requires the idempotent re-mask below to stay sound.
+import os as _os
+_KEEP_BLOCKDIAG = _os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "0") == "1"
+
+
 # --------------------------------------------------------------------------- #
 # Logical-index resolution
 # --------------------------------------------------------------------------- #
@@ -156,6 +164,27 @@ def produce_diag(
         raise ValueError(f"produce_diag: factor must be positive, got {factor}.")
 
     (is_out_i, rel_i, di), (is_out_j, rel_j, dj) = _resolve(st, i, j)
+
+    # GRAPHAX_KEEP_BLOCKDIAG idempotence: with the keep-sparse block-diagonal
+    # path an edge that was already ``Diag(i, j, factor)``-masked on the previous
+    # vertex re-enters here still block-diagonal. Re-masking by the SAME factor is
+    # a no-op (the meta-block-diagonal indicator is idempotent), so return ``st``
+    # unchanged instead of raising "must be a plain DenseIndex" — which upstream
+    # would catch and SKIP, silently under-masking. This is what makes the
+    # per-vertex uniform-Diag re-mask structure-invariant (see the densify note in
+    # core._normalize_approx_edge). Only a MATCHING coupled pair short-circuits;
+    # a different sparse structure still raises (correctness over silent skip).
+    if _KEEP_BLOCKDIAG and (di.is_sparse or dj.is_sparse):
+        di_meta = getattr(di, "size", None)
+        dj_meta = getattr(dj, "size", None)
+        coupled = (
+            di.is_sparse and dj.is_sparse
+            and getattr(di, "other_id", None) == dj.id
+            and getattr(dj, "other_id", None) == di.id
+            and di_meta == factor and dj_meta == factor
+        )
+        if coupled:
+            return st
 
     if di.is_sparse or di.is_compressed:
         raise ValueError(
