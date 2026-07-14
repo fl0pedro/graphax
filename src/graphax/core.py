@@ -745,25 +745,57 @@ def _eliminate_vertex(
     eqn = jaxpr.eqns[vertex - 1]
     adds = muls = fmas = mem = 0
 
-    # Approximation placement (env-toggled A/B). DEFAULT: every transform acts
-    # on the OUTPUT edge (``edge_outval``) after the contraction — only the
-    # result edge is approximated, so the matmul itself runs full size /
-    # precision. With ``GRAPHAX_APPROX_MATMUL=1``: Diag/Compress shrink the
-    # matmul INPUT (``pre_val``) and Quant casts the matmul operands, so the
-    # approximation targets the contraction's own cost. Callables always stay
-    # on ``edge_outval`` (the user escape hatch).
-    _approx_matmul = os.getenv("GRAPHAX_APPROX_MATMUL") == "1"
-    if _approx_matmul:
-        _matmul_diag_compress = [
-            t for t in transforms if isinstance(t, (Diag, Compress))
-        ]
-        _matmul_quant = [t for t in transforms if isinstance(t, Quant)]
-        _edge_transforms = [
-            t for t in transforms if not isinstance(t, (Diag, Compress, Quant))
-        ]
-    else:
-        _matmul_diag_compress = _matmul_quant = ()
-        _edge_transforms = transforms
+    # Approximation PLACEMENT sweep (env-selected). ``GRAPHAX_APPROX_POS`` puts
+    # the whole per-vertex transform sequence at ONE of six structural points:
+    #   matmul_pre  — the contraction's RIGHT operand (pre_val), pre-contraction
+    #   matmul_post — the contraction's LEFT operand (post_val), pre-contraction
+    #   matmul_out  — the contraction RESULT (edge_outval), post-contraction
+    #   add_pre     — the NEW addend (edge_outval) before the merge add
+    #   add_post    — the EXISTING edge (_edge) before the merge add
+    #   add_out     — the SUM after the merge add
+    # (add_* only fire on a merge edge that actually has an existing edge.)
+    # Unset => historical placement: the final loop on ``edge_outval`` after the
+    # merge. ``_apply_seq`` applies the sequence best-effort (skip-on-ValueError
+    # for a shape-changing Diag/Compress that doesn't fit the current geometry).
+    _pos = os.getenv("GRAPHAX_APPROX_POS") or None
+
+    def _apply_seq(_st):
+        for _t in transforms:
+            try:
+                if isinstance(_t, Diag):
+                    _st = apply_diag(_st, _t)
+                elif isinstance(_t, Compress):
+                    _st = apply_compress(_st, _t)
+                elif isinstance(_t, Quant):
+                    _st = apply_quant(_st, _t)
+                elif callable(_t):
+                    _st = _t(_st)
+            except ValueError:
+                continue
+        return _st
+
+    def _contract(_pst, _pr):
+        # The scalar×scalar / sparse_matmul / ``@`` dispatch, factored so an
+        # approximated contraction can be retried exact on a geometry miss.
+        # Returns (edge_outval, adds, muls, fmas, mem_delta).
+        _a2 = _m2 = _f2 = _mm2 = 0
+        if _is_scalar_st(_pst) and _is_scalar_st(_pr):
+            _ev = _pst * _pr
+            _m2 = 1
+        elif count_ops:
+            _ev, (_a2, _m2, _f2) = sparse_matmul(_pst, _pr, count=True)
+        else:
+            _ev = _pst @ _pr
+        if count_ops:
+            _ps = _pst.val.size if _pst.val is not None else 0
+            _prz = _pr.val.size if _pr.val is not None else 0
+            _os = _ev.val.size if _ev.val is not None else 0
+            _mm2 = max(
+                _ps * _pst.dtype.itemsize,
+                _prz * _pr.dtype.itemsize,
+                _os * _ev.dtype.itemsize,
+            )
+        return _ev, int(_a2), int(_m2), int(_f2), _mm2
 
     for central_var in eqn.outvars:
         if central_var not in graph:
@@ -815,55 +847,46 @@ def _eliminate_vertex(
                     or (pre_val.val is None and not _acts_as_identity(_pre_val))
                 )
                 if _need_contract:
-                    if _approx_matmul:
-                        # Diag/Compress shrink the matmul INPUT (pre_val); Quant
-                        # casts BOTH operands so the contraction runs at the
-                        # quantized precision. A transform that doesn't fit the
-                        # current edge geometry is skipped (same best-effort
-                        # contract as the edge_outval path).
-                        for _t in _matmul_diag_compress:
-                            try:
-                                if isinstance(_t, Diag):
-                                    _pre_val = apply_diag(_pre_val, _t)
-                                else:
-                                    _pre_val = apply_compress(_pre_val, _t)
-                            except ValueError:
-                                continue
-                        for _t in _matmul_quant:
-                            _post_val = apply_quant(_post_val, _t)
-                            _pre_val = apply_quant(_pre_val, _t)
-                    # A scalar × scalar contraction is an elementwise multiply:
-                    # ``sparse_matmul`` rejects 0-rank operands, so it must NEVER
-                    # be routed through matmul — on either the count or non-count
-                    # path (the count path used to crash here).
-                    if _is_scalar_st(_post_val) and _is_scalar_st(_pre_val):
-                        edge_outval = _post_val * _pre_val
-                        if count_ops:
-                            muls += 1
-                    elif count_ops:
-                        edge_outval, (_a, _m, _f) = sparse_matmul(
-                            _post_val, _pre_val, count=True
+                    # Approximate a matmul operand, but if the resulting
+                    # contraction is geometry-incompatible (a high-rank ViT/MoE
+                    # edge where Diag/Compress changes a contracted dim's size →
+                    # "Contraction size mismatch"), fall back to the EXACT operand
+                    # for this edge instead of crashing — the same best-effort
+                    # skip apply_diag/apply_compress use when a transform doesn't
+                    # fit. So the approximation fires where it helps and is
+                    # silently skipped where it would break the elimination.
+                    if _pos in ("matmul_pre", "matmul_post"):
+                        # A correct Diag/Compress at a matmul operand preserves the
+                        # edge's LOGICAL shape (only the block representation
+                        # changes), so the approximated contraction must still
+                        # yield the nominal edge shape. If it doesn't (or raises) —
+                        # a high-rank ViT/MoE geometry the transform mishandles —
+                        # discard it and contract EXACT for this edge. This keeps
+                        # every stored edge nominal-shaped, so the corruption never
+                        # propagates into a downstream contraction.
+                        _nominal = tuple(
+                            list(out_edge.aval.shape) + list(in_edge.aval.shape)
                         )
-                        adds += int(_a)
-                        muls += int(_m)
-                        fmas += int(_f)
+                        _approx = _pre_val if _pos == "matmul_pre" else _post_val
+                        _approx = _apply_seq(_approx)
+                        try:
+                            if _pos == "matmul_pre":
+                                edge_outval, _a, _m, _f, _mm = _contract(_post_val, _approx)
+                            else:
+                                edge_outval, _a, _m, _f, _mm = _contract(_approx, _pre_val)
+                            if edge_outval.shape != _nominal:
+                                raise ValueError("approx changed the edge's logical shape")
+                        except (ValueError, TypeError):
+                            # ValueError = contraction size mismatch; TypeError =
+                            # reshape failure (high-rank MoE band buffers). Either
+                            # way, skip the approximation on this edge.
+                            edge_outval, _a, _m, _f, _mm = _contract(_post_val, _pre_val)
                     else:
-                        edge_outval = _post_val @ _pre_val
-                    if count_ops:
-                        post_size = (
-                            _post_val.val.size if _post_val.val is not None else 0
-                        )
-                        pre_size = _pre_val.val.size if _pre_val.val is not None else 0
-                        out_size = (
-                            edge_outval.val.size
-                            if edge_outval.val is not None
-                            else 0
-                        )
-                        mem += max(
-                            post_size * _post_val.dtype.itemsize,
-                            pre_size * _pre_val.dtype.itemsize,
-                            out_size * edge_outval.dtype.itemsize,
-                        )
+                        edge_outval, _a, _m, _f, _mm = _contract(_post_val, _pre_val)
+                    adds += _a
+                    muls += _m
+                    fmas += _f
+                    mem += _mm
 
                 elif pre_val.val is not None:
                     # post is a pure-diagonal identity up to its scalar_mult:
@@ -899,6 +922,8 @@ def _eliminate_vertex(
                     edge_outval = _materialize_for_op(edge_outval)
 
                 _assert_sparse_tensor_consistency(edge_outval)
+                if _pos == "matmul_out":
+                    edge_outval = _apply_seq(edge_outval)
                 # If there is already an edge between the two vertices, add the new
                 # edge to the existing one
                 if graph.get(in_edge).get(out_edge) is not None:
@@ -912,17 +937,25 @@ def _eliminate_vertex(
                     _edge = _drain_transforms(_edge)
                     _assert_sparse_tensor_consistency(_edge)
 
+                    if _pos == "add_pre":
+                        edge_outval = _apply_seq(edge_outval)
+                    if _pos == "add_post":
+                        _edge = _apply_seq(_edge)
+
                     # Check if the computed edge Jacobian shapes actually match
-                    # what we expect
-                    edge_shape = tuple(
-                        list(out_edge.aval.shape) + list(in_edge.aval.shape)
-                    )
-                    assert edge_shape == edge_outval.shape, (
-                        f"Computed edge shape {edge_outval.shape} does not match expected shape {edge_shape}!"
-                    )
-                    assert edge_shape == _edge.shape, (
-                        f"Existing edge shape {_edge.shape} does not match expected shape {edge_shape}!"
-                    )
+                    # what we expect. Skipped when approximating: a shape-changing
+                    # Diag/Compress at an add/matmul_out position legitimately
+                    # changes the edge shape away from the nominal Jacobian shape.
+                    if _pos is None:
+                        edge_shape = tuple(
+                            list(out_edge.aval.shape) + list(in_edge.aval.shape)
+                        )
+                        assert edge_shape == edge_outval.shape, (
+                            f"Computed edge shape {edge_outval.shape} does not match expected shape {edge_shape}!"
+                        )
+                        assert edge_shape == _edge.shape, (
+                            f"Existing edge shape {_edge.shape} does not match expected shape {edge_shape}!"
+                        )
                     if count_ops:
                         edge_outval, (_a, _m, _f) = add_w_counts(edge_outval, _edge)
                         adds += int(_a)
@@ -935,6 +968,8 @@ def _eliminate_vertex(
                         ) * edge_outval.dtype.itemsize
                     else:
                         edge_outval += _edge
+                    if _pos == "add_out":
+                        edge_outval = _apply_seq(edge_outval)
 
                 # Apply per-vertex transforms in order. Diag / Compress are
                 # dispatched to the atomic helpers in micro_actions; any
@@ -956,7 +991,7 @@ def _eliminate_vertex(
                 # alternative is to push the full edge geometry up to the
                 # caller so it can pre-filter, which couples the typed
                 # transform API to internal sparse representations.
-                for _t in _edge_transforms:
+                for _t in (transforms if _pos is None else ()):
                     try:
                         if isinstance(_t, Diag):
                             edge_outval = apply_diag(edge_outval, _t)
