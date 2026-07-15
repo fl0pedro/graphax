@@ -956,7 +956,19 @@ def _eliminate_vertex(
     # every edge, so compute it ONCE here rather than per (in_edge, out_edge).
     # Gates the approx-edge normalization below; ``transforms == ()`` (the EXACT
     # AD path) gives ``any([]) == False`` so that path stays byte-identical.
-    _is_approx_cfg = any(isinstance(_t, (Diag, Compress)) for _t in transforms)
+    # A transform is an approximation if it is a Diag/Compress instance OR a CALLABLE —
+    # the `transforms` API documents "a callable (SparseTensor) -> SparseTensor — escape
+    # hatch for arbitrary user-defined transforms", but the old isinstance-only test did
+    # not match callables, so a callable transform set _is_approx_cfg=False and SILENTLY
+    # BYPASSED the whole approx path: every `_normalize_approx_edge` gate is keyed off this
+    # (and `_approx_elim`), so a non-nominal approx edge sailed into the merge-path shape
+    # assert => "Computed edge shape (10,4,16,16) does not match expected shape (4,16,16)"
+    # (MoE) / "matmul: mismatch in core dimension 0" (NN). Callables are exactly what a
+    # MASK-AWARE policy must use (the mask needs the real edge, only known mid-elimination),
+    # so this silently broke the one correct way to apply approximations.
+    _is_approx_cfg = any(
+        isinstance(_t, (Diag, Compress)) or callable(_t) for _t in transforms
+    )
     # GLOBAL approx flag: True for the whole elimination iff ANY vertex carries an
     # approximation (set in ``vertex_elimination_jaxpr``). The merge below must
     # reconcile an edge that was PERMUTED by an upstream approx vertex even when
