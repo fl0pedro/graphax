@@ -630,6 +630,35 @@ def append_pre_transforms(pre, out):
     return out
 
 
+def _identity_passthrough(keep, ident, side: str):
+    """Pass ``keep`` through an IDENTITY ``ident`` operand (the ``_need_contract
+    is False`` shortcut), folding the identity's ``scalar_mult``.
+
+    Both contraction paths re-attach ``post_val.post_transforms`` /
+    ``pre_val.pre_transforms`` to the emitted edge immediately below. That is
+    correct after a REAL contraction, because ``sparse_matmul`` / ``unload_*``
+    rebuild the tensor and DROP its queued transforms -- the re-attach restores
+    them exactly once. The pass-through shortcut is a ``copy()``, which KEEPS
+    the queue, so the very same transform object got queued a SECOND time
+    (observed: ``pre_transforms = (transpose, transpose)`` on a ViT edge -- the
+    relabel applied twice, cos 1/32). Clear the side that is about to be
+    re-attached so the shortcut has the same postcondition as the contract path.
+
+    ``side="pre"``  -- ``keep`` is the pre operand; its ``pre_transforms``
+                      are re-appended by ``append_pre_transforms``.
+    ``side="post"`` -- ``keep`` is the post operand; its ``post_transforms``
+                      are re-prepended by ``prepend_post_transforms``.
+    The OTHER side is deliberately preserved: it lives on the surviving
+    (non-contracted) dims and nothing re-attaches it.
+    """
+    out = keep.copy(scalar_mult=_scaled_mul_promote(keep.scalar_mult, ident.scalar_mult))
+    if side == "pre":
+        out.pre_transforms = ()
+    else:
+        out.post_transforms = ()
+    return out
+
+
 def _drain_transforms(tensor, post_first: bool = True):
     """Fold a tensor's queued Jacobian transforms into its data: apply each
     ``post_transform`` forward (``apply``) and each ``pre_transform`` in reverse
@@ -1068,16 +1097,12 @@ def _eliminate_vertex(
                     # pass pre through, FOLDING post's scalar_mult (a scalar /
                     # scaled-identity edge multiplies by it; dropping it was the
                     # ``sum(z*sum(z))`` bug — 10·pre became pre).
-                    edge_outval = _pre_val.copy(
-                        scalar_mult=_scaled_mul_promote(_pre_val.scalar_mult, _post_val.scalar_mult)
-                    )
+                    edge_outval = _identity_passthrough(_pre_val, _post_val, "pre")
                     if count_ops:
                         muls += 1
                 else:
                     # pre is the identity (up to scalar_mult): pass post through.
-                    edge_outval = _post_val.copy(
-                        scalar_mult=_scaled_mul_promote(_post_val.scalar_mult, _pre_val.scalar_mult)
-                    )
+                    edge_outval = _identity_passthrough(_post_val, _pre_val, "post")
                     if count_ops:
                         muls += 1
                 # Offload the remain Jacobian transforms to the output tensor
@@ -2442,13 +2467,9 @@ def _accumulate_edge_triplet(
         else:
             edge_outval = _post_val @ _pre_val
     elif pre_val.val is not None:
-        edge_outval = _pre_val.copy(
-            scalar_mult=_scaled_mul_promote(_pre_val.scalar_mult, _post_val.scalar_mult)
-        )
+        edge_outval = _identity_passthrough(_pre_val, _post_val, "pre")
     else:
-        edge_outval = _post_val.copy(
-            scalar_mult=_scaled_mul_promote(_post_val.scalar_mult, _pre_val.scalar_mult)
-        )
+        edge_outval = _identity_passthrough(_post_val, _pre_val, "post")
 
     if len(post_val.post_transforms) > 0:
         edge_outval = prepend_post_transforms(post_val, edge_outval)
