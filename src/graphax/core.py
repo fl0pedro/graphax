@@ -2006,8 +2006,18 @@ def vertex_elimination_jaxpr(
     # flag mid-flight (that would silently route the outer's remaining approx
     # edges onto the existing path).
     from .sparse.elemental.dispatch import approx_active, set_approx_active
+    # Same rule as `_is_approx_cfg`: a transform is an approximation if it is a
+    # Diag/Compress instance OR a CALLABLE (the documented
+    # "(SparseTensor) -> SparseTensor escape hatch"). The isinstance-only test made a
+    # callable set _approx_on=False -> set_approx_active(False) -> try_elemental_matmul's
+    # EXACT-AD guard (`if not approx_active(): return None`) short-circuited the ENTIRE
+    # elemental dispatch, so contract_implicit was NEVER REACHED (telemetry:
+    # matmul_pure_dense_skip=11, DISPATCH_FALLBACK_LOG empty). The implicit (Compress-away)
+    # dim was therefore never consumed by the contraction and rode through as a phantom out
+    # dim, which _normalize_approx_edge then could not regroup ("per-side logical-extent
+    # mismatch — edge (out 10 | primal 8) vs nominal (out () | primal (8,))").
     _approx_on = any(
-        isinstance(_t, (Diag, Compress))
+        isinstance(_t, (Diag, Compress)) or callable(_t)
         for _spec in (transforms or ())
         for _t in (_spec[1] if isinstance(_spec, (tuple, list)) and len(_spec) == 2 else ())
     )
