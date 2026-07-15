@@ -745,12 +745,26 @@ def _squeeze_elementals(primals, val_out, **params):
 
         out_ids = [d.id for d in new_out_dims]
         primal_ids = [d.id for d in new_primal_dims]
-        new_val_axes = [d.axis for d in new_out_dims if d.axis is not None]
-        new_val_axes += [
-            d.axis
-            for d in new_primal_dims
-            if not d.is_sparse and d.axis is not None
-        ]
+        # Surviving val axes, used below to re-compact the axis numbers after
+        # ``jnp.squeeze`` drops ``squeeze_dims``: a surviving old axis ``a``
+        # becomes ``rank of a among the surviving axes``.
+        #
+        # This list MUST be SORTED. It is consumed as ``new_val_axes.index(a)``,
+        # and ``list.index`` returns a POSITION -- which equals the rank only if
+        # the list is ascending. Collected in DIM order (the old code) it
+        # silently renumbered every dim to the identity map whenever a dim ->
+        # val-axis permutation was present, WITHOUT transposing ``val`` to
+        # match: the tensor came out transposed. A dim's ``axis`` is NOT
+        # required to equal its position -- a transposed edge keeps dims in
+        # logical order with axes permuted (e.g. 0,1,3,2). Under forward /
+        # reverse elimination the axes happen to arrive in dim order, so the
+        # list was already sorted and the defect was invisible; under a general
+        # elimination order it transposed the edge (the MoE / ConvNet / ViT
+        # random-order jacve inexactness). ``set`` because a diagonal pair
+        # shares one val axis: both dims must map to that single axis's rank.
+        new_val_axes = sorted({d.axis for d in new_out_dims if d.axis is not None}
+                              | {d.axis for d in new_primal_dims
+                                 if not d.is_sparse and d.axis is not None})
 
         for i, d in enumerate(new_out_dims):
             updates = {"id": out_ids.index(d.id)}
