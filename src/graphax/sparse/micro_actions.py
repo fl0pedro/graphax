@@ -225,6 +225,21 @@ def apply_diag(st: SparseTensor, action: Diag) -> SparseTensor:
     d1 = st.out_dims[rel_i] if is_out1 else st.primal_dims[rel_i]
     d2 = st.out_dims[rel_j] if is_out2 else st.primal_dims[rel_j]
 
+    # A Jacobian diagonal ties an OUT axis to a PRIMAL axis (nonzero only where
+    # out_idx == in_idx). out<->out and primal<->primal pairs are therefore
+    # meaningless. This was never validated: is_out1/is_out2 were computed and
+    # never compared, so such a pair was ACCEPTED and produced a dim whose
+    # other_id points into the primal range — which later detonated as
+    # `IndexError: list index out of range` in inverse_transpose_transform
+    # (ViT + Diag). Reject it at the source instead of tolerating the bad state.
+    if is_out1 == is_out2:
+        side = "out_dims" if is_out1 else "primal_dims"
+        raise ValueError(
+            f"Diag pair ({action.i}, {action.j}) is not split across out/primal: "
+            f"both indices are in {side}. A diagonal must tie one out axis to one "
+            f"primal axis."
+        )
+
     if d1.is_sparse and d1.other_id != d2.id:
         raise ValueError(
             f"Diag pair conflict: logical index {action.i} is already paired "
