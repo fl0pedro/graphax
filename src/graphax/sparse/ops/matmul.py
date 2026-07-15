@@ -154,10 +154,32 @@ def _full_pair_data(lo, li, ro, ri, swap_rhs=False):
 
 def _matched_pair(lout, lprimal, rout, rprimal):
     """Pair of dims that exists on both sides (post-id-alignment)."""
+    # NB the message used to print `.id` while the CHECK is on `.logical_size`, so
+    # "Batch mismatch: 1 vs 4" read like "batch size 1 vs 4" (a broadcast case) when it
+    # actually meant "dim id 1 vs dim id 4" and told you NOTHING about the sizes.
+    def _d(d):
+        return (f"id={d.id} logical_size={d.logical_size} size={d.size} "
+                f"block={getattr(d, 'block_size', None)} axis={getattr(d, 'axis', None)} "
+                f"sparse={d.is_sparse}")
+    def _full(tag, lo, li, ro, ri):
+        import sys as _s
+        f = lambda d: "None" if d is None else _d(d)
+        print(f"[PAIRDUMP] {tag}", file=_s.stderr)
+        print(f"[PAIRDUMP]   lhs.out ={f(lo)}", file=_s.stderr)
+        print(f"[PAIRDUMP]   lhs.prim={f(li)}", file=_s.stderr)
+        print(f"[PAIRDUMP]   rhs.out ={f(ro)}", file=_s.stderr)
+        print(f"[PAIRDUMP]   rhs.prim={f(ri)}", file=_s.stderr)
     if lout and rout and lout.logical_size != rout.logical_size:
-        raise ValueError(f"Batch mismatch: {lout.id} vs {rout.id}")
+        raise ValueError(
+            f"Batch mismatch (out side): lhs[{_d(lout)}] vs rhs[{_d(rout)}] — "
+            f"logical_size {lout.logical_size} != {rout.logical_size}"
+        )
     if lprimal and rprimal and lprimal.logical_size != rprimal.logical_size:
-        raise ValueError(f"Batch mismatch: {lprimal.id} vs {rprimal.id}")
+        _full("PRIMAL-SIDE MISMATCH", lout, lprimal, rout, rprimal)
+        raise ValueError(
+            f"Batch mismatch (primal side): lhs[{_d(lprimal)}] vs rhs[{_d(rprimal)}] — "
+            f"logical_size {lprimal.logical_size} != {rprimal.logical_size}"
+        )
     if lout and lprimal and rout and rprimal:
         return Pair(
             "batch_sparse",
@@ -301,11 +323,36 @@ def _resolve_contract_pair(lp, ro, lhs_out_map, rhs_primal_map):
 
 
 def _resolve_broadcast_topos(lhs_topos, rhs_topos, offset):
+    def _deferred_broadcast(a, b):
+        """A size-1 IMPLICIT dim that ``_align_contract_dims`` deliberately skipped and,
+        per its own docstring, "falls through to ``_resolve_broadcast_topos`` as a
+        free/broadcast dim". It must therefore NOT be re-captured here as a MATCHED
+        batch pair: ``_matched_pair`` compares logical_size and would raise
+        "Batch mismatch" on the very broadcast the skip deferred (ViT layer_norm:
+        mean(keepdims=True) gives a size-1 seq axis against x's size-8 -> 1 vs 8).
+
+        The producer (_align_contract_dims, 0a07b41) got the _is_implicit_block_dim
+        gate; this consumer (_matched_pair/_resolve_broadcast_topos, 6a6afa47) predates
+        it and never did — the deferral had no receiver.
+
+        This does NOT weaken the 1-vs-N guard: a size-1 dim WITH a physical axis is not
+        _is_implicit_block_dim, so it is still matched and still raises the genuine
+        "Contraction size mismatch" in _resolve_contract_pair."""
+        if a is None or b is None:
+            return False
+        if int(a.logical_size) == int(b.logical_size):
+            return False
+        return _is_implicit_block_dim(a) or _is_implicit_block_dim(b)
+
     def find_match(lout, lprimal, candidates):
         for i, (rout, rprimal) in enumerate(candidates):
             if lout and rout and lout.id == rout.id - offset:
+                if _deferred_broadcast(lout, rout):
+                    continue                     # free/broadcast dim -> _unmatched_pair
                 return i
             if lprimal and rprimal and lprimal.id == rprimal.id - offset:
+                if _deferred_broadcast(lprimal, rprimal):
+                    continue                     # free/broadcast dim -> _unmatched_pair
                 return i
         return -1
 
