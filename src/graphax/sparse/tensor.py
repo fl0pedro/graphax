@@ -968,9 +968,17 @@ def _subdivide_coupled_blockdiag(
         def _shift(p):
             if p is None or moved is None:
                 return p
-            n_front = len([a for a in moved if a is not None])
+            # ``new_val`` ALWAYS carries exactly 3 leading axes -- ``[N*k, b1n, b2n]`` --
+            # no matter how many of (meta_ax, b1_ax, b2_ax) were physically present in the
+            # INPUT val. Deriving the shift from the input's front count was an off-by-one
+            # whenever the meta axis was IMPLICIT (size == 1 => axis is None => only 2 axes
+            # moved to the front): every surviving dim's axis then pointed one axis short of
+            # its own data. On ViT that put a size-32 dim on axis 2 -- a size-1 block axis --
+            # while its payload sat at axis 3, and dense_for_matmul densified the wrong axis.
+            # ``b1n``/``b2n`` of 1 still occupy an axis here (they are simply unreferenced by
+            # the rebuilt DiagonalIndex, which sets block_axis=None), so the count is 3 flat.
             n_before = sum(1 for a in range(p) if a not in moved)
-            return n_front + n_before
+            return 3 + n_before
 
         def _map(d, slot_is_out, slot_rel):
             if slot_is_out == is_out1 and slot_rel == rel_i:
