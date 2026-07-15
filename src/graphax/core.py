@@ -1230,23 +1230,48 @@ def _eliminate_vertex(
                                 "expected Diag, Compress, Quant, or a callable "
                                 "(SparseTensor) -> SparseTensor."
                             )
-                    except ValueError:
-                        # Out-of-range axes / shape mismatch — skip this
-                        # transform on this edge. The TypeError above is
-                        # intentionally NOT caught: it's a structural
-                        # programming error, not a per-edge geometry miss.
+                    except ValueError as _exc:
+                        # LOUD BY DEFAULT (2026-07-15). This used to `continue`,
+                        # silently dropping the transform on this edge. That silent
+                        # skip is the single defect behind this whole bug family:
+                        # two edges meeting at a shared variable receive DIFFERENT
+                        # effective approximations and desync in rank/extent (the
+                        # "Contraction size mismatch" family), and a 100%-skipped
+                        # Diag reports cos=1.0 — indistinguishable from a working
+                        # approximation. Measured: blind Diag failed 47/47 on
+                        # NN/MoE/ViT, every one swallowed here.
                         #
-                        # CORRECTNESS DEPENDENCY (do not break): this skip is sound
-                        # ONLY because _normalize_approx_edge densifies every approx
-                        # edge back to its nominal dense form, so the NEXT vertex's
-                        # transform sees a dense edge that always fits and re-masks
-                        # uniformly. If an edge is kept block-diagonal instead, a
-                        # later Diag's pair CONFLICTS, lands here, and is silently
-                        # skipped → UNDER-MASKED (a different, lighter approximation).
-                        # Two at-scale attempts to keep edges sparse hit exactly this
-                        # (cos→0.05 vs the dense oracle); don't weaken the densify
-                        # without first making every transform structure-invariant.
-                        continue
+                        # The old note said this skip was sound ONLY because
+                        # _normalize_approx_edge densifies every approx edge back to
+                        # nominal so the NEXT transform always fits, and warned:
+                        # "don't weaken the densify without first making every
+                        # transform structure-invariant". That is precisely what
+                        # up-front masking now does (diag_mask / compress_mask):
+                        # an invalid action is never PROPOSED, so this handler
+                        # should be unreachable. If it fires, that is a REAL bug
+                        # (or an unmasked caller) and must be seen, not buried.
+                        #
+                        # Escape hatch for the legacy best-effort contract:
+                        #   GRAPHAX_BEST_EFFORT_TRANSFORMS=1
+                        if os.environ.get("GRAPHAX_BEST_EFFORT_TRANSFORMS", "0") == "1":
+                            continue
+                        _f = lambda ds: [
+                            (d.size, getattr(d, "other_id", None),
+                             getattr(d, "block_size", None), getattr(d, "axis", None))
+                            for d in ds
+                        ]
+                        raise ValueError(
+                            f"TRANSFORM DID NOT FIT at vertex {vertex}: {_t!r} on edge "
+                            f"(in={in_edge}, out={out_edge}) -> {type(_exc).__name__}: {_exc}. "
+                            f"edge out_dims={_f(edge_outval.out_dims)} "
+                            f"primal_dims={_f(edge_outval.primal_dims)} "
+                            f"val={None if edge_outval.val is None else tuple(edge_outval.val.shape)}. "
+                            "This transform was previously SKIPPED SILENTLY, which desyncs the two "
+                            "edges of a shared variable and makes a no-op approximation report "
+                            "cos=1.0. Mask invalid actions up front (see diag_mask/compress_mask) "
+                            "instead of discovering them by throwing. Set "
+                            "GRAPHAX_BEST_EFFORT_TRANSFORMS=1 to restore the legacy silent skip."
+                        ) from _exc
                     _assert_sparse_tensor_consistency(edge_outval)
 
                 # Post-transform approx-edge normalization: a freshly Diag-split
