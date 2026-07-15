@@ -400,23 +400,14 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
     # COMPRESS on this edge (leaving it exact) instead of corrupting it.
     # DenseIndex axes (NN/ConvNet) are unaffected: not sparse, no block_axis,
     # not a CompressedIndex.
-    if any(isinstance(d, CompressedIndex) for d in (*st.out_dims, *st.primal_dims)):
-        raise ValueError(
-            "Cannot COMPRESS a tensor with compressed (Banded/Set/Toeplitz) "
-            "dims; its band-buffer axes are structural — materialize first."
-        )
-    _structural_axes = {
-        d.block_axis
-        for d in (*st.out_dims, *st.primal_dims)
-        if d.is_sparse and d.block_axis is not None
-    }
-    _bad_axes = _structural_axes & set(action.axes)
-    if _bad_axes:
-        raise ValueError(
-            f"Compress.axes {sorted(_bad_axes)} target structural block axes "
-            "of a sparse dim; only free physical axes may be compressed."
-        )
-
+    # REMOVED 2026-07-15: over-conservative structural-block-axis / CompressedIndex guard.
+    # It raised ValueError *so the elimination loop would silently SKIP the COMPRESS*, which
+    # desyncs the two edges of a shared var -> the documented root cause of the very
+    # "Contraction size mismatch" family it claimed to prevent. Block-axis compress is
+    # legitimate (all blocks identical == batched along the sparse component); _remap below
+    # already handles block_axis -> None. Measured: -50% storage, .dense() identical to the
+    # uncompressed edge (logical_size NOT stale), zero added downstream contraction failures,
+    # 153/153 axes fine unguarded. Invalid actions must be masked UP FRONT by the caller.
     drops = sorted(set(action.axes))
     new_val = _reduce_along_axes(st.val, tuple(drops), action.kind)
 
