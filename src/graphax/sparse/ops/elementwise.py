@@ -10,6 +10,7 @@ Pipeline:
 """
 from __future__ import annotations
 import math
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable
 
@@ -685,6 +686,21 @@ def elementwise(
     """
     _record_path(None)
     lhs, rhs = _normalize_inputs(lhs, rhs)
+    # Structure-lowering layer (GRAPHAX_STRUCT_LOWER, default OFF): compile the
+    # minimal physical computation for structurally-matched operands and build
+    # the output structure symbolically (graphax/sparse/lower/add.py). A case
+    # without a rule returns None and falls through UNCHANGED (lower.add bumps
+    # its skip counters — no silent behavior change). Flag OFF ⇒ this block is
+    # a single env-dict lookup.
+    if os.environ.get("GRAPHAX_STRUCT_LOWER", "0") not in ("", "0", "false", "False"):
+        from graphax.sparse.lower.add import lower_add
+
+        _low = lower_add(lhs, rhs, op, is_intersection=is_intersection)
+        if _low is not None:
+            _record_path("lower_add")
+            if count:
+                return _low, _ew_op_count(lhs, rhs, is_intersection)
+            return _low
     # Elemental fast path (Phase: bridge-cse): route a STRUCTURED elementwise op
     # (block-diagonal / implicit dims) through the elemental kernels. Returns
     # None for a pure-dense op so the existing general path stays byte-identical

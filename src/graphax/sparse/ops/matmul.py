@@ -1703,6 +1703,13 @@ def _pad_axis_to(arr, axis: int, size: int, fill):
 # --- Both-implicit contracting-pair analytic fold (GRAPHAX_KEEP_BLOCKDIAG) -----
 import os as _os
 _KEEP_BLOCKDIAG_MM = _os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "1") != "0"
+
+
+def _struct_lower_enabled() -> bool:
+    """Structure-lowering layer gate (GRAPHAX_STRUCT_LOWER, default OFF).
+    Read per call so tests / the differential harness can toggle it without
+    re-importing the module."""
+    return _os.environ.get("GRAPHAX_STRUCT_LOWER", "0") != "0"
 # Two-scalar matmul -> elementwise multiply (seed-vertex aggregation). Default on.
 _SEED_SCALAR_MM = _os.environ.get("GRAPHAX_SEED_VERTICES_SCALAR_MM", "1") != "0"
 
@@ -2140,6 +2147,22 @@ def matmul(lhs, rhs, count: bool = False):
             "matmul of two 0-rank SparseTensors is not supported; "
             "use ``lhs * rhs`` (elementwise) instead"
         )
+    # Structure-lowering layer (GRAPHAX_STRUCT_LOWER, default OFF): compile
+    # the minimal physical computation for a structured contraction (ONE
+    # einsum over physical axes only) and build the output structure
+    # SYMBOLICALLY — a free implicit dim stays implicit, a surviving
+    # block-diagonal pair stays a pair, val=None stays val=None. Returns None
+    # on any case without a rule; every miss is counted in
+    # ``lower.matmul.LOWER_STATS`` (no silent behavior change). Gated on
+    # ``approx_active()`` inside, so the EXACT-AD path never enters here and
+    # stays byte-identical whether the env flag is on or off.
+    if _struct_lower_enabled():
+        from graphax.sparse.lower.matmul import try_lower_matmul
+
+        _low = try_lower_matmul(lhs, rhs, count=count)
+        if _low is not None:
+            _record_path("struct_lower")
+            return _low
     # Elemental fast path (Phase: bridge-cse): route a STRUCTURED contraction
     # (block-diagonal / implicit / compressed contracted dims) through the
     # composed elemental kernels. Returns None for a pure-dense contraction, so
