@@ -726,7 +726,18 @@ _KEEP_BLOCKDIAG = os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "1") != "0"
 def _is_pure_blockdiag(edge) -> bool:
     """True iff edge carries >=1 meta-block-diagonal (Diagonal) dim and NO
     compressed/implicit dim — a residual structure the batched block-diagonal
-    contraction kernel can consume directly (no densify needed)."""
+    contraction kernel can consume directly (no densify needed).
+
+    ITEM-3 fix: the docstring always promised "NO compressed/implicit dim", but
+    the body only tested ``is_compressed`` (the Banded/Set discriminator) and
+    NEVER ``axis is None``. A Compress-produced dim is a plain ``DenseIndex``
+    (``is_sparse=False``, ``is_compressed=False``) with ``axis=None``, so a
+    Diag+Compress edge returned True here, routed to ``_blockdiag_addable``'s
+    nesting check, and reached the ``+`` with its implicit Compress dim
+    unreconciled. We now reject a NON-sparse ``axis is None`` dim (a genuine
+    implicit Compress dim). A SPARSE dim MAY legitimately carry ``axis is None``
+    (a coupled implicit block-diagonal whose meta axis lives on its partner — see
+    apply_diag), so that case is still allowed."""
     dims = getattr(edge, "dims", None)
     if dims is None:
         return False
@@ -734,7 +745,11 @@ def _is_pure_blockdiag(edge) -> bool:
     for d in dims:
         if getattr(d, "is_compressed", False):
             return False
-        if getattr(d, "is_sparse", False):
+        is_sp = bool(getattr(d, "is_sparse", False))
+        if not is_sp and getattr(d, "axis", "x") is None:
+            # NON-sparse implicit (Compress) dim -> not a pure block-diagonal.
+            return False
+        if is_sp:
             has_diag = True
     return has_diag
 
