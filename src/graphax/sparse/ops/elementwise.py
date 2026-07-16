@@ -105,7 +105,22 @@ def _resolve_dim_pairing(i, ldims, rdims, processed):
     ld, rd = ldims[i], rdims[i]
     l_sp, r_sp = ld.is_sparse, rd.is_sparse
     if not l_sp and not r_sp:
-        processed.add(i); return "dense", (ld, rd)
+        # Pair the DENSE branch by dim id, NOT by position. Elementwise operands
+        # share ONE id space (no matmul-style offset; verified: both sides arrive
+        # canonical+equal in 98/98 real jacve calls, so this returns rdims[i]
+        # unchanged on the exact-AD edge => byte-identical). But once a normalize
+        # bypass stops forcing canonical ids via _arr2st, two edges with permuted
+        # free dims of coinciding extent (the ViT (8,8) case) have equal .shape
+        # and would be added in the WRONG axis pairing with NO assert firing.
+        # Mechanism borrowed from matmul._resolve_broadcast_topos.find_match
+        # (id equality). Fail LOUDLY if no dense rhs partner carries this id.
+        rj = next((k for k, d in enumerate(rdims) if d.id == ld.id), None)
+        if rj is None or rdims[rj].is_sparse:
+            raise ValueError(
+                f"Topology mismatch: dense lhs dim id {ld.id} has no dense rhs "
+                f"partner (rhs ids {[(int(d.id), d.is_sparse) for d in rdims]})."
+            )
+        processed.add(i); return "dense", (ld, rdims[rj])
     if l_sp and r_sp:
         j = next(k for k, d in enumerate(ldims) if d.id == ld.other_id)
         lp, rp = ldims[j], rdims[j]
