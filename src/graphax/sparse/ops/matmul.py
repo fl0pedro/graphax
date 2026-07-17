@@ -1710,6 +1710,14 @@ def _struct_lower_enabled() -> bool:
     Read per call so tests / the differential harness can toggle it without
     re-importing the module."""
     return _os.environ.get("GRAPHAX_STRUCT_LOWER", "0") != "0"
+
+
+def _einsum_general_enabled() -> bool:
+    """New einsum general-path gate (GRAPHAX_EINSUM_GENERAL, default OFF).
+    Read per call so the differential harness can toggle it without
+    re-importing the module. When OFF, ``matmul`` is byte-identical to the
+    incumbent waterfall."""
+    return _os.environ.get("GRAPHAX_EINSUM_GENERAL", "0") != "0"
 # Two-scalar matmul -> elementwise multiply (seed-vertex aggregation). Default on.
 _SEED_SCALAR_MM = _os.environ.get("GRAPHAX_SEED_VERTICES_SCALAR_MM", "1") != "0"
 
@@ -1793,6 +1801,154 @@ def _fold_both_implicit(lhs, rhs, count):
     fac = jnp.asarray(factor, dtype=out.scalar_mult.dtype)
     out = out.copy(scalar_mult=out.scalar_mult * fac)
     return (out, cnt) if count else out
+
+
+# --- New einsum general path (GRAPHAX_EINSUM_GENERAL, default OFF) ----------
+# Plan tags whose rule the differential harness proves data-dependently wrong
+# on some geometries (right on others, so not tag-discriminable): the two
+# block-refine re-associations (a plain-diagonal pair refined onto a
+# rectangular-block grid) and the forced-broadcast escape (materialize a
+# metadata-required physical axis by broadcasting a partial einsum result — its
+# axis bookkeeping mis-maps when ``_normalize_inputs`` has permuted the operand
+# val). A contraction whose plan needs one of these is left on the incumbent
+# path rather than risking a wrong result. Every other structured rule —
+# plain/block diagonal contract, split, spatial, implicit fold — is proven
+# correct on normalized inputs. Fixing these rules in ``_lower`` (respect the
+# normalized val axis order) would let them drop out and widen coverage.
+_EINSUM_UNPROVEN_TAGS = frozenset(
+    {
+        "rule:contract_refine_lhs",
+        "rule:contract_refine_rhs",
+        "out:forced_broadcast",
+    }
+)
+
+
+def _carries_sparse_pair(st) -> bool:
+    """True iff any dim of ``st`` is a member of a DiagonalIndex pair
+    (``is_sparse`` == ``other_id is not None``) — a plain diagonal, a
+    block-diagonal, or a spatial-sparse pair. Admits plain-diagonal
+    contractions (``block_size`` None) to the einsum lowering, which keeps the
+    surviving diagonal a pair instead of densifying it."""
+    return any(
+        getattr(d, "is_sparse", False)
+        for d in (*st.out_dims, *st.primal_dims)
+    )
+
+
+def _einsum_matmul_general(lhs, rhs, count: bool = False):
+    """Sparsity-retaining general contraction path.
+
+    Emits ONE ``jnp.einsum`` over the operands' PHYSICAL axes only; every
+    implicit dim (``axis is None``, logical>1 = extent stored once) contributes
+    an einsum letter but is NEVER materialized into a physical buffer:
+
+      * an implicit-vs-physical contraction lowers to a ``jnp.sum`` reduction
+        over the physical operand's axis (XLA already fuses the broadcast),
+      * a both-implicit contraction folds analytically to a scale-by-N into
+        ``scalar_mult`` (no compute at all),
+      * a surviving free implicit dim stays ``axis=None`` in the output; a
+        surviving diagonal / block pair stays a ``DiagonalIndex`` pair;
+        ``val=None`` stays ``val=None``.
+
+    The pairing (what contracts / batches / rides through) is NOT re-derived:
+    it consumes the incumbent ``_align_tensor_ids`` / ``_build_matmul_topology``
+    ``Pair`` list, so it can never disagree with the tiled path about topology
+    — it only changes HOW the physical buffers combine. Output ids are the
+    canonical ``_build_output_tensor`` numbering so a downstream multi-edge
+    contraction aligns by id.
+
+    Returns the contracted ``SparseTensor`` (or ``(result, (adds, muls, fmas))``
+    with ``count=True``), or ``None`` on any case it cannot yet prove correct —
+    the caller then falls through to the existing path UNCHANGED. Returning
+    ``None`` (fall through) is always the safe choice.
+
+    The planner/executor is the shared einsum implementation in
+    ``graphax.sparse.lower.matmul`` (the working prototype); this entry point
+    applies the correctness firewall and routes it under the new flag. On
+    normalized inputs (``matmul`` always normalizes before this hook) the
+    planner is proven correct by the differential harness for every structured
+    contraction except (a) a rank-0 (scalar) operand and (b) the block-refine /
+    forced-broadcast plans (``_EINSUM_UNPROVEN_TAGS``), both excluded below.
+    Gate: ``GRAPHAX_EINSUM_GENERAL`` (read by the caller) plus the guards below.
+    """
+    # EXACT-AD firewall: only an elimination carrying a Diag/Compress/Quant
+    # transform (approx_active) may be re-associated. An exact-AD contraction
+    # (transforms=()) never enters here, so the exact path is byte-identical
+    # whether the flag is on or off.
+    from graphax.sparse.elemental.dispatch import approx_active
+
+    if not approx_active():
+        return None
+    from graphax.sparse.ops.utils import _is_approx, _is_zero_fill
+
+    # The einsum path assumes zero fill on the implicit positions (a broadcast
+    # of the stored extent). A non-zero fill is owned by the densify path.
+    if not (_is_zero_fill(lhs) and _is_zero_fill(rhs)):
+        return None
+    # Compressed dims are materialized by ``_normalize_inputs`` before this hook;
+    # this is a defensive guard for any direct caller.
+    if any(getattr(d, "is_compressed", False) for d in (*lhs.dims, *rhs.dims)):
+        return None
+    if lhs.dtype == jnp.bool_ or rhs.dtype == jnp.bool_:
+        return None
+    # Only take cases that actually carry lowerable structure — an implicit dim
+    # (Compress), a rectangular block (Diag), a PLAIN-DIAGONAL pair, or a
+    # pure-structure (``val=None``) operand. The plain-diagonal case is the big
+    # one: the incumbent general/elemental paths SKIP a diagonal-⊗-diagonal
+    # contraction ('no_lowerable_structure') and densify it O(N²), but a
+    # diagonal composed with a diagonal IS a diagonal — a repeated einsum index
+    # (elementwise, O(N)) with the surviving pair kept symbolic. ``is_sparse``
+    # (== ``other_id is not None``) detects any DiagonalIndex-pair member,
+    # including a plain diagonal (``block_size`` None). A plain-dense contraction
+    # carries no such structure and stays on the incumbent path.
+    if not (
+        _is_approx(lhs)
+        or _is_approx(rhs)
+        or lhs.val is None
+        or rhs.val is None
+        or _carries_sparse_pair(lhs)
+        or _carries_sparse_pair(rhs)
+    ):
+        return None
+    # Metadata-stated size-1↔size-N embeds are owned by the densify path.
+    if _has_implicit_block_contraction(lhs, rhs):
+        return None
+
+    # A RANK-0 (scalar) operand has no dim to contract: ``X @ scalar`` is a
+    # broadcast/scale, not a contraction, and the shared planner's topology
+    # mis-shapes it (it treats the surviving lhs structure as a spatial-sparse
+    # ride-through and expands the collapsed axis). The incumbent path owns
+    # this degenerate case, so fall through. (Two-scalar matmul is already
+    # handled earlier in ``matmul``.) This static geometry test — plus the
+    # block-refine / forced-broadcast plan-tag gate below — is what the
+    # differential harness needs to reach zero correctness failures; the plain /
+    # block diagonal contract, split, spatial and implicit-fold rules are proven
+    # correct and pass straight through.
+    if (not lhs.out_dims and not lhs.primal_dims) or (
+        not rhs.out_dims and not rhs.primal_dims
+    ):
+        return None
+
+    from graphax.sparse.lower.matmul import _NoRule, _lower
+
+    try:
+        out, counts, tags = _lower(lhs, rhs)
+    except _NoRule:
+        # No rule yet for this geometry — fall through to the existing path.
+        return None
+    except Exception:
+        # Any unexpected planner error is a fall-through, never a wrong result.
+        return None
+    # Fall through when the plan used a block-refine rule that isn't yet proven
+    # correct (see ``_EINSUM_UNPROVEN_TAGS``). ``_lower`` is pure — it builds a
+    # jax expression but executes nothing — so discarding the plan here costs
+    # only the (cheap, static) planning.
+    if _EINSUM_UNPROVEN_TAGS.intersection(tags):
+        return None
+    if count:
+        return out, counts
+    return out
 
 
 # --- Late-densification escape hatch for non-zero fill_value --------------
@@ -2147,6 +2303,20 @@ def matmul(lhs, rhs, count: bool = False):
             "matmul of two 0-rank SparseTensors is not supported; "
             "use ``lhs * rhs`` (elementwise) instead"
         )
+    # New einsum general path (GRAPHAX_EINSUM_GENERAL, default OFF): the
+    # sparsity-retaining contraction. Tried FIRST after normalize/scalar, before
+    # the elemental cascade and the tiled path. Emits ONE einsum over physical
+    # axes, keeps implicit dims / block pairs / val=None symbolic, and folds a
+    # both-implicit contraction into scalar_mult. Returns None on any case it
+    # cannot yet prove correct, falling through to the EXISTING path UNCHANGED —
+    # so nothing regresses while this path is built out. Gated on
+    # ``approx_active()`` inside, so the EXACT-AD path never enters and stays
+    # byte-identical whether the flag is on or off.
+    if _einsum_general_enabled():
+        _ein = _einsum_matmul_general(lhs, rhs, count=count)
+        if _ein is not None:
+            _record_path("einsum_general")
+            return _ein
     # Structure-lowering layer (GRAPHAX_STRUCT_LOWER, default OFF): compile
     # the minimal physical computation for a structured contraction (ONE
     # einsum over physical axes only) and build the output structure
