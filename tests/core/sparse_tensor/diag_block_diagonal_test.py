@@ -18,6 +18,7 @@ import numpy as np
 from graphax.sparse.indexes import DenseIndex
 from graphax.sparse.micro_actions import Diag, apply_diag
 from graphax.sparse.tensor import SparseTensor
+from utils import assert_structure
 
 
 def _dense_pair_st(n: int):
@@ -40,6 +41,8 @@ def test_diag_factor_two_is_block_diagonal():
     """factor == 2 on a 4x4 -> two 2x2 diagonal blocks, off-block zeroed."""
     st, val = _dense_pair_st(4)
     out = apply_diag(st, Diag(0, 1, 2))
+    # STRUCTURE: apply_diag must yield a block-diagonal PAIR, stored compactly (not dense 4x4)
+    assert_structure(out, expect_block=True, msg='diag factor-2')
     expected = np.zeros((4, 4), dtype=np.float32)
     expected[0:2, 0:2] = val[0:2, 0:2]
     expected[2:4, 2:4] = val[2:4, 2:4]

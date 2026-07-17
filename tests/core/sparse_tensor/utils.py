@@ -589,3 +589,92 @@ class TestUtils(unittest.TestCase):
         # Fix: use jnp.allclose for JAX arrays
         self.assertTrue(jnp.allclose(res_st.val, expected))
         self.assertTrue(jnp.allclose(res_st.dense(), expected))
+# To be appended to tests/core/sparse_tensor/utils.py once both trunks land.
+# Structure-retention assertions: verify an op's OUTPUT keeps the sparsity structure
+# it mathematically should, and specifically that it was NOT densified.
+
+def structure_sig(st):
+    """Compact per-dim structure signature of a SparseTensor.
+      D dense-physical · I implicit(axis=None,logical>1) · B block-diag pair(block_size>1)
+      S plain diagonal pair · 1 logical-1 ; suffix U = val is None.
+    This is the *representation* fingerprint — what got kept vs materialized."""
+    if st is None:
+        return "None"
+    parts = []
+    for d in st.dims:
+        if d.is_sparse and (getattr(d, "block_size", None) or 1) > 1:
+            parts.append("B")
+        elif d.is_sparse:
+            parts.append("S")
+        elif d.axis is None and int(d.logical_size) > 1:
+            parts.append("I")
+        elif int(d.logical_size) == 1:
+            parts.append("1")
+        else:
+            parts.append("D")
+    s = "".join(parts) or "0"
+    if st.val is None:
+        s += "U"
+    return s
+
+
+def is_structured(st):
+    """True if the tensor carries money-saving structure (implicit / block / diag / uniform)."""
+    return any(c in structure_sig(st) for c in "IBSU")
+
+
+def has_block_pair(st):
+    return any(d.is_sparse and (getattr(d, "block_size", None) or 1) > 1 for d in st.dims)
+
+
+def has_implicit(st):
+    return any((not d.is_sparse) and d.axis is None and int(d.logical_size) > 1 for d in st.dims)
+
+
+def phys_bytes(st):
+    """Physical val element count (0 for val=None). The peak-memory proxy: a densified
+    result stores prod(logical) elements; a structured one stores far fewer."""
+    return int(st.val.size) if (st is not None and st.val is not None) else 0
+
+
+def assert_structure(st, *, expect_sig=None, expect_block=None, expect_implicit=None,
+                     not_densified_vs_logical=True, max_phys_frac=None, msg=""):
+    """Assert an output SparseTensor retained the structure it should.
+
+    expect_sig            exact structure_sig() match (strongest)
+    expect_block=True     must carry >=1 block-diagonal pair
+    expect_implicit=True  must carry >=1 implicit (axis=None) dim
+    not_densified_vs_logical  physical val must be strictly smaller than the dense logical
+                              size (i.e. it was NOT materialized to full dense)
+    max_phys_frac         physical/logical bytes must be <= this fraction (e.g. 0.5)
+    """
+    import numpy as _np
+    sig = structure_sig(st)
+    tag = f"{msg} [{sig}]"
+    if expect_sig is not None:
+        assert sig == expect_sig, f"{tag}: structure {sig} != expected {expect_sig}"
+    if expect_block:
+        assert has_block_pair(st), f"{tag}: expected a block-diagonal pair, got {sig}"
+    if expect_implicit:
+        assert has_implicit(st), f"{tag}: expected an implicit dim, got {sig}"
+    logical = 1
+    for d in st.dims:
+        logical *= int(d.logical_size)
+    if not_densified_vs_logical and is_structured(st):
+        assert phys_bytes(st) < logical or st.val is None, (
+            f"{tag}: DENSIFIED — physical {phys_bytes(st)} >= logical {logical} "
+            f"for a structured result")
+    if max_phys_frac is not None and logical > 0:
+        frac = phys_bytes(st) / logical
+        assert frac <= max_phys_frac, f"{tag}: physical/logical {frac:.3f} > {max_phys_frac}"
+
+
+def assert_value_and_structure(result, expected_dense, op_name="op", **structure_kw):
+    """One-call combo: value correctness (vs a dense reference) AND retained structure."""
+    import jax.numpy as _jnp
+    got = result.dense()
+    assert got.shape == expected_dense.shape, (
+        f"{op_name}: shape {got.shape} != {expected_dense.shape}")
+    assert bool(_jnp.allclose(got, expected_dense, atol=1e-5)), f"{op_name}: value mismatch"
+    if structure_kw:
+        assert_structure(result, msg=op_name, **structure_kw)
