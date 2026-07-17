@@ -387,11 +387,22 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
     dropped in one XLA op rather than a sequence of single-axis reductions.
     """
     if st.val is None:
-        if action.axes:
-            raise ValueError(
-                "Cannot compress a SparseTensor with val=None along "
-                f"axes={action.axes!r}."
-            )
+        # A ``val is None`` tensor is UNIFORM: every logical cell equals the
+        # (post-scaled) ``scalar_mult``, and every dim is already stored-once
+        # (implicit). Compress reduces a dim to a single representative and
+        # marks it implicit — but for a uniform tensor that representative is
+        # the value the dim already holds, and the dim is already implicit, so
+        # the reduction is a NO-OP by construction (``return st``). This is
+        # exact for EVERY supported ``Compress.kind`` because all of them —
+        # mean, min, max, median, abs_min, abs_max — are IDEMPOTENT on a set of
+        # identical values (there is no sum/prod kind). Previously this branch
+        # raised on ``action.axes``; that raise only ever fired when a later
+        # transform met an already-uniform edge (e.g. one the sparsity-retaining
+        # elementwise path collapsed earlier than the materializing path would),
+        # surfacing as core.py's "TRANSFORM DID NOT FIT". Returning the uniform
+        # tensor unchanged is the correct result the materializing path also
+        # reaches (mean of N identical cells == that cell), so no approximation
+        # semantics change — only the spurious failure is removed.
         return st
     if not action.axes:
         return st
