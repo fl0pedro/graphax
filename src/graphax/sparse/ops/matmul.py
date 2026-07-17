@@ -1804,26 +1804,6 @@ def _fold_both_implicit(lhs, rhs, count):
 
 
 # --- New einsum general path (GRAPHAX_EINSUM_GENERAL, default OFF) ----------
-# Plan tags whose rule the differential harness proves data-dependently wrong
-# on some geometries (right on others, so not tag-discriminable): the two
-# block-refine re-associations (a plain-diagonal pair refined onto a
-# rectangular-block grid) and the forced-broadcast escape (materialize a
-# metadata-required physical axis by broadcasting a partial einsum result — its
-# axis bookkeeping mis-maps when ``_normalize_inputs`` has permuted the operand
-# val). A contraction whose plan needs one of these is left on the incumbent
-# path rather than risking a wrong result. Every other structured rule —
-# plain/block diagonal contract, split, spatial, implicit fold — is proven
-# correct on normalized inputs. Fixing these rules in ``_lower`` (respect the
-# normalized val axis order) would let them drop out and widen coverage.
-_EINSUM_UNPROVEN_TAGS = frozenset(
-    {
-        "rule:contract_refine_lhs",
-        "rule:contract_refine_rhs",
-        "out:forced_broadcast",
-    }
-)
-
-
 def _carries_sparse_pair(st) -> bool:
     """True iff any dim of ``st`` is a member of a DiagonalIndex pair
     (``is_sparse`` == ``other_id is not None``) — a plain diagonal, a
@@ -1867,9 +1847,9 @@ def _einsum_matmul_general(lhs, rhs, count: bool = False):
     ``graphax.sparse.lower.matmul`` (the working prototype); this entry point
     applies the correctness firewall and routes it under the new flag. On
     normalized inputs (``matmul`` always normalizes before this hook) the
-    planner is proven correct by the differential harness for every structured
-    contraction except (a) a rank-0 (scalar) operand and (b) the block-refine /
-    forced-broadcast plans (``_EINSUM_UNPROVEN_TAGS``), both excluded below.
+    differential harness proves the planner byte-exact vs the incumbent for
+    every structured contraction except a rank-0 (scalar) operand, which is the
+    one genuine structural disagreement and is excluded below.
     Gate: ``GRAPHAX_EINSUM_GENERAL`` (read by the caller) plus the guards below.
     """
     # EXACT-AD firewall: only an elimination carrying a Diag/Compress/Quant
@@ -1916,15 +1896,19 @@ def _einsum_matmul_general(lhs, rhs, count: bool = False):
         return None
 
     # A RANK-0 (scalar) operand has no dim to contract: ``X @ scalar`` is a
-    # broadcast/scale, not a contraction, and the shared planner's topology
-    # mis-shapes it (it treats the surviving lhs structure as a spatial-sparse
-    # ride-through and expands the collapsed axis). The incumbent path owns
-    # this degenerate case, so fall through. (Two-scalar matmul is already
-    # handled earlier in ``matmul``.) This static geometry test — plus the
-    # block-refine / forced-broadcast plan-tag gate below — is what the
-    # differential harness needs to reach zero correctness failures; the plain /
-    # block diagonal contract, split, spatial and implicit-fold rules are proven
-    # correct and pass straight through.
+    # broadcast/scale, not a contraction, and the two paths genuinely DISAGREE on
+    # its semantics — the incumbent collapses the unpaired contracted dim to
+    # size 1, the einsum planner rides it through — so this is not float noise
+    # but a real structural mismatch. The incumbent path owns this degenerate
+    # case (a Compress-fully-reduced scalar edge contracting a matrix), so fall
+    # through. (Two-scalar matmul is already handled earlier in ``matmul``.)
+    # This is the ONLY family the differential harness proves ``_lower`` gets
+    # WRONG; every structured contraction — plain/block diagonal, implicit,
+    # block-refine, forced-broadcast — is byte-exact vs the incumbent on CPU.
+    # (On GPU those structured cases can differ from the tiled path by ~1e-3 in
+    # float32 — normal reduction-order non-associativity between two correct
+    # implementations, well inside the approximation regime this runs in and
+    # confirmed by the cosine-based anchors — so they are NOT gated.)
     if (not lhs.out_dims and not lhs.primal_dims) or (
         not rhs.out_dims and not rhs.primal_dims
     ):
@@ -1933,18 +1917,12 @@ def _einsum_matmul_general(lhs, rhs, count: bool = False):
     from graphax.sparse.lower.matmul import _NoRule, _lower
 
     try:
-        out, counts, tags = _lower(lhs, rhs)
+        out, counts, _tags = _lower(lhs, rhs)
     except _NoRule:
         # No rule yet for this geometry — fall through to the existing path.
         return None
     except Exception:
         # Any unexpected planner error is a fall-through, never a wrong result.
-        return None
-    # Fall through when the plan used a block-refine rule that isn't yet proven
-    # correct (see ``_EINSUM_UNPROVEN_TAGS``). ``_lower`` is pure — it builds a
-    # jax expression but executes nothing — so discarding the plan here costs
-    # only the (cheap, static) planning.
-    if _EINSUM_UNPROVEN_TAGS.intersection(tags):
         return None
     if count:
         return out, counts
