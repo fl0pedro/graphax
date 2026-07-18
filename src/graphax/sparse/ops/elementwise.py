@@ -80,9 +80,22 @@ def _reconcile_broadcast_dims(lhs, rhs):
     INVARIANT (guarded): broadcast a size-1 dim ONLY toward a same-``id`` partner
     whose ``logical_size > 1``. A genuine ``logical_size == 1`` on BOTH sides has
     no such partner and is left untouched (``1`` stays ``1``) — we never fabricate
-    an extent. Only DENSE (unpaired) dims are reconciled; sparse pairs of equal
-    logical size but different block granularity are a real LCM-grid job and stay
-    with the downstream ``_map_topology`` / ``_promote_to_unified`` path.
+    an extent. Only the DENSE size-1 side is ever broadcast (``not d.is_sparse``);
+    we never broadcast the sparse side of a pair.
+
+    The same-``id`` PARTNER may itself be SPARSE (a diagonal side). ViT fan-in
+    accumulates a Compress/Diag-collapsed dense free dim (logical 1) against a
+    sibling where that dim is the DIAGONAL partner of extent N. Broadcasting the
+    dense-1 side up to a materialized dense N is still exactly the ``op`` add: the
+    diagonal contribution (nonzero on i==j) plus the constant-broadcast dense
+    contribution sums to a DENSE result in that dim (diagonal + full = full,
+    losing the diagonal structure — correct and unavoidable). The downstream
+    ``_map_topology`` / ``_promote_to_unified`` path already materializes the
+    diagonal onto the LCM grid (0 off-diagonal) and adds the promoted full block,
+    so no new math is needed here — only the reconcile of the shrunk dense dim.
+
+    Two SPARSE dims of equal logical size but different block granularity are a
+    real LCM-grid job (both sides sparse) and stay with the downstream path.
     """
     from graphax.sparse.tensor import SparseTensor
 
@@ -95,7 +108,12 @@ def _reconcile_broadcast_dims(lhs, rhs):
         new_by_id = {}
         for d in t.dims:
             od = other_map.get(d.id)
-            if (od is not None and not d.is_sparse and not od.is_sparse
+            # Broadcast the DENSE size-1 side (``not d.is_sparse``) toward its
+            # same-``id`` partner of logical N>1. The partner ``od`` may be DENSE
+            # (the original fan-in case) OR SPARSE (a diagonal side — ViT); in the
+            # sparse-partner case the downstream promote path densifies the
+            # diagonal against this now-materialized dense dim (diagonal+full=full).
+            if (od is not None and not d.is_sparse
                     and int(d.logical_size) == 1 and int(od.logical_size) > 1):
                 N = int(od.logical_size)
                 if d.axis is not None and val is not None and val.shape[d.axis] == 1:
