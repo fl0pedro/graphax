@@ -998,6 +998,15 @@ def _subdivide_coupled_blockdiag(
         return SparseTensor(
             new_out, new_primal, new_val,
             scalar_mult=st.scalar_mult, fill_value=st.fill_value,
+            # ROOT FIX (2026-07-18): forward the edge pending pre_/post_transforms (the deferred
+            # reshape/relabel a ViT seq/embed view carries). A block-diagonal subdivision is a MASK
+            # that preserves the LOGICAL (dense) shape, so the transforms -- which act on .dense() --
+            # ride through unchanged, exactly as apply_quant/apply_compress forward them. Dropping
+            # them (the prior behaviour) changed the edge dense shape and desynced a shared
+            # contraction vertex -> matmul "Contraction size mismatch: 32 vs 16" (ViT approx).
+            # Forwarding keeps the edge LAZY -- the transform materialises only at the next drain.
+            pre_transforms=st.pre_transforms,
+            post_transforms=st.post_transforms,
             check_consistency=False,
         )
 
@@ -1262,6 +1271,14 @@ def _apply_block_diagonal(
         new_primal,
         val,
         scalar_mult=st.scalar_mult,
+        # ROOT FIX (2026-07-18): forward pending pre_/post_transforms. A block-diagonal restructure
+        # is a MASK preserving the LOGICAL (dense) shape; the deferred transforms act on .dense() and
+        # ride through unchanged (mirrors apply_quant/apply_compress). Dropping them changed the edge
+        # dense shape (e.g. a stored size-1 axis a reshape expands to its real extent) and desynced a
+        # shared contraction vertex -> matmul "Contraction size mismatch: 32 vs 16" (ViT approx,
+        # repro_one seed 1 step 760). Forwarding keeps the edge LAZY (no premature densify).
+        pre_transforms=st.pre_transforms,
+        post_transforms=st.post_transforms,
         check_consistency=False,
     )
 
