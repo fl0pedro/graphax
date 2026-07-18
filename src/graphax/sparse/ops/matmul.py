@@ -2212,6 +2212,412 @@ def _execute_tiled(ctx, rhs_dims):
     return _build_output_tensor(ctx, rhs_dims, res)
 
 
+
+# STOPGAP (task #28->#35): exact pure-diagonal contraction. To be folded into
+# _resolve_contract_pair's general factorization reconciliation and DELETED.
+# Fires only where the tiled resolver currently raises on a diagonal operand.
+def _is_pure_diagonal_operand(st) -> bool:
+    """True iff ``st`` is a pure (identity) diagonal Jacobian: every out dim pairs
+    1:1 with a primal dim of equal logical size via ``other_id`` (each sparse dim
+    ``block_size`` in {None, 1}), zero fill (``fill_value is None``), and ``val``
+    present. Contracting anything against such a tensor is a plain elementwise
+    scale-and-relabel of the OTHER operand's contracted axis by the stored diagonal
+    vector -- NOT a real GEMM -- so no id-based topology pairing is needed and the
+    tiled resolver's factorization wall is sidestepped. Any non-sparse dim must be a
+    trivial size-1 axis, never a real dense axis."""
+    from graphax.sparse.tensor import SparseTensor
+    if not isinstance(st, SparseTensor):
+        return False
+    if st.val is None or st.fill_value is not None:
+        return False
+    if len(st.out_dims) != len(st.primal_dims):
+        return False
+    for d in st.dims:
+        if getattr(d, "is_compressed", False):
+            return False
+        if d.block_size not in (None, 1):
+            return False
+    prim_by_id = {d.id: d for d in st.primal_dims}
+    paired = 0
+    for d in st.out_dims:
+        if d.is_sparse:
+            p = prim_by_id.get(d.other_id)
+            if p is None or not p.is_sparse or p.other_id != d.id:
+                return False
+            if int(p.logical_size) != int(d.logical_size):
+                return False
+            paired += 1
+        elif int(d.logical_size) != 1:
+            return False
+    for d in st.primal_dims:
+        if not d.is_sparse and int(d.logical_size) != 1:
+            return False
+    return paired >= 1
+
+
+def _diagonal_phys_axes(dims):
+    """``(physical_axis, size)`` for every materialized sub-axis of ``dims`` in
+    logical flatten order (dim order; meta axis then block axis within a dim)."""
+    out = []
+    for d in dims:
+        if d.axis is not None:
+            out.append((d.axis, int(d.size)))
+        if d.is_sparse and d.block_axis is not None and (d.block_size or 1) > 1:
+            out.append((d.block_axis, int(d.block_size)))
+    return out
+
+
+def _diagonal_vector(D, facing_dims):
+    """Flatten ``D.val`` into the length-S diagonal vector in ``facing_dims``
+    logical order (a free reshape of the stored diagonal). Returns ``None`` when
+    the facing side does not reference ``D.val``'s non-unit axes cleanly (bail)."""
+    phys = _diagonal_phys_axes(facing_dims)
+    axes = [a for a, _ in phys]
+    if len(set(axes)) != len(axes):
+        return None
+    covered = set(axes)
+    for a in range(D.val.ndim):
+        if a not in covered and int(D.val.shape[a]) != 1:
+            return None
+    perm = axes + [a for a in range(D.val.ndim) if a not in covered]
+    v = jnp.transpose(D.val, perm)
+    return v.reshape(-1)
+
+
+def _diag_reassign_axes(X):
+    """Rebuild ``X`` with each dim's physical ``axis`` / ``block_axis`` reassigned
+    to the val axis carrying its extent, UNAMBIGUOUSLY (sparse pairs share their
+    meta axis). Repairs a permuted / collided layout (an approx Diag can leave a
+    block_axis and a sibling dim's axis both claiming one val axis) that
+    ``_reconcile_permuted_val`` bails on, so ``.dense()`` can consume it. Returns
+    ``None`` when a required extent is not uniquely placeable."""
+    from dataclasses import replace
+    from graphax.sparse.tensor import SparseTensor
+    val = X.val
+    ndim = val.ndim
+    used = [False] * ndim
+    assign: dict = {}
+
+    def take(size, key):
+        if key in assign:
+            return assign[key]
+        cands = [a for a in range(ndim) if not used[a] and int(val.shape[a]) == size]
+        if len(cands) != 1:
+            return None
+        used[cands[0]] = True
+        assign[key] = cands[0]
+        return cands[0]
+
+    newdims = {}
+    for d in X.dims:
+        if d.is_sparse:
+            mkey = ("m", frozenset({d.id, d.other_id}))
+            ma = take(int(d.size), mkey)
+            ba = None
+            if (d.block_size or 1) > 1:
+                ba = take(int(d.block_size), ("b", d.id))
+                if ba is None:
+                    return None
+            if ma is None:
+                return None
+            newdims[d.id] = (ma, ba)
+        elif int(d.logical_size) > 1 and d.axis is not None:
+            a = take(int(d.logical_size), ("d", d.id))
+            if a is None:
+                return None
+            newdims[d.id] = (a, None)
+        else:
+            newdims[d.id] = (d.axis, None)  # size-1 / already axis-less
+
+    def _rebuild(d):
+        ma, ba = newdims[d.id]
+        if d.is_sparse:
+            return replace(d, axis=ma, block_axis=ba)
+        return replace(d, axis=ma)
+
+    return SparseTensor(
+        tuple(_rebuild(d) for d in X.out_dims),
+        tuple(_rebuild(d) for d in X.primal_dims),
+        val, scalar_mult=X.scalar_mult, fill_value=X.fill_value,
+        check_consistency=False,
+    )
+
+
+def _diag_robust_dense(X):
+    """``X.dense()``, repairing a permuted/collided physical layout first if the
+    direct densify rejects it (see ``_diag_reassign_axes``). Returns ``None`` if it
+    still cannot be densified."""
+    try:
+        return X.dense()
+    except Exception:
+        clean = _diag_reassign_axes(X)
+        if clean is None:
+            return None
+        try:
+            return clean.dense()
+        except Exception:
+            return None
+
+
+def _diagonal_fastpath(lhs, rhs, count):
+    """STOPGAP exact pure-diagonal contraction. When EXACTLY one operand is a pure
+    diagonal ``D``, the contraction scales the OTHER operand ``X``'s contracted axis
+    by ``D``'s diagonal vector and relabels it to ``D``'s surviving (canonical)
+    dims -- reconciling the two operands' differing factorizations of the shared
+    axis is a free reshape of the length-S diagonal, no id-topology pairing, and the
+    diagonal is never materialized S x S (only the length-S vector). A contracted
+    pure diagonal's surviving side is always paired INTO the contracted side, so it
+    collapses to a plain dense factorization -- exactly what the tiled path would
+    emit if it could resolve the pairing. Returns ``(result[, counts])`` or ``None``
+    (fall through to the tiled path) when the predicate does not hold or the shared
+    axis cannot be safely reconciled. A diagonal contraction is ``output_size``
+    muls, 0 fmas."""
+    from graphax.sparse.tensor import SparseTensor
+    from graphax.sparse.dtype_compute import _scaled_mul
+    l_diag = _is_pure_diagonal_operand(lhs)
+    r_diag = _is_pure_diagonal_operand(rhs)
+    if l_diag == r_diag:  # need EXACTLY one pure-diagonal operand
+        return None
+    if r_diag:
+        # matmul(X, D): out = X.out (survivor), primal = D.primal; contract X.primal / D.out.
+        D, X = rhs, lhs
+        x_contract, facing, surviving = X.primal_dims, rhs.out_dims, rhs.primal_dims
+    else:
+        # matmul(D, X): out = D.out, primal = X.primal (survivor); contract X.out / D.primal.
+        D, X = lhs, rhs
+        x_contract, facing, surviving = X.out_dims, lhs.primal_dims, lhs.out_dims
+    if X.val is None or X.fill_value is not None:
+        return None
+    S = math.prod(int(d.logical_size) for d in x_contract)
+    if S != math.prod(int(d.logical_size) for d in facing):
+        return None
+    d_flat = _diagonal_vector(D, facing)
+    if d_flat is None or int(d_flat.shape[0]) != S:
+        return None
+    d_flat = _scaled_mul(d_flat, D.scalar_mult)  # fold the diagonal's own scalar_mult
+
+    Xd = _diag_robust_dense(X)  # (X.out_shape..., X.primal_shape...), scalar/fill folded
+    if Xd is None:
+        return None
+    if r_diag:
+        out_shape = X.out_shape
+        primal_shape = tuple(int(d.logical_size) for d in surviving)
+        M = Xd.reshape(math.prod(out_shape) if out_shape else 1, S)
+        R = M * d_flat[None, :]
+    else:
+        out_shape = tuple(int(d.logical_size) for d in surviving)
+        primal_shape = X.primal_shape
+        M = Xd.reshape(S, math.prod(primal_shape) if primal_shape else 1)
+        R = d_flat[:, None] * M
+    val = R.reshape(tuple(out_shape) + tuple(primal_shape))
+    n_out = len(out_shape)
+    out_dims = tuple(DenseIndex(i, int(s), axis=i) for i, s in enumerate(out_shape))
+    primal_dims = tuple(
+        DenseIndex(n_out + i, int(s), axis=n_out + i) for i, s in enumerate(primal_shape)
+    )
+    res = SparseTensor(out_dims, primal_dims, val,
+                       scalar_mult=jnp.array(1, dtype=val.dtype),
+                       fill_value=None, check_consistency=False)
+    if count:
+        return res, (0, int(res.size), 0)
+    return res
+
+
+# ---- NEW: general block-diagonal-closed structured contraction fastpath ----
+def _is_pure_block_diagonal_operand(st) -> bool:
+    """True iff ``st`` is a pure meta-block-diagonal Jacobian: every out dim pairs
+    1:1 with a primal dim of equal META count (``size``) via ``other_id`` (each a
+    non-compressed ``DiagonalIndex``, block_size arbitrary), zero fill
+    (``fill_value is None``) and ``val`` present. Any non-sparse dim must be a
+    trivial size-1 axis. This GENERALIZES ``_is_pure_diagonal_operand`` (the
+    block_size in {None,1} corner): a pure-diagonal operand also satisfies this
+    predicate. Contracting anything against such a tensor is a per-meta-block
+    matmul of the OTHER operand's contracted axis -- the two operands' differing
+    factorizations of the shared logical axis reconcile through the CANONICAL
+    logical flatten (both sides agree on it), so no id-topology pairing is needed
+    and the tiled resolver's factorization wall is sidestepped."""
+    from graphax.sparse.tensor import SparseTensor
+    if not isinstance(st, SparseTensor):
+        return False
+    if st.val is None or st.fill_value is not None:
+        return False
+    if len(st.out_dims) != len(st.primal_dims):
+        return False
+    for d in st.dims:
+        if getattr(d, "is_compressed", False):
+            return False
+    prim_by_id = {d.id: d for d in st.primal_dims}
+    paired = 0
+    for d in st.out_dims:
+        if d.is_sparse:
+            p = prim_by_id.get(d.other_id)
+            if p is None or not p.is_sparse or p.other_id != d.id:
+                return False
+            # A block-diagonal pair shares one META count; block sizes may differ.
+            if int(p.size) != int(d.size):
+                return False
+            paired += 1
+        elif int(d.logical_size) != 1:
+            return False
+    for d in st.primal_dims:
+        if not d.is_sparse and int(d.logical_size) != 1:
+            return False
+    return paired >= 1
+
+
+def _block_diagonal_fastpath(lhs, rhs, count):
+    """Exact structured contraction when EXACTLY one operand ``D`` is a pure
+    meta-block-diagonal Jacobian (see ``_is_pure_block_diagonal_operand``).
+
+    ``D``'s contracted side is a set of block-diagonal factors (meta ``N_p`` x
+    contract-block ``Bc_p``) whose partners (meta ``N_p`` x free-block ``Bf_p``)
+    survive. Because ``D`` is block-diagonal, a contracted logical position only
+    couples its own meta group, so:
+
+        matmul(D, X):  out[(g_p,r_p), Xprimal] = sum_{i_p} D[g_p,r_p,i_p]
+                                                 * X[(g_p,i_p), Xprimal]
+        matmul(X, D):  symmetric, D on the right.
+
+    The other operand ``X`` is densified and its contracted axis is reshaped to
+    ``(N_p, Bc_p)`` per pair -- correct because both operands share the CANONICAL
+    logical flatten of the contracted axis (meta high-order within each factor).
+    A single batched ``einsum`` over the meta axes contracts the block widths;
+    ``D``'s full ``K x F`` block-diagonal is never materialized (blocks only).
+    The surviving meta+free block ``(N_p, Bf_p)`` collapses to one dense output
+    axis ``F_p = N_p*Bf_p``. block_size==1 is the pure-diagonal corner (blocks
+    become a length-``N`` vector, the einsum a scale) so this SUBSUMES
+    ``_diagonal_fastpath``. Returns ``(result[, counts])`` or ``None`` (fall
+    through) when the predicate does not hold or the reconciliation cannot be
+    proven. Exact: the dense oracle max_abs_diff is 0."""
+    import string as _string
+    from graphax.sparse.dtype_compute import _scaled_mul
+    from graphax.sparse.elemental._common import (
+        canonical_block_buffer,
+        emit_dense_result,
+    )
+    from graphax.sparse.ops.utils import _compute_dtype
+
+    l_bd = _is_pure_block_diagonal_operand(lhs)
+    r_bd = _is_pure_block_diagonal_operand(rhs)
+    if l_bd == r_bd:  # need EXACTLY one pure-block-diagonal operand
+        return None
+    if r_bd:
+        # matmul(X, D): out = X.out, primal = D.primal (survivors); contract
+        # X.primal against D.out.
+        D, X = rhs, lhs
+        D_contract_dims, D_surv_dims = D.out_dims, D.primal_dims
+        x_contract_dims, x_surv_dims = X.primal_dims, X.out_dims
+        D_is_left = False
+    else:
+        # matmul(D, X): out = D.out (survivors), primal = X.primal; contract
+        # D.primal against X.out.
+        D, X = lhs, rhs
+        D_contract_dims, D_surv_dims = D.primal_dims, D.out_dims
+        x_contract_dims, x_surv_dims = X.out_dims, X.primal_dims
+        D_is_left = True
+    if X.val is None or X.fill_value is not None:
+        return None
+
+    K = 1
+    for d in D_contract_dims:
+        K *= int(d.logical_size)
+    Kx = 1
+    for d in x_contract_dims:
+        Kx *= int(d.logical_size)
+    if K != Kx or K == 0:
+        return None
+
+    surv_by_id = {d.id: d for d in D_surv_dims}
+    pairs = []  # (contract_dim, free_dim, N, Bc, Bf) in D contract-side order
+    for c in D_contract_dims:
+        if not c.is_sparse:
+            if int(c.logical_size) != 1:
+                return None  # a real dense contracted dim -> not pure block-diag
+            continue
+        f = surv_by_id.get(c.other_id)
+        if f is None:
+            return None
+        N = int(c.size)
+        Bc = int(c.block_size or 1)
+        Bf = int(f.block_size or 1)
+        if int(f.size) != N:
+            return None
+        pairs.append((c, f, N, Bc, Bf))
+    if not pairs:
+        return None
+
+    Xd = _diag_robust_dense(X)  # (X.out..., X.primal...), scalar_mult/fill folded
+    if Xd is None:
+        return None
+    out_dtype = _compute_dtype(lhs.dtype, rhs.dtype)
+
+    # Canonicalize D's block buffer to (N1,Bc1,Bf1, N2,Bc2,Bf2, ...) contract order.
+    slots = []
+    for (c, f, N, Bc, Bf) in pairs:
+        meta_axis = c.axis if c.axis is not None else f.axis
+        slots.append((meta_axis, N))
+        slots.append((c.block_axis, Bc))
+        slots.append((f.block_axis, Bf))
+    blocks = canonical_block_buffer(D.val, slots, dtype=D.dtype).astype(out_dtype)
+
+    # einsum letters: (g_p meta, i_p contract-block, j_p free-block) per pair,
+    # plus one letter per surviving axis of X.
+    pool = iter(_string.ascii_letters)
+    try:
+        pair_letters = [(next(pool), next(pool), next(pool)) for _ in pairs]
+        x_surv_sizes = [int(d.logical_size) for d in x_surv_dims]
+        surv_letters = [next(pool) for _ in x_surv_sizes]
+    except StopIteration:
+        return None  # too many axes for the letter pool -> bail to tiled/raise
+
+    d_sub = "".join(g + i + j for (g, i, j) in pair_letters)
+
+    # Reshape X's densified contracted axis into per-pair (N_p, Bc_p) factors.
+    pf = []
+    for (c, f, N, Bc, Bf) in pairs:
+        pf += [N, Bc]
+    if D_is_left:
+        M = Xd.reshape((K,) + tuple(x_surv_sizes)).reshape(tuple(pf) + tuple(x_surv_sizes))
+        m_sub = "".join(pl[0] + pl[1] for pl in pair_letters) + "".join(surv_letters)
+    else:
+        M = Xd.reshape(tuple(x_surv_sizes) + (K,)).reshape(tuple(x_surv_sizes) + tuple(pf))
+        m_sub = "".join(surv_letters) + "".join(pl[0] + pl[1] for pl in pair_letters)
+    M = M.astype(out_dtype)
+
+    # Output: surviving pairs in D-SURVIVOR order (keeping meta g_p adjacent to
+    # free-block j_p so they collapse), plus X survivors on their native side.
+    pair_by_survid = {f.id: k for k, (c, f, N, Bc, Bf) in enumerate(pairs)}
+    surv_pair_order = [pair_by_survid[d.id] for d in D_surv_dims if d.id in pair_by_survid]
+    o_pair = "".join(pair_letters[k][0] + pair_letters[k][2] for k in surv_pair_order)
+    o_surv = "".join(surv_letters)
+    o_sub = (o_pair + o_surv) if D_is_left else (o_surv + o_pair)
+
+    R = jnp.einsum(f"{d_sub},{m_sub}->{o_sub}", blocks, M)
+    R = _scaled_mul(R.astype(out_dtype), D.scalar_mult)  # X scale already in Xd
+
+    # Collapse each surviving (N_p, Bf_p) meta+block pair into one dense axis.
+    F_sizes = [pairs[k][2] * pairs[k][4] for k in surv_pair_order]
+    if D_is_left:
+        R = R.reshape(tuple(F_sizes) + tuple(x_surv_sizes))
+        no = len(F_sizes)
+        out_specs = [(F_sizes[k], k) for k in range(no)]
+        primal_specs = [(x_surv_sizes[k], no + k) for k in range(len(x_surv_sizes))]
+    else:
+        R = R.reshape(tuple(x_surv_sizes) + tuple(F_sizes))
+        no = len(x_surv_sizes)
+        out_specs = [(x_surv_sizes[k], k) for k in range(no)]
+        primal_specs = [(F_sizes[k], no + k) for k in range(len(F_sizes))]
+
+    res = emit_dense_result(R, out_specs, primal_specs, dtype=out_dtype)
+    if count:
+        Kblock = 1
+        for (c, f, N, Bc, Bf) in pairs:
+            Kblock *= Bc
+        sz = int(res.size)
+        return res, (0, sz, sz * (Kblock - 1) if Kblock > 1 else 0)
+    return res
+
+
 def matmul(lhs, rhs, count: bool = False):
     """Sparse matmul dispatcher. Tries fast paths in priority order, falls
     back to the tiled algorithm. Each fast path is a function that returns
@@ -2360,12 +2766,29 @@ def matmul(lhs, rhs, count: bool = False):
             )
         # Zero-fill broadcast that isn't densify-safe (a permuted dim order):
         # fall through to the tiled path, which raises the strict size error.
-    rhs_out_dims, rhs_primal_dims, rhs_id_offset = _align_tensor_ids(lhs, rhs)
-    rhs_dims = rhs_out_dims + rhs_primal_dims
-    pairs = _build_matmul_topology(lhs, rhs_out_dims, rhs_primal_dims, rhs_id_offset)
-    ctx = Ctx(lhs=lhs, rhs=rhs, pairs=pairs, rhs_id_offset=rhs_id_offset)
-    _record_path("tiled")
-    out = _execute_tiled(ctx, rhs_dims)
+    # STOPGAP (task #28->#35): exact pure-diagonal contraction. Fires ONLY
+    # where the tiled resolver raises on a diagonal operand (its factorization
+    # wall); every contraction tiled CAN resolve stays on it, so its canonical
+    # output -- and the EXACT-AD path -- is untouched. Not gated by approx_active
+    # (a diagonal contraction is exact); to be folded into _resolve_contract_pair
+    # and DELETED.
+    try:
+        rhs_out_dims, rhs_primal_dims, rhs_id_offset = _align_tensor_ids(lhs, rhs)
+        rhs_dims = rhs_out_dims + rhs_primal_dims
+        pairs = _build_matmul_topology(lhs, rhs_out_dims, rhs_primal_dims, rhs_id_offset)
+        ctx = Ctx(lhs=lhs, rhs=rhs, pairs=pairs, rhs_id_offset=rhs_id_offset)
+        _record_path("tiled")
+        out = _execute_tiled(ctx, rhs_dims)
+    except (ValueError, TypeError):
+        _bd = _block_diagonal_fastpath(lhs, rhs, count)
+        if _bd is not None:
+            _record_path("block_diagonal_fastpath")
+            return _bd
+        _diag = _diagonal_fastpath(lhs, rhs, count)
+        if _diag is not None:
+            _record_path("diagonal_fastpath")
+            return _diag
+        raise
     if count:
         return out, _compute_matmul_count(lhs, rhs, out)
     return out
