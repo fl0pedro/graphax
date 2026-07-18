@@ -451,6 +451,53 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
             if getattr(d, "block_axis", None) is not None:
                 _check_block_axis(d, dim_map, block_axiss)
 
+    # Physical-buffer agreement. Every non-compressed dim's ``axis`` /
+    # ``block_axis`` must point at a val axis whose extent equals the dim's
+    # declared ``size`` / ``block_size`` (a size-1 physical axis is allowed as a
+    # broadcast/implicit stand-in). This catches metadata that disagrees with the
+    # buffer -- e.g. a dense dim whose ``axis`` was renumbered onto a
+    # DiagonalIndex block axis (the MoE-9 squeeze construction bug) -- LOUDLY at
+    # construction, instead of as an opaque "transpose permutation isn't a
+    # permutation" far downstream in a contraction. Compressed dims carry band /
+    # set buffers whose axes are not plain (size / block_size) extents, so they
+    # are skipped (their own densify path validates them).
+    val = getattr(st, "val", None)
+    if val is not None:
+        try:
+            vshape = tuple(val.shape)
+        except Exception:
+            vshape = None
+        if vshape is not None:
+            ndim = len(vshape)
+            for d in st.dims:
+                if d.is_compressed:
+                    continue
+                ax = d.axis
+                if ax is not None:
+                    if ax < 0 or ax >= ndim:
+                        raise ValueError(
+                            f"Topology Error: Index {d.id} axis={ax} out of range "
+                            f"for val.ndim={ndim}"
+                        )
+                    if vshape[ax] != d.size and vshape[ax] != 1:
+                        raise ValueError(
+                            f"Topology Error: Index {d.id} axis={ax} declares "
+                            f"size={d.size} but val.shape[{ax}]={vshape[ax]}"
+                        )
+                if d.is_sparse and getattr(d, "block_axis", None) is not None:
+                    ba = d.block_axis
+                    if ba < 0 or ba >= ndim:
+                        raise ValueError(
+                            f"Topology Error: Index {d.id} block_axis={ba} out of "
+                            f"range for val.ndim={ndim}"
+                        )
+                    bsz = d.block_size
+                    if bsz is not None and vshape[ba] != bsz and vshape[ba] != 1:
+                        raise ValueError(
+                            f"Topology Error: Index {d.id} block_axis={ba} declares "
+                            f"block_size={bsz} but val.shape[{ba}]={vshape[ba]}"
+                        )
+
 
 # --- Construction / mutation --------------------------------------------
 def _copy(st: SparseTensor, val: Array | None = None, scalar_mult: Array | None = None,
