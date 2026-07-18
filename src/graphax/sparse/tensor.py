@@ -964,21 +964,21 @@ def _subdivide_coupled_blockdiag(
     b1_ax = d1.block_axis
     b2_ax = d2.block_axis
 
-    def _rebuild(new_d1, new_d2, new_val, *, moved=None):
+    def _rebuild(new_d1, new_d2, new_val, *, moved=None, n_lead=3):
         def _shift(p):
             if p is None or moved is None:
                 return p
-            # ``new_val`` ALWAYS carries exactly 3 leading axes -- ``[N*k, b1n, b2n]`` --
-            # no matter how many of (meta_ax, b1_ax, b2_ax) were physically present in the
-            # INPUT val. Deriving the shift from the input's front count was an off-by-one
-            # whenever the meta axis was IMPLICIT (size == 1 => axis is None => only 2 axes
-            # moved to the front): every surviving dim's axis then pointed one axis short of
-            # its own data. On ViT that put a size-32 dim on axis 2 -- a size-1 block axis --
-            # while its payload sat at axis 3, and dense_for_matmul densified the wrong axis.
-            # ``b1n``/``b2n`` of 1 still occupy an axis here (they are simply unreferenced by
-            # the rebuilt DiagonalIndex, which sets block_axis=None), so the count is 3 flat.
+            # ``new_val`` carries ``n_lead`` leading axes: the grown meta axis
+            # (``N*k``) plus one physical axis per block side that is BOTH present
+            # in the INPUT val AND still > 1 after the ``k`` split. An IMPLICIT
+            # (broadcast, block_axis=None) block never had a val axis, and a block
+            # that collapses to size 1 is dropped -- neither occupies a leading
+            # axis. The count is therefore passed in, not hard-coded: the old flat
+            # ``3`` over-counted whenever a coupled side was implicit, landing every
+            # surviving dim's axis one-or-more past its own data (the ViT reshape
+            # storm / size-32-on-a-size-1-axis densify bug).
             n_before = sum(1 for a in range(p) if a not in moved)
-            return 3 + n_before
+            return n_lead + n_before
 
         def _map(d, slot_is_out, slot_rel):
             if slot_is_out == is_out1 and slot_rel == rel_i:
@@ -1015,27 +1015,74 @@ def _subdivide_coupled_blockdiag(
         return _rebuild(new_d1, new_d2, None)
 
     val = st.val
+    # Only the PHYSICALLY-present axes live in the buffer. Either coupled side may
+    # carry a purely IMPLICIT (broadcast) block (block_size > 1, block_axis=None),
+    # and the shared meta axis itself may be IMPLICIT (axis=None) -- an implicit
+    # meta densifies as ``N`` IDENTICAL diagonal blocks, so the buffer stores a
+    # single block with no meta axis. The old code reshaped as
+    # ``[N, k, b1n, k, b2n]`` unconditionally (assuming meta AND both blocks were
+    # materialised), over-counting the buffer whenever any of them was implicit --
+    # the ViT ``cannot reshape (4, 2) into [4, 2, 1, 2, 1]`` (implicit block) and
+    # the reshape-by-factor-N mismatch (implicit meta) crashes.
+    p1 = b1_ax is not None
+    p2 = b2_ax is not None
+    pm = meta_ax is not None
     moved = (meta_ax, b1_ax, b2_ax)
     front = [a for a in moved if a is not None]
     rest = [a for a in range(val.ndim) if a not in front]
-    v = jnp.transpose(val, front + rest)  # (N, b1, b2, *rest)
+    v = jnp.transpose(val, front + rest)  # ([N], [b1], [b2], *rest)
     rest_shape = list(v.shape[len(front):])
-    v = v.reshape([N, k, b1n, k, b2n] + rest_shape)  # (N, ki, b1n, kj, b2n, *rest)
-    eye = jnp.eye(k, dtype=v.dtype)
-    # sub[N, g, r, c, *rest] = sum_{ki,kj} eye[g,ki] eye[g,kj] v[N,ki,r,kj,c,*rest]
-    sub = jnp.einsum("gi,gj,nirjc...->ngrc...", eye, eye, v)  # (N, k, b1n, b2n, *rest)
-    new_val = sub.reshape([N * k, b1n, b2n] + rest_shape)  # (factor, b1n, b2n, *rest)
+    if not pm:
+        # IMPLICIT meta: materialise the shared meta axis by broadcasting the
+        # single stored block into ``N`` identical diagonal blocks. This restores
+        # the canonical (N, [b1], [b2], *rest) leading layout so the split logic
+        # below is identical to the meta-present case; every ``rest`` axis keeps
+        # its original index (the synthetic meta axis is not one of them), so the
+        # ``_shift`` bookkeeping over ``moved`` stays correct.
+        v = jnp.broadcast_to(v[None, ...], (N,) + v.shape)
+
+    # A block side occupies a NEW leading val axis iff it is present AND still
+    # bigger than 1 after the split; otherwise it is implicit / collapses away.
+    keep1 = p1 and b1n > 1
+    keep2 = p2 and b2n > 1
+    out_lead = [N * k] + ([b1n] if keep1 else []) + ([b2n] if keep2 else [])
+    n_lead = len(out_lead)
+
+    if p1 and p2:
+        # Both block axes materialised: split each into (k, bn) and keep the
+        # meta-diagonal (ki == kj == g) sub-block via the eye-einsum.
+        v = v.reshape([N, k, b1n, k, b2n] + rest_shape)  # (N, ki, b1n, kj, b2n, *rest)
+        eye = jnp.eye(k, dtype=v.dtype)
+        # sub[N, g, r, c, *rest] = sum_{ki,kj} eye[g,ki] eye[g,kj] v[N,ki,r,kj,c,*rest]
+        sub = jnp.einsum("gi,gj,nirjc...->ngrc...", eye, eye, v)  # (N, k, b1n, b2n, *rest)
+        new_val = sub.reshape(out_lead + rest_shape)  # (factor, [b1n], [b2n], *rest)
+    elif p1 or p2:
+        # Exactly one block axis is materialised; its ``k`` split IS the new meta
+        # sub-index (the finer diagonal), and the implicit side stays broadcast.
+        # No eye-einsum: contracting eye[g, kj] against a val that is CONSTANT over
+        # the implicit ``kj`` just reselects the same (broadcast) value, so masking
+        # the present side and relabelling ``k`` into the meta axis is sufficient.
+        bn = b1n if p1 else b2n
+        v = v.reshape([N, k, bn] + rest_shape)  # (N, k, bn, *rest)
+        new_val = v.reshape(out_lead + rest_shape)  # (factor, [bn], *rest)
+    else:
+        # Both blocks implicit: the meta block is CONSTANT over b1 x b2, so each of
+        # the ``k`` finer meta-diagonal sub-blocks carries that same constant. Grow
+        # the physical meta axis N -> N*k by repeating; both sub-blocks stay implicit.
+        v = jnp.broadcast_to(v.reshape([N, 1] + rest_shape), [N, k] + rest_shape)
+        new_val = v.reshape(out_lead + rest_shape)  # (factor, *rest)
+
     new_d1 = DiagonalIndex(
         id=d1.id, size=factor, axis=0, other_id=d2.id,
         block_size=b1n if b1n > 1 else None,
-        block_axis=1 if b1n > 1 else None,
+        block_axis=(1 if keep1 else None),
     )
     new_d2 = DiagonalIndex(
         id=d2.id, size=factor, axis=0, other_id=d1.id,
         block_size=b2n if b2n > 1 else None,
-        block_axis=2 if b2n > 1 else None,
+        block_axis=((1 + (1 if keep1 else 0)) if keep2 else None),
     )
-    return _rebuild(new_d1, new_d2, new_val, moved=moved)
+    return _rebuild(new_d1, new_d2, new_val, moved=moved, n_lead=n_lead)
 
 
 def _apply_block_diagonal(
