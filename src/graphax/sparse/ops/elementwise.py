@@ -61,6 +61,69 @@ def _identity_scalar_mult(dtype) -> Array:
     return jnp.array(True) if dtype == jnp.bool_ else jnp.array(1.0, dtype=dtype)
 
 
+def _reconcile_broadcast_dims(lhs, rhs):
+    """Reconcile a compact broadcast dim (``logical_size == 1``, i.e. the
+    "extent N stored once" that an approximation collapsed on ONE fan-in
+    contribution) against its same-``id`` MATERIALIZED partner (``logical_size
+    N > 1``) BEFORE the physical-shape equality check, so accumulating two
+    contributions to one vertex no longer raises ``Shape mismatch``.
+
+    Fan-in accumulation (``cf[t] + prod`` in the face engine) adds two partial
+    Jacobians of the SAME edge — dims are paired by ``id`` (elementwise operands
+    share ONE id space). When a Compress/Diag approximation collapses a dense
+    free dim on one contribution to its compact size-1 form while the sibling
+    kept it materialized at extent N, the two operands have equal-``id`` dims of
+    logical extent 1 vs N. The add of extent-1 and extent-N is exactly the
+    extent-N broadcast (numpy/`op` semantics; verified byte-exact against the
+    dense oracle), so promote the size-1 side to N here.
+
+    INVARIANT (guarded): broadcast a size-1 dim ONLY toward a same-``id`` partner
+    whose ``logical_size > 1``. A genuine ``logical_size == 1`` on BOTH sides has
+    no such partner and is left untouched (``1`` stays ``1``) — we never fabricate
+    an extent. Only DENSE (unpaired) dims are reconciled; sparse pairs of equal
+    logical size but different block granularity are a real LCM-grid job and stay
+    with the downstream ``_map_topology`` / ``_promote_to_unified`` path.
+    """
+    from graphax.sparse.tensor import SparseTensor
+
+    l_map = {d.id: d for d in lhs.dims}
+    r_map = {d.id: d for d in rhs.dims}
+
+    def _fix(t, other_map):
+        val = t.val
+        changed = False
+        new_by_id = {}
+        for d in t.dims:
+            od = other_map.get(d.id)
+            if (od is not None and not d.is_sparse and not od.is_sparse
+                    and int(d.logical_size) == 1 and int(od.logical_size) > 1):
+                N = int(od.logical_size)
+                if d.axis is not None and val is not None and val.shape[d.axis] == 1:
+                    # Materialized compact axis: physically broadcast it to N.
+                    val = jnp.broadcast_to(
+                        val, val.shape[:d.axis] + (N,) + val.shape[d.axis + 1:]
+                    )
+                    new_by_id[d.id] = replace(d, size=N)
+                else:
+                    # No physical size-1 axis to grow (implicit / val is None):
+                    # carry the true logical extent as an implicit (axis=None)
+                    # broadcast dim; the downstream align/promote path expands it.
+                    new_by_id[d.id] = replace(d, size=N, axis=None)
+                changed = True
+            else:
+                new_by_id[d.id] = d
+        if not changed:
+            return t
+        return SparseTensor(
+            tuple(new_by_id[d.id] for d in t.out_dims),
+            tuple(new_by_id[d.id] for d in t.primal_dims),
+            val, scalar_mult=t.scalar_mult, fill_value=t.fill_value,
+            check_consistency=False,
+        )
+
+    return _fix(lhs, r_map), _fix(rhs, l_map)
+
+
 def _normalize_inputs(lhs, rhs):
     target_dtype = (lhs.dtype if _is_sparse(lhs) and not _is_sparse(rhs)
                     else rhs.dtype if _is_sparse(rhs) and not _is_sparse(lhs)
@@ -83,6 +146,10 @@ def _normalize_inputs(lhs, rhs):
     from .utils import _materialize_for_op
     lhs = _materialize_for_op(lhs)
     rhs = _materialize_for_op(rhs)
+    # Reconcile a compact broadcast dim (logical 1) against its same-id
+    # materialized partner (logical N>1) so a fan-in accumulation of two
+    # contributions to one vertex broadcasts instead of raising below.
+    lhs, rhs = _reconcile_broadcast_dims(lhs, rhs)
     # Static shape comparison: ``SparseTensor.shape`` returns Python ints
     # derived from the dim metadata, so this is a trace-time check (no runtime
     # branching on traced shapes).
