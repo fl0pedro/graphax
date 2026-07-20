@@ -409,9 +409,24 @@ def jacve(
 
 
 # Per-vertex Jacobian-transform spec — the shared type of the ``transforms``
-# argument on jacve / grad / value_and_grad: ``[(vertex_id, [transform, ...])]``.
+# argument on jacve / grad / value_and_grad. Two per-vertex forms:
+#   * legacy list ``[(vertex_id, [transform, ...])]`` — transforms applied to
+#     each merged edge (normalized to nominal shape).
+#   * face-like per-path dict ``[(vertex_id, {(primal_id, out_id): hooks})]`` —
+#     ``hooks`` is ``(pre, post, new)`` [contraction] or
+#     ``((pre, post, new), (lhs, rhs, res))`` [contraction + join]; each hook is a
+#     callable ``SparseTensor -> SparseTensor`` or ``None``. Applied at the op
+#     boundary, so the edge is never normalized (the sparse ops reconcile shapes).
+_Hook = Callable[["SparseTensor"], "SparseTensor"]
+_PathHooks = Union[
+    Tuple[_Hook, _Hook, _Hook],
+    Tuple[Tuple[_Hook, _Hook, _Hook], Tuple[_Hook, _Hook, _Hook]],
+]
 TransformSpec = Sequence[
-    Tuple[int, Sequence[Union[Diag, Compress, Callable[["SparseTensor"], "SparseTensor"]]]]
+    Tuple[int, Union[
+        Sequence[Union[Diag, Compress, _Hook]],
+        Dict[Tuple[int, int], _PathHooks],
+    ]]
 ]
 
 
@@ -723,6 +738,61 @@ def _match_nominal_axes(d_shape, n_out, out_aval_shape, in_aval_shape):
 _KEEP_BLOCKDIAG = os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "1") != "0"
 
 
+# Face-like per-path approximation: the `transforms` entry for a vertex may be a
+# dict keyed by (primal_vertex_id, out_vertex_id) -> per-path hooks. This applies
+# the approximation at the OP boundary (contraction operands + result, join
+# operands + result) exactly like the face engine, so an edge NEVER needs
+# `_normalize_approx_edge` (the sparse matmul/+ reconcile shapes locally). Vertex
+# ids follow the eqn-position scheme (1-based, matching `order`); graph inputs
+# take a negative id -(invar_index+1). See `_parse_path_hooks` for the value
+# shape. This path is byte-identical to exact AD when `transforms == ()`.
+_NULL3 = (None, None, None)
+
+
+def _parse_path_hooks(value):
+    """Normalize a per-path transforms value into ``((pre, post, new),
+    (lhs, rhs, res))`` — the contraction hooks and the join/add hooks.
+
+    Accepted forms:
+      * ``None``                       -> no hooks
+      * ``(pre, post, new)``           -> contraction hooks only, join = identity
+      * ``((pre,post,new),(lhs,rhs,res))`` -> both ops (either 3-tuple may be
+        ``None`` for identity). Each hook is a callable ``SparseTensor ->
+        SparseTensor`` or ``None`` (identity).
+
+    ``pre``/``post`` apply to the two contraction operands, ``new`` to the
+    contraction result; ``lhs``/``rhs`` apply to the two join operands (the new
+    contribution and the existing edge), ``res`` to the summed edge.
+    """
+    if value is None:
+        return _NULL3, _NULL3
+
+    def _as3(h):
+        if h is None:
+            return _NULL3
+        h = tuple(h)
+        if len(h) != 3:
+            raise ValueError(
+                f"per-path hook must be a 3-tuple (a, b, res); got length {len(h)}"
+            )
+        return h
+
+    # ((pre,post,new),(lhs,rhs,res)): a length-2 outer whose members are each a
+    # 3-tuple or None. Distinguished from a bare (pre,post,new) [length 3].
+    if (
+        len(value) == 2
+        and all(m is None or (hasattr(m, "__len__") and len(m) == 3 and not callable(m))
+                for m in value)
+    ):
+        return _as3(value[0]), _as3(value[1])
+    if len(value) == 3:
+        return _as3(value), _NULL3
+    raise ValueError(
+        "per-path transforms value must be (pre,post,new) or "
+        f"((pre,post,new),(lhs,rhs,res)); got {value!r}"
+    )
+
+
 def _is_pure_blockdiag(edge) -> bool:
     """True iff edge carries >=1 meta-block-diagonal (Diagonal) dim and NO
     compressed/implicit dim — a residual structure the batched block-diagonal
@@ -958,6 +1028,7 @@ def _eliminate_vertex(
     transforms: Sequence[
         Union[Diag, Compress, Callable[["SparseTensor"], "SparseTensor"]]
     ] = (),
+    var_vid: Dict[core.Var, int] = None,
 ) -> Tuple[int, int, int, int]:
     """
     Function that eliminates a vertex from the computational graph.
@@ -1010,7 +1081,12 @@ def _eliminate_vertex(
     # (MoE) / "matmul: mismatch in core dimension 0" (NN). Callables are exactly what a
     # MASK-AWARE policy must use (the mask needs the real edge, only known mid-elimination),
     # so this silently broke the one correct way to apply approximations.
-    _is_approx_cfg = any(
+    # Per-path (face-like) mode: `transforms` is a dict keyed by
+    # (primal_vertex_id, out_vertex_id). Hooks are applied at the op boundary and
+    # NO `_normalize_approx_edge` runs (the sparse ops reconcile shapes). The
+    # legacy list form keeps its post-merge normalization untouched.
+    _perpath = isinstance(transforms, dict)
+    _is_approx_cfg = (not _perpath) and any(
         isinstance(_t, (Diag, Compress)) or callable(_t) for _t in transforms
     )
     # GLOBAL approx flag: True for the whole elimination iff ANY vertex carries an
@@ -1046,6 +1122,17 @@ def _eliminate_vertex(
                     continue  # no Jacobian (e.g. stop_gradient blocks grad); skip
                 pre_val = _pre_raw
 
+                # Resolve this path's per-op hooks. The path (in_edge -> vertex ->
+                # out_edge) is keyed by its neighbour vertex ids; ``_h_*`` default
+                # to None (identity) for any unaddressed path or role.
+                (_h_pre, _h_post, _h_new), (_h_lhs, _h_rhs, _h_res) = _NULL3, _NULL3
+                if _perpath:
+                    _pid = var_vid.get(in_edge) if var_vid is not None else None
+                    _oid = var_vid.get(out_edge) if var_vid is not None else None
+                    (_h_pre, _h_post, _h_new), (_h_lhs, _h_rhs, _h_res) = (
+                        _parse_path_hooks(transforms.get((_pid, _oid)))
+                    )
+
                 # TODO implement a process that discards unnecessary edges from the computation
 
                 # Handle stuff like reshape, squeeze etc.
@@ -1073,6 +1160,13 @@ def _eliminate_vertex(
                     or (post_val.val is None and not _acts_as_identity(_post_val))
                     or (pre_val.val is None and not _acts_as_identity(_pre_val))
                 )
+                # Per-path contraction-operand hooks (pre -> in-edge Jacobian,
+                # post -> out-edge Jacobian). Applied to the working copies that
+                # feed the contraction, mirroring face_env (pre->cf[u], post->cf[w]).
+                if _perpath and _h_pre is not None:
+                    _pre_val = _h_pre(_pre_val)
+                if _perpath and _h_post is not None:
+                    _post_val = _h_post(_post_val)
                 if _need_contract:
                     # A scalar × scalar contraction is an elementwise multiply:
                     # ``sparse_matmul`` rejects 0-rank operands, so it must NEVER
@@ -1136,13 +1230,22 @@ def _eliminate_vertex(
                 if _compressed_dims(edge_outval):
                     edge_outval = _materialize_for_op(edge_outval)
 
+                # Per-path contraction-RESULT hook (``new``). The face engine
+                # applies its ``new`` to the product; here we apply it to the
+                # freshly-contracted edge before the join. A join ``lhs`` hook
+                # (below) then composes on top for the merge case.
+                if _perpath and _h_new is not None:
+                    edge_outval = _h_new(edge_outval)
+                    _assert_sparse_tensor_consistency(edge_outval)
+
                 # Pre-merge approx-edge normalization (gated on Diag/Compress).
                 # The multi-edge ``+`` merge below adds two edges and asserts the
                 # nominal shape, so an approx edge whose contraction surfaced a
                 # non-nominal free-dim order must be reconciled to nominal FIRST.
                 # ``_is_approx_cfg`` is statically False on the EXACT-AD path, so
-                # the no-approximation edge is byte-identical.
-                if _approx_elim and graph.get(in_edge).get(out_edge) is not None:
+                # the no-approximation edge is byte-identical. Per-path (face-like)
+                # mode SKIPS this densify entirely — the sparse ``+`` reconciles.
+                if _approx_elim and not _perpath and graph.get(in_edge).get(out_edge) is not None:
                     # KEEP_BLOCKDIAG: if BOTH the new and existing edge are matching
                     # pure block-diagonals, their SparseTensor + stays block-sparse
                     # (verified block-wise add), so skip the merge densify. Otherwise
@@ -1173,7 +1276,7 @@ def _eliminate_vertex(
                     # order — under an approximation the two contraction paths feed
                     # the merge in mismatched layouts (the ViT seq/embed swap). Bring
                     # the existing edge to the same nominal layout so the add aligns.
-                    if _approx_elim and not (
+                    if _approx_elim and not _perpath and not (
                         _KEEP_BLOCKDIAG and _blockdiag_addable(edge_outval, _edge)
                     ):
                         _edge = _normalize_approx_edge(
@@ -1181,17 +1284,27 @@ def _eliminate_vertex(
                         )
                     _assert_sparse_tensor_consistency(_edge)
 
-                    # Check if the computed edge Jacobian shapes actually match
-                    # what we expect
-                    edge_shape = tuple(
-                        list(out_edge.aval.shape) + list(in_edge.aval.shape)
-                    )
-                    assert edge_shape == edge_outval.shape, (
-                        f"Computed edge shape {edge_outval.shape} does not match expected shape {edge_shape}!"
-                    )
-                    assert edge_shape == _edge.shape, (
-                        f"Existing edge shape {_edge.shape} does not match expected shape {edge_shape}!"
-                    )
+                    # Per-path JOIN operand hooks: ``lhs`` -> the new contribution,
+                    # ``rhs`` -> the existing edge. Applied to the drained addends
+                    # before the sparse ``+`` (which reconciles their layouts).
+                    if _perpath and _h_lhs is not None:
+                        edge_outval = _h_lhs(edge_outval)
+                    if _perpath and _h_rhs is not None:
+                        _edge = _h_rhs(_edge)
+
+                    # Nominal-shape asserts only hold when normalization ran; in
+                    # per-path (face-like) mode edges stay sparse/permuted and the
+                    # ``+`` reconciles them, so the asserts do not apply.
+                    if not _perpath:
+                        edge_shape = tuple(
+                            list(out_edge.aval.shape) + list(in_edge.aval.shape)
+                        )
+                        assert edge_shape == edge_outval.shape, (
+                            f"Computed edge shape {edge_outval.shape} does not match expected shape {edge_shape}!"
+                        )
+                        assert edge_shape == _edge.shape, (
+                            f"Existing edge shape {_edge.shape} does not match expected shape {edge_shape}!"
+                        )
                     if count_ops:
                         edge_outval, (_a, _m, _f) = add_w_counts(edge_outval, _edge)
                         adds += int(_a)
@@ -1204,6 +1317,10 @@ def _eliminate_vertex(
                         ) * edge_outval.dtype.itemsize
                     else:
                         edge_outval += _edge
+
+                    # Per-path JOIN result hook (``res`` -> the summed edge).
+                    if _perpath and _h_res is not None:
+                        edge_outval = _h_res(edge_outval)
 
                 # Drain queued Jacobian transforms (slice / concatenate / reshape
                 # / transpose relabels awaiting embed) into the edge BEFORE the
@@ -1253,7 +1370,10 @@ def _eliminate_vertex(
                 # alternative is to push the full edge geometry up to the
                 # caller so it can pre-filter, which couples the typed
                 # transform API to internal sparse representations.
-                for _t in transforms:
+                #
+                # Per-path (dict) mode applied its hooks at the op boundaries
+                # above, so the legacy per-vertex list loop is skipped here.
+                for _t in (() if _perpath else transforms):
                     try:
                         if isinstance(_t, Diag):
                             edge_outval = apply_diag(edge_outval, _t)
@@ -1900,10 +2020,25 @@ class VertexEliminator:
 
         # Build a per-vertex transforms dict for fast lookup during the
         # elimination scan. Vertices missing from `transforms` get an
-        # empty tuple (no transforms applied).
-        t_dict: Dict[int, Tuple] = {
-            int(v): tuple(ts) for v, ts in (transforms or ())
-        }
+        # empty tuple (no transforms applied). A per-vertex value that is a
+        # dict is the face-like per-path spec (kept as-is); a sequence is the
+        # legacy per-vertex transform list.
+        t_dict: Dict[int, object] = {}
+        for v, ts in (transforms or ()):
+            t_dict[int(v)] = ts if isinstance(ts, dict) else tuple(ts)
+
+        # Var -> integer vertex-id map so per-path dicts keyed by
+        # (primal_vertex_id, out_vertex_id) resolve during elimination: a
+        # produced var takes its eqn-position id (1-based, matching `order`); a
+        # graph input takes a negative id -(invar_index+1).
+        _has_perpath = any(isinstance(_x, dict) for _x in t_dict.values())
+        _var_vid: Dict[core.Var, int] = {}
+        if _has_perpath:
+            for _i, _eqn in enumerate(jaxpr.eqns, start=1):
+                for _ov in _eqn.outvars:
+                    _var_vid[_ov] = _i
+            for _j, _iv in enumerate(jaxpr.invars):
+                _var_vid.setdefault(_iv, -(_j + 1))
 
         # When counting, never reuse the cached prefix: a node's stored counts
         # are only real if the run that created it had count_ops=True. A prior
@@ -1911,7 +2046,7 @@ class VertexEliminator:
         # prefix here would report muls/adds=0 and an empty per-step breakdown.
         # Re-run the full order so the counts are honest (count_ops is an
         # analysis path, not the hot path); the graph result is identical.
-        if ENABLE_CACHE and not count_ops:
+        if ENABLE_CACHE and not count_ops and not _has_perpath:
             for vertex in order:
                 v_transforms = t_dict.get(vertex, ())
                 key = (vertex, v_transforms)
@@ -1940,6 +2075,7 @@ class VertexEliminator:
                 vo_vertices,
                 count_ops=count_ops,
                 transforms=v_transforms,
+                var_vid=_var_vid,
             )
             adds += _adds
             muls += _muls
@@ -1948,7 +2084,9 @@ class VertexEliminator:
             if count_ops:
                 counts.append((adds, muls, fmas, mem))
 
-            if ENABLE_CACHE:
+            # Per-path transform dicts are unhashable and path-specific, so they
+            # are never memoized in the prefix tree (like the count path).
+            if ENABLE_CACHE and not _has_perpath:
                 key = (vertex, v_transforms)
                 with node.lock:
                     if key not in node.children:
