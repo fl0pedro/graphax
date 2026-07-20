@@ -21,7 +21,7 @@ from jax import Array
 
 from .utils import (
     _arr2st, _is_sparse, _val_or_one, _prepare_physical_array, _is_zero_fill,
-    _apply_scalar_mult, _scaled_fill,
+    _apply_scalar_mult, _scaled_fill, _copy,
 )
 from .layout import generate_block_permutation
 from graphax.sparse.dtype_compute import _unify_operand_dtypes, _compute_dtype
@@ -97,7 +97,13 @@ def _reconcile_broadcast_dims(lhs, rhs):
     Two SPARSE dims of equal logical size but different block granularity are a
     real LCM-grid job (both sides sparse) and stay with the downstream path.
     """
-    from graphax.sparse.tensor import SparseTensor
+    # Reconcile can only broadcast a DENSE logical-1 dim toward a materialized
+    # N-partner; when neither operand has such a dim it is a strict no-op, so
+    # skip the dict build + per-dim scan entirely (the common case in the loop).
+    def _has_dense_unit(t):
+        return any((not d.is_sparse) and int(d.logical_size) == 1 for d in t.dims)
+    if not _has_dense_unit(lhs) and not _has_dense_unit(rhs):
+        return lhs, rhs
 
     l_map = {d.id: d for d in lhs.dims}
     r_map = {d.id: d for d in rhs.dims}
@@ -132,11 +138,13 @@ def _reconcile_broadcast_dims(lhs, rhs):
                 new_by_id[d.id] = d
         if not changed:
             return t
-        return SparseTensor(
-            tuple(new_by_id[d.id] for d in t.out_dims),
-            tuple(new_by_id[d.id] for d in t.primal_dims),
-            val, scalar_mult=t.scalar_mult, fill_value=t.fill_value,
-            check_consistency=False,
+        # _copy carries scalar_mult / fill_value AND pre/post_transforms (which a
+        # hand-rolled SparseTensor(...) would silently drop -- the transform-drop
+        # class the campaign fixed elsewhere), and keeps check_consistency=False.
+        return _copy(
+            t, val=val,
+            out_dims=tuple(new_by_id[d.id] for d in t.out_dims),
+            primal_dims=tuple(new_by_id[d.id] for d in t.primal_dims),
         )
 
     return _fix(lhs, r_map), _fix(rhs, l_map)

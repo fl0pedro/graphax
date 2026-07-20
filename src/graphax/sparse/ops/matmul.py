@@ -2214,25 +2214,30 @@ def _execute_tiled(ctx, rhs_dims):
 
 
 def matmul(lhs, rhs, count: bool = False):
-    """Sparse matmul dispatcher. Tries fast paths in priority order, falls
-    back to the tiled algorithm. Each fast path is a function that returns
-    ``None`` when its conditions don't apply.
+    """Sparse matmul dispatcher. Runs a cascade of paths, first-applicable
+    wins, falling back to the general tiled algorithm; each path either
+    handles the operands or declines (returns ``None`` / predicate false) and
+    control passes to the next.
 
-    Dispatch order (first applicable wins):
-      1. ``dense_dense``      — both operands are arrays (no SparseTensor).
-      2. ``densify``          — non-zero ``fill_value`` on either side
-                                *and* contracting dim sizes line up
-                                positionally (``_densify_is_safe``). The
-                                tiled path assumes implicit positions are
-                                zero, which is wrong when ``fill ≠ 0``;
-                                we materialize via ``dense_for_matmul`` +
-                                ``dot_general`` instead. When the safety
-                                check fails (graphax's AD can produce
-                                permuted dim orders), we skip this and let
-                                the tiled path handle it via id-aware
-                                topology resolution.
-      3. ``tiled``            — full LCM/topology/finalize pipeline; handles
-                                everything else.
+    Dispatch order (first applicable wins), in body order:
+      1. ``dense_dense``        -- both operands are plain arrays (no SparseTensor).
+      2. ``scalar_elementwise`` -- both 0-rank scalars, routed through ``*``.
+      3. ``einsum_general``     -- opt-in (``GRAPHAX_EINSUM_GENERAL``): opt_einsum
+                                  lowering that retains sparsity.
+      4. ``struct_lower``       -- opt-in (``GRAPHAX_STRUCT_LOWER``): structure-
+                                  lowering contraction planner.
+      5. ``both_implicit_fold`` -- both contracted dims implicit: analytic
+                                  scale-by-N folded into ``scalar_mult``.
+      6. ``elemental``          -- structured (diagonal/block/banded) kernels,
+                                  active only under ``approx_active()``.
+      7. ``densify``            -- non-zero ``fill_value`` OR an implicit-block
+                                  contraction, when ``_densify_is_safe``:
+                                  materialize via ``dense_for_matmul`` +
+                                  ``dot_general`` (tiled assumes implicit
+                                  positions are zero, wrong when fill != 0).
+                                  Runs LATE, after the structured paths above.
+      8. ``tiled``              -- general LCM/topology/finalize pipeline; the
+                                  sparsity-preserving fallback for everything else.
 
     Scalar @ scalar (both 0-rank SparseTensors) is rejected — use
     ``lhs * rhs`` (elementwise) instead. Vertex elimination routes scalar
