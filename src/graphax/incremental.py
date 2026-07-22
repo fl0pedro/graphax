@@ -22,6 +22,10 @@ import contextlib
 from jax._src.interpreters import partial_eval as pe
 from jax._src import core as jcore, source_info_util
 
+# jax renamed core.get_aval -> core.typeof in 0.10; support both so the
+# AOJ works across the versions this project pins.
+_get_aval = getattr(jcore, "get_aval", None) or jcore.typeof
+
 from .core import (
     _build_graph, _prune_graph, _eliminate_vertex, _force, faces_of,
 )
@@ -47,7 +51,7 @@ class IncrementalJacobian:
         self.trace = pe.DynamicJaxprTrace(self.dbg, parent_trace=None)
 
         with jcore.set_current_trace(self.trace):
-            self.in_tracers = [self.trace.new_arg(jcore.get_aval(a), self.si)
+            self.in_tracers = [self.trace.new_arg(_get_aval(a), self.si)
                                for a in args]
             # base = primal forward + elemental edge partials, traced into the
             # persistent jaxpr once.
