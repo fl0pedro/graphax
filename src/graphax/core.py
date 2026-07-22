@@ -36,6 +36,7 @@ from .sparse.micro_actions import (
     Compress, Diag, Quant, apply_compress, apply_diag, apply_quant,
 )
 from .sparse.utils import zeros_like
+from .sparse.tracer import get_face_sink as _get_face_sink
 
 EliminationOrder = Union[Sequence[int], str]
 ComputationalGraph = Dict[core.Var, Dict[core.Var, jnp.ndarray]]
@@ -904,6 +905,107 @@ def _acts_as_identity(t) -> bool:
     return True
 
 
+def _contract_edge_val(_post_val, _pre_val, pre_val, post_val,
+                       need_contract, count_ops):
+    """One (post-edge x pre-edge) chain-rule contraction. Returns
+    ``(edge_val, d_adds, d_muls, d_fmas, d_mem)``. Extracted verbatim from the
+    former inline body so it can be traced in isolation by a ``PathSink`` while
+    staying the single source of truth for the exact-AD path."""
+    _da = _dm = _df = _dmem = 0
+    if need_contract:
+        # A scalar × scalar contraction is an elementwise multiply:
+        # ``sparse_matmul`` rejects 0-rank operands, so it must NEVER be routed
+        # through matmul — on either the count or non-count path.
+        if _is_scalar_st(_post_val) and _is_scalar_st(_pre_val):
+            _eo = _post_val * _pre_val
+            if count_ops:
+                _dm += 1
+        elif count_ops:
+            _eo, (_a, _m, _f) = sparse_matmul(_post_val, _pre_val, count=True)
+            _da += int(_a)
+            _dm += int(_m)
+            _df += int(_f)
+        else:
+            _eo = _post_val @ _pre_val
+        if count_ops:
+            post_size = _post_val.val.size if _post_val.val is not None else 0
+            pre_size = _pre_val.val.size if _pre_val.val is not None else 0
+            out_size = _eo.val.size if _eo.val is not None else 0
+            _dmem += max(
+                post_size * _post_val.dtype.itemsize,
+                pre_size * _pre_val.dtype.itemsize,
+                out_size * _eo.dtype.itemsize,
+            )
+    elif pre_val.val is not None:
+        # post is a pure-diagonal identity up to its scalar_mult: pass pre
+        # through, FOLDING post's scalar_mult (dropping it was the
+        # ``sum(z*sum(z))`` bug — 10·pre became pre).
+        _eo = _pre_val.copy(
+            scalar_mult=_scaled_mul_promote(_pre_val.scalar_mult, _post_val.scalar_mult)
+        )
+        if count_ops:
+            _dm += 1
+    else:
+        # pre is the identity (up to scalar_mult): pass post through.
+        _eo = _post_val.copy(
+            scalar_mult=_scaled_mul_promote(_post_val.scalar_mult, _pre_val.scalar_mult)
+        )
+        if count_ops:
+            _dm += 1
+    return _eo, _da, _dm, _df, _dmem
+
+
+def _accumulate_edge_val(edge_outval, _edge, count_ops):
+    """Accumulate a parallel path onto an existing edge. Returns
+    ``(edge_val, d_adds, d_muls, d_fmas, d_mem)``; single source of truth for
+    the exact-AD merge, traceable in isolation by a ``PathSink``."""
+    _da = _dm = _df = _dmem = 0
+    if count_ops:
+        edge_outval, (_a, _m, _f) = add_w_counts(edge_outval, _edge)
+        _da += int(_a)
+        _dm += int(_m)
+        _df += int(_f)
+        _dmem += (
+            edge_outval.val.size if edge_outval.val is not None else 0
+        ) * edge_outval.dtype.itemsize
+    else:
+        edge_outval += _edge
+    return edge_outval, _da, _dm, _df, _dmem
+
+
+def _stable_var_index(jaxpr):
+    """Var -> first-appearance position in the jaxpr (constvars, invars, then
+    each eqn's outvars). Gives a deterministic key for ordering the id-hashed
+    edge maps during path tokenization."""
+    idx = {}
+    for v in jaxpr.constvars:
+        idx.setdefault(v, len(idx))
+    for v in jaxpr.invars:
+        idx.setdefault(v, len(idx))
+    for e in jaxpr.eqns:
+        for v in e.outvars:
+            idx.setdefault(v, len(idx))
+    return idx
+
+
+def _apply_micro(edge_outval, _t):
+    """Dispatch one typed micro-action; traced in isolation by a PathSink."""
+    if isinstance(_t, Diag):
+        return apply_diag(edge_outval, _t)
+    if isinstance(_t, Compress):
+        return apply_compress(edge_outval, _t)
+    return apply_quant(edge_outval, _t)
+
+
+def _approx_meta(_t):
+    """(TYPE token, params dict) for a typed micro-action -> approx block head."""
+    if isinstance(_t, Diag):
+        return "DIAG", {"i": int(_t.i), "j": int(_t.j), "factor": int(_t.factor)}
+    if isinstance(_t, Compress):
+        return "COMPRESS", {"kind": _t.kind, "axes": tuple(int(a) for a in _t.axes)}
+    return "QUANT", {"dtype": _t.dtype}
+
+
 def _eliminate_vertex(
     vertex: int,
     jaxpr: core.Jaxpr,
@@ -968,11 +1070,38 @@ def _eliminate_vertex(
 
     _approx_elim = approx_active()
 
+    # Path tokenization sink (None on the exact-AD hot path -> zero overhead,
+    # every contraction/accumulation runs inline exactly as before).
+    # Face sink: records per-face edge identities + equation ranges into the
+    # PRESERVED trace's frame (contraction/join vs each approximation), so the
+    # tokenizer can label "which elimination, which path, which approx". None on
+    # the exact-AD path -> zero overhead.
+    _face_sink = _get_face_sink()
+
+    # In tokenize mode, iterate the edge maps in a STABLE order (they are keyed
+    # by id-hashed core.Var, so their native iteration order varies per trace,
+    # which would make the emitted op stream — and its first-appearance names —
+    # nondeterministic). Sorting by first-appearance position in the jaxpr fixes
+    # the order without touching the exact-AD path (numeric result is
+    # order-invariant; only token determinism needs it). The index is invariant
+    # over the whole elimination, so build it ONCE and cache it on the sink
+    # (rebuilding per vertex would be O(V^2)).
+    _vidx = None
+    if _face_sink is not None:
+        _vidx = _face_sink.vidx
+        if _vidx is None:
+            _vidx = _face_sink.vidx = _stable_var_index(jaxpr)
+
+    def _ordered(keys):
+        if _vidx is None:
+            return keys
+        return sorted(keys, key=lambda v: _vidx.get(v, 1 << 30))
+
     for central_var in eqn.outvars:
         if central_var not in graph:
             continue  # dead or already-eliminated vertex
 
-        for out_edge in graph[central_var].keys():
+        for out_edge in _ordered(graph[central_var].keys()):
             _post_raw = _force(graph[central_var][out_edge])
             if _post_raw is None:
                 continue  # no Jacobian for this out-edge; skip
@@ -984,11 +1113,14 @@ def _eliminate_vertex(
             # (a defensive ``.copy()`` of these read-only bases was pure
             # per-edge overhead on the O(E²) AD hot path).
             post_val = _post_raw
-            for in_edge in transpose_graph[central_var].keys():
+            for in_edge in _ordered(transpose_graph[central_var].keys()):
                 _pre_raw = _force(transpose_graph[central_var][in_edge])
                 if _pre_raw is None:
                     continue  # no Jacobian (e.g. stop_gradient blocks grad); skip
                 pre_val = _pre_raw
+                if _face_sink is not None:
+                    # one FACE = this (in_edge -> central_var -> out_edge) path
+                    _face_sink.open_face(vertex, in_edge, central_var, out_edge)
 
                 # TODO implement a process that discards unnecessary edges from the computation
 
@@ -1017,57 +1149,19 @@ def _eliminate_vertex(
                     or (post_val.val is None and not _acts_as_identity(_post_val))
                     or (pre_val.val is None and not _acts_as_identity(_pre_val))
                 )
-                if _need_contract:
-                    # A scalar × scalar contraction is an elementwise multiply:
-                    # ``sparse_matmul`` rejects 0-rank operands, so it must NEVER
-                    # be routed through matmul — on either the count or non-count
-                    # path (the count path used to crash here).
-                    if _is_scalar_st(_post_val) and _is_scalar_st(_pre_val):
-                        edge_outval = _post_val * _pre_val
-                        if count_ops:
-                            muls += 1
-                    elif count_ops:
-                        edge_outval, (_a, _m, _f) = sparse_matmul(
-                            _post_val, _pre_val, count=True
-                        )
-                        adds += int(_a)
-                        muls += int(_m)
-                        fmas += int(_f)
-                    else:
-                        edge_outval = _post_val @ _pre_val
-                    if count_ops:
-                        post_size = (
-                            _post_val.val.size if _post_val.val is not None else 0
-                        )
-                        pre_size = _pre_val.val.size if _pre_val.val is not None else 0
-                        out_size = (
-                            edge_outval.val.size
-                            if edge_outval.val is not None
-                            else 0
-                        )
-                        mem += max(
-                            post_size * _post_val.dtype.itemsize,
-                            pre_size * _pre_val.dtype.itemsize,
-                            out_size * edge_outval.dtype.itemsize,
-                        )
 
-                elif pre_val.val is not None:
-                    # post is a pure-diagonal identity up to its scalar_mult:
-                    # pass pre through, FOLDING post's scalar_mult (a scalar /
-                    # scaled-identity edge multiplies by it; dropping it was the
-                    # ``sum(z*sum(z))`` bug — 10·pre became pre).
-                    edge_outval = _pre_val.copy(
-                        scalar_mult=_scaled_mul_promote(_pre_val.scalar_mult, _post_val.scalar_mult)
-                    )
-                    if count_ops:
-                        muls += 1
-                else:
-                    # pre is the identity (up to scalar_mult): pass post through.
-                    edge_outval = _post_val.copy(
-                        scalar_mult=_scaled_mul_promote(_post_val.scalar_mult, _pre_val.scalar_mult)
-                    )
-                    if count_ops:
-                        muls += 1
+                # The contraction is a module-level helper (``_contract_edge_val``)
+                # -- same ops in the same order as the pre-factoring inline code
+                # (verified against ``jax.jacrev``), no per-iteration closure. In
+                # tokenize mode it binds into the persistent trace; the face sink
+                # records only the eqn-index range around it (see below).
+                edge_outval, _da, _dm, _df, _dmem = _contract_edge_val(
+                    _post_val, _pre_val, pre_val, post_val,
+                    _need_contract, count_ops)
+                adds += _da
+                muls += _dm
+                fmas += _df
+                mem += _dmem
                 # Offload the remain Jacobian transforms to the output tensor
                 if len(post_val.post_transforms) > 0:
                     edge_outval = prepend_post_transforms(post_val, edge_outval)
@@ -1140,18 +1234,14 @@ def _eliminate_vertex(
                     assert edge_shape == _edge.shape, (
                         f"Existing edge shape {_edge.shape} does not match expected shape {edge_shape}!"
                     )
-                    if count_ops:
-                        edge_outval, (_a, _m, _f) = add_w_counts(edge_outval, _edge)
-                        adds += int(_a)
-                        muls += int(_m)
-                        fmas += int(_f)
-                        mem += (
-                            edge_outval.val.size
-                            if edge_outval.val is not None
-                            else 0
-                        ) * edge_outval.dtype.itemsize
-                    else:
-                        edge_outval += _edge
+                    # Parallel-path accumulation (contraction + join land in one
+                    # combined block; the face sink's range spans both).
+                    edge_outval, _da, _dm, _df, _dmem = _accumulate_edge_val(
+                        edge_outval, _edge, count_ops)
+                    adds += _da
+                    muls += _dm
+                    fmas += _df
+                    mem += _dmem
 
                 # Drain queued Jacobian transforms (slice / concatenate / reshape
                 # / transpose relabels awaiting embed) into the edge BEFORE the
@@ -1203,12 +1293,17 @@ def _eliminate_vertex(
                 # transform API to internal sparse representations.
                 for _t in transforms:
                     try:
-                        if isinstance(_t, Diag):
-                            edge_outval = apply_diag(edge_outval, _t)
-                        elif isinstance(_t, Compress):
-                            edge_outval = apply_compress(edge_outval, _t)
-                        elif isinstance(_t, Quant):
-                            edge_outval = apply_quant(edge_outval, _t)
+                        if isinstance(_t, (Diag, Compress, Quant)):
+                            # ONE dispatch (``_apply_micro``); in tokenize mode the
+                            # face sink is pure instrumentation recording the eqn
+                            # range around it as a labelled ``approx`` block.
+                            if _face_sink is not None:
+                                _as = _face_sink.n_eqns()
+                                edge_outval = _apply_micro(edge_outval, _t)
+                                _face_sink.approx(*_approx_meta(_t), _as,
+                                                  _face_sink.n_eqns())
+                            else:
+                                edge_outval = _apply_micro(edge_outval, _t)
                         elif callable(_t):
                             edge_outval = _t(edge_outval)
                         else:
@@ -1280,6 +1375,8 @@ def _eliminate_vertex(
 
                 _set_inner(graph, in_edge, out_edge, edge_outval)
                 _set_inner(transpose_graph, out_edge, in_edge, edge_outval)
+                if _face_sink is not None:
+                    _face_sink.close_face()
 
         # Cleanup of input and output edges for this output variable
         if central_var not in vo_vertices:
