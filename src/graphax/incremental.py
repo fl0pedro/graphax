@@ -22,7 +22,9 @@ import contextlib
 from jax._src.interpreters import partial_eval as pe
 from jax._src import core as jcore, source_info_util
 
-from .core import _build_graph, _prune_graph, _eliminate_vertex, _force
+from .core import (
+    _build_graph, _prune_graph, _eliminate_vertex, _force, faces_of,
+)
 
 
 class IncrementalJacobian:
@@ -54,7 +56,11 @@ class IncrementalJacobian:
             _prune_graph(self.graph, self.tgraph, jaxpr, self.argnums)
 
         self.n_base = self._n_eqns()
-        # per eliminated vertex: (vertex, rules, eqn_start, eqn_end, face_start, face_end)
+        # per eliminated vertex, in elimination order:
+        #   (vertex, rules, eqn_start, eqn_end, face_start, face_end,
+        #    face_transforms)
+        # Indexed positionally (not unpacked) by the accessors below so the
+        # record can grow without breaking them.
         self.steps = []
         if track_faces:
             from .sparse.tracer import FaceSink
@@ -71,13 +77,32 @@ class IncrementalJacobian:
         return list(self.trace.frame.get_eqns()[:self.n_base])
 
     def step_eqns(self, i):
-        _, _, s, e, _, _ = self.steps[i]
+        s, e = self.steps[i][2:4]
         return list(self.trace.frame.get_eqns()[s:e])
 
     # ---- incremental elimination -------------------------------------
-    def eliminate(self, vertex, rules=()):
+    def faces(self, vertex):
+        """This vertex's FACE KEYS, in the order ``eliminate`` will visit them.
+
+        Thin binding of :func:`graphax.faces_of` to this builder's live graph —
+        call it BEFORE ``eliminate`` to enumerate the local paths a policy may
+        approximate, then pass the chosen ``{key: (lhs, rhs, res)}`` back in as
+        ``face_transforms``.
+        """
+        return faces_of(self.graph, self.tgraph, int(vertex), self.jaxpr)
+
+    def eliminate(self, vertex, rules=(), face_transforms=None):
         """Eliminate one vertex, APPENDING its equations to the persistent
-        jaxpr. Returns the new equations (this step's delta)."""
+        jaxpr. Returns the new equations (this step's delta).
+
+        ``rules`` are the PER-VERTEX transforms (applied uniformly to every
+        face). ``face_transforms`` is the PER-FACE (per local path) mapping
+        ``(vidx[in_edge], vidx[out_edge]) -> (lhs, rhs, res)`` — enumerate the
+        keys up front with :func:`graphax.faces_of`. Both are recorded in
+        ``self.steps`` so a replay of the step list reproduces this trace
+        exactly; ``face_transforms`` is shallow-copied so a caller mutating its
+        dict afterwards cannot rewrite history.
+        """
         s = self._n_eqns()
         f0 = len(self.face_sink.faces) if self.face_sink is not None else 0
         sink_cm = (self.face_sink if self.face_sink is not None
@@ -85,18 +110,27 @@ class IncrementalJacobian:
         with jcore.set_current_trace(self.trace), sink_cm:
             _eliminate_vertex(int(vertex), self.jaxpr, self.graph,
                               self.tgraph, self.vo, False,
-                              transforms=tuple(rules))
+                              transforms=tuple(rules),
+                              face_transforms=face_transforms)
         e = self._n_eqns()
         f1 = len(self.face_sink.faces) if self.face_sink is not None else 0
-        self.steps.append((int(vertex), tuple(rules), s, e, f0, f1))
+        self.steps.append((
+            int(vertex), tuple(rules), s, e, f0, f1,
+            None if face_transforms is None else dict(face_transforms),
+        ))
         return self.trace.frame.get_eqns()[s:e]
 
     def step_faces(self, i):
         """FaceRecords for step ``i`` (empty if faces aren't tracked)."""
         if self.face_sink is None:
             return []
-        _, _, _, _, f0, f1 = self.steps[i]
+        f0, f1 = self.steps[i][4:6]
         return self.face_sink.faces[f0:f1]
+
+    def step_face_transforms(self, i):
+        """The per-face transform map recorded for step ``i`` (``None`` if the
+        step ran without one)."""
+        return self.steps[i][6]
 
     def all_eqns(self):
         return self.trace.frame.get_eqns()

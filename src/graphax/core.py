@@ -1007,6 +1007,178 @@ def _approx_meta(_t):
     return "QUANT", {"dtype": _t.dtype}
 
 
+# ---------------------------------------------------------------------------
+# Per-FACE (per local path) Jacobian transforms
+# ---------------------------------------------------------------------------
+#
+# A vertex elimination contracts one FACE per (in_edge -> central_var ->
+# out_edge) path. The per-vertex ``transforms`` argument is applied uniformly to
+# every one of those faces, which is exactly what an RL policy that must choose
+# an approximation PER PATH cannot express. ``face_transforms`` adds that: a
+# mapping FACE KEY -> ``(lhs, rhs, res)`` where
+#
+#   * FACE KEY is ``(vidx[in_edge], vidx[out_edge])`` under the SAME stable var
+#     index (:func:`_stable_var_index`) the face sink caches — the vertex is
+#     implicit because the mapping is per-vertex-elimination;
+#   * ``lhs`` transforms the in_edge Jacobian (``pre_val``) and ``rhs`` the
+#     out_edge Jacobian (``post_val``), BOTH before the contraction;
+#   * ``res`` transforms the contraction result (``edge_outval``) at the same
+#     site as the per-vertex ``transforms``, immediately AFTER them.
+#
+# Naming follows the slot semantics of the local path ``res = op(lhs, rhs)``.
+
+# ONE-ENTRY memo for the stable var index. An elimination sequence walks the
+# same jaxpr for every vertex, so rebuilding the index per ``_eliminate_vertex``
+# call would be O(V^2); the face sink already caches it for the tracked path,
+# this covers the untracked ``face_transforms`` path. Thread-local and bounded
+# to a single jaxpr, so it can't leak across threads or grow.
+_VIDX_MEMO = threading.local()
+
+
+def _vidx_for(jaxpr):
+    """``_stable_var_index(jaxpr)``, memoized on the last jaxpr seen."""
+    cached = getattr(_VIDX_MEMO, "entry", None)
+    if cached is not None and cached[0] is jaxpr:
+        return cached[1]
+    idx = _stable_var_index(jaxpr)
+    _VIDX_MEMO.entry = (jaxpr, idx)
+    return idx
+
+
+def _known_none_edge(edge) -> bool:
+    """True iff ``_force(edge)`` is KNOWN to be ``None`` WITHOUT forcing.
+
+    A :class:`LazyEdge` whose thunk has not run yet emits jax equations when
+    forced, so a read-only enumeration (:func:`faces_of`) must not touch it:
+    such an edge reports ``False`` ("not known to be None") and its face is
+    listed even though the elimination may later skip it.
+    """
+    if isinstance(edge, LazyEdge):
+        return edge._value is not _UNSET and edge._value is None
+    return edge is None
+
+
+def _unpack_face_slots(slots, vertex):
+    """Validate one ``face_transforms`` entry -> ``(lhs, rhs, res)``.
+
+    A malformed entry is a structural programming error, so it raises
+    ``TypeError`` — which the per-face dispatch deliberately does NOT catch.
+    """
+    try:
+        lhs, rhs, res = slots
+    except (TypeError, ValueError):
+        raise TypeError(
+            f"face_transforms entry at vertex {vertex} must be a 3-tuple "
+            f"(lhs, rhs, res); got {slots!r}."
+        ) from None
+    return lhs, rhs, res
+
+
+def _apply_face_transform(val, _t, slot, vertex, _face_sink):
+    """Apply ONE per-face slot transform to ONE Jacobian operand.
+
+    Mirrors the per-vertex ``transforms`` dispatch in :func:`_eliminate_vertex`
+    exactly: ``Diag`` / ``Compress`` / ``Quant`` go through :func:`_apply_micro`
+    (and are recorded on the currently open face as a labelled ``approx`` block
+    whenever a face sink is installed), any other callable is handed the tensor
+    directly, and anything else raises ``TypeError``.
+
+    A ``ValueError`` is the documented best-effort miss — the transform does not
+    fit THIS operand's geometry — so the transform is skipped, the operand is
+    returned unchanged, and NOTHING is recorded, which keeps the face record
+    truthful. ``TypeError`` is deliberately NOT caught (see the per-vertex loop).
+    """
+    if _t is None:
+        return val
+    try:
+        if isinstance(_t, (Diag, Compress, Quant)):
+            if _face_sink is not None:
+                _as = _face_sink.n_eqns()
+                out = _apply_micro(val, _t)
+                _face_sink.approx(*_approx_meta(_t), _as, _face_sink.n_eqns())
+            else:
+                out = _apply_micro(val, _t)
+        elif callable(_t):
+            out = _t(val)
+        else:
+            raise TypeError(
+                f"Unknown per-face transform of type {type(_t).__name__} in "
+                f"slot {slot!r} at vertex {vertex}; expected None, Diag, "
+                "Compress, Quant, or a callable (SparseTensor) -> SparseTensor."
+            )
+    except ValueError:
+        return val
+    _assert_sparse_tensor_consistency(out)
+    return out
+
+
+def faces_of(graph, transpose_graph, vertex, jaxpr):
+    """The FACE KEYS of ``vertex``, in the order the elimination will visit them.
+
+    A policy that must pick an approximation per local path needs the path list
+    BEFORE the vertex is eliminated (so the choice loop can be unrolled
+    statically). This returns exactly the keys
+    :func:`_eliminate_vertex` looks up in ``face_transforms``::
+
+        [(vidx[in_edge], vidx[out_edge]), ...]
+
+    under the same stable var index (:func:`_stable_var_index`) and the same
+    ``out_edge``-major / ``in_edge``-minor nested product the elimination loop
+    walks, with the same ordering (first-appearance position in ``jaxpr``).
+
+    Args:
+        graph: the computational graph (``graph[u][v]`` = edge Jacobian).
+        transpose_graph: its transpose.
+        vertex (int): the vertex about to be eliminated (1-based, as everywhere
+            else — its equation is ``jaxpr.eqns[vertex - 1]``).
+        jaxpr (core.Jaxpr): the traced jaxpr the graph was built from.
+
+    Returns:
+        list[tuple[int, int]]: face keys in elimination order.
+
+    Notes:
+        * Call this IMMEDIATELY before eliminating ``vertex``. Every elimination
+          rewires the graph (a predecessor's elimination replaces this vertex's
+          in-edges with ITS predecessors), so keys enumerated earlier describe a
+          graph that no longer exists.
+        * The elimination SKIPS a face whose edge Jacobian forces to ``None``
+          (e.g. a ``stop_gradient`` blocked path). An edge that is already
+          concrete (or an already-evaluated ``LazyEdge``) is filtered out here
+          too, but an *unevaluated* ``LazyEdge`` is NOT forced — forcing emits
+          jax equations into whatever trace happens to be current, which would
+          corrupt the append-only jaxpr. Such faces are therefore listed
+          optimistically; if the elimination later skips one, its key simply
+          never matches and the transform is a no-op. The returned list is thus
+          a superset of the visited faces, never a subset.
+        * A multi-output vertex contributes the faces of every one of its
+          output variables; the central variable is not part of the key (the
+          mapping is per-vertex-elimination), so in the rare case where two
+          output variables share the same ``(in_edge, out_edge)`` pair their key
+          collides and one entry configures both faces.
+    """
+    eqn = jaxpr.eqns[int(vertex) - 1]
+    vidx = _vidx_for(jaxpr)
+
+    def _ordered(keys):
+        return sorted(keys, key=lambda v: vidx.get(v, 1 << 30))
+
+    keys = []
+    for central_var in eqn.outvars:
+        if central_var not in graph:
+            continue  # dead or already-eliminated vertex
+        # read-only: never materialize a missing transpose entry (the loop uses
+        # a defaultdict, this helper must not mutate the caller's graph)
+        _in_edges = transpose_graph.get(central_var) or {}
+        for out_edge in _ordered(graph[central_var].keys()):
+            if _known_none_edge(graph[central_var][out_edge]):
+                continue
+            for in_edge in _ordered(_in_edges.keys()):
+                if _known_none_edge(_in_edges[in_edge]):
+                    continue
+                keys.append((vidx.get(in_edge), vidx.get(out_edge)))
+    return keys
+
+
 def _eliminate_vertex(
     vertex: int,
     jaxpr: core.Jaxpr,
@@ -1017,6 +1189,16 @@ def _eliminate_vertex(
     transforms: Sequence[
         Union[Diag, Compress, Callable[["SparseTensor"], "SparseTensor"]]
     ] = (),
+    face_transforms: Union[
+        Dict[
+            Tuple[int, int],
+            Tuple[
+                Union[None, Diag, Compress, Quant,
+                      Callable[["SparseTensor"], "SparseTensor"]], ...
+            ],
+        ],
+        None,
+    ] = None,
 ) -> Tuple[int, int, int, int]:
     """
     Function that eliminates a vertex from the computational graph.
@@ -1047,6 +1229,29 @@ def _eliminate_vertex(
                 hatch for arbitrary user-defined transforms.
             ``DIAG ∘ COMPRESS ≠ COMPRESS ∘ DIAG``, so the sequence order
             is preserved exactly. Defaults to ``()`` (no transforms).
+        face_transforms (Dict[Tuple[int, int], Tuple]): PER-FACE (per local
+            path) transforms, i.e. one choice per ``in_edge -> central_var ->
+            out_edge`` path rather than one choice for the whole vertex. Maps a
+            FACE KEY ``(vidx[in_edge], vidx[out_edge])`` — the same stable var
+            index :func:`_stable_var_index` produces, enumerable up front with
+            :func:`faces_of` — to a 3-tuple ``(lhs, rhs, res)`` of slots named
+            after the local path ``res = op(lhs, rhs)``:
+
+              * ``lhs`` is applied to ``pre_val``, the in_edge Jacobian, and
+                ``rhs`` to ``post_val``, the out_edge Jacobian, BOTH before the
+                contraction;
+              * ``res`` is applied to ``edge_outval``, the contraction result,
+                at the same site as ``transforms`` above and immediately AFTER
+                them (so a per-vertex rule composes before a per-face one).
+
+            Each slot is ``None`` (leave that operand exact), a :class:`Diag` /
+            :class:`Compress` / :class:`Quant`, or a callable
+            ``(SparseTensor) -> SparseTensor``. Slots follow the same
+            best-effort semantics as ``transforms``: a ``ValueError`` (the
+            transform does not fit that operand's geometry) skips just that
+            slot, a ``TypeError`` propagates. Keys with no matching face are
+            silently unused. ``None`` (the default) leaves the exact-AD /
+            per-vertex path byte-identical.
 
     Returns:
         Tuple[int, int, int, int]: ``(adds, muls, fmas, mem)`` accumulated
@@ -1060,6 +1265,17 @@ def _eliminate_vertex(
     # Gates the approx-edge normalization below; ``transforms == ()`` (the EXACT
     # AD path) gives ``any([]) == False`` so that path stays byte-identical.
     _is_approx_cfg = any(isinstance(_t, (Diag, Compress)) for _t in transforms)
+    # A PER-FACE Diag/Compress approximates this vertex just as much as a
+    # per-vertex one, so it must arm the same edge normalization (the skip in
+    # the transform loop below is only sound while approx edges are densified
+    # back to nominal). Guarded on ``face_transforms`` so the None path keeps
+    # the statically-False value above.
+    if face_transforms:
+        _is_approx_cfg = _is_approx_cfg or any(
+            isinstance(_t, (Diag, Compress))
+            for _slots in face_transforms.values()
+            for _t in _slots
+        )
     # GLOBAL approx flag: True for the whole elimination iff ANY vertex carries an
     # approximation (set in ``vertex_elimination_jaxpr``). The merge below must
     # reconcile an edge that was PERMUTED by an upstream approx vertex even when
@@ -1092,6 +1308,12 @@ def _eliminate_vertex(
         _vidx = _face_sink.vidx
         if _vidx is None:
             _vidx = _face_sink.vidx = _stable_var_index(jaxpr)
+    elif face_transforms is not None:
+        # Per-face transforms are keyed by the SAME index, so it has to exist
+        # even with face tracking OFF (no sink to cache it on) -> memoized on
+        # the last jaxpr instead. This also stabilizes ``_ordered`` below, so
+        # ``faces_of`` enumerates in exactly the order used here.
+        _vidx = _vidx_for(jaxpr)
 
     def _ordered(keys):
         if _vidx is None:
@@ -1122,6 +1344,35 @@ def _eliminate_vertex(
                 if _face_sink is not None:
                     # one FACE = this (in_edge -> central_var -> out_edge) path
                     _face_sink.open_face(vertex, in_edge, central_var, out_edge)
+
+                # ---- PER-FACE transforms: the ``lhs`` / ``rhs`` slots --------
+                # This face's local path is ``res = op(lhs, rhs)`` with
+                # ``lhs = pre_val`` (the in_edge Jacobian) and ``rhs = post_val``
+                # (the out_edge Jacobian), so both slots land HERE, before the
+                # contraction below consumes them; the ``res`` slot is carried in
+                # ``_face_res_t`` down to the per-vertex transform site.
+                #
+                # ``post_val`` is bound ONCE per out_edge in the enclosing loop
+                # and shared by every in_edge, so it is re-seeded from the
+                # read-only ``_post_raw`` base here — an ``rhs`` transform must
+                # affect THIS face only, not the rest of the out_edge's fan-in.
+                # ``pre_val`` is already re-seeded per face just above.
+                #
+                # The whole block is skipped when ``face_transforms is None``,
+                # so the exact-AD / per-vertex path is untouched.
+                _face_res_t = None
+                if face_transforms is not None:
+                    post_val = _post_raw
+                    _slots = face_transforms.get(
+                        (_vidx.get(in_edge), _vidx.get(out_edge))
+                    )
+                    if _slots is not None:
+                        _lhs_t, _rhs_t, _face_res_t = _unpack_face_slots(
+                            _slots, vertex)
+                        pre_val = _apply_face_transform(
+                            pre_val, _lhs_t, "lhs", vertex, _face_sink)
+                        post_val = _apply_face_transform(
+                            post_val, _rhs_t, "rhs", vertex, _face_sink)
 
                 # TODO implement a process that discards unnecessary edges from the computation
 
@@ -1332,6 +1583,16 @@ def _eliminate_vertex(
                         # without first making every transform structure-invariant.
                         continue
                     _assert_sparse_tensor_consistency(edge_outval)
+
+                # ---- PER-FACE transforms: the ``res`` slot -------------------
+                # ``res`` is this face's contraction result, so it is applied at
+                # the SAME site as the per-vertex ``transforms`` above and
+                # immediately AFTER them: a per-vertex rule (uniform over every
+                # face) composes first, then this face's own choice. Same
+                # best-effort ValueError skip, same approx recording.
+                if _face_res_t is not None:
+                    edge_outval = _apply_face_transform(
+                        edge_outval, _face_res_t, "res", vertex, _face_sink)
 
                 # Post-transform approx-edge normalization: a freshly Diag-split
                 # (rectangular) / Compress-implicit edge is reconciled to its

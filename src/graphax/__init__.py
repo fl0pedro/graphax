@@ -1,6 +1,7 @@
 import sys
 
 from .core import (
+    faces_of,
     grad,
     jacve,
     set_jit_fallback_order,
