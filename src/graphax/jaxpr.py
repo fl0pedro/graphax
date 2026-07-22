@@ -941,7 +941,7 @@ def get_params_tuple(eqn, tokenized_param_names=None):
 # Append-only PATH-ELIMINATION token stream (see IncrementalPathTokenizer).
 #
 # The Jacobian is built incrementally on ONE persistent trace
-# (graphax.incremental.IncrementalJacobian); each elimination step APPENDS its
+# (graphax.incremental.IncrementalJaxpr); each elimination step APPENDS its
 # real SparseTensor contraction + join to the growing jaxpr. This tokenizer
 # renders that as base + one ``path`` block per face (+ ``approx`` blocks). Var
 # names follow the jaxpr.py scheme (`name_gen_python_style` hex atoms,
@@ -979,9 +979,9 @@ class IncrementalPathTokenizer:
 
     def __init__(self, jaxpr, argnums, consts, args, digit_base: int = 10,
                  track_faces: bool = True):
-        from graphax.incremental import IncrementalJacobian
-        self.ij = IncrementalJacobian(jaxpr, argnums, consts, args,
-                                      track_faces=track_faces)
+        from graphax.incremental import IncrementalJaxpr
+        self.ij = IncrementalJaxpr(jaxpr, argnums, consts, args,
+                                   track_faces=track_faces)
         self.jaxpr = jaxpr
         self.argnums = tuple(argnums)
         self.digit_base = digit_base

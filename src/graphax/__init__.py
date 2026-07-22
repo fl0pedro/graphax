@@ -14,7 +14,9 @@ from .utils import tree_allclose
 
 # Primary jaxpr tokenizer (append-only, preserved-trace).
 from .jaxpr import IncrementalPathTokenizer
-from .incremental import IncrementalJacobian
+# ``IncrementalJaxpr`` is the current name; ``IncrementalJacobian`` is kept as a
+# backward-compat alias (alphagrad imports the old name).
+from .incremental import IncrementalJacobian, IncrementalJaxpr
 
 if sys.version_info[:2] >= (3, 8):
     # TODO: Import directly (no need for conditional) when `python_requires = >= 3.8`

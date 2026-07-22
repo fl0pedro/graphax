@@ -37,7 +37,10 @@ from .sparse.micro_actions import (
     Compress, Diag, Quant, apply_compress, apply_diag, apply_quant,
 )
 from .sparse.utils import zeros_like
-from .sparse.tracer import get_face_sink as _get_face_sink
+from .sparse.tracer import (
+    get_face_sink as _get_face_sink,
+    get_transform_log as _get_transform_log,
+)
 
 EliminationOrder = Union[Sequence[int], str]
 ComputationalGraph = Dict[core.Var, Dict[core.Var, jnp.ndarray]]
@@ -906,6 +909,73 @@ def _approx_meta(_t):
     return "QUANT", {"dtype": _t.dtype}
 
 
+def _micro_applied(before, after) -> bool:
+    """Did a micro-action actually CHANGE the tensor?
+
+    ``apply_quant`` returns its input UNCHANGED (the same object) for a
+    structural ``val is None`` edge or an already-matching dtype, and
+    ``_materialize_compressed`` / ``apply_*`` may likewise short-circuit — so a
+    dispatched micro-action is not evidence that an approximation happened. The
+    identity check is the reliable signal (every real micro-action builds a new
+    :class:`SparseTensor`); the field-wise fallback additionally catches a fresh
+    wrapper around an untouched payload.
+
+    This is a TRACE-TIME fact, not a numerical one: a value-EXACT approximation
+    (int8 quantization of a uniform-magnitude structural Jacobian round-trips
+    bit-exactly) still counts as applied, because two traced tensors cannot be
+    compared by value while tracing. See :class:`TransformRecord`.
+    """
+    if after is before:
+        return False
+    return not (
+        getattr(after, "val", None) is getattr(before, "val", "x")
+        and getattr(after, "scalar_mult", None)
+        is getattr(before, "scalar_mult", "x")
+        and getattr(after, "fill_value", None)
+        is getattr(before, "fill_value", "x")
+        and getattr(after, "out_dims", None) == getattr(before, "out_dims", "x")
+        and getattr(after, "primal_dims", None)
+        == getattr(before, "primal_dims", "x")
+        and getattr(after, "pre_transforms", None)
+        == getattr(before, "pre_transforms", "x")
+        and getattr(after, "post_transforms", None)
+        == getattr(before, "post_transforms", "x")
+    )
+
+
+def _eqn_count(_face_sink, _xlog) -> int:
+    """Current persistent-frame equation count, from whichever recorder is
+    installed (``0`` when neither is — nothing consumes the range then)."""
+    if _face_sink is not None:
+        return _face_sink.n_eqns()
+    if _xlog is not None:
+        return _xlog.n_eqns()
+    return 0
+
+
+def _record_micro(_t, before, after, vertex, slot, in_edge, out_edge,
+                  start, _face_sink, _xlog):
+    """Record ONE dispatched micro-action, truthfully.
+
+    Writes to the always-on :class:`TransformLog` (installed by
+    ``IncrementalJaxpr`` for every elimination, so the record exists even with
+    ``track_faces=False``) with an explicit ``applied`` flag, and — only when the
+    action really changed the tensor — to the opt-in :class:`FaceSink`'s
+    ``approx`` block list, so the tokenizer never renders an empty block for a
+    no-op. Both sinks are optional; with neither installed this is a no-op.
+    """
+    if _face_sink is None and _xlog is None:
+        return
+    applied = _micro_applied(before, after)
+    end = _eqn_count(_face_sink, _xlog)
+    _atype, _params = _approx_meta(_t)
+    if _face_sink is not None and applied:
+        _face_sink.approx(_atype, _params, start, end)
+    if _xlog is not None:
+        _xlog.record("transform", vertex, slot, _atype, _params,
+                     in_edge, out_edge, start, end, applied)
+
+
 # ---------------------------------------------------------------------------
 # Per-FACE (per local path) Jacobian transforms
 # ---------------------------------------------------------------------------
@@ -973,30 +1043,30 @@ def _unpack_face_slots(slots, vertex):
     return lhs, rhs, res
 
 
-def _apply_face_transform(val, _t, slot, vertex, _face_sink):
+def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
+                          out_edge=None, _xlog=None):
     """Apply ONE per-face slot transform to ONE Jacobian operand.
 
     Mirrors the per-vertex ``transforms`` dispatch in :func:`_eliminate_vertex`
     exactly: ``Diag`` / ``Compress`` / ``Quant`` go through :func:`_apply_micro`
-    (and are recorded on the currently open face as a labelled ``approx`` block
-    whenever a face sink is installed), any other callable is handed the tensor
+    (and are recorded by :func:`_record_micro` — on the currently open face as a
+    labelled ``approx`` block when a face sink is installed, and ALWAYS on the
+    :class:`TransformLog` when one is), any other callable is handed the tensor
     directly, and anything else raises ``TypeError``.
 
     A ``ValueError`` is the documented best-effort miss — the transform does not
     fit THIS operand's geometry — so the transform is skipped, the operand is
-    returned unchanged, and NOTHING is recorded, which keeps the face record
+    returned unchanged, and NOTHING is recorded, which keeps the record
     truthful. ``TypeError`` is deliberately NOT caught (see the per-vertex loop).
     """
     if _t is None:
         return val
     try:
         if isinstance(_t, (Diag, Compress, Quant)):
-            if _face_sink is not None:
-                _as = _face_sink.n_eqns()
-                out = _apply_micro(val, _t)
-                _face_sink.approx(*_approx_meta(_t), _as, _face_sink.n_eqns())
-            else:
-                out = _apply_micro(val, _t)
+            _as = _eqn_count(_face_sink, _xlog)
+            out = _apply_micro(val, _t)
+            _record_micro(_t, val, out, vertex, slot, in_edge, out_edge,
+                          _as, _face_sink, _xlog)
         elif callable(_t):
             out = _t(val)
         else:
@@ -1201,6 +1271,11 @@ def _eliminate_vertex(
     # tokenizer can label "which elimination, which path, which approx". None on
     # the exact-AD path -> zero overhead.
     _face_sink = _get_face_sink()
+    # Always-on transform log (``sparse.tracer.TransformLog``): records EVERY
+    # dispatched micro-action with a truthful ``applied`` flag, independent of
+    # ``track_faces``. One thread-local lookup per vertex elimination; ``None``
+    # (zero cost) unless a builder installed one.
+    _xlog = _get_transform_log()
 
     # In tokenize mode, iterate the edge maps in a STABLE order (they are keyed
     # by id-hashed core.Var, so their native iteration order varies per trace,
@@ -1277,9 +1352,11 @@ def _eliminate_vertex(
                         _lhs_t, _rhs_t, _face_res_t = _unpack_face_slots(
                             _slots, vertex)
                         pre_val = _apply_face_transform(
-                            pre_val, _lhs_t, "lhs", vertex, _face_sink)
+                            pre_val, _lhs_t, "lhs", vertex, _face_sink,
+                            in_edge, out_edge, _xlog)
                         post_val = _apply_face_transform(
-                            post_val, _rhs_t, "rhs", vertex, _face_sink)
+                            post_val, _rhs_t, "rhs", vertex, _face_sink,
+                            in_edge, out_edge, _xlog)
 
                 # Resolve this path's per-op hooks. The path (in_edge -> vertex ->
                 # out_edge) is keyed by its neighbour vertex ids; ``_h_*`` default
@@ -1571,16 +1648,16 @@ def _eliminate_vertex(
                 for _t in (() if _perpath else transforms):
                     try:
                         if isinstance(_t, (Diag, Compress, Quant)):
-                            # ONE dispatch (``_apply_micro``); in tokenize mode the
-                            # face sink is pure instrumentation recording the eqn
-                            # range around it as a labelled ``approx`` block.
-                            if _face_sink is not None:
-                                _as = _face_sink.n_eqns()
-                                edge_outval = _apply_micro(edge_outval, _t)
-                                _face_sink.approx(*_approx_meta(_t), _as,
-                                                  _face_sink.n_eqns())
-                            else:
-                                edge_outval = _apply_micro(edge_outval, _t)
+                            # ONE dispatch (``_apply_micro``); the recorders are
+                            # pure instrumentation logging the eqn range around
+                            # it (a labelled ``approx`` block on the face sink,
+                            # a TransformRecord on the always-on log).
+                            _as = _eqn_count(_face_sink, _xlog)
+                            _before = edge_outval
+                            edge_outval = _apply_micro(edge_outval, _t)
+                            _record_micro(_t, _before, edge_outval, vertex,
+                                          "vertex", in_edge, out_edge, _as,
+                                          _face_sink, _xlog)
                         elif callable(_t):
                             edge_outval = _t(edge_outval)
                         else:
@@ -1642,7 +1719,8 @@ def _eliminate_vertex(
                 # best-effort ValueError skip, same approx recording.
                 if _face_res_t is not None:
                     edge_outval = _apply_face_transform(
-                        edge_outval, _face_res_t, "res", vertex, _face_sink)
+                        edge_outval, _face_res_t, "res", vertex, _face_sink,
+                        in_edge, out_edge, _xlog)
 
                 # Post-transform edges stay SPARSE: normalization to nominal dense
                 # form was deleted with the rest of the norm. A freshly Diag-split /
