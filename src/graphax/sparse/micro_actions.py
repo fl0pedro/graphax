@@ -46,8 +46,32 @@ from graphax.sparse.tensor import SparseTensor, _apply_block_diagonal, _subdivid
 from graphax.sparse.dtype_compute import _scaled_mul
 
 import os as _os
+from functools import wraps as _wraps
+from graphax.sparse.ops.utils import _squeeze_unreferenced_val_axes
 # Default ON; set GRAPHAX_KEEP_BLOCKDIAG=0 to force the legacy densify path.
 _KEEP_BLOCKDIAG = _os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "1") != "0"
+
+
+def _squeeze_result(fn):
+    """Fold away non-data size-1 ``val`` axes from a micro-action's result.
+
+    DIAG (block-diagonal split / subdivide) and COMPRESS both INSERT a fresh
+    physical axis per meta / block side and never reclaim the leftovers, so an
+    approx edge's ``val.ndim`` creeps upward step-by-step toward the numpy/XLA
+    32-axis cap while its logical rank stays tiny (measured on ViT approx: a
+    logical-rank-4 edge carried ``val.ndim`` 11-12, the extra axes all size 1).
+    Those axes carry no data — every consumer works off ``dim.axis`` /
+    ``dim.block_axis`` pointers, not the raw ``val.ndim`` — so squeezing them is
+    a byte-identical reshape. A no-op when there are none, so it never perturbs a
+    result that was already minimal (``apply_*`` that returned ``st`` unchanged,
+    or the EXACT-AD path, which never invokes these actions)."""
+    @_wraps(fn)
+    def _wrapper(st, action, *a, **k):
+        out = fn(st, action, *a, **k)
+        if isinstance(out, SparseTensor):
+            return _squeeze_unreferenced_val_axes(out)
+        return out
+    return _wrapper
 
 
 
@@ -194,6 +218,7 @@ MicroAction = Union[Diag, Compress, Quant]
 # ---------------------------------------------------------------------------
 
 
+@_squeeze_result
 def apply_diag(st: SparseTensor, action: Diag) -> SparseTensor:
     """Apply a single block-diagonalisation rule to ``st``.
 
@@ -379,6 +404,7 @@ def _reduce_along_axes(val: jnp.ndarray, axes: tuple[int, ...], kind: str):
     raise ValueError(f"Unknown Compress.kind {kind!r}")
 
 
+@_squeeze_result
 def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
     """Reduce the listed physical axes via ``action.kind`` (default ``mean``).
 
@@ -541,6 +567,7 @@ def _int_dtype_max(target) -> float:
     return float(max(int(ii.max), 1))
 
 
+@_squeeze_result
 def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
     """Cast ``st.val`` to ``action.dtype``.
 

@@ -499,6 +499,68 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
                         )
 
 
+def _squeeze_unreferenced_val_axes(st: "SparseTensor") -> "SparseTensor":
+    """Drop physical ``val`` axes of size 1 that NO dim references.
+
+    Repeated block-diagonal restructuring (``_apply_block_diagonal`` /
+    ``_subdivide_coupled_blockdiag``) and ``apply_diag`` / ``apply_compress``
+    INSERT a fresh physical axis per meta / block side and never fold the
+    leftovers, so an approx edge accumulates a long tail of size-1 ``val`` axes
+    that carry no data (measured: a ViT approx edge with logical rank 4 but
+    ``val.ndim`` 11-12, the trailing axes all size 1). They are pure rank waste
+    — every downstream op works off ``dim.axis`` / ``dim.block_axis`` pointers,
+    not the raw ``val.ndim`` — and march the physical rank toward the numpy/XLA
+    32-axis cap.
+
+    Removing a size-1 axis that no ``dim.axis`` / ``dim.block_axis`` points at is
+    a pure reshape (byte-identical: a size-1 axis contributes nothing to the
+    buffer), after which every surviving dim's pointer is shifted down to its new
+    position. A no-op — returns ``self`` unchanged, hence byte-identical — when
+    there are no such axes, which is ALWAYS the case on the EXACT-AD path (the
+    tiled ``_build_output_tensor`` already squeezes its output, and matmul /
+    elementwise never emit unreferenced size-1 axes). Referenced size-1 axes (a
+    genuinely size-1 dim carried explicitly) are kept."""
+    val = getattr(st, "val", None)
+    if val is None:
+        return st
+    try:
+        ndim = val.ndim
+    except Exception:
+        return st
+    referenced = set()
+    for d in st.dims:
+        if d.axis is not None:
+            referenced.add(d.axis)
+        if d.is_sparse and getattr(d, "block_axis", None) is not None:
+            referenced.add(d.block_axis)
+    drop = [a for a in range(ndim) if a not in referenced and int(val.shape[a]) == 1]
+    if not drop:
+        return st
+    keep = [a for a in range(ndim) if a not in drop]
+    shift = {old: new for new, old in enumerate(keep)}
+    new_val = val.reshape(tuple(val.shape[a] for a in keep))
+
+    def _remap(d):
+        kw = {}
+        if d.axis is not None:
+            kw["axis"] = shift[d.axis]
+        if d.is_sparse and getattr(d, "block_axis", None) is not None:
+            kw["block_axis"] = shift[d.block_axis]
+        return replace(d, **kw) if kw else d
+
+    cls = _get_sparse_tensor_cls()
+    return cls(
+        tuple(_remap(d) for d in st.out_dims),
+        tuple(_remap(d) for d in st.primal_dims),
+        new_val,
+        scalar_mult=st.scalar_mult,
+        fill_value=st.fill_value,
+        pre_transforms=st.pre_transforms,
+        post_transforms=st.post_transforms,
+        check_consistency=False,
+    )
+
+
 # --- Construction / mutation --------------------------------------------
 def _copy(st: SparseTensor, val: Array | None = None, scalar_mult: Array | None = None,
           fill_value=_KEEP, out_dims: Sequence[Index] | None = None,
