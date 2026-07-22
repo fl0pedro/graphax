@@ -1068,12 +1068,31 @@ def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
             _record_micro(_t, val, out, vertex, slot, in_edge, out_edge,
                           _as, _face_sink, _xlog)
         elif callable(_t):
-            out = _t(val)
+            # A slot callable may act as a CHOOSER: handed the live operand, it
+            # returns the micro-action it picked (or None to skip) instead of a
+            # tensor. The operands here are join intermediates -- lhs is the
+            # fresh contraction, rhs the existing edge -- so a policy cannot
+            # know their index structure until this moment; masking legal
+            # actions requires seeing the tensor. Routing a chosen action back
+            # through _apply_micro/_record_micro keeps it as visible to the
+            # transform log as a literal one, which a plain tensor-returning
+            # callable is NOT.
+            _chosen = _t(val)
+            if _chosen is None:
+                return val
+            if isinstance(_chosen, (Diag, Compress, Quant)):
+                _as = _eqn_count(_face_sink, _xlog)
+                out = _apply_micro(val, _chosen)
+                _record_micro(_chosen, val, out, vertex, slot, in_edge,
+                              out_edge, _as, _face_sink, _xlog)
+            else:
+                out = _chosen
         else:
             raise TypeError(
                 f"Unknown per-face transform of type {type(_t).__name__} in "
                 f"slot {slot!r} at vertex {vertex}; expected None, Diag, "
-                "Compress, Quant, or a callable (SparseTensor) -> SparseTensor."
+                "Compress, Quant, or a callable taking a SparseTensor and "
+                "returning either a SparseTensor or a chosen micro-action."
             )
     except ValueError:
         return val
