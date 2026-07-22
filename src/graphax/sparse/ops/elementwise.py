@@ -10,6 +10,7 @@ Pipeline:
 """
 from __future__ import annotations
 import math
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable
 
@@ -20,7 +21,7 @@ from jax import Array
 
 from .utils import (
     _arr2st, _is_sparse, _val_or_one, _prepare_physical_array, _is_zero_fill,
-    _apply_scalar_mult, _scaled_fill,
+    _apply_scalar_mult, _scaled_fill, _copy,
 )
 from .layout import generate_block_permutation
 from graphax.sparse.dtype_compute import _unify_operand_dtypes, _compute_dtype
@@ -60,6 +61,95 @@ def _identity_scalar_mult(dtype) -> Array:
     return jnp.array(True) if dtype == jnp.bool_ else jnp.array(1.0, dtype=dtype)
 
 
+def _reconcile_broadcast_dims(lhs, rhs):
+    """Reconcile a compact broadcast dim (``logical_size == 1``, i.e. the
+    "extent N stored once" that an approximation collapsed on ONE fan-in
+    contribution) against its same-``id`` MATERIALIZED partner (``logical_size
+    N > 1``) BEFORE the physical-shape equality check, so accumulating two
+    contributions to one vertex no longer raises ``Shape mismatch``.
+
+    Fan-in accumulation (``cf[t] + prod`` in the face engine) adds two partial
+    Jacobians of the SAME edge — dims are paired by ``id`` (elementwise operands
+    share ONE id space). When a Compress/Diag approximation collapses a dense
+    free dim on one contribution to its compact size-1 form while the sibling
+    kept it materialized at extent N, the two operands have equal-``id`` dims of
+    logical extent 1 vs N. The add of extent-1 and extent-N is exactly the
+    extent-N broadcast (numpy/`op` semantics; verified byte-exact against the
+    dense oracle), so promote the size-1 side to N here.
+
+    INVARIANT (guarded): broadcast a size-1 dim ONLY toward a same-``id`` partner
+    whose ``logical_size > 1``. A genuine ``logical_size == 1`` on BOTH sides has
+    no such partner and is left untouched (``1`` stays ``1``) — we never fabricate
+    an extent. Only the DENSE size-1 side is ever broadcast (``not d.is_sparse``);
+    we never broadcast the sparse side of a pair.
+
+    The same-``id`` PARTNER may itself be SPARSE (a diagonal side). ViT fan-in
+    accumulates a Compress/Diag-collapsed dense free dim (logical 1) against a
+    sibling where that dim is the DIAGONAL partner of extent N. Broadcasting the
+    dense-1 side up to a materialized dense N is still exactly the ``op`` add: the
+    diagonal contribution (nonzero on i==j) plus the constant-broadcast dense
+    contribution sums to a DENSE result in that dim (diagonal + full = full,
+    losing the diagonal structure — correct and unavoidable). The downstream
+    ``_map_topology`` / ``_promote_to_unified`` path already materializes the
+    diagonal onto the LCM grid (0 off-diagonal) and adds the promoted full block,
+    so no new math is needed here — only the reconcile of the shrunk dense dim.
+
+    Two SPARSE dims of equal logical size but different block granularity are a
+    real LCM-grid job (both sides sparse) and stay with the downstream path.
+    """
+    # Reconcile can only broadcast a DENSE logical-1 dim toward a materialized
+    # N-partner; when neither operand has such a dim it is a strict no-op, so
+    # skip the dict build + per-dim scan entirely (the common case in the loop).
+    def _has_dense_unit(t):
+        return any((not d.is_sparse) and int(d.logical_size) == 1 for d in t.dims)
+    if not _has_dense_unit(lhs) and not _has_dense_unit(rhs):
+        return lhs, rhs
+
+    l_map = {d.id: d for d in lhs.dims}
+    r_map = {d.id: d for d in rhs.dims}
+
+    def _fix(t, other_map):
+        val = t.val
+        changed = False
+        new_by_id = {}
+        for d in t.dims:
+            od = other_map.get(d.id)
+            # Broadcast the DENSE size-1 side (``not d.is_sparse``) toward its
+            # same-``id`` partner of logical N>1. The partner ``od`` may be DENSE
+            # (the original fan-in case) OR SPARSE (a diagonal side — ViT); in the
+            # sparse-partner case the downstream promote path densifies the
+            # diagonal against this now-materialized dense dim (diagonal+full=full).
+            if (od is not None and not d.is_sparse
+                    and int(d.logical_size) == 1 and int(od.logical_size) > 1):
+                N = int(od.logical_size)
+                if d.axis is not None and val is not None and val.shape[d.axis] == 1:
+                    # Materialized compact axis: physically broadcast it to N.
+                    val = jnp.broadcast_to(
+                        val, val.shape[:d.axis] + (N,) + val.shape[d.axis + 1:]
+                    )
+                    new_by_id[d.id] = replace(d, size=N)
+                else:
+                    # No physical size-1 axis to grow (implicit / val is None):
+                    # carry the true logical extent as an implicit (axis=None)
+                    # broadcast dim; the downstream align/promote path expands it.
+                    new_by_id[d.id] = replace(d, size=N, axis=None)
+                changed = True
+            else:
+                new_by_id[d.id] = d
+        if not changed:
+            return t
+        # _copy carries scalar_mult / fill_value AND pre/post_transforms (which a
+        # hand-rolled SparseTensor(...) would silently drop -- the transform-drop
+        # class the campaign fixed elsewhere), and keeps check_consistency=False.
+        return _copy(
+            t, val=val,
+            out_dims=tuple(new_by_id[d.id] for d in t.out_dims),
+            primal_dims=tuple(new_by_id[d.id] for d in t.primal_dims),
+        )
+
+    return _fix(lhs, r_map), _fix(rhs, l_map)
+
+
 def _normalize_inputs(lhs, rhs):
     target_dtype = (lhs.dtype if _is_sparse(lhs) and not _is_sparse(rhs)
                     else rhs.dtype if _is_sparse(rhs) and not _is_sparse(lhs)
@@ -82,6 +172,10 @@ def _normalize_inputs(lhs, rhs):
     from .utils import _materialize_for_op
     lhs = _materialize_for_op(lhs)
     rhs = _materialize_for_op(rhs)
+    # Reconcile a compact broadcast dim (logical 1) against its same-id
+    # materialized partner (logical N>1) so a fan-in accumulation of two
+    # contributions to one vertex broadcasts instead of raising below.
+    lhs, rhs = _reconcile_broadcast_dims(lhs, rhs)
     # Static shape comparison: ``SparseTensor.shape`` returns Python ints
     # derived from the dim metadata, so this is a trace-time check (no runtime
     # branching on traced shapes).
@@ -100,26 +194,58 @@ def _promote_dense(d, partner_id):
                            block_size=d.size, block_axis=d.axis)
 
 
+def _partner(dims, oid):
+    """Index of the dim in `dims` whose id is `oid` (a sparse dim's other_id);
+    raises Topology mismatch (caught -> densify fallback) if it dangles."""
+    j = next((k for k, d in enumerate(dims) if d.id == oid), None)
+    if j is None:
+        raise ValueError(f"Topology mismatch: dangling other_id {oid}.")
+    return j
+
+
 def _resolve_dim_pairing(i, ldims, rdims, processed):
     """Pair dim i across (lhs, rhs); promote Dense↔Sparse to a synthetic 1-block sparse pair."""
     ld, rd = ldims[i], rdims[i]
     l_sp, r_sp = ld.is_sparse, rd.is_sparse
     if not l_sp and not r_sp:
-        processed.add(i); return "dense", (ld, rd)
+        # Pair the DENSE branch by dim id, NOT by position. Elementwise operands
+        # share ONE id space (no matmul-style offset; verified: both sides arrive
+        # canonical+equal in 98/98 real jacve calls, so this returns rdims[i]
+        # unchanged on the exact-AD edge => byte-identical). But once a normalize
+        # bypass stops forcing canonical ids via _arr2st, two edges with permuted
+        # free dims of coinciding extent (the ViT (8,8) case) have equal .shape
+        # and would be added in the WRONG axis pairing with NO assert firing.
+        # Mechanism borrowed from matmul._resolve_broadcast_topos.find_match
+        # (id equality). Fail LOUDLY if no dense rhs partner carries this id.
+        rj = next((k for k, d in enumerate(rdims) if d.id == ld.id), None)
+        if rj is None or rdims[rj].is_sparse:
+            raise ValueError(
+                f"Topology mismatch: dense lhs dim id {ld.id} has no dense rhs "
+                f"partner (rhs ids {[(int(d.id), d.is_sparse) for d in rdims]})."
+            )
+        processed.add(i); return "dense", (ld, rdims[rj])
+    # Pair the SPARSE primary dims by id too (mirror the dense branch): two
+    # different-id sparse blocks of equal extent at the same position would
+    # otherwise be combined silently. Fail loudly -> densify fallback.
+    if ld.id != rd.id:
+        raise ValueError(
+            f"Topology mismatch: sparse dim id {ld.id} (lhs) vs {rd.id} (rhs) "
+            f"at position {i} — permuted sparse pairing."
+        )
     if l_sp and r_sp:
-        j = next(k for k, d in enumerate(ldims) if d.id == ld.other_id)
+        j = _partner(ldims, ld.other_id)
         lp, rp = ldims[j], rdims[j]
         if not rp.is_sparse or rd.other_id != rp.id:
             raise ValueError("Topology mismatch: sparse pairs do not align.")
         processed.update([i, j]); return "sparse", (ld, lp, rd, rp)
     if l_sp:
-        j = next(k for k, d in enumerate(ldims) if d.id == ld.other_id)
+        j = _partner(ldims, ld.other_id)
         lp, rp = ldims[j], rdims[j]
         if not not rp.is_sparse:
             raise ValueError("Topology mismatch: expected DenseIndex partner.")
         processed.update([i, j])
         return "sparse", (ld, lp, _promote_dense(rd, rp.id), _promote_dense(rp, rd.id))
-    j = next(k for k, d in enumerate(rdims) if d.id == rd.other_id)
+    j = _partner(rdims, rd.other_id)
     rp, lp = rdims[j], ldims[j]
     if not not lp.is_sparse:
         raise ValueError("Topology mismatch: expected DenseIndex partner.")
@@ -405,6 +531,15 @@ def _should_emit_divisor_remainder(lhs, rhs, op, is_intersection):
         if d.block_size is not None and d.block_size > 1
     ):
         return None
+    # The K=1 emission flattens each val via reshape(-1) assuming the physical
+    # layout is (meta=axis 0, block_h=1, block_w=2). A different axis order
+    # would transpose the packed blocks; decline so the (always-correct)
+    # general path handles it instead of silently mis-packing.
+    if not all(
+        o.axis == 0 and o.block_axis == 1 and i.block_axis == 2
+        for o, i in ((ao, ai), (bo, bi))
+    ):
+        return None
     a_b_h, a_b_w = ao.block_size or 1, ai.block_size or 1
     b_b_h, b_b_w = bo.block_size or 1, bi.block_size or 1
     a_n, b_n = ao.size, bo.size
@@ -629,6 +764,37 @@ def _emit_multi_set(lhs, rhs, op, geom):
     )
 
 
+# --- Sparsity-retaining general path (GRAPHAX_EINSUM_GENERAL) --------------
+# The NEW general elementwise trunk. Pairs operand dims BY ID (commit 6b1bfe9:
+# elementwise operands share ONE id space — never pair positionally) and emits
+# ONE physical ``op`` over reconciled layouts, building the output structure
+# SYMBOLICALLY: a matched implicit (axis=None) role stays implicit, a same-grid
+# block pair stays a pair, a uniform (val is None) operand stays uniform, and an
+# implicit-vs-physical role broadcasts ONLY that single size-1 axis under
+# ``op``'s numpy semantics — never the whole-tensor ``_align_value`` broadcast,
+# never the ``_promote_to_unified`` LCM densify.
+#
+# This is the ``lower_add`` prototype (graphax/sparse/lower/add.py) promoted to
+# the main op: its eq / ibroad / uu / u_x rules are already proven correct under
+# the ``GRAPHAX_STRUCT_LOWER`` differential harness, so ``_einsum_ew_general``
+# drives them directly rather than re-deriving the (correctness-critical) layout
+# algebra. Every signature the rules can't yet represent — a sparse↔dense
+# promotion pair, a MISALIGNED block grid (different block sizes ⇒ genuine LCM
+# tiling), leftover physical axes, a non-zero fill the rule can't compose —
+# returns ``None`` so ``elementwise`` falls through to the EXISTING path
+# UNCHANGED. ``None`` is always the safe answer (correct-but-partial by design).
+def _einsum_ew_general(lhs, rhs, op, is_intersection: bool = False,
+                       count: bool = False):
+    from graphax.sparse.lower.add import lower_add
+
+    out = lower_add(lhs, rhs, op, is_intersection=is_intersection)
+    if out is None:
+        return None
+    if count:
+        return out, _ew_op_count(lhs, rhs, is_intersection)
+    return out
+
+
 # --- Path tracing (test-only) ---------------------------------------------
 # Re-exports from ``_path_tracking``. See that module for the full design;
 # tests opt in via the ``track_paths()`` context manager or ``TRACK_PATHS=1``
@@ -670,6 +836,34 @@ def elementwise(
     """
     _record_path(None)
     lhs, rhs = _normalize_inputs(lhs, rhs)
+    # Sparsity-retaining general path (GRAPHAX_EINSUM_GENERAL, default OFF):
+    # tried FIRST — before the elemental cascade and the _map_topology general
+    # path. Pairs dims by id and retains implicit/block/uniform structure
+    # instead of broadcasting implicit dims to physical. Returns None on any
+    # signature it can't yet represent ⇒ falls through UNCHANGED. When OFF this
+    # block is a single env-dict lookup, so the op is byte-identical to today.
+    if os.environ.get("GRAPHAX_EINSUM_GENERAL", "0") not in ("", "0", "false", "False"):
+        _eg = _einsum_ew_general(
+            lhs, rhs, op, is_intersection=is_intersection, count=count
+        )
+        if _eg is not None:
+            _record_path("einsum_general")
+            return _eg
+    # Structure-lowering layer (GRAPHAX_STRUCT_LOWER, default OFF): compile the
+    # minimal physical computation for structurally-matched operands and build
+    # the output structure symbolically (graphax/sparse/lower/add.py). A case
+    # without a rule returns None and falls through UNCHANGED (lower.add bumps
+    # its skip counters — no silent behavior change). Flag OFF ⇒ this block is
+    # a single env-dict lookup.
+    if os.environ.get("GRAPHAX_STRUCT_LOWER", "0") not in ("", "0", "false", "False"):
+        from graphax.sparse.lower.add import lower_add
+
+        _low = lower_add(lhs, rhs, op, is_intersection=is_intersection)
+        if _low is not None:
+            _record_path("lower_add")
+            if count:
+                return _low, _ew_op_count(lhs, rhs, is_intersection)
+            return _low
     # Elemental fast path (Phase: bridge-cse): route a STRUCTURED elementwise op
     # (block-diagonal / implicit dims) through the elemental kernels. Returns
     # None for a pure-dense op so the existing general path stays byte-identical

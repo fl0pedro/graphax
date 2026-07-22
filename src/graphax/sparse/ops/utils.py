@@ -371,6 +371,9 @@ def _prepare_physical_array(val: Array, axis_axes: Sequence[int | None]) -> Arra
     ``None`` for synthetic axes) lands at its position index in the result; trailing axes
     preserved in their original order. Used by both elementwise (per pair-axis) and matmul
     (per ``PairData`` triple)."""
+    # NB: a source axis >= val.ndim is INTENTIONAL for an implicit dim whose
+    # nominal axis lies beyond the compact val; it is treated as synthetic
+    # (size-1) below, so the `v < val.ndim` filter is load-bearing.
     valid = tuple(i for i, v in enumerate(axis_axes) if v is not None and v < val.ndim)
     src = tuple(axis_axes[i] for i in valid)
     leftover = [v for v in range(val.ndim) if v not in src]
@@ -450,6 +453,115 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
                 )
             if getattr(d, "block_axis", None) is not None:
                 _check_block_axis(d, dim_map, block_axiss)
+
+    # Physical-buffer agreement. Every non-compressed dim's ``axis`` /
+    # ``block_axis`` must point at a val axis whose extent equals the dim's
+    # declared ``size`` / ``block_size`` (a size-1 physical axis is allowed as a
+    # broadcast/implicit stand-in). This catches metadata that disagrees with the
+    # buffer -- e.g. a dense dim whose ``axis`` was renumbered onto a
+    # DiagonalIndex block axis (the MoE-9 squeeze construction bug) -- LOUDLY at
+    # construction, instead of as an opaque "transpose permutation isn't a
+    # permutation" far downstream in a contraction. Compressed dims carry band /
+    # set buffers whose axes are not plain (size / block_size) extents, so they
+    # are skipped (their own densify path validates them).
+    val = getattr(st, "val", None)
+    if val is not None:
+        try:
+            vshape = tuple(val.shape)
+        except Exception:
+            vshape = None
+        if vshape is not None:
+            ndim = len(vshape)
+            for d in st.dims:
+                if d.is_compressed:
+                    continue
+                ax = d.axis
+                if ax is not None:
+                    if ax < 0 or ax >= ndim:
+                        raise ValueError(
+                            f"Topology Error: Index {d.id} axis={ax} out of range "
+                            f"for val.ndim={ndim}"
+                        )
+                    if vshape[ax] != d.size and vshape[ax] != 1:
+                        raise ValueError(
+                            f"Topology Error: Index {d.id} axis={ax} declares "
+                            f"size={d.size} but val.shape[{ax}]={vshape[ax]}"
+                        )
+                if d.is_sparse and getattr(d, "block_axis", None) is not None:
+                    ba = d.block_axis
+                    if ba < 0 or ba >= ndim:
+                        raise ValueError(
+                            f"Topology Error: Index {d.id} block_axis={ba} out of "
+                            f"range for val.ndim={ndim}"
+                        )
+                    bsz = d.block_size
+                    if bsz is not None and vshape[ba] != bsz and vshape[ba] != 1:
+                        raise ValueError(
+                            f"Topology Error: Index {d.id} block_axis={ba} declares "
+                            f"block_size={bsz} but val.shape[{ba}]={vshape[ba]}"
+                        )
+
+
+def _squeeze_unreferenced_val_axes(st: "SparseTensor") -> "SparseTensor":
+    """Drop physical ``val`` axes of size 1 that NO dim references.
+
+    Repeated block-diagonal restructuring (``_apply_block_diagonal`` /
+    ``_subdivide_coupled_blockdiag``) and ``apply_diag`` / ``apply_compress``
+    INSERT a fresh physical axis per meta / block side and never fold the
+    leftovers, so an approx edge accumulates a long tail of size-1 ``val`` axes
+    that carry no data (measured: a ViT approx edge with logical rank 4 but
+    ``val.ndim`` 11-12, the trailing axes all size 1). They are pure rank waste
+    — every downstream op works off ``dim.axis`` / ``dim.block_axis`` pointers,
+    not the raw ``val.ndim`` — and march the physical rank toward the numpy/XLA
+    32-axis cap.
+
+    Removing a size-1 axis that no ``dim.axis`` / ``dim.block_axis`` points at is
+    a pure reshape (byte-identical: a size-1 axis contributes nothing to the
+    buffer), after which every surviving dim's pointer is shifted down to its new
+    position. A no-op — returns ``self`` unchanged, hence byte-identical — when
+    there are no such axes, which is ALWAYS the case on the EXACT-AD path (the
+    tiled ``_build_output_tensor`` already squeezes its output, and matmul /
+    elementwise never emit unreferenced size-1 axes). Referenced size-1 axes (a
+    genuinely size-1 dim carried explicitly) are kept."""
+    val = getattr(st, "val", None)
+    if val is None:
+        return st
+    try:
+        ndim = val.ndim
+    except Exception:
+        return st
+    referenced = set()
+    for d in st.dims:
+        if d.axis is not None:
+            referenced.add(d.axis)
+        if d.is_sparse and getattr(d, "block_axis", None) is not None:
+            referenced.add(d.block_axis)
+    drop = [a for a in range(ndim) if a not in referenced and int(val.shape[a]) == 1]
+    if not drop:
+        return st
+    keep = [a for a in range(ndim) if a not in drop]
+    shift = {old: new for new, old in enumerate(keep)}
+    new_val = val.reshape(tuple(val.shape[a] for a in keep))
+
+    def _remap(d):
+        kw = {}
+        if d.axis is not None:
+            kw["axis"] = shift[d.axis]
+        if d.is_sparse and getattr(d, "block_axis", None) is not None:
+            kw["block_axis"] = shift[d.block_axis]
+        return replace(d, **kw) if kw else d
+
+    cls = _get_sparse_tensor_cls()
+    return cls(
+        tuple(_remap(d) for d in st.out_dims),
+        tuple(_remap(d) for d in st.primal_dims),
+        new_val,
+        scalar_mult=st.scalar_mult,
+        fill_value=st.fill_value,
+        pre_transforms=st.pre_transforms,
+        post_transforms=st.post_transforms,
+        check_consistency=False,
+    )
 
 
 # --- Construction / mutation --------------------------------------------

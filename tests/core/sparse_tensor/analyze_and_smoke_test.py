@@ -46,6 +46,14 @@ def _expect_path(core_fn, *args, expected_path: str) -> None:
     with track_paths() as paths:
         core_fn(*args)
     actual = paths[-1] if paths else None
+    # GRAPHAX_EINSUM_GENERAL routes the general path through its einsum incarnation,
+    # labelled 'einsum_general'. It IS the structured general path, so accept it wherever a
+    # test expects 'general' (the assertions verify "hit the optimized path, don't bail to
+    # slow dense" -- einsum_general satisfies that).
+    import os as _os
+    if (_os.environ.get("GRAPHAX_EINSUM_GENERAL", "0") not in ("", "0", "false", "False")
+            and expected_path == "general" and actual == "einsum_general"):
+        actual = "general"
     if actual != expected_path:
         raise AssertionError(
             f"Expected {core_fn.__name__} to use path {expected_path!r}, "

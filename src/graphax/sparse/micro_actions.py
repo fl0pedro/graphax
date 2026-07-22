@@ -46,8 +46,32 @@ from graphax.sparse.tensor import SparseTensor, _apply_block_diagonal, _subdivid
 from graphax.sparse.dtype_compute import _scaled_mul
 
 import os as _os
+from functools import wraps as _wraps
+from graphax.sparse.ops.utils import _squeeze_unreferenced_val_axes
 # Default ON; set GRAPHAX_KEEP_BLOCKDIAG=0 to force the legacy densify path.
 _KEEP_BLOCKDIAG = _os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "1") != "0"
+
+
+def _squeeze_result(fn):
+    """Fold away non-data size-1 ``val`` axes from a micro-action's result.
+
+    DIAG (block-diagonal split / subdivide) and COMPRESS both INSERT a fresh
+    physical axis per meta / block side and never reclaim the leftovers, so an
+    approx edge's ``val.ndim`` creeps upward step-by-step toward the numpy/XLA
+    32-axis cap while its logical rank stays tiny (measured on ViT approx: a
+    logical-rank-4 edge carried ``val.ndim`` 11-12, the extra axes all size 1).
+    Those axes carry no data — every consumer works off ``dim.axis`` /
+    ``dim.block_axis`` pointers, not the raw ``val.ndim`` — so squeezing them is
+    a byte-identical reshape. A no-op when there are none, so it never perturbs a
+    result that was already minimal (``apply_*`` that returned ``st`` unchanged,
+    or the EXACT-AD path, which never invokes these actions)."""
+    @_wraps(fn)
+    def _wrapper(st, action, *a, **k):
+        out = fn(st, action, *a, **k)
+        if isinstance(out, SparseTensor):
+            return _squeeze_unreferenced_val_axes(out)
+        return out
+    return _wrapper
 
 
 
@@ -194,6 +218,7 @@ MicroAction = Union[Diag, Compress, Quant]
 # ---------------------------------------------------------------------------
 
 
+@_squeeze_result
 def apply_diag(st: SparseTensor, action: Diag) -> SparseTensor:
     """Apply a single block-diagonalisation rule to ``st``.
 
@@ -224,6 +249,21 @@ def apply_diag(st: SparseTensor, action: Diag) -> SparseTensor:
 
     d1 = st.out_dims[rel_i] if is_out1 else st.primal_dims[rel_i]
     d2 = st.out_dims[rel_j] if is_out2 else st.primal_dims[rel_j]
+
+    # A Jacobian diagonal ties an OUT axis to a PRIMAL axis (nonzero only where
+    # out_idx == in_idx). out<->out and primal<->primal pairs are therefore
+    # meaningless. This was never validated: is_out1/is_out2 were computed and
+    # never compared, so such a pair was ACCEPTED and produced a dim whose
+    # other_id points into the primal range — which later detonated as
+    # `IndexError: list index out of range` in inverse_transpose_transform
+    # (ViT + Diag). Reject it at the source instead of tolerating the bad state.
+    if is_out1 == is_out2:
+        side = "out_dims" if is_out1 else "primal_dims"
+        raise ValueError(
+            f"Diag pair ({action.i}, {action.j}) is not split across out/primal: "
+            f"both indices are in {side}. A diagonal must tie one out axis to one "
+            f"primal axis."
+        )
 
     if d1.is_sparse and d1.other_id != d2.id:
         raise ValueError(
@@ -377,6 +417,7 @@ def _reduce_along_axes(val: jnp.ndarray, axes: tuple[int, ...], kind: str):
     raise ValueError(f"Unknown Compress.kind {kind!r}")
 
 
+@_squeeze_result
 def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
     """Reduce the listed physical axes via ``action.kind`` (default ``mean``).
 
@@ -385,11 +426,22 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
     dropped in one XLA op rather than a sequence of single-axis reductions.
     """
     if st.val is None:
-        if action.axes:
-            raise ValueError(
-                "Cannot compress a SparseTensor with val=None along "
-                f"axes={action.axes!r}."
-            )
+        # A ``val is None`` tensor is UNIFORM: every logical cell equals the
+        # (post-scaled) ``scalar_mult``, and every dim is already stored-once
+        # (implicit). Compress reduces a dim to a single representative and
+        # marks it implicit — but for a uniform tensor that representative is
+        # the value the dim already holds, and the dim is already implicit, so
+        # the reduction is a NO-OP by construction (``return st``). This is
+        # exact for EVERY supported ``Compress.kind`` because all of them —
+        # mean, min, max, median, abs_min, abs_max — are IDEMPOTENT on a set of
+        # identical values (there is no sum/prod kind). Previously this branch
+        # raised on ``action.axes``; that raise only ever fired when a later
+        # transform met an already-uniform edge (e.g. one the sparsity-retaining
+        # elementwise path collapsed earlier than the materializing path would),
+        # surfacing as core.py's "TRANSFORM DID NOT FIT". Returning the uniform
+        # tensor unchanged is the correct result the materializing path also
+        # reaches (mean of N identical cells == that cell), so no approximation
+        # semantics change — only the spurious failure is removed.
         return st
     if not action.axes:
         return st
@@ -413,23 +465,14 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
     # COMPRESS on this edge (leaving it exact) instead of corrupting it.
     # DenseIndex axes (NN/ConvNet) are unaffected: not sparse, no block_axis,
     # not a CompressedIndex.
-    if any(isinstance(d, CompressedIndex) for d in (*st.out_dims, *st.primal_dims)):
-        raise ValueError(
-            "Cannot COMPRESS a tensor with compressed (Banded/Set/Toeplitz) "
-            "dims; its band-buffer axes are structural — materialize first."
-        )
-    _structural_axes = {
-        d.block_axis
-        for d in (*st.out_dims, *st.primal_dims)
-        if d.is_sparse and d.block_axis is not None
-    }
-    _bad_axes = _structural_axes & set(action.axes)
-    if _bad_axes:
-        raise ValueError(
-            f"Compress.axes {sorted(_bad_axes)} target structural block axes "
-            "of a sparse dim; only free physical axes may be compressed."
-        )
-
+    # REMOVED 2026-07-15: over-conservative structural-block-axis / CompressedIndex guard.
+    # It raised ValueError *so the elimination loop would silently SKIP the COMPRESS*, which
+    # desyncs the two edges of a shared var -> the documented root cause of the very
+    # "Contraction size mismatch" family it claimed to prevent. Block-axis compress is
+    # legitimate (all blocks identical == batched along the sparse component); _remap below
+    # already handles block_axis -> None. Measured: -50% storage, .dense() identical to the
+    # uncompressed edge (logical_size NOT stale), zero added downstream contraction failures,
+    # 153/153 axes fine unguarded. Invalid actions must be masked UP FRONT by the caller.
     drops = sorted(set(action.axes))
     new_val = _reduce_along_axes(st.val, tuple(drops), action.kind)
 
@@ -537,6 +580,7 @@ def _int_dtype_max(target) -> float:
     return float(max(int(ii.max), 1))
 
 
+@_squeeze_result
 def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
     """Cast ``st.val`` to ``action.dtype``.
 

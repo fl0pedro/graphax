@@ -8,7 +8,7 @@ is a no-op — production code pays nothing. Tests opt in via either:
 
         with track_paths() as paths:
             res = matmul(a, b)
-        assert paths[-1] == "aligned_pair"
+        assert paths[-1] == "tiled"
 
   * ``TRACK_PATHS=1`` env var — globally enables tracking; the dispatcher
     writes to ``last_path`` and tests read it back. Useful for ad-hoc

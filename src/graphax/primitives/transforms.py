@@ -778,27 +778,49 @@ def _squeeze_elementals(primals, val_out, **params):
 
         out_ids = [d.id for d in new_out_dims]
         primal_ids = [d.id for d in new_primal_dims]
-        new_val_axes = [d.axis for d in new_out_dims if d.axis is not None]
-        new_val_axes += [
-            d.axis
-            for d in new_primal_dims
-            if not d.is_sparse and d.axis is not None
-        ]
+        # Surviving val axes, used below to re-compact the axis numbers after
+        # ``jnp.squeeze`` drops the squeezed (size-1) axes: a surviving old axis
+        # ``a`` becomes its rank among the surviving axes (``new_val_axes.index(a)``).
+        #
+        # ``new_val_axes`` MUST enumerate EVERY physical val axis that survives
+        # the squeeze -- ``range(pre.val.ndim)`` minus the squeezed axes -- NOT
+        # only the axes named by dim ``axis`` pointers. A DiagonalIndex
+        # (block-diagonal) pair carries a ``block_axis`` that is a REAL physical
+        # val axis yet is not an ``axis`` pointer; the old code built the list
+        # from ``axis`` pointers only, so every ``block_axis`` was OMITTED. A
+        # dense dim sitting AFTER a block axis was then renumbered onto that block
+        # axis's slot (MoE-9: a size-4 dense primal on val axis 3 collapsed to
+        # axis 1 -- the size-5 block axis of the out DiagonalIndex -- producing a
+        # tensor whose metadata disagreed with its buffer and detonated as a bad
+        # transpose permutation downstream). Deriving the list from the buffer
+        # itself is also order-robust (it stays ascending, the property the old
+        # ``sorted`` guaranteed). Both ``axis`` AND ``block_axis`` are re-compacted
+        # through this one surviving-axis list (the old code never remapped
+        # ``block_axis`` at all).
+        squeezed_axes = {a for a in squeeze_dims if a is not None}
+        if pre.val is not None:
+            new_val_axes = [a for a in range(pre.val.ndim) if a not in squeezed_axes]
+        else:
+            new_val_axes = []
+
+        def _recompact(a):
+            return new_val_axes.index(a) if a is not None else None
 
         for i, d in enumerate(new_out_dims):
-            updates = {"id": out_ids.index(d.id)}
-            if d.axis is not None:
-                updates["axis"] = new_val_axes.index(d.axis)
+            updates = {"id": out_ids.index(d.id), "axis": _recompact(d.axis)}
             if d.is_sparse:
                 updates["other_id"] = len(new_out_dims) + primal_ids.index(d.other_id)
+                if getattr(d, "block_axis", None) is not None:
+                    updates["block_axis"] = _recompact(d.block_axis)
             new_out_dims[i] = replace(d, **updates)
 
         for i, d in enumerate(new_primal_dims):
-            updates = {"id": len(new_out_dims) + primal_ids.index(d.id)}
-            if d.axis is not None:
-                updates["axis"] = new_val_axes.index(d.axis)
+            updates = {"id": len(new_out_dims) + primal_ids.index(d.id),
+                       "axis": _recompact(d.axis)}
             if d.is_sparse:
                 updates["other_id"] = out_ids.index(d.other_id)
+                if getattr(d, "block_axis", None) is not None:
+                    updates["block_axis"] = _recompact(d.block_axis)
             new_primal_dims[i] = replace(d, **updates)
 
         squeeze_dims = [d for d in squeeze_dims if d is not None]

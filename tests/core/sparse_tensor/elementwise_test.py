@@ -3,7 +3,7 @@ import unittest
 import operator
 import jax.numpy as jnp
 import jax.random as jrand
-from utils import generate_tensors, idfn
+from utils import generate_tensors, idfn, assert_structure
 from graphax.sparse.indexes import DiagonalIndex, DenseIndex
 from graphax.sparse.tensor import SparseTensor
 from graphax.sparse.ops.elementwise import elementwise, _arr2st
@@ -100,6 +100,9 @@ class TestElementwise(unittest.TestCase):
         self.assertTrue(
             jnp.allclose(ta.copy(val=expected_val_mul).dense(), (ta * tb).dense())
         )
+        # STRUCTURE: block+block (aligned) must stay a block-diagonal pair, not densify
+        assert_structure(ta + tb, expect_block=True, msg='aligned add')
+        assert_structure(ta * tb, expect_block=True, msg='aligned mul')
 
     def test_perfect_intersect_blocks(self):
         d0_a = DiagonalIndex(

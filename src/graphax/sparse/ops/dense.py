@@ -261,11 +261,64 @@ def dense_for_matmul(tensor: SparseTensor) -> Array:
             # Reorder dense_pair's axes to match tensor.dims order. ``target_axes[i]`` is
             # the dense_pair axis that should land at result position ``i``, so the
             # transpose permutation is ``target_axes`` directly (NOT its inverse).
-            leftover_iter = iter(range(2, 2 + len(leftover_sizes)))
-            target_axes = [
-                0 if d is d_o else 1 if d is d_i else next(leftover_iter)
-                for d in tensor.dims
-            ]
+            #
+            # The permutation must be built in the PHYSICAL frame. Handing the leftover axes
+            # out POSITIONALLY (an iterator walking ``tensor.dims``) made ``target_axes`` one
+            # entry per LOGICAL dim and then applied it to the PHYSICAL ``dense_pair``. Those
+            # ranks agree only if every val axis is named by exactly one dim -- but a
+            # Diag-split / Compress leaves ``val`` with EXTRA size-1 axes that no dim
+            # references (the ``(...,1,1,1)`` tails the fully-dense path above already
+            # handles), so jax raised "transpose permutation isn't a permutation" (ViT:
+            # 4 dims vs a rank-6 dense_pair). ``leftover[m]`` is dense_pair axis ``2 + m``.
+            pair_axis = {ax: 2 + m for m, ax in enumerate(leftover)}
+            target_axes, claimed = [], set()
+            for d in tensor.dims:
+                if d is d_o:
+                    target_axes.append(0)
+                elif d is d_i:
+                    target_axes.append(1)
+                else:
+                    ax = pair_axis.get(d.axis)
+                    # A dense dim whose ``.axis`` does not describe the val it is attached to
+                    # (it names an axis the sparse pair already consumed, or the extents
+                    # disagree) is stale metadata. The positional iterator never read
+                    # ``.axis``, so it silently rode over this and could emit a mis-ordered
+                    # Jacobian; refuse loudly instead of guessing.
+                    if ax is None:
+                        raise ValueError(
+                            "dense_for_matmul: dim id=%d (logical_size=%d) claims val axis %r, "
+                            "which the sparse pair already consumed (gather_axes=%r). "
+                            "val.shape=%r dims=%r"
+                            % (d.id, d.logical_size, d.axis, gather_axes,
+                               tuple(tensor.val.shape),
+                               [(x.id, x.size, x.axis, x.block_axis) for x in tensor.dims])
+                        )
+                    if int(dense_pair.shape[ax]) != int(d.logical_size):
+                        raise ValueError(
+                            "dense_for_matmul: dim id=%d claims val axis %r of extent %d, but "
+                            "its logical_size is %d. val.shape=%r dims=%r"
+                            % (d.id, d.axis, int(dense_pair.shape[ax]), int(d.logical_size),
+                               tuple(tensor.val.shape),
+                               [(x.id, x.size, x.axis, x.block_axis) for x in tensor.dims])
+                        )
+                    target_axes.append(ax)
+                    claimed.add(d.axis)
+            # Leftover val axes no dim references must be size-1 (they carry no logical
+            # extent): transpose them to the tail and reshape them away. Anything else would
+            # mean silently discarding real data.
+            unclaimed = [pair_axis[ax] for ax in leftover if ax not in claimed]
+            if unclaimed:
+                bad = [a for a in unclaimed if int(dense_pair.shape[a]) != 1]
+                if bad:
+                    raise ValueError(
+                        "dense_for_matmul: val axes %r (sizes %r) are referenced by no dim and "
+                        "are not size-1 -- refusing to silently drop data. val.shape=%r dims=%r"
+                        % (bad, [int(dense_pair.shape[a]) for a in bad],
+                           tuple(tensor.val.shape),
+                           [(x.id, x.size, x.axis, x.block_axis) for x in tensor.dims])
+                    )
+                out = dense_pair.transpose(target_axes + unclaimed)
+                return out.reshape(out.shape[: len(target_axes)])
             return dense_pair.transpose(target_axes)
 
     densified = dense(tensor, hard=True)

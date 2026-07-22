@@ -30,6 +30,7 @@ from .sparse.dtype_compute import _scaled_mul as _scaled_mul_promote
 from .sparse.ops.matmul import matmul as sparse_matmul
 from .sparse.ops.utils import (
     _compressed_dims, _materialize_for_op, _is_approx,
+    _squeeze_unreferenced_val_axes,
 )
 from .sparse.tensor import _assert_sparse_tensor_consistency
 from .sparse.micro_actions import (
@@ -410,9 +411,24 @@ def jacve(
 
 
 # Per-vertex Jacobian-transform spec — the shared type of the ``transforms``
-# argument on jacve / grad / value_and_grad: ``[(vertex_id, [transform, ...])]``.
+# argument on jacve / grad / value_and_grad. Two per-vertex forms:
+#   * legacy list ``[(vertex_id, [transform, ...])]`` — transforms applied to
+#     each merged edge (normalized to nominal shape).
+#   * face-like per-path dict ``[(vertex_id, {(primal_id, out_id): hooks})]`` —
+#     ``hooks`` is ``(pre, post, new)`` [contraction] or
+#     ``((pre, post, new), (lhs, rhs, res))`` [contraction + join]; each hook is a
+#     callable ``SparseTensor -> SparseTensor`` or ``None``. Applied at the op
+#     boundary, so the edge is never normalized (the sparse ops reconcile shapes).
+_Hook = Callable[["SparseTensor"], "SparseTensor"]
+_PathHooks = Union[
+    Tuple[_Hook, _Hook, _Hook],
+    Tuple[Tuple[_Hook, _Hook, _Hook], Tuple[_Hook, _Hook, _Hook]],
+]
 TransformSpec = Sequence[
-    Tuple[int, Sequence[Union[Diag, Compress, Callable[["SparseTensor"], "SparseTensor"]]]]
+    Tuple[int, Union[
+        Sequence[Union[Diag, Compress, _Hook]],
+        Dict[Tuple[int, int], _PathHooks],
+    ]]
 ]
 
 
@@ -630,6 +646,35 @@ def append_pre_transforms(pre, out):
     return out
 
 
+def _identity_passthrough(keep, ident, side: str):
+    """Pass ``keep`` through an IDENTITY ``ident`` operand (the ``_need_contract
+    is False`` shortcut), folding the identity's ``scalar_mult``.
+
+    Both contraction paths re-attach ``post_val.post_transforms`` /
+    ``pre_val.pre_transforms`` to the emitted edge immediately below. That is
+    correct after a REAL contraction, because ``sparse_matmul`` / ``unload_*``
+    rebuild the tensor and DROP its queued transforms -- the re-attach restores
+    them exactly once. The pass-through shortcut is a ``copy()``, which KEEPS
+    the queue, so the very same transform object got queued a SECOND time
+    (observed: ``pre_transforms = (transpose, transpose)`` on a ViT edge -- the
+    relabel applied twice, cos 1/32). Clear the side that is about to be
+    re-attached so the shortcut has the same postcondition as the contract path.
+
+    ``side="pre"``  -- ``keep`` is the pre operand; its ``pre_transforms``
+                      are re-appended by ``append_pre_transforms``.
+    ``side="post"`` -- ``keep`` is the post operand; its ``post_transforms``
+                      are re-prepended by ``prepend_post_transforms``.
+    The OTHER side is deliberately preserved: it lives on the surviving
+    (non-contracted) dims and nothing re-attaches it.
+    """
+    out = keep.copy(scalar_mult=_scaled_mul_promote(keep.scalar_mult, ident.scalar_mult))
+    if side == "pre":
+        out.pre_transforms = ()
+    else:
+        out.post_transforms = ()
+    return out
+
+
 def _drain_transforms(tensor, post_first: bool = True):
     """Fold a tensor's queued Jacobian transforms into its data: apply each
     ``post_transform`` forward (``apply``) and each ``pre_transform`` in reverse
@@ -649,210 +694,132 @@ def _drain_transforms(tensor, post_first: bool = True):
     return _pre(_post(tensor)) if post_first else _post(_pre(tensor))
 
 
-def _match_nominal_axes(d_shape, n_out, out_aval_shape, in_aval_shape):
-    """Axis permutation reordering a densified approx edge — one array axis per
-    logical dim, out dims first then primal dims — back to nominal
-    ``out_aval + in_aval`` order, matching WITHIN each side by logical size.
+def _peel_reconciler_transforms(tensor):
+    """Materialise the SHAPE-RECONCILING transforms queued on ``tensor`` into its
+    data BEFORE it enters a contraction, leaving pure RELABELS queued for the
+    post-contraction re-attach. Returns ``(reduced_tensor, remaining_pre,
+    remaining_post)`` where the remaining lists are the un-peeled transforms
+    (still to be re-attached to the contraction output).
 
-    A flat reshape only RE-GROUPS axes; it cannot fix a free-dim PERMUTATION (the
-    ViT seq<->embed ``(17, 8)`` swap that surfaces as a transposed merge / a
-    ``17 vs 8`` contraction). When the densified rank matches nominal and each side
-    forms an UNAMBIGUOUS size-bijection with its aval (distinct sizes per side, the
-    ViT case), this returns the transpose that restores nominal order. Returns
-    ``None`` — caller falls back to the reshape/guard — when a side can't be matched
-    (rank/grouping change) or a size repeats within a side (size alone can't
-    disambiguate; risking a wrong transpose would be worse than the reshape)."""
+    A *reconciler* (concatenate slot embed/slice, broadcast reduce, slice) folds
+    an INFLATED operand axis back to its nominal size — its ``apply`` /
+    ``apply_inverse`` acts on the operand's OWN dims and STRICTLY shrinks the
+    logical size. A *relabel* (transpose / reshape / squeeze) is size-preserving
+    and is defined against the CONTRACTION-OUTPUT dim list, so applying it to the
+    operand indexes a dim it does not have (``IndexError``); it must ride the
+    re-attach path unchanged.
 
-    def _bijection(axis_indices, target_sizes):
-        axes = list(axis_indices)
-        used, perm = set(), []
-        for s in target_sizes:
-            matches = [
-                k for k in axes if k not in used and int(d_shape[k]) == int(s)
-            ]
-            if len(matches) != 1:  # 0 = no axis of this size; >1 = ambiguous
-                return None
-            used.add(matches[0])
-            perm.append(matches[0])
-        return perm
-
-    out_perm = _bijection(range(n_out), out_aval_shape)
-    primal_perm = _bijection(range(n_out, len(d_shape)), in_aval_shape)
-    if out_perm is None or primal_perm is None:
-        return None
-    if len(out_perm) + len(primal_perm) != len(d_shape):
-        return None
-    return tuple(out_perm + primal_perm)
-
-
-# GRAPHAX_KEEP_BLOCKDIAG=1: keep a pure block-diagonal (Diag) approx edge SPARSE
-# through the per-vertex reconciliation so its next contraction hits the batched
-# block-diagonal (GEMM) kernel rather than a full N x N densify. Sound because a
-# later UNIFORM Diag re-mask (micro_actions.apply_diag) is a no-op on an already
-# block-diagonal edge; a non-uniform (non-nestable) factor raises and core.py
-# then skips keeping that edge sparse.
-# Default ON: the sparse block-diagonal (batched-GEMM) path is the default; set
-# GRAPHAX_KEEP_BLOCKDIAG=0 to force the legacy densify path (regression/debug).
-_KEEP_BLOCKDIAG = os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "1") != "0"
-
-
-def _is_pure_blockdiag(edge) -> bool:
-    """True iff edge carries >=1 meta-block-diagonal (Diagonal) dim and NO
-    compressed/implicit dim — a residual structure the batched block-diagonal
-    contraction kernel can consume directly (no densify needed)."""
-    dims = getattr(edge, "dims", None)
-    if dims is None:
-        return False
-    has_diag = False
-    for d in dims:
-        if getattr(d, "is_compressed", False):
-            return False
-        if getattr(d, "is_sparse", False):
-            has_diag = True
-    return has_diag
-
-
-def _is_keep_sparse_edge(edge, out_aval_shape, in_aval_shape) -> bool:
-    """Generalisation of ``_is_pure_blockdiag``: an approx edge whose compaction is
-    a block-diagonal AND/OR an IMPLICIT (``axis is None``) dim AND/OR a structural
-    ``val is None`` — i.e. a form the downstream contraction consumes WITHOUT a
-    full densify — provided it is ALREADY at its nominal logical shape (so no
-    re-layout is needed and the merge/next re-mask see a nominal-shaped edge).
-
-    ``val is None`` structural edges and implicit dims broadcast to their nominal
-    logical size in ``.dense()`` for free, so keeping them avoids materialising an
-    N-fold-larger buffer. Requires nominal shape to guarantee the reshape/merge
-    invariants the densify otherwise restores; a non-nominal (permuted / regroup)
-    edge still densifies (correct)."""
-    dims = getattr(edge, "dims", None)
-    if dims is None:
-        return False
-    nominal = tuple(out_aval_shape) + tuple(in_aval_shape)
-    if tuple(getattr(edge, "shape", ())) != nominal:
-        return False
-    has_compact = getattr(edge, "val", "x") is None
-    for d in dims:
-        if getattr(d, "is_sparse", False):
-            has_compact = True
-        if getattr(d, "is_compressed", False) or getattr(d, "axis", "x") is None:
-            has_compact = True
-    return has_compact
-
-
-def _blockdiag_addable(a, b) -> bool:
-    """True iff two edges are BOTH pure block-diagonal and NESTABLE — their
-    SparseTensor ``+`` stays block-sparse (no densify, no zero-padding).
-
-    Per matching-id dim position both must be sparse block-diagonal with the SAME
-    nominal logical size, and their meta counts must NEST: one divides the other
-    (equivalently one block size divides the other). A finer block-diagonal's
-    support is contained in the coarser one's, so the sum is representable at the
-    coarser block structure — which the elementwise add already produces (verified
-    diff 0 vs dense-add for 2-block + 4-block etc.). Identical structures are the
-    degenerate nesting (ratio 1). A non-nestable pair (meta counts not
-    divisor-related, or different nominal size) still densifies (correct)."""
-    if not (_is_pure_blockdiag(a) and _is_pure_blockdiag(b)):
-        return False
-    da, db = getattr(a, "dims", None), getattr(b, "dims", None)
-    if da is None or db is None or len(da) != len(db):
-        return False
-    for x, y in zip(da, db):
-        if getattr(x, "id", None) != getattr(y, "id", None):
-            return False
-        xs = bool(getattr(x, "is_sparse", False))
-        ys = bool(getattr(y, "is_sparse", False))
-        if xs != ys:
-            return False
-        if getattr(x, "logical_size", None) != getattr(y, "logical_size", None):
-            return False
-        if xs:
-            mx = getattr(x, "size", None) or 1
-            my = getattr(y, "size", None) or 1
-            hi, lo = (mx, my) if mx >= my else (my, mx)
-            if lo == 0 or hi % lo != 0:
-                return False  # meta counts do not nest -> not block-addable
-    return True
-
-
-def _normalize_approx_edge(edge, out_aval_shape, in_aval_shape):
-    """Reconcile an approximation-bearing edge to its TRUE dense form at the
-    NOMINAL logical shape ``out_aval + in_aval``.
-
-    A contraction / per-vertex Diag/Compress can leave an approx edge with its
-    surviving free dims in a NON-nominal order (an upstream reshape/transpose
-    transform permutes the operands' free dims) or with a residual rectangular-
-    Diag / implicit-Compress structure. Vertex elimination compares the edge to
-    the nominal ``out.aval + in.aval`` and the multi-edge ``+`` merge adds two
-    edges that must share a layout, so we normalize an approx edge to its nominal
-    dense form here.
-
-    Queued ``pre`` / ``post`` transforms are DRAINED into the dense value and NOT
-    re-attached — re-attaching them (the old band-aid) let a queued transpose
-    re-permute the already-nominal edge, mis-aligning the merge. ``dense()``
-    materializes every approx axis at its nominal logical size and lays the array
-    out in nominal ``(out..., primal...)`` order, so it is a drop-in for the
-    un-approximated edge with canonical ``range(0, n)`` ids.
-
-    The regroup is a flat ``reshape``, which only RE-GROUPS axes — it cannot fix a
-    free-dim PERMUTATION. The drain puts each side's dims in nominal order, so no
-    within-side permutation survives; what a flat reshape *could* silently
-    scramble is a cross-boundary mismatch (out-side and primal-side extents not
-    lining up with ``out_aval`` / ``in_aval``). We guard that explicitly and fail
-    loudly rather than mis-lay-out the Jacobian.
-
-    NOTE — this densify is LOAD-BEARING, not just a memory cost. The nominal-dense
-    form is what lets the next vertex's Diag/Compress re-mask the edge uniformly (a
-    block-diagonal edge makes a later Diag's pair conflict → it skips → under-masks;
-    see the densify-dependency note in the per-vertex transform loop). Keeping edges
-    sparse to dodge the N**2 densify was tried TWICE at scale and failed every way:
-    a wrong approximation (cos→0.05 vs the dense oracle), a ``transpose_transform``
-    topology crash, AND higher peak RSS (the sparse + densify-retry overhead exceeds
-    the savings). The per-vertex densify-mask is intrinsic to this approximation;
-    the lever for the random-order OOM is the elimination ORDER (``rev`` is
-    near-minimal fill), not edge sparsity. Don't re-attempt the sparse path without
-    first making transpose/Diag/Compress/merge all structure-invariant.
+    Why this matters: the matmul is CORRECT on nominal operands, but a diagonal
+    ``dW/dV`` contracted against a ``dV/dU`` whose ``U`` axis is stored INFLATED
+    (a concat slot at full width) emits a block-diagonal coupling that pins the
+    inflated size onto ``U`` — a transform-free NON-NOMINAL edge that then
+    broadcasts through every sibling merge until an ``N`` vs ``M`` (neither 1)
+    collision crashes ``_reconcile_broadcast_dims``. Folding the reconciler into
+    the operand first feeds the contraction a nominal ``U`` so no coupling forms.
+    Peels in the exact drain order (post forward, then pre reversed) and STOPS at
+    the first non-reconciler so the kept remainder is a valid transform prefix.
     """
-    from .sparse.ops.utils import _arr2st
+    import math as _math
 
-    nominal = tuple(out_aval_shape) + tuple(in_aval_shape)
-    drained = _drain_transforms(edge)
-    if tuple(drained.shape) == nominal and not _is_approx(drained):
-        # Already nominal-shaped plain-dense — nothing to reconcile (avoid a
-        # needless densify on the clean fast path).
-        return drained
-    d = drained.dense()
-    if tuple(d.shape) != nominal:
-        # First restore nominal axis ORDER: dense() lays out one axis per logical
-        # dim (out dims then primal dims), so a free-dim PERMUTATION (the ViT
-        # seq<->embed (17,8) swap) leaves the array transposed relative to nominal.
-        # A flat reshape can only re-group, never reorder, so match each side's
-        # axes to the nominal axes by logical size and TRANSPOSE first; the reshape
-        # below then only has to regroup a residual size-1 split.
-        if d.ndim == len(nominal):
-            perm = _match_nominal_axes(
-                d.shape, len(drained.out_dims), out_aval_shape, in_aval_shape
-            )
-            if perm is not None and list(perm) != list(range(d.ndim)):
-                d = jnp.transpose(d, perm)
-    if tuple(d.shape) != nominal:
-        # ``dense()`` lays the array out out-side-first, so the reshape regroups
-        # the out side into ``out_aval`` and the primal side into ``in_aval`` iff
-        # the per-side logical extents already match. If they don't, a flat
-        # reshape would re-lay-out ACROSS the out/primal boundary (silent scramble)
-        # — surface it instead.
-        out_log = int(np.prod([int(x.logical_size) for x in drained.out_dims]))
-        in_log = int(np.prod([int(x.logical_size) for x in drained.primal_dims]))
-        if out_log != int(np.prod(out_aval_shape)) or in_log != int(
-            np.prod(in_aval_shape)
-        ):
+    def _sz(x):
+        s = x.shape
+        return _math.prod(s) if s else 1
+
+    post = list(tensor.post_transforms)
+    pre = list(tensor.pre_transforms)
+    cur = tensor.copy()
+    cur.post_transforms = ()
+    cur.pre_transforms = ()
+
+    for k in range(len(post)):
+        before = _sz(cur)
+        try:
+            cand = post[k].apply(cur)
+            _assert_sparse_tensor_consistency(cand)
+        except Exception:
+            cand = None
+        if cand is None or _sz(cand) >= before:
+            cur.post_transforms = tuple(post[k:])
+            cur.pre_transforms = tuple(pre)
+            return cur, tuple(pre), tuple(post[k:])
+        cur = cand
+
+    for j in range(len(pre) - 1, -1, -1):
+        before = _sz(cur)
+        try:
+            cand = pre[j].apply_inverse(cur)
+            _assert_sparse_tensor_consistency(cand)
+        except Exception:
+            cand = None
+        if cand is None or _sz(cand) >= before:
+            cur.pre_transforms = tuple(pre[: j + 1])
+            cur.post_transforms = ()
+            return cur, tuple(pre[: j + 1]), ()
+        cur = cand
+
+    cur.pre_transforms = ()
+    cur.post_transforms = ()
+    return cur, (), ()
+
+
+# Face-like per-path approximation: the `transforms` entry for a vertex may be a
+# dict keyed by (primal_vertex_id, out_vertex_id) -> per-path hooks. This applies
+# the approximation at the OP boundary (contraction operands + result, join
+# operands + result) exactly like the face engine, so an edge NEVER needs
+# `_normalize_approx_edge` (the sparse matmul/+ reconcile shapes locally). Vertex
+# ids follow the eqn-position scheme (1-based, matching `order`); graph inputs
+# take a negative id -(invar_index+1). See `_parse_path_hooks` for the value
+# shape. This path is byte-identical to exact AD when `transforms == ()`.
+_NULL3 = (None, None, None)
+
+
+def _parse_path_hooks(value):
+    """Normalize a per-path transforms value into ``((pre, post, new),
+    (lhs, rhs, res))`` — the contraction hooks and the join/add hooks. The two
+    ops are ordered ``(contraction, join)``; an EMPTY tuple ``()`` (or ``None``)
+    in either slot means "no approximation for that op".
+
+    Dispatch is by outer length, so the two ops are never ambiguous:
+      * ``None`` / ``()``                        -> no approximation at all
+      * ``(pre, post, new)``      (length 3)     -> contraction only, join = none
+      * ``((pre,post,new),)``     (length 1)     -> contraction only, join = none
+      * ``((pre,post,new), (lhs,rhs,res))`` (length 2) -> both ops
+      * ``((), (lhs,rhs,res))``   (length 2)     -> join only (contraction skipped)
+      * ``((pre,post,new), ())``  (length 2)     -> contraction only
+
+    ``pre``/``post`` apply to the two contraction operands, ``new`` to the
+    contraction result; ``lhs``/``rhs`` apply to the two join operands (the new
+    contribution and the existing edge), ``res`` to the summed edge. Each hook is
+    a callable ``SparseTensor -> SparseTensor`` or ``None`` (identity).
+    """
+    if value is None:
+        return _NULL3, _NULL3
+
+    def _as3(h):
+        # None or an empty tuple -> no approximation for this op.
+        if h is None or (hasattr(h, "__len__") and len(h) == 0):
+            return _NULL3
+        h = tuple(h)
+        if len(h) != 3:
             raise ValueError(
-                "_normalize_approx_edge: per-side logical-extent mismatch — edge "
-                f"(out {out_log} | primal {in_log}) cannot regroup to nominal "
-                f"(out {tuple(out_aval_shape)} | primal {tuple(in_aval_shape)}) "
-                "without scrambling across the out/primal boundary."
+                f"per-path op hooks must be a 3-tuple (a, b, res) or () / None; "
+                f"got length {len(h)}"
             )
-        d = d.reshape(nominal)
-    return _arr2st(d, out_ndim=len(out_aval_shape))
+        return h
+
+    n = len(value)
+    if n == 0:                                   # ()  -> no approximation
+        return _NULL3, _NULL3
+    if n == 3:                                    # bare (pre, post, new)
+        return _as3(value), _NULL3
+    if n == 1:                                    # ((pre,post,new),)
+        return _as3(value[0]), _NULL3
+    if n == 2:                                    # (contraction, join)
+        return _as3(value[0]), _as3(value[1])
+    raise ValueError(
+        "per-path transforms value must be (pre,post,new), ((pre,post,new),), "
+        f"or ((pre,post,new),(lhs,rhs,res)); got {value!r}"
+    )
 
 
 def _is_scalar_st(t) -> bool:
@@ -1199,6 +1166,7 @@ def _eliminate_vertex(
         ],
         None,
     ] = None,
+    var_vid: Dict[core.Var, int] = None,
 ) -> Tuple[int, int, int, int]:
     """
     Function that eliminates a vertex from the computational graph.
@@ -1264,28 +1232,35 @@ def _eliminate_vertex(
     # every edge, so compute it ONCE here rather than per (in_edge, out_edge).
     # Gates the approx-edge normalization below; ``transforms == ()`` (the EXACT
     # AD path) gives ``any([]) == False`` so that path stays byte-identical.
-    _is_approx_cfg = any(isinstance(_t, (Diag, Compress)) for _t in transforms)
-    # A PER-FACE Diag/Compress approximates this vertex just as much as a
-    # per-vertex one, so it must arm the same edge normalization (the skip in
-    # the transform loop below is only sound while approx edges are densified
-    # back to nominal). Guarded on ``face_transforms`` so the None path keeps
-    # the statically-False value above.
+    # A transform is an approximation if it is a Diag/Compress instance OR a CALLABLE —
+    # the `transforms` API documents "a callable (SparseTensor) -> SparseTensor — escape
+    # hatch for arbitrary user-defined transforms", but the old isinstance-only test did
+    # not match callables, so a callable transform set _is_approx_cfg=False and SILENTLY
+    # BYPASSED the whole approx path: every `_normalize_approx_edge` gate is keyed off this
+    # (and `_approx_elim`), so a non-nominal approx edge sailed into the merge-path shape
+    # assert => "Computed edge shape (10,4,16,16) does not match expected shape (4,16,16)"
+    # (MoE) / "matmul: mismatch in core dimension 0" (NN). Callables are exactly what a
+    # MASK-AWARE policy must use (the mask needs the real edge, only known mid-elimination),
+    # so this silently broke the one correct way to apply approximations.
+    # Per-path (face-like) mode: `transforms` is a dict keyed by
+    # (primal_vertex_id, out_vertex_id). Hooks are applied at the op boundary; the
+    # legacy list form applies its transforms post-merge. NEITHER normalizes to a
+    # nominal dense edge any more (the norm was deleted) — the sparse matmul/+
+    # reconcile every layout. Exact AD (`transforms == ()`) leaves `_is_approx_cfg`
+    # False so it stays byte-identical.
+    _perpath = isinstance(transforms, dict)
+    _is_approx_cfg = (not _perpath) and any(
+        isinstance(_t, (Diag, Compress)) or callable(_t) for _t in transforms
+    )
+    # A PER-FACE Diag/Compress approximates this vertex as much as a per-vertex
+    # one, so it must arm the same non-shortcut contraction path. Guarded on
+    # ``face_transforms`` so the None path keeps the value above.
     if face_transforms:
         _is_approx_cfg = _is_approx_cfg or any(
             isinstance(_t, (Diag, Compress))
             for _slots in face_transforms.values()
             for _t in _slots
         )
-    # GLOBAL approx flag: True for the whole elimination iff ANY vertex carries an
-    # approximation (set in ``vertex_elimination_jaxpr``). The merge below must
-    # reconcile an edge that was PERMUTED by an upstream approx vertex even when
-    # THIS vertex has no approx of its own (the policy approximates only some
-    # vertices) — so its layout normalization is gated on this global flag, not the
-    # per-vertex ``_is_approx_cfg``. Exact AD (no approx anywhere) leaves it False,
-    # so that path stays byte-identical.
-    from .sparse.elemental.dispatch import approx_active
-
-    _approx_elim = approx_active()
 
     # Path tokenization sink (None on the exact-AD hot path -> zero overhead,
     # every contraction/accumulation runs inline exactly as before).
@@ -1374,6 +1349,17 @@ def _eliminate_vertex(
                         post_val = _apply_face_transform(
                             post_val, _rhs_t, "rhs", vertex, _face_sink)
 
+                # Resolve this path's per-op hooks. The path (in_edge -> vertex ->
+                # out_edge) is keyed by its neighbour vertex ids; ``_h_*`` default
+                # to None (identity) for any unaddressed path or role.
+                (_h_pre, _h_post, _h_new), (_h_lhs, _h_rhs, _h_res) = _NULL3, _NULL3
+                if _perpath:
+                    _pid = var_vid.get(in_edge) if var_vid is not None else None
+                    _oid = var_vid.get(out_edge) if var_vid is not None else None
+                    (_h_pre, _h_post, _h_new), (_h_lhs, _h_rhs, _h_res) = (
+                        _parse_path_hooks(transforms.get((_pid, _oid)))
+                    )
+
                 # TODO implement a process that discards unnecessary edges from the computation
 
                 # Handle stuff like reshape, squeeze etc.
@@ -1401,25 +1387,132 @@ def _eliminate_vertex(
                     or (post_val.val is None and not _acts_as_identity(_post_val))
                     or (pre_val.val is None and not _acts_as_identity(_pre_val))
                 )
+                # Per-path contraction-operand hooks (pre -> in-edge Jacobian,
+                # post -> out-edge Jacobian). Applied to the working copies that
+                # feed the contraction, mirroring face_env (pre->cf[u], post->cf[w]).
+                if _perpath and _h_pre is not None:
+                    _pre_val = _h_pre(_pre_val)
+                if _perpath and _h_post is not None:
+                    _post_val = _h_post(_post_val)
 
-                # The contraction is a module-level helper (``_contract_edge_val``)
-                # -- same ops in the same order as the pre-factoring inline code
-                # (verified against ``jax.jacrev``), no per-iteration closure. In
-                # tokenize mode it binds into the persistent trace; the face sink
-                # records only the eqn-index range around it (see below).
-                edge_outval, _da, _dm, _df, _dmem = _contract_edge_val(
-                    _post_val, _pre_val, pre_val, post_val,
-                    _need_contract, count_ops)
-                adds += _da
-                muls += _dm
-                fmas += _df
-                mem += _dmem
-                # Offload the remain Jacobian transforms to the output tensor
-                if len(post_val.post_transforms) > 0:
-                    edge_outval = prepend_post_transforms(post_val, edge_outval)
+                # Reconciliation drain (2026-07-21). An operand can carry
+                # ``seed_drainable`` transforms — concatenate slot embed/slice,
+                # head slices, position-embed broadcast — that reconcile its
+                # non-nominal STORED shape back to nominal (a concat slot is
+                # stored at the FULL concat width and sliced to its own width on
+                # drain; the stored edge is a bare identity-seed: empty dims,
+                # ``val is None``, only the queued reconciler). The old code rode
+                # those transforms THROUGH the contraction and re-attached them to
+                # the OUTPUT. That is correct only while the reconcilable axis
+                # stays a free dim: a diagonal ``dW/dV`` contracted against such a
+                # ``dV/dU`` couples W's axis to U's axis in a block-diagonal pair
+                # that PINS the full concat width onto ``U`` — a transform-free
+                # NON-NOMINAL edge (logical 32 on a nominal-16/-1 axis) that then
+                # broadcasts through every sibling merge until an ``N`` vs ``M``
+                # (neither 1) collision crashes ``_reconcile_broadcast_dims`` (the
+                # ViT-compress ``(1,32,8,16)`` vs ``(1,32,8,32)`` merge). Folding
+                # the reconciler into the OPERAND here feeds the contraction a
+                # nominal ``U`` so no coupling forms. Only the RELABEL remainder
+                # (``_pre_reattach`` / ``_post_reattach``) rides the re-attach.
+                # Gated on the approx config so EXACT AD (``transforms == ()``)
+                # keeps the operands' full queues and is byte-identical.
+                _pre_reattach = pre_val.pre_transforms
+                _post_reattach = post_val.post_transforms
+                if _perpath or _is_approx_cfg:
+                    if _pre_val.pre_transforms or _pre_val.post_transforms:
+                        _pre_val, _pre_rem_pre, _pre_rem_post = (
+                            _peel_reconciler_transforms(_pre_val)
+                        )
+                        _pre_reattach = _pre_rem_pre
+                    if _post_val.pre_transforms or _post_val.post_transforms:
+                        _post_val, _post_rem_pre, _post_rem_post = (
+                            _peel_reconciler_transforms(_post_val)
+                        )
+                        _post_reattach = _post_rem_post
+                    # Recompute the contraction decision from the PEELED operands.
+                    # ``_need_contract`` above was computed from the STORED
+                    # operands, where a concatenate/slice edge is a bare
+                    # identity-seed — ``_acts_as_identity`` sees the scalar seed
+                    # and chooses the pass-through. Peeling MATERIALISES that seed
+                    # into a real RECTANGULAR Jacobian (e.g. ``(8,32,8,16)`` for a
+                    # concat slot), which must be CONTRACTED, not passed through:
+                    # the stale decision returns the other operand verbatim
+                    # (``(8,32,8,32)``), pinning the concat width onto the input
+                    # axis. Only re-evaluated in the approx path, so EXACT AD is
+                    # untouched.
+                    _need_contract = (
+                        (_pre_val.val is not None and _post_val.val is not None)
+                        or (_post_val.val is None
+                            and not _acts_as_identity(_post_val))
+                        or (_pre_val.val is None
+                            and not _acts_as_identity(_pre_val))
+                    )
+                if _need_contract:
+                    # A scalar × scalar contraction is an elementwise multiply:
+                    # ``sparse_matmul`` rejects 0-rank operands, so it must NEVER
+                    # be routed through matmul — on either the count or non-count
+                    # path (the count path used to crash here).
+                    if _is_scalar_st(_post_val) and _is_scalar_st(_pre_val):
+                        edge_outval = _post_val * _pre_val
+                        if count_ops:
+                            muls += 1
+                    elif count_ops:
+                        edge_outval, (_a, _m, _f) = sparse_matmul(
+                            _post_val, _pre_val, count=True
+                        )
+                        adds += int(_a)
+                        muls += int(_m)
+                        fmas += int(_f)
+                    else:
+                        edge_outval = _post_val @ _pre_val
+                    if count_ops:
+                        post_size = (
+                            _post_val.val.size if _post_val.val is not None else 0
+                        )
+                        pre_size = _pre_val.val.size if _pre_val.val is not None else 0
+                        out_size = (
+                            edge_outval.val.size
+                            if edge_outval.val is not None
+                            else 0
+                        )
+                        mem += max(
+                            post_size * _post_val.dtype.itemsize,
+                            pre_size * _pre_val.dtype.itemsize,
+                            out_size * edge_outval.dtype.itemsize,
+                        )
 
-                if len(pre_val.pre_transforms) > 0:
-                    edge_outval = append_pre_transforms(pre_val, edge_outval)
+                elif (_pre_val.val is not None if (_perpath or _is_approx_cfg)
+                      else pre_val.val is not None):
+                    # post is a pure-diagonal identity up to its scalar_mult:
+                    # pass pre through, FOLDING post's scalar_mult (a scalar /
+                    # scaled-identity edge multiplies by it; dropping it was the
+                    # ``sum(z*sum(z))`` bug — 10·pre became pre). In the approx
+                    # path a peeled operand's own ``val`` decides which side is the
+                    # identity (the stored ``pre_val`` may be a since-materialised
+                    # seed); EXACT AD keeps the original ``pre_val.val`` test and
+                    # is byte-identical.
+                    edge_outval = _identity_passthrough(_pre_val, _post_val, "pre")
+                    if count_ops:
+                        muls += 1
+                else:
+                    # pre is the identity (up to scalar_mult): pass post through.
+                    edge_outval = _identity_passthrough(_post_val, _pre_val, "post")
+                    if count_ops:
+                        muls += 1
+                # Offload the remaining (un-peeled) Jacobian transforms to the
+                # output tensor. ``_post_reattach`` / ``_pre_reattach`` are the
+                # operands' full queues on EXACT AD (byte-identical to the old
+                # ``prepend_post_transforms`` / ``append_pre_transforms``) and the
+                # RELABEL remainder after a reconciler peel in an approx config.
+                if len(_post_reattach) > 0:
+                    edge_outval.post_transforms = (
+                        tuple(_post_reattach) + tuple(edge_outval.post_transforms)
+                    )
+
+                if len(_pre_reattach) > 0:
+                    edge_outval.pre_transforms = (
+                        tuple(_pre_reattach) + tuple(edge_outval.pre_transforms)
+                    )
 
                 # A misaligned-contract matmul can emit a compressed output
                 # (BandedIndex / SetIndex). The consistency check and the
@@ -1430,25 +1523,13 @@ def _eliminate_vertex(
                 if _compressed_dims(edge_outval):
                     edge_outval = _materialize_for_op(edge_outval)
 
-                # Pre-merge approx-edge normalization (gated on Diag/Compress).
-                # The multi-edge ``+`` merge below adds two edges and asserts the
-                # nominal shape, so an approx edge whose contraction surfaced a
-                # non-nominal free-dim order must be reconciled to nominal FIRST.
-                # ``_is_approx_cfg`` is statically False on the EXACT-AD path, so
-                # the no-approximation edge is byte-identical.
-                if _approx_elim and graph.get(in_edge).get(out_edge) is not None:
-                    # KEEP_BLOCKDIAG: if BOTH the new and existing edge are matching
-                    # pure block-diagonals, their SparseTensor + stays block-sparse
-                    # (verified block-wise add), so skip the merge densify. Otherwise
-                    # normalize to nominal so the + aligns (the load-bearing case).
-                    _existing_bd = _force(transpose_graph[out_edge][in_edge])
-                    if not (
-                        _KEEP_BLOCKDIAG
-                        and _blockdiag_addable(edge_outval, _existing_bd)
-                    ):
-                        edge_outval = _normalize_approx_edge(
-                            edge_outval, out_edge.aval.shape, in_edge.aval.shape
-                        )
+                # Per-path contraction-RESULT hook (``new``). The face engine
+                # applies its ``new`` to the product; here we apply it to the
+                # freshly-contracted edge before the join. A join ``lhs`` hook
+                # (below) then composes on top for the merge case.
+                if _perpath and _h_new is not None:
+                    edge_outval = _h_new(edge_outval)
+                    _assert_sparse_tensor_consistency(edge_outval)
 
                 _assert_sparse_tensor_consistency(edge_outval)
                 # If there is already an edge between the two vertices, add the new
@@ -1462,38 +1543,46 @@ def _eliminate_vertex(
                     _assert_sparse_tensor_consistency(edge_outval)
 
                     _edge = _drain_transforms(_edge)
-                    # The new edge_outval was reconciled to nominal layout above,
-                    # but the EXISTING edge can be in a different (permuted) natural
-                    # order — under an approximation the two contraction paths feed
-                    # the merge in mismatched layouts (the ViT seq/embed swap). Bring
-                    # the existing edge to the same nominal layout so the add aligns.
-                    if _approx_elim and not (
-                        _KEEP_BLOCKDIAG and _blockdiag_addable(edge_outval, _edge)
-                    ):
-                        _edge = _normalize_approx_edge(
-                            _edge, out_edge.aval.shape, in_edge.aval.shape
-                        )
                     _assert_sparse_tensor_consistency(_edge)
 
-                    # Check if the computed edge Jacobian shapes actually match
-                    # what we expect
-                    edge_shape = tuple(
-                        list(out_edge.aval.shape) + list(in_edge.aval.shape)
-                    )
-                    assert edge_shape == edge_outval.shape, (
-                        f"Computed edge shape {edge_outval.shape} does not match expected shape {edge_shape}!"
-                    )
-                    assert edge_shape == _edge.shape, (
-                        f"Existing edge shape {_edge.shape} does not match expected shape {edge_shape}!"
-                    )
-                    # Parallel-path accumulation (contraction + join land in one
-                    # combined block; the face sink's range spans both).
-                    edge_outval, _da, _dm, _df, _dmem = _accumulate_edge_val(
-                        edge_outval, _edge, count_ops)
-                    adds += _da
-                    muls += _dm
-                    fmas += _df
-                    mem += _dmem
+                    # Per-path JOIN operand hooks: ``lhs`` -> the new contribution,
+                    # ``rhs`` -> the existing edge. Applied to the drained addends
+                    # before the sparse ``+`` (which reconciles their layouts).
+                    if _perpath and _h_lhs is not None:
+                        edge_outval = _h_lhs(edge_outval)
+                    if _perpath and _h_rhs is not None:
+                        _edge = _h_rhs(_edge)
+
+                    # Nominal-shape asserts hold only for EXACT AD (no approx of
+                    # any kind): an approximation (per-path OR legacy list) can
+                    # leave an edge sparse/permuted, and the sparse ``+`` reconciles
+                    # it — there is no normalization to nominal any more.
+                    if not _perpath and not _is_approx_cfg:
+                        edge_shape = tuple(
+                            list(out_edge.aval.shape) + list(in_edge.aval.shape)
+                        )
+                        assert edge_shape == edge_outval.shape, (
+                            f"Computed edge shape {edge_outval.shape} does not match expected shape {edge_shape}!"
+                        )
+                        assert edge_shape == _edge.shape, (
+                            f"Existing edge shape {_edge.shape} does not match expected shape {edge_shape}!"
+                        )
+                    if count_ops:
+                        edge_outval, (_a, _m, _f) = add_w_counts(edge_outval, _edge)
+                        adds += int(_a)
+                        muls += int(_m)
+                        fmas += int(_f)
+                        mem += (
+                            edge_outval.val.size
+                            if edge_outval.val is not None
+                            else 0
+                        ) * edge_outval.dtype.itemsize
+                    else:
+                        edge_outval += _edge
+
+                    # Per-path JOIN result hook (``res`` -> the summed edge).
+                    if _perpath and _h_res is not None:
+                        edge_outval = _h_res(edge_outval)
 
                 # Drain queued Jacobian transforms (slice / concatenate / reshape
                 # / transpose relabels awaiting embed) into the edge BEFORE the
@@ -1518,9 +1607,10 @@ def _eliminate_vertex(
                     and edge_outval.val is not None
                     and (edge_outval.out_dims or edge_outval.primal_dims)
                 ):
-                    edge_outval = _normalize_approx_edge(
-                        edge_outval, out_edge.aval.shape, in_edge.aval.shape
-                    )
+                    # Drain queued transforms (NO densify) so the legacy per-vertex
+                    # Diag/Compress below sees a clean edge; the sparse ops reconcile
+                    # downstream — there is no normalization to nominal any more.
+                    edge_outval = _drain_transforms(edge_outval)
                     _assert_sparse_tensor_consistency(edge_outval)
 
                 # Apply per-vertex transforms in order. Diag / Compress are
@@ -1543,7 +1633,10 @@ def _eliminate_vertex(
                 # alternative is to push the full edge geometry up to the
                 # caller so it can pre-filter, which couples the typed
                 # transform API to internal sparse representations.
-                for _t in transforms:
+                #
+                # Per-path (dict) mode applied its hooks at the op boundaries
+                # above, so the legacy per-vertex list loop is skipped here.
+                for _t in (() if _perpath else transforms):
                     try:
                         if isinstance(_t, (Diag, Compress, Quant)):
                             # ONE dispatch (``_apply_micro``); in tokenize mode the
@@ -1565,23 +1658,48 @@ def _eliminate_vertex(
                                 "expected Diag, Compress, Quant, or a callable "
                                 "(SparseTensor) -> SparseTensor."
                             )
-                    except ValueError:
-                        # Out-of-range axes / shape mismatch — skip this
-                        # transform on this edge. The TypeError above is
-                        # intentionally NOT caught: it's a structural
-                        # programming error, not a per-edge geometry miss.
+                    except ValueError as _exc:
+                        # LOUD BY DEFAULT (2026-07-15). This used to `continue`,
+                        # silently dropping the transform on this edge. That silent
+                        # skip is the single defect behind this whole bug family:
+                        # two edges meeting at a shared variable receive DIFFERENT
+                        # effective approximations and desync in rank/extent (the
+                        # "Contraction size mismatch" family), and a 100%-skipped
+                        # Diag reports cos=1.0 — indistinguishable from a working
+                        # approximation. Measured: blind Diag failed 47/47 on
+                        # NN/MoE/ViT, every one swallowed here.
                         #
-                        # CORRECTNESS DEPENDENCY (do not break): this skip is sound
-                        # ONLY because _normalize_approx_edge densifies every approx
-                        # edge back to its nominal dense form, so the NEXT vertex's
-                        # transform sees a dense edge that always fits and re-masks
-                        # uniformly. If an edge is kept block-diagonal instead, a
-                        # later Diag's pair CONFLICTS, lands here, and is silently
-                        # skipped → UNDER-MASKED (a different, lighter approximation).
-                        # Two at-scale attempts to keep edges sparse hit exactly this
-                        # (cos→0.05 vs the dense oracle); don't weaken the densify
-                        # without first making every transform structure-invariant.
-                        continue
+                        # The old note said this skip was sound ONLY because
+                        # _normalize_approx_edge densifies every approx edge back to
+                        # nominal so the NEXT transform always fits, and warned:
+                        # "don't weaken the densify without first making every
+                        # transform structure-invariant". That is precisely what
+                        # up-front masking now does (diag_mask / compress_mask):
+                        # an invalid action is never PROPOSED, so this handler
+                        # should be unreachable. If it fires, that is a REAL bug
+                        # (or an unmasked caller) and must be seen, not buried.
+                        #
+                        # Escape hatch for the legacy best-effort contract:
+                        #   GRAPHAX_BEST_EFFORT_TRANSFORMS=1
+                        if os.environ.get("GRAPHAX_BEST_EFFORT_TRANSFORMS", "0") == "1":
+                            continue
+                        _f = lambda ds: [
+                            (d.size, getattr(d, "other_id", None),
+                             getattr(d, "block_size", None), getattr(d, "axis", None))
+                            for d in ds
+                        ]
+                        raise ValueError(
+                            f"TRANSFORM DID NOT FIT at vertex {vertex}: {_t!r} on edge "
+                            f"(in={in_edge}, out={out_edge}) -> {type(_exc).__name__}: {_exc}. "
+                            f"edge out_dims={_f(edge_outval.out_dims)} "
+                            f"primal_dims={_f(edge_outval.primal_dims)} "
+                            f"val={None if edge_outval.val is None else tuple(edge_outval.val.shape)}. "
+                            "This transform was previously SKIPPED SILENTLY, which desyncs the two "
+                            "edges of a shared variable and makes a no-op approximation report "
+                            "cos=1.0. Mask invalid actions up front (see diag_mask/compress_mask) "
+                            "instead of discovering them by throwing. Set "
+                            "GRAPHAX_BEST_EFFORT_TRANSFORMS=1 to restore the legacy silent skip."
+                        ) from _exc
                     _assert_sparse_tensor_consistency(edge_outval)
 
                 # ---- PER-FACE transforms: the ``res`` slot -------------------
@@ -1594,36 +1712,11 @@ def _eliminate_vertex(
                     edge_outval = _apply_face_transform(
                         edge_outval, _face_res_t, "res", vertex, _face_sink)
 
-                # Post-transform approx-edge normalization: a freshly Diag-split
-                # (rectangular) / Compress-implicit edge is reconciled to its
-                # nominal dense form so the NEXT vertex's contraction and any
-                # later multi-edge merge consume a clean, nominal-ordered edge.
-                # This is the legitimate "the approximation is a dense factor of
-                # nominal shape" reconciliation (the same semantics the dense
-                # oracle uses), with transforms drained so a queued transpose
-                # can't re-permute it. Gated on Diag/Compress, so EXACT-AD is
-                # untouched.
-                if _is_approx_cfg and _is_approx(edge_outval):
-                    # GRAPHAX_KEEP_BLOCKDIAG: keep a pure block-diagonal edge SPARSE
-                    # so the next contraction routes through the batched block-
-                    # diagonal (GEMM) kernel instead of a full N x N densify. A later
-                    # UNIFORM Diag re-mask (micro_actions.apply_diag) is a sound no-op
-                    # on this already block-diagonal edge, so the load-bearing densify
-                    # is not needed here.
-                    # GRAPHAX_KEEP_BLOCKDIAG generalised: keep any block-diagonal
-                    # / implicit (val_dim=None) / structural (val=None) edge SPARSE
-                    # when it is already at nominal shape — the downstream contraction
-                    # consumes it without the full N-fold densify.
-                    if not (
-                        _KEEP_BLOCKDIAG
-                        and _is_keep_sparse_edge(
-                            edge_outval, out_edge.aval.shape, in_edge.aval.shape
-                        )
-                    ):
-                        edge_outval = _normalize_approx_edge(
-                            edge_outval, out_edge.aval.shape, in_edge.aval.shape
-                        )
-                    _assert_sparse_tensor_consistency(edge_outval)
+                # Post-transform edges stay SPARSE: normalization to nominal dense
+                # form was deleted with the rest of the norm. A freshly Diag-split /
+                # Compress-implicit edge rides into the next vertex's contraction and
+                # any later merge as-is, and the sparse matmul/+ reconcile its layout
+                # (the same guarantee the face engine relies on).
 
                 # NOTE: the previous KNOWN-INCOMPLETE "densify approx edge to
                 # nominal" band-aid that lived here was removed — the structured
@@ -1634,6 +1727,17 @@ def _eliminate_vertex(
                 # fresh-id rebuild mis-aligned downstream multi-edge contractions
                 # (permuted edge_outval → merge shape-assert), which the kernels'
                 # canonical output-id convention now avoids.
+
+                # Fold away non-data size-1 val axes that no dim references
+                # before the edge is stored / accumulated. Block-diagonal
+                # restructuring and Diag/Compress insert a fresh physical axis
+                # per meta/block side and never reclaim the leftovers, so an
+                # approx edge's ``val.ndim`` creeps toward the 32-axis cap while
+                # its logical rank stays tiny. A pure reshape (byte-identical);
+                # a strict no-op on the EXACT-AD path (tiled output is already
+                # squeezed), so it never perturbs exact Jacobians.
+                if os.environ.get("GX_NO_SQUEEZE", "0") != "1":
+                    edge_outval = _squeeze_unreferenced_val_axes(edge_outval)
 
                 _set_inner(graph, in_edge, out_edge, edge_outval)
                 _set_inner(transpose_graph, out_edge, in_edge, edge_outval)
@@ -2182,10 +2286,25 @@ class VertexEliminator:
 
         # Build a per-vertex transforms dict for fast lookup during the
         # elimination scan. Vertices missing from `transforms` get an
-        # empty tuple (no transforms applied).
-        t_dict: Dict[int, Tuple] = {
-            int(v): tuple(ts) for v, ts in (transforms or ())
-        }
+        # empty tuple (no transforms applied). A per-vertex value that is a
+        # dict is the face-like per-path spec (kept as-is); a sequence is the
+        # legacy per-vertex transform list.
+        t_dict: Dict[int, object] = {}
+        for v, ts in (transforms or ()):
+            t_dict[int(v)] = ts if isinstance(ts, dict) else tuple(ts)
+
+        # Var -> integer vertex-id map so per-path dicts keyed by
+        # (primal_vertex_id, out_vertex_id) resolve during elimination: a
+        # produced var takes its eqn-position id (1-based, matching `order`); a
+        # graph input takes a negative id -(invar_index+1).
+        _has_perpath = any(isinstance(_x, dict) for _x in t_dict.values())
+        _var_vid: Dict[core.Var, int] = {}
+        if _has_perpath:
+            for _i, _eqn in enumerate(jaxpr.eqns, start=1):
+                for _ov in _eqn.outvars:
+                    _var_vid[_ov] = _i
+            for _j, _iv in enumerate(jaxpr.invars):
+                _var_vid.setdefault(_iv, -(_j + 1))
 
         # When counting, never reuse the cached prefix: a node's stored counts
         # are only real if the run that created it had count_ops=True. A prior
@@ -2193,7 +2312,7 @@ class VertexEliminator:
         # prefix here would report muls/adds=0 and an empty per-step breakdown.
         # Re-run the full order so the counts are honest (count_ops is an
         # analysis path, not the hot path); the graph result is identical.
-        if ENABLE_CACHE and not count_ops:
+        if ENABLE_CACHE and not count_ops and not _has_perpath:
             for vertex in order:
                 v_transforms = t_dict.get(vertex, ())
                 key = (vertex, v_transforms)
@@ -2222,6 +2341,7 @@ class VertexEliminator:
                 vo_vertices,
                 count_ops=count_ops,
                 transforms=v_transforms,
+                var_vid=_var_vid,
             )
             adds += _adds
             muls += _muls
@@ -2230,7 +2350,9 @@ class VertexEliminator:
             if count_ops:
                 counts.append((adds, muls, fmas, mem))
 
-            if ENABLE_CACHE:
+            # Per-path transform dicts are unhashable and path-specific, so they
+            # are never memoized in the prefix tree (like the count path).
+            if ENABLE_CACHE and not _has_perpath:
                 key = (vertex, v_transforms)
                 with node.lock:
                     if key not in node.children:
@@ -2353,8 +2475,18 @@ def vertex_elimination_jaxpr(
     # flag mid-flight (that would silently route the outer's remaining approx
     # edges onto the existing path).
     from .sparse.elemental.dispatch import approx_active, set_approx_active
+    # Same rule as `_is_approx_cfg`: a transform is an approximation if it is a
+    # Diag/Compress instance OR a CALLABLE (the documented
+    # "(SparseTensor) -> SparseTensor escape hatch"). The isinstance-only test made a
+    # callable set _approx_on=False -> set_approx_active(False) -> try_elemental_matmul's
+    # EXACT-AD guard (`if not approx_active(): return None`) short-circuited the ENTIRE
+    # elemental dispatch, so contract_implicit was NEVER REACHED (telemetry:
+    # matmul_pure_dense_skip=11, DISPATCH_FALLBACK_LOG empty). The implicit (Compress-away)
+    # dim was therefore never consumed by the contraction and rode through as a phantom out
+    # dim, which _normalize_approx_edge then could not regroup ("per-side logical-extent
+    # mismatch — edge (out 10 | primal 8) vs nominal (out () | primal (8,))").
     _approx_on = any(
-        isinstance(_t, (Diag, Compress))
+        isinstance(_t, (Diag, Compress)) or callable(_t)
         for _spec in (transforms or ())
         for _t in (_spec[1] if isinstance(_spec, (tuple, list)) and len(_spec) == 2 else ())
     )
@@ -2530,17 +2662,26 @@ def extract_jaxpr(
 
     cache_key = (jaxpr, tuple(argnums), _order, _transforms, sparse_representation)
 
+    # A per-path transforms entry is a dict of opaque per-path hook callables;
+    # ``tuple(ts)`` above captures only its (primal_id, out_id) KEYS, never the
+    # hooks, so two different hook sets share a cache_key. Exclude per-path runs
+    # from the topology cache entirely (same rule the eliminate-tree cache uses),
+    # so a cached topology is never served for a different set of hooks.
+    _perpath = any(isinstance(ts, dict) for _, ts in (transforms or ()))
+    _use_cache = ENABLE_CACHE and not _perpath
+
     must_compute = False
     event = None
     with _topology_lock:
-        if ENABLE_CACHE and cache_key in _topology_cache:
+        if _use_cache and cache_key in _topology_cache:
             return _topology_cache[cache_key]
 
-        if ENABLE_CACHE and cache_key in _topology_pending:
+        if _use_cache and cache_key in _topology_pending:
             event = _topology_pending[cache_key]
         else:
             event = threading.Event()
-            _topology_pending[cache_key] = event
+            if _use_cache:
+                _topology_pending[cache_key] = event
             must_compute = True
 
     if not must_compute:
@@ -2580,7 +2721,7 @@ def extract_jaxpr(
             # just the exact elimination order. ``_transforms`` is already the
             # normalised ((vertex, (transform_obj, ...)), ...) structure.
             ve_jaxpr = VEJaxpr(jaxpr, elim_order=_order, transforms=_transforms)
-            if ENABLE_CACHE:
+            if _use_cache:
                 with _topology_lock:
                     _topology_cache[cache_key] = ve_jaxpr
             return ve_jaxpr
@@ -2594,14 +2735,15 @@ def extract_jaxpr(
         closed = jax.make_jaxpr(eval_graph)(*dummy_args)
         ve_jaxpr = VEJaxpr(closed.jaxpr)
 
-        if ENABLE_CACHE:
+        if _use_cache:
             with _topology_lock:
                 _topology_cache[cache_key] = ve_jaxpr
         return ve_jaxpr
     finally:
-        with _topology_lock:
-            _topology_pending.pop(cache_key, None)
-        event.set()
+        if _use_cache:
+            with _topology_lock:
+                _topology_pending.pop(cache_key, None)
+            event.set()
 
 
 # ---------------------------------------------------------------------------

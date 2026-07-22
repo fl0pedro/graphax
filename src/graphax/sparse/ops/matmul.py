@@ -154,10 +154,23 @@ def _full_pair_data(lo, li, ro, ri, swap_rhs=False):
 
 def _matched_pair(lout, lprimal, rout, rprimal):
     """Pair of dims that exists on both sides (post-id-alignment)."""
+    # NB the message used to print `.id` while the CHECK is on `.logical_size`, so
+    # "Batch mismatch: 1 vs 4" read like "batch size 1 vs 4" (a broadcast case) when it
+    # actually meant "dim id 1 vs dim id 4" and told you NOTHING about the sizes.
+    def _d(d):
+        return (f"id={d.id} logical_size={d.logical_size} size={d.size} "
+                f"block={getattr(d, 'block_size', None)} axis={getattr(d, 'axis', None)} "
+                f"sparse={d.is_sparse}")
     if lout and rout and lout.logical_size != rout.logical_size:
-        raise ValueError(f"Batch mismatch: {lout.id} vs {rout.id}")
+        raise ValueError(
+            f"Batch mismatch (out side): lhs[{_d(lout)}] vs rhs[{_d(rout)}] — "
+            f"logical_size {lout.logical_size} != {rout.logical_size}"
+        )
     if lprimal and rprimal and lprimal.logical_size != rprimal.logical_size:
-        raise ValueError(f"Batch mismatch: {lprimal.id} vs {rprimal.id}")
+        raise ValueError(
+            f"Batch mismatch (primal side): lhs[{_d(lprimal)}] vs rhs[{_d(rprimal)}] — "
+            f"logical_size {lprimal.logical_size} != {rprimal.logical_size}"
+        )
     if lout and lprimal and rout and rprimal:
         return Pair(
             "batch_sparse",
@@ -301,11 +314,36 @@ def _resolve_contract_pair(lp, ro, lhs_out_map, rhs_primal_map):
 
 
 def _resolve_broadcast_topos(lhs_topos, rhs_topos, offset):
+    def _deferred_broadcast(a, b):
+        """A size-1 IMPLICIT dim that ``_align_contract_dims`` deliberately skipped and,
+        per its own docstring, "falls through to ``_resolve_broadcast_topos`` as a
+        free/broadcast dim". It must therefore NOT be re-captured here as a MATCHED
+        batch pair: ``_matched_pair`` compares logical_size and would raise
+        "Batch mismatch" on the very broadcast the skip deferred (ViT layer_norm:
+        mean(keepdims=True) gives a size-1 seq axis against x's size-8 -> 1 vs 8).
+
+        The producer (_align_contract_dims, 0a07b41) got the _is_implicit_block_dim
+        gate; this consumer (_matched_pair/_resolve_broadcast_topos, 6a6afa47) predates
+        it and never did — the deferral had no receiver.
+
+        This does NOT weaken the 1-vs-N guard: a size-1 dim WITH a physical axis is not
+        _is_implicit_block_dim, so it is still matched and still raises the genuine
+        "Contraction size mismatch" in _resolve_contract_pair."""
+        if a is None or b is None:
+            return False
+        if int(a.logical_size) == int(b.logical_size):
+            return False
+        return _is_implicit_block_dim(a) or _is_implicit_block_dim(b)
+
     def find_match(lout, lprimal, candidates):
         for i, (rout, rprimal) in enumerate(candidates):
             if lout and rout and lout.id == rout.id - offset:
+                if _deferred_broadcast(lout, rout):
+                    continue                     # free/broadcast dim -> _unmatched_pair
                 return i
             if lprimal and rprimal and lprimal.id == rprimal.id - offset:
+                if _deferred_broadcast(lprimal, rprimal):
+                    continue                     # free/broadcast dim -> _unmatched_pair
                 return i
         return -1
 
@@ -476,9 +514,21 @@ def _contraction_factors(pairs):
         total.append(lcm_len)
         s = 1
         if p.lhs.shared_block_len > 1:
-            s = p.lhs.shared_block_len // (lcm_len // p.lhs.outer_len)
+            _den = lcm_len // p.lhs.outer_len
+            if _den == 0 or p.lhs.shared_block_len % _den != 0:
+                raise ValueError(
+                    f"Non-divisible contraction split: lhs.shared_block_len "
+                    f"{p.lhs.shared_block_len} not a multiple of {_den}."
+                )
+            s = p.lhs.shared_block_len // _den
         elif p.rhs.block_len > 1:
-            s = p.rhs.block_len // (lcm_len // p.rhs.outer_len)
+            _den = lcm_len // p.rhs.outer_len
+            if _den == 0 or p.rhs.block_len % _den != 0:
+                raise ValueError(
+                    f"Non-divisible contraction split: rhs.block_len "
+                    f"{p.rhs.block_len} not a multiple of {_den}."
+                )
+            s = p.rhs.block_len // _den
         split.append(s)
     return shared, total, split, scalar
 
@@ -1004,6 +1054,8 @@ def _build_output_tensor(ctx, rhs_dims, res):
         if grid_view.size == math.prod(final_shape):
             values = grid_view.reshape(final_shape)
         else:
+            # NOTE: a squeezed axis may be size>1 but UNIFORM (all slices
+            # equal — e.g. a broadcast factor), so slice-0 is exact here.
             idx = tuple(0 if i in unique_sq else slice(None) for i in range(len(shape)))
             values = grid_view[idx]
             if values.shape != tuple(final_shape):
@@ -1641,6 +1693,21 @@ def _pad_axis_to(arr, axis: int, size: int, fill):
 # --- Both-implicit contracting-pair analytic fold (GRAPHAX_KEEP_BLOCKDIAG) -----
 import os as _os
 _KEEP_BLOCKDIAG_MM = _os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "1") != "0"
+
+
+def _struct_lower_enabled() -> bool:
+    """Structure-lowering layer gate (GRAPHAX_STRUCT_LOWER, default OFF).
+    Read per call so tests / the differential harness can toggle it without
+    re-importing the module."""
+    return _os.environ.get("GRAPHAX_STRUCT_LOWER", "0") != "0"
+
+
+def _einsum_general_enabled() -> bool:
+    """New einsum general-path gate (GRAPHAX_EINSUM_GENERAL, default OFF).
+    Read per call so the differential harness can toggle it without
+    re-importing the module. When OFF, ``matmul`` is byte-identical to the
+    incumbent waterfall."""
+    return _os.environ.get("GRAPHAX_EINSUM_GENERAL", "0") != "0"
 # Two-scalar matmul -> elementwise multiply (seed-vertex aggregation). Default on.
 _SEED_SCALAR_MM = _os.environ.get("GRAPHAX_SEED_VERTICES_SCALAR_MM", "1") != "0"
 
@@ -1724,6 +1791,132 @@ def _fold_both_implicit(lhs, rhs, count):
     fac = jnp.asarray(factor, dtype=out.scalar_mult.dtype)
     out = out.copy(scalar_mult=out.scalar_mult * fac)
     return (out, cnt) if count else out
+
+
+# --- New einsum general path (GRAPHAX_EINSUM_GENERAL, default OFF) ----------
+def _carries_sparse_pair(st) -> bool:
+    """True iff any dim of ``st`` is a member of a DiagonalIndex pair
+    (``is_sparse`` == ``other_id is not None``) — a plain diagonal, a
+    block-diagonal, or a spatial-sparse pair. Admits plain-diagonal
+    contractions (``block_size`` None) to the einsum lowering, which keeps the
+    surviving diagonal a pair instead of densifying it."""
+    return any(
+        getattr(d, "is_sparse", False)
+        for d in (*st.out_dims, *st.primal_dims)
+    )
+
+
+def _einsum_matmul_general(lhs, rhs, count: bool = False):
+    """Sparsity-retaining general contraction path.
+
+    Emits ONE ``jnp.einsum`` over the operands' PHYSICAL axes only; every
+    implicit dim (``axis is None``, logical>1 = extent stored once) contributes
+    an einsum letter but is NEVER materialized into a physical buffer:
+
+      * an implicit-vs-physical contraction lowers to a ``jnp.sum`` reduction
+        over the physical operand's axis (XLA already fuses the broadcast),
+      * a both-implicit contraction folds analytically to a scale-by-N into
+        ``scalar_mult`` (no compute at all),
+      * a surviving free implicit dim stays ``axis=None`` in the output; a
+        surviving diagonal / block pair stays a ``DiagonalIndex`` pair;
+        ``val=None`` stays ``val=None``.
+
+    The pairing (what contracts / batches / rides through) is NOT re-derived:
+    it consumes the incumbent ``_align_tensor_ids`` / ``_build_matmul_topology``
+    ``Pair`` list, so it can never disagree with the tiled path about topology
+    — it only changes HOW the physical buffers combine. Output ids are the
+    canonical ``_build_output_tensor`` numbering so a downstream multi-edge
+    contraction aligns by id.
+
+    Returns the contracted ``SparseTensor`` (or ``(result, (adds, muls, fmas))``
+    with ``count=True``), or ``None`` on any case it cannot yet prove correct —
+    the caller then falls through to the existing path UNCHANGED. Returning
+    ``None`` (fall through) is always the safe choice.
+
+    The planner/executor is the shared einsum implementation in
+    ``graphax.sparse.lower.matmul`` (the working prototype); this entry point
+    applies the correctness firewall and routes it under the new flag. On
+    normalized inputs (``matmul`` always normalizes before this hook) the
+    differential harness proves the planner byte-exact vs the incumbent for
+    every structured contraction except a rank-0 (scalar) operand, which is the
+    one genuine structural disagreement and is excluded below.
+    Gate: ``GRAPHAX_EINSUM_GENERAL`` (read by the caller) plus the guards below.
+    """
+    # EXACT-AD firewall: only an elimination carrying a Diag/Compress/Quant
+    # transform (approx_active) may be re-associated. An exact-AD contraction
+    # (transforms=()) never enters here, so the exact path is byte-identical
+    # whether the flag is on or off.
+    from graphax.sparse.elemental.dispatch import approx_active
+
+    if not approx_active():
+        return None
+    from graphax.sparse.ops.utils import _is_approx, _is_zero_fill
+
+    # The einsum path assumes zero fill on the implicit positions (a broadcast
+    # of the stored extent). A non-zero fill is owned by the densify path.
+    if not (_is_zero_fill(lhs) and _is_zero_fill(rhs)):
+        return None
+    # Compressed dims are materialized by ``_normalize_inputs`` before this hook;
+    # this is a defensive guard for any direct caller.
+    if any(getattr(d, "is_compressed", False) for d in (*lhs.dims, *rhs.dims)):
+        return None
+    if lhs.dtype == jnp.bool_ or rhs.dtype == jnp.bool_:
+        return None
+    # Only take cases that actually carry lowerable structure — an implicit dim
+    # (Compress), a rectangular block (Diag), a PLAIN-DIAGONAL pair, or a
+    # pure-structure (``val=None``) operand. The plain-diagonal case is the big
+    # one: the incumbent general/elemental paths SKIP a diagonal-⊗-diagonal
+    # contraction ('no_lowerable_structure') and densify it O(N²), but a
+    # diagonal composed with a diagonal IS a diagonal — a repeated einsum index
+    # (elementwise, O(N)) with the surviving pair kept symbolic. ``is_sparse``
+    # (== ``other_id is not None``) detects any DiagonalIndex-pair member,
+    # including a plain diagonal (``block_size`` None). A plain-dense contraction
+    # carries no such structure and stays on the incumbent path.
+    if not (
+        _is_approx(lhs)
+        or _is_approx(rhs)
+        or lhs.val is None
+        or rhs.val is None
+        or _carries_sparse_pair(lhs)
+        or _carries_sparse_pair(rhs)
+    ):
+        return None
+    # Metadata-stated size-1↔size-N embeds are owned by the densify path.
+    if _has_implicit_block_contraction(lhs, rhs):
+        return None
+
+    # A RANK-0 (scalar) operand has no dim to contract: ``X @ scalar`` is a
+    # broadcast/scale, not a contraction, and the two paths genuinely DISAGREE on
+    # its semantics — the incumbent collapses the unpaired contracted dim to
+    # size 1, the einsum planner rides it through — so this is not float noise
+    # but a real structural mismatch. The incumbent path owns this degenerate
+    # case (a Compress-fully-reduced scalar edge contracting a matrix), so fall
+    # through. (Two-scalar matmul is already handled earlier in ``matmul``.)
+    # This is the ONLY family the differential harness proves ``_lower`` gets
+    # WRONG; every structured contraction — plain/block diagonal, implicit,
+    # block-refine, forced-broadcast — is byte-exact vs the incumbent on CPU.
+    # (On GPU those structured cases can differ from the tiled path by ~1e-3 in
+    # float32 — normal reduction-order non-associativity between two correct
+    # implementations, well inside the approximation regime this runs in and
+    # confirmed by the cosine-based anchors — so they are NOT gated.)
+    if (not lhs.out_dims and not lhs.primal_dims) or (
+        not rhs.out_dims and not rhs.primal_dims
+    ):
+        return None
+
+    from graphax.sparse.lower.matmul import _NoRule, _lower
+
+    try:
+        out, counts, _tags = _lower(lhs, rhs)
+    except _NoRule:
+        # No rule yet for this geometry — fall through to the existing path.
+        return None
+    except Exception:
+        # Any unexpected planner error is a fall-through, never a wrong result.
+        return None
+    if count:
+        return out, counts
+    return out
 
 
 # --- Late-densification escape hatch for non-zero fill_value --------------
@@ -1989,6 +2182,214 @@ def _normalize_inputs(lhs, rhs):
     return lhs, rhs
 
 
+def _compact_frame_enabled() -> bool:
+    """GRAPHAX_COMPACT_FRAME (default OFF): compute each contraction via the
+    compact einsum planner and re-canonicalize its layout to the incumbent
+    tiled output (byte-identical), skipping the size-1-padded physical frame.
+    Any case the planner declines / can't align falls back to the tiled path."""
+    return _os.environ.get("GRAPHAX_COMPACT_FRAME", "0") != "0"
+
+
+def _compact_block_lens(pairs, shared, total, split):
+    """Pure replica of _finalize_output's final_lhs_lens / final_rhs_lens."""
+    N = len(pairs)
+    non_contract = [i for i, p in enumerate(pairs) if p.pairing_type != "contract"]
+    d_ls = [p.lhs.block_len for p in pairs]
+    f_ls = [p.rhs.shared_block_len for p in pairs]
+    ss_out = [split[i] if i in non_contract else 1 for i in range(N)]
+    fll = [d_ls[i] * (ss_out[i] if pairs[i].pairing_type == "spatial_sparse_rhs" else 1)
+           for i in range(N)]
+    frl = [f_ls[i] * (ss_out[i] if pairs[i].pairing_type != "spatial_sparse_rhs" else 1)
+           for i in range(N)]
+    return fll, frl
+
+
+def _output_dims(ctx, rhs_dims, res):
+    """Canonical output dims (ids/sizes/axis) — the pure metadata half of
+    _build_output_tensor, derived from res.grid.shape (no val touched)."""
+    shape, (sh_map, lhs_map, rhs_map), squeeze = _resolve_output_shape(ctx, res)
+    next_id = (
+        builtins.max([d.id for d in ctx.lhs.dims] + [d.id for d in rhs_dims] + [-1]) + 1
+    )
+    out_dims, primal_dims = [], []
+    for i, pm in enumerate(ctx.pairs):
+        od, pd, next_id = _build_pair_dims(
+            pm, i, sh_map[i], lhs_map[i], rhs_map[i], res, next_id
+        )
+        if od:
+            out_dims.append(od)
+        if pd:
+            primal_dims.append(pd)
+    used_axes = set()
+    for d in out_dims + primal_dims:
+        if d.axis is not None:
+            used_axes.add(d.axis)
+        if getattr(d, "block_axis", None) is not None:
+            used_axes.add(d.block_axis)
+    for i in range(len(ctx.pairs)):
+        for ax in (sh_map[i], lhs_map[i], rhs_map[i]):
+            if ax not in used_axes:
+                squeeze.append(ax)
+    if squeeze:
+        unique_sq = tuple(sorted(set(squeeze)))
+
+        def shift(v):
+            return None if v is None else v - sum(1 for s in unique_sq if s < v)
+
+        def update(dims):
+            return [
+                replace(
+                    d,
+                    axis=shift(d.axis),
+                    **({"block_axis": shift(d.block_axis)} if d.is_sparse else {}),
+                )
+                for d in dims
+            ]
+
+        out_dims, primal_dims = update(out_dims), update(primal_dims)
+    final_out = tuple(sorted(out_dims, key=lambda d: d.id))
+    final_primal = tuple(sorted(primal_dims, key=lambda d: d.id))
+    id_map = {d.id: i for i, d in enumerate(final_out + final_primal)}
+
+    def finalize(d, new_id):
+        kw = {"id": new_id}
+        if d.is_sparse:
+            kw["other_id"] = id_map.get(d.other_id, d.other_id)
+        return replace(d, **kw)
+
+    final_out = tuple(finalize(d, i) for i, d in enumerate(final_out))
+    n_out = len(final_out)
+    final_primal = tuple(finalize(d, n_out + i) for i, d in enumerate(final_primal))
+    return final_out, final_primal
+
+
+def _execute_compact(ctx, rhs_dims, count=False):
+    """Compute the contraction via the compact einsum planner and re-canonicalize
+    its layout to the incumbent tiled output (byte-identical), skipping the
+    size-1-padded frame. Returns None to fall back to the tiled path on any case
+    the planner declines or a layout it cannot align."""
+    from graphax.sparse.tensor import SparseTensor
+    from graphax.sparse.dtype_compute import _scaled_mul as _sm
+    from graphax.sparse.lower.matmul import _lower, _NoRule
+    # Match try_lower_matmul's firewall: the einsum planner is unsafe for
+    # bool (einsum bool semantics != dot_general), non-zero fill (the tiled
+    # path assumes zero-fill), or a not-yet-materialized compressed dim.
+    if ctx.lhs.dtype == jnp.bool_ or ctx.rhs.dtype == jnp.bool_:
+        return None
+    if not (_is_zero_fill(ctx.lhs) and _is_zero_fill(ctx.rhs)):
+        return None
+    if any(getattr(d, "is_compressed", False) for d in (*ctx.lhs.dims, *ctx.rhs.dims)):
+        return None
+    try:
+        low_t, _, _ = _lower(ctx.lhs, ctx.rhs)
+    except Exception:
+        return None
+    try:
+        shared, total, split, scalar = _contraction_factors(ctx.pairs)
+        fll, frl = _compact_block_lens(ctx.pairs, shared, total, split)
+        # Banded output geometry is owned by the tiled path (band-packed val,
+        # different layout) — fall back rather than emit a dense result.
+        _lu = set()
+        _ru = set()
+        for _pm in ctx.pairs:
+            _lu.update((_pm.lhs.outer_axis, _pm.lhs.block_axis, _pm.lhs.shared_block_axis))
+            _ru.update((_pm.rhs.outer_axis, _pm.rhs.block_axis, _pm.rhs.shared_block_axis))
+        _lu.discard(None)
+        _ru.discard(None)
+        _lval = _val_or_one(ctx.lhs)
+        _rval = _val_or_one(ctx.rhs)
+        _llo = [_lval.shape[a] for a in range(_lval.ndim) if a not in _lu]
+        _rlo = [_rval.shape[a] for a in range(_rval.ndim) if a not in _ru]
+        if (
+            _should_emit_block_banded(ctx, ctx.pairs, shared, total, fll, frl, _llo, _rlo)
+            is not None
+            or _should_emit_multi_axis_banded(
+                ctx, ctx.pairs, shared, total, fll, frl, _llo, _rlo
+            )
+            is not None
+        ):
+            return None
+        # _output_dims reads only the pair factors/lens from `res`; res.grid is
+        # never observed (only its .shape[5N:] leftover, which these contractions
+        # do not have), so a placeholder avoids re-tracing the whole tiled
+        # contraction just to size a grid that is then discarded.
+        res_meta = CRes(
+            grid=jax.ShapeDtypeStruct((), ctx.lhs.dtype),
+            shared_factors=shared,
+            lhs_block_lens=fll,
+            rhs_block_lens=frl,
+            scalar_mult=scalar,
+            banded_geom=None,
+        )
+        final_out, final_primal = _output_dims(ctx, rhs_dims, res_meta)
+    except Exception:
+        return None
+    canon = {d.id: d for d in (final_out + final_primal)}
+    low = {d.id: d for d in low_t.dims}
+    if set(canon) != set(low):
+        return None
+    lv = low_t.val
+    ndim = lv.ndim if lv is not None else 0
+    perm = [None] * ndim
+    # Single pass: every matched id must agree on size + sparsity kind, and
+    # (when the planner produced a val) each physical axis maps canonical<-planner.
+    for did, cd in canon.items():
+        ld = low[did]
+        if int(cd.size) != int(ld.size) or bool(cd.is_sparse) != bool(ld.is_sparse):
+            return None
+        if lv is None:
+            continue
+        for ca, la in (
+            (cd.axis, ld.axis),
+            (getattr(cd, "block_axis", None), getattr(ld, "block_axis", None)),
+        ):
+            if ca is not None and la is not None:
+                if ca >= ndim or perm[ca] is not None:
+                    return None
+                perm[ca] = la
+            elif (ca is None) != (la is None):
+                return None
+    if lv is None:
+        # planner produced pure structure: every canonical dim must be implicit.
+        if any(d.axis is not None or getattr(d, "block_axis", None) is not None
+               for d in canon.values()):
+            return None
+        values = None
+    elif any(p is None for p in perm):
+        return None
+    else:
+        values = lv.transpose(perm) if perm != list(range(ndim)) else lv
+    # Trust the planner's own scalar_mult: its (val, scalar_mult) pair
+    # reproduces the tiled path's .dense() (validated byte-identical across
+    # the contraction census + q1 exact all-orders). Recomputing it would
+    # double-count the fold on a pure-structure (val=None) output.
+    final_mult = low_t.scalar_mult
+    has_val = any(
+        d.axis is not None
+        or (d.is_sparse and getattr(d, "block_axis", None) is not None)
+        for d in final_out + final_primal
+    )
+    if not has_val and values is not None and values.size == 1:
+        final_mult = _sm(final_mult, jnp.squeeze(values))
+        values = None
+    out_dtype = values.dtype if values is not None else jnp.asarray(final_mult).dtype
+    try:
+        out = SparseTensor(
+            final_out,
+            final_primal,
+            values,
+            scalar_mult=jnp.asarray(final_mult).astype(out_dtype),
+            fill_value=low_t.fill_value,
+        )
+    except Exception:
+        # A structural mismatch the guards missed -> fall back, never crash.
+        return None
+    if count:
+        return out, _compute_matmul_count(ctx.lhs, ctx.rhs, out)
+    return out
+
+
+
 def _execute_tiled(ctx, rhs_dims):
     """Fallback: full tiled algorithm. Handles every case the fast paths
     bail on, including LCM-mismatched outer sizes, spatial sparse pairs,
@@ -2009,26 +2410,32 @@ def _execute_tiled(ctx, rhs_dims):
     return _build_output_tensor(ctx, rhs_dims, res)
 
 
-def matmul(lhs, rhs, count: bool = False):
-    """Sparse matmul dispatcher. Tries fast paths in priority order, falls
-    back to the tiled algorithm. Each fast path is a function that returns
-    ``None`` when its conditions don't apply.
 
-    Dispatch order (first applicable wins):
-      1. ``dense_dense``      — both operands are arrays (no SparseTensor).
-      2. ``densify``          — non-zero ``fill_value`` on either side
-                                *and* contracting dim sizes line up
-                                positionally (``_densify_is_safe``). The
-                                tiled path assumes implicit positions are
-                                zero, which is wrong when ``fill ≠ 0``;
-                                we materialize via ``dense_for_matmul`` +
-                                ``dot_general`` instead. When the safety
-                                check fails (graphax's AD can produce
-                                permuted dim orders), we skip this and let
-                                the tiled path handle it via id-aware
-                                topology resolution.
-      3. ``tiled``            — full LCM/topology/finalize pipeline; handles
-                                everything else.
+def matmul(lhs, rhs, count: bool = False):
+    """Sparse matmul dispatcher. Runs a cascade of paths, first-applicable
+    wins, falling back to the general tiled algorithm; each path either
+    handles the operands or declines (returns ``None`` / predicate false) and
+    control passes to the next.
+
+    Dispatch order (first applicable wins), in body order:
+      1. ``dense_dense``        -- both operands are plain arrays (no SparseTensor).
+      2. ``scalar_elementwise`` -- both 0-rank scalars, routed through ``*``.
+      3. ``einsum_general``     -- opt-in (``GRAPHAX_EINSUM_GENERAL``): opt_einsum
+                                  lowering that retains sparsity.
+      4. ``struct_lower``       -- opt-in (``GRAPHAX_STRUCT_LOWER``): structure-
+                                  lowering contraction planner.
+      5. ``both_implicit_fold`` -- both contracted dims implicit: analytic
+                                  scale-by-N folded into ``scalar_mult``.
+      6. ``elemental``          -- structured (diagonal/block/banded) kernels,
+                                  active only under ``approx_active()``.
+      7. ``densify``            -- non-zero ``fill_value`` OR an implicit-block
+                                  contraction, when ``_densify_is_safe``:
+                                  materialize via ``dense_for_matmul`` +
+                                  ``dot_general`` (tiled assumes implicit
+                                  positions are zero, wrong when fill != 0).
+                                  Runs LATE, after the structured paths above.
+      8. ``tiled``              -- general LCM/topology/finalize pipeline; the
+                                  sparsity-preserving fallback for everything else.
 
     Scalar @ scalar (both 0-rank SparseTensors) is rejected — use
     ``lhs * rhs`` (elementwise) instead. Vertex elimination routes scalar
@@ -2078,6 +2485,36 @@ def matmul(lhs, rhs, count: bool = False):
             "matmul of two 0-rank SparseTensors is not supported; "
             "use ``lhs * rhs`` (elementwise) instead"
         )
+    # New einsum general path (GRAPHAX_EINSUM_GENERAL, default OFF): the
+    # sparsity-retaining contraction. Tried FIRST after normalize/scalar, before
+    # the elemental cascade and the tiled path. Emits ONE einsum over physical
+    # axes, keeps implicit dims / block pairs / val=None symbolic, and folds a
+    # both-implicit contraction into scalar_mult. Returns None on any case it
+    # cannot yet prove correct, falling through to the EXISTING path UNCHANGED —
+    # so nothing regresses while this path is built out. Gated on
+    # ``approx_active()`` inside, so the EXACT-AD path never enters and stays
+    # byte-identical whether the flag is on or off.
+    if _einsum_general_enabled():
+        _ein = _einsum_matmul_general(lhs, rhs, count=count)
+        if _ein is not None:
+            _record_path("einsum_general")
+            return _ein
+    # Structure-lowering layer (GRAPHAX_STRUCT_LOWER, default OFF): compile
+    # the minimal physical computation for a structured contraction (ONE
+    # einsum over physical axes only) and build the output structure
+    # SYMBOLICALLY — a free implicit dim stays implicit, a surviving
+    # block-diagonal pair stays a pair, val=None stays val=None. Returns None
+    # on any case without a rule; every miss is counted in
+    # ``lower.matmul.LOWER_STATS`` (no silent behavior change). Gated on
+    # ``approx_active()`` inside, so the EXACT-AD path never enters here and
+    # stays byte-identical whether the env flag is on or off.
+    if _struct_lower_enabled():
+        from graphax.sparse.lower.matmul import try_lower_matmul
+
+        _low = try_lower_matmul(lhs, rhs, count=count)
+        if _low is not None:
+            _record_path("struct_lower")
+            return _low
     # Elemental fast path (Phase: bridge-cse): route a STRUCTURED contraction
     # (block-diagonal / implicit / compressed contracted dims) through the
     # composed elemental kernels. Returns None for a pure-dense contraction, so
@@ -2127,10 +2564,24 @@ def matmul(lhs, rhs, count: bool = False):
             )
         # Zero-fill broadcast that isn't densify-safe (a permuted dim order):
         # fall through to the tiled path, which raises the strict size error.
+    # Tiled path: the sole sparse contraction engine. It preserves output
+    # sparsity and resolves factored / block-diagonal contracted mids through
+    # its id-aware topology resolver (upstream apply_block_diagonal /
+    # _subdivide_coupled_blockdiag reconcile the two operands' factorings
+    # BEFORE the contraction). A genuinely irreconcilable size mismatch raises
+    # ValueError here, loudly. The former pure-diagonal / block-diagonal
+    # densifying fast-path fallbacks were removed (Phase bridge-cse): they only
+    # fired when tiled raised, and no live trajectory (ViT / ConvNet / MoE,
+    # exact + approx) reaches that fallback any more.
     rhs_out_dims, rhs_primal_dims, rhs_id_offset = _align_tensor_ids(lhs, rhs)
     rhs_dims = rhs_out_dims + rhs_primal_dims
     pairs = _build_matmul_topology(lhs, rhs_out_dims, rhs_primal_dims, rhs_id_offset)
     ctx = Ctx(lhs=lhs, rhs=rhs, pairs=pairs, rhs_id_offset=rhs_id_offset)
+    if _compact_frame_enabled():
+        _cf = _execute_compact(ctx, rhs_dims, count=count)
+        if _cf is not None:
+            _record_path("compact")
+            return _cf
     _record_path("tiled")
     out = _execute_tiled(ctx, rhs_dims)
     if count:
