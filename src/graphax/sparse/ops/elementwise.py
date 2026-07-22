@@ -194,6 +194,15 @@ def _promote_dense(d, partner_id):
                            block_size=d.size, block_axis=d.axis)
 
 
+def _partner(dims, oid):
+    """Index of the dim in `dims` whose id is `oid` (a sparse dim's other_id);
+    raises Topology mismatch (caught -> densify fallback) if it dangles."""
+    j = next((k for k, d in enumerate(dims) if d.id == oid), None)
+    if j is None:
+        raise ValueError(f"Topology mismatch: dangling other_id {oid}.")
+    return j
+
+
 def _resolve_dim_pairing(i, ldims, rdims, processed):
     """Pair dim i across (lhs, rhs); promote Dense↔Sparse to a synthetic 1-block sparse pair."""
     ld, rd = ldims[i], rdims[i]
@@ -215,20 +224,28 @@ def _resolve_dim_pairing(i, ldims, rdims, processed):
                 f"partner (rhs ids {[(int(d.id), d.is_sparse) for d in rdims]})."
             )
         processed.add(i); return "dense", (ld, rdims[rj])
+    # Pair the SPARSE primary dims by id too (mirror the dense branch): two
+    # different-id sparse blocks of equal extent at the same position would
+    # otherwise be combined silently. Fail loudly -> densify fallback.
+    if ld.id != rd.id:
+        raise ValueError(
+            f"Topology mismatch: sparse dim id {ld.id} (lhs) vs {rd.id} (rhs) "
+            f"at position {i} — permuted sparse pairing."
+        )
     if l_sp and r_sp:
-        j = next(k for k, d in enumerate(ldims) if d.id == ld.other_id)
+        j = _partner(ldims, ld.other_id)
         lp, rp = ldims[j], rdims[j]
         if not rp.is_sparse or rd.other_id != rp.id:
             raise ValueError("Topology mismatch: sparse pairs do not align.")
         processed.update([i, j]); return "sparse", (ld, lp, rd, rp)
     if l_sp:
-        j = next(k for k, d in enumerate(ldims) if d.id == ld.other_id)
+        j = _partner(ldims, ld.other_id)
         lp, rp = ldims[j], rdims[j]
         if not not rp.is_sparse:
             raise ValueError("Topology mismatch: expected DenseIndex partner.")
         processed.update([i, j])
         return "sparse", (ld, lp, _promote_dense(rd, rp.id), _promote_dense(rp, rd.id))
-    j = next(k for k, d in enumerate(rdims) if d.id == rd.other_id)
+    j = _partner(rdims, rd.other_id)
     rp, lp = rdims[j], ldims[j]
     if not not lp.is_sparse:
         raise ValueError("Topology mismatch: expected DenseIndex partner.")
@@ -512,6 +529,15 @@ def _should_emit_divisor_remainder(lhs, rhs, op, is_intersection):
         d.block_axis is None
         for d in (ao, ai, bo, bi)
         if d.block_size is not None and d.block_size > 1
+    ):
+        return None
+    # The K=1 emission flattens each val via reshape(-1) assuming the physical
+    # layout is (meta=axis 0, block_h=1, block_w=2). A different axis order
+    # would transpose the packed blocks; decline so the (always-correct)
+    # general path handles it instead of silently mis-packing.
+    if not all(
+        o.axis == 0 and o.block_axis == 1 and i.block_axis == 2
+        for o, i in ((ao, ai), (bo, bi))
     ):
         return None
     a_b_h, a_b_w = ao.block_size or 1, ai.block_size or 1

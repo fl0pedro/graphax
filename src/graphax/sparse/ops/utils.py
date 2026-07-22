@@ -371,6 +371,9 @@ def _prepare_physical_array(val: Array, axis_axes: Sequence[int | None]) -> Arra
     ``None`` for synthetic axes) lands at its position index in the result; trailing axes
     preserved in their original order. Used by both elementwise (per pair-axis) and matmul
     (per ``PairData`` triple)."""
+    # NB: a source axis >= val.ndim is INTENTIONAL for an implicit dim whose
+    # nominal axis lies beyond the compact val; it is treated as synthetic
+    # (size-1) below, so the `v < val.ndim` filter is load-bearing.
     valid = tuple(i for i, v in enumerate(axis_axes) if v is not None and v < val.ndim)
     src = tuple(axis_axes[i] for i in valid)
     leftover = [v for v in range(val.ndim) if v not in src]
