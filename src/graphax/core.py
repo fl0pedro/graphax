@@ -694,6 +694,74 @@ def _drain_transforms(tensor, post_first: bool = True):
     return _pre(_post(tensor)) if post_first else _post(_pre(tensor))
 
 
+def _peel_reconciler_transforms(tensor):
+    """Materialise the SHAPE-RECONCILING transforms queued on ``tensor`` into its
+    data BEFORE it enters a contraction, leaving pure RELABELS queued for the
+    post-contraction re-attach. Returns ``(reduced_tensor, remaining_pre,
+    remaining_post)`` where the remaining lists are the un-peeled transforms
+    (still to be re-attached to the contraction output).
+
+    A *reconciler* (concatenate slot embed/slice, broadcast reduce, slice) folds
+    an INFLATED operand axis back to its nominal size — its ``apply`` /
+    ``apply_inverse`` acts on the operand's OWN dims and STRICTLY shrinks the
+    logical size. A *relabel* (transpose / reshape / squeeze) is size-preserving
+    and is defined against the CONTRACTION-OUTPUT dim list, so applying it to the
+    operand indexes a dim it does not have (``IndexError``); it must ride the
+    re-attach path unchanged.
+
+    Why this matters: the matmul is CORRECT on nominal operands, but a diagonal
+    ``dW/dV`` contracted against a ``dV/dU`` whose ``U`` axis is stored INFLATED
+    (a concat slot at full width) emits a block-diagonal coupling that pins the
+    inflated size onto ``U`` — a transform-free NON-NOMINAL edge that then
+    broadcasts through every sibling merge until an ``N`` vs ``M`` (neither 1)
+    collision crashes ``_reconcile_broadcast_dims``. Folding the reconciler into
+    the operand first feeds the contraction a nominal ``U`` so no coupling forms.
+    Peels in the exact drain order (post forward, then pre reversed) and STOPS at
+    the first non-reconciler so the kept remainder is a valid transform prefix.
+    """
+    import math as _math
+
+    def _sz(x):
+        s = x.shape
+        return _math.prod(s) if s else 1
+
+    post = list(tensor.post_transforms)
+    pre = list(tensor.pre_transforms)
+    cur = tensor.copy()
+    cur.post_transforms = ()
+    cur.pre_transforms = ()
+
+    for k in range(len(post)):
+        before = _sz(cur)
+        try:
+            cand = post[k].apply(cur)
+            _assert_sparse_tensor_consistency(cand)
+        except Exception:
+            cand = None
+        if cand is None or _sz(cand) >= before:
+            cur.post_transforms = tuple(post[k:])
+            cur.pre_transforms = tuple(pre)
+            return cur, tuple(pre), tuple(post[k:])
+        cur = cand
+
+    for j in range(len(pre) - 1, -1, -1):
+        before = _sz(cur)
+        try:
+            cand = pre[j].apply_inverse(cur)
+            _assert_sparse_tensor_consistency(cand)
+        except Exception:
+            cand = None
+        if cand is None or _sz(cand) >= before:
+            cur.pre_transforms = tuple(pre[: j + 1])
+            cur.post_transforms = ()
+            return cur, tuple(pre[: j + 1]), ()
+        cur = cand
+
+    cur.pre_transforms = ()
+    cur.post_transforms = ()
+    return cur, (), ()
+
+
 # Face-like per-path approximation: the `transforms` entry for a vertex may be a
 # dict keyed by (primal_vertex_id, out_vertex_id) -> per-path hooks. This applies
 # the approximation at the OP boundary (contraction operands + result, join
@@ -946,6 +1014,59 @@ def _eliminate_vertex(
                     _pre_val = _h_pre(_pre_val)
                 if _perpath and _h_post is not None:
                     _post_val = _h_post(_post_val)
+
+                # Reconciliation drain (2026-07-21). An operand can carry
+                # ``seed_drainable`` transforms — concatenate slot embed/slice,
+                # head slices, position-embed broadcast — that reconcile its
+                # non-nominal STORED shape back to nominal (a concat slot is
+                # stored at the FULL concat width and sliced to its own width on
+                # drain; the stored edge is a bare identity-seed: empty dims,
+                # ``val is None``, only the queued reconciler). The old code rode
+                # those transforms THROUGH the contraction and re-attached them to
+                # the OUTPUT. That is correct only while the reconcilable axis
+                # stays a free dim: a diagonal ``dW/dV`` contracted against such a
+                # ``dV/dU`` couples W's axis to U's axis in a block-diagonal pair
+                # that PINS the full concat width onto ``U`` — a transform-free
+                # NON-NOMINAL edge (logical 32 on a nominal-16/-1 axis) that then
+                # broadcasts through every sibling merge until an ``N`` vs ``M``
+                # (neither 1) collision crashes ``_reconcile_broadcast_dims`` (the
+                # ViT-compress ``(1,32,8,16)`` vs ``(1,32,8,32)`` merge). Folding
+                # the reconciler into the OPERAND here feeds the contraction a
+                # nominal ``U`` so no coupling forms. Only the RELABEL remainder
+                # (``_pre_reattach`` / ``_post_reattach``) rides the re-attach.
+                # Gated on the approx config so EXACT AD (``transforms == ()``)
+                # keeps the operands' full queues and is byte-identical.
+                _pre_reattach = pre_val.pre_transforms
+                _post_reattach = post_val.post_transforms
+                if _perpath or _is_approx_cfg:
+                    if _pre_val.pre_transforms or _pre_val.post_transforms:
+                        _pre_val, _pre_rem_pre, _pre_rem_post = (
+                            _peel_reconciler_transforms(_pre_val)
+                        )
+                        _pre_reattach = _pre_rem_pre
+                    if _post_val.pre_transforms or _post_val.post_transforms:
+                        _post_val, _post_rem_pre, _post_rem_post = (
+                            _peel_reconciler_transforms(_post_val)
+                        )
+                        _post_reattach = _post_rem_post
+                    # Recompute the contraction decision from the PEELED operands.
+                    # ``_need_contract`` above was computed from the STORED
+                    # operands, where a concatenate/slice edge is a bare
+                    # identity-seed — ``_acts_as_identity`` sees the scalar seed
+                    # and chooses the pass-through. Peeling MATERIALISES that seed
+                    # into a real RECTANGULAR Jacobian (e.g. ``(8,32,8,16)`` for a
+                    # concat slot), which must be CONTRACTED, not passed through:
+                    # the stale decision returns the other operand verbatim
+                    # (``(8,32,8,32)``), pinning the concat width onto the input
+                    # axis. Only re-evaluated in the approx path, so EXACT AD is
+                    # untouched.
+                    _need_contract = (
+                        (_pre_val.val is not None and _post_val.val is not None)
+                        or (_post_val.val is None
+                            and not _acts_as_identity(_post_val))
+                        or (_pre_val.val is None
+                            and not _acts_as_identity(_pre_val))
+                    )
                 if _need_contract:
                     # A scalar × scalar contraction is an elementwise multiply:
                     # ``sparse_matmul`` rejects 0-rank operands, so it must NEVER
@@ -980,11 +1101,16 @@ def _eliminate_vertex(
                             out_size * edge_outval.dtype.itemsize,
                         )
 
-                elif pre_val.val is not None:
+                elif (_pre_val.val is not None if (_perpath or _is_approx_cfg)
+                      else pre_val.val is not None):
                     # post is a pure-diagonal identity up to its scalar_mult:
                     # pass pre through, FOLDING post's scalar_mult (a scalar /
                     # scaled-identity edge multiplies by it; dropping it was the
-                    # ``sum(z*sum(z))`` bug — 10·pre became pre).
+                    # ``sum(z*sum(z))`` bug — 10·pre became pre). In the approx
+                    # path a peeled operand's own ``val`` decides which side is the
+                    # identity (the stored ``pre_val`` may be a since-materialised
+                    # seed); EXACT AD keeps the original ``pre_val.val`` test and
+                    # is byte-identical.
                     edge_outval = _identity_passthrough(_pre_val, _post_val, "pre")
                     if count_ops:
                         muls += 1
@@ -993,12 +1119,20 @@ def _eliminate_vertex(
                     edge_outval = _identity_passthrough(_post_val, _pre_val, "post")
                     if count_ops:
                         muls += 1
-                # Offload the remain Jacobian transforms to the output tensor
-                if len(post_val.post_transforms) > 0:
-                    edge_outval = prepend_post_transforms(post_val, edge_outval)
+                # Offload the remaining (un-peeled) Jacobian transforms to the
+                # output tensor. ``_post_reattach`` / ``_pre_reattach`` are the
+                # operands' full queues on EXACT AD (byte-identical to the old
+                # ``prepend_post_transforms`` / ``append_pre_transforms``) and the
+                # RELABEL remainder after a reconciler peel in an approx config.
+                if len(_post_reattach) > 0:
+                    edge_outval.post_transforms = (
+                        tuple(_post_reattach) + tuple(edge_outval.post_transforms)
+                    )
 
-                if len(pre_val.pre_transforms) > 0:
-                    edge_outval = append_pre_transforms(pre_val, edge_outval)
+                if len(_pre_reattach) > 0:
+                    edge_outval.pre_transforms = (
+                        tuple(_pre_reattach) + tuple(edge_outval.pre_transforms)
+                    )
 
                 # A misaligned-contract matmul can emit a compressed output
                 # (BandedIndex / SetIndex). The consistency check and the
