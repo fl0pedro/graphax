@@ -203,6 +203,7 @@ def test_aoj_equals_jacve_under_custom_orders(order):
         assert _relerr(g, r) <= 1e-6
 
 
+
 @pytest.mark.parametrize("name,fn,args,argnums", CASES,
                          ids=[c[0] for c in CASES])
 @pytest.mark.parametrize("order", ORDERS)
@@ -213,7 +214,25 @@ def test_aoj_equals_jacve_with_approximations(name, fn, args, argnums, order,
     """Same equivalence with an APPROXIMATION applied: the per-vertex transform
     spec ``jacve`` accepts, driven identically through both paths."""
     spec = [(3, [micro])]
-    ref = _jacve_flat(fn, args, argnums, order, transforms=spec)
+
+    # A per-VERTEX transform spec lands the SAME micro-action on every edge of
+    # that vertex, and those edges do not share a geometry -- a Diag(i, j) that
+    # fits one may be illegal on another (wrong side of the out/primal split,
+    # an already-paired dim, an implicit axis). graphax rejects such an action
+    # loudly rather than silently mangling the tensor. That rejection is itself
+    # part of the semantics, so the invariant under test is the stronger one:
+    # jacve and the AOJ must agree on the SAME sequence, including agreeing to
+    # REJECT it. (The env masks these out up front so a policy never proposes
+    # one -- see alphagrad approx/common/masks.diag_valid_mask.)
+    try:
+        ref = _jacve_flat(fn, args, argnums, order, transforms=spec)
+    except ValueError as exc:
+        if "did not fit" not in str(exc).lower():
+            raise
+        with pytest.raises(ValueError, match="(?i)did not fit"):
+            _recover(_drive(fn, args, argnums, order, transforms=spec), args)
+        return
+
     ij = _drive(fn, args, argnums, order, transforms=spec)
     got, _ = _recover(ij, args)
     assert len(got) == len(ref)
@@ -241,7 +260,9 @@ def test_aoj_equals_reference_with_per_face_approximations(
     orig = gcore._eliminate_vertex
 
     def _patched(vertex, jx, graph, tgraph, vo, count_ops=False,
-                 transforms=(), face_transforms=None):
+                 transforms=(), face_transforms=None, **_kw):
+        # **_kw: forward-compatible with new graphax kwargs (e.g. var_vid)
+        # so a core.py signature change cannot silently break this harness.
         ft = (_slots(faces_of(graph, tgraph, int(vertex), jx))
               if int(vertex) == target else None)
         return orig(vertex, jx, graph, tgraph, vo, count_ops,
