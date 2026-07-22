@@ -1,4 +1,3 @@
-import jax
 import jax.numpy as jnp
 
 
@@ -46,9 +45,6 @@ def KerrSenn_metric(t, r, theta, phi):
 				2.*M*r*a**2*sintheta2/sigma)*sintheta2
 	gphit = -2.*M*r*a/sintheta2
 	return gtt, grr, gthetatheta, gphiphi, gphit
-
-def KerrSenn_Jacobian(t, r, theta, phi):
-    return jax.jacfwd(KerrSenn_metric)(t, r, theta, phi)
 
 
 ### Thermodynamics and Statistical Mechanics

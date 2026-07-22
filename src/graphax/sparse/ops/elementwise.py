@@ -633,7 +633,7 @@ def _emit_multi_set(lhs, rhs, op, geom):
 # Re-exports from ``_path_tracking``. See that module for the full design;
 # tests opt in via the ``track_paths()`` context manager or ``TRACK_PATHS=1``
 # env var. Production runs pay nothing.
-from ._path_tracking import record_path as _record_path, last_path  # noqa: E402, F401
+from ._path_tracking import record_path as _record_path  # noqa: E402, F401
 
 
 def elementwise(

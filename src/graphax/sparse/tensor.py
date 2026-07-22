@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import math
-from abc import ABC
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
-from functools import partial, wraps
+from dataclasses import replace
+from functools import wraps
 from math import prod
-from typing import Any, Callable, Literal, override
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax import Array
 from jax.tree_util import register_pytree_node_class
 from jax.typing import DTypeLike
@@ -378,16 +376,6 @@ class SparseTensor(SparseMathMixin):
     def primal_shape(self) -> tuple[int, ...]:
         return tuple(d.logical_size for d in self.primal_dims)
 
-    def sparse_pairs(self, key: Literal["out", "primal"] = "out") -> dict[int, int]:
-        res = {}
-        for d in self.out_dims:
-            if d.is_sparse:
-                if key == "out":
-                    res[d.id] = d.other_id
-                elif key == "primal":
-                    res[d.other_id] = d.id
-        return res
-
     @property
     def sparse_shape(self) -> tuple[int, ...]:
         sparse_dims = []
@@ -482,9 +470,6 @@ class SparseTensor(SparseMathMixin):
         if self.val is not None:
             return self.val
         return self.scalar_mult
-
-    def eff_val(self) -> Array | None:  # put this somewhere else?
-        return self.val
 
     def block_until_ready(self) -> SparseTensor:
         _ = self._target_arr.block_until_ready()
@@ -863,75 +848,6 @@ class SparseTensor(SparseMathMixin):
         return self._target_arr.on_device_size_in_bytes()
 
 
-def get_valid_pairings(
-    st: SparseTensor,
-    dim_id: int,
-    grouping_vector: tuple[int, ...] | None = None,
-) -> list[int]:
-    """Find dimension IDs that can be paired with ``dim_id`` in ``st``.
-
-    If ``grouping_vector`` is provided, dimensions already paired
-    (entry != -1) are excluded from the result.
-    """
-    target_dim = None
-    is_out_dim = False
-    target_dim_pos = -1
-
-    out_len = len(st.out_dims)
-
-    for i, d in enumerate(st.out_dims):
-        if d.id == dim_id:
-            target_dim = d
-            is_out_dim = True
-            target_dim_pos = i
-            break
-
-    if target_dim is None:
-        for i, d in enumerate(st.primal_dims):
-            if d.id == dim_id:
-                target_dim = d
-                target_dim_pos = out_len + i
-                break
-
-    if target_dim is None:
-        raise ValueError(f"Index ID {dim_id} not found in SparseTensor.")
-
-    if grouping_vector is not None and target_dim_pos < len(grouping_vector):
-        if grouping_vector[target_dim_pos] != -1:
-            return []
-
-    def _get_dim_pos(search_id: int) -> int:
-        for i, d in enumerate(st.out_dims):
-            if d.id == search_id:
-                return i
-        for i, d in enumerate(st.primal_dims):
-            if d.id == search_id:
-                return out_len + i
-        return -1
-
-    valid_ids: list[int] = []
-    if target_dim.is_sparse:
-        valid_ids = [target_dim.other_id]
-    else:
-        opposite_dims = st.primal_dims if is_out_dim else st.out_dims
-        for d in opposite_dims:
-            if (
-                not d.is_sparse
-                and math.gcd(target_dim.logical_size, d.logical_size) > 1
-            ):
-                valid_ids.append(d.id)
-
-    if grouping_vector is not None:
-        filtered_ids = []
-        for v_id in valid_ids:
-            idx = _get_dim_pos(v_id)
-            if idx != -1 and idx < len(grouping_vector) and grouping_vector[idx] == -1:
-                filtered_ids.append(v_id)
-        valid_ids = filtered_ids
-
-    return valid_ids
-
-
 def _subdivide_coupled_blockdiag(
     st, is_out1, rel_i, d1, is_out2, rel_j, d2, factor,
 ):
@@ -1207,6 +1123,9 @@ def _apply_block_diagonal(
         new_primal,
         val,
         scalar_mult=st.scalar_mult,
+        fill_value=st.fill_value,
+        pre_transforms=st.pre_transforms,
+        post_transforms=st.post_transforms,
         check_consistency=False,
     )
 

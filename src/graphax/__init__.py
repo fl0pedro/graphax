@@ -1,6 +1,5 @@
 import sys
 
-from . import instrumentation
 from .core import (
     grad,
     jacve,

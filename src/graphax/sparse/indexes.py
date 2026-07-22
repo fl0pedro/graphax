@@ -361,8 +361,3 @@ def DiagonalIndex(
     Historically named ``SparseIndex``; the new name better describes the
     underlying structure."""
     return Index(id, size, axis, other_id, block_size, block_axis)
-
-
-# Back-compat alias for the rename in Phase 8.A. Delete after every call
-# site migrates to ``DiagonalIndex``.
-SparseIndex = DiagonalIndex

@@ -1221,7 +1221,6 @@ def _row_band_spans(
         # b_hi: smallest b such that b*B_b_h >= a_hi, i.e., b >= ceil(a_hi/B_b_h).
         b_hi = -(-a_hi // B_b_h)
         b_lo = builtins.max(0, b_lo)
-        b_hi = builtins.min(M_b, b_hi)
         spans.append((b_lo, b_hi))
     return spans
 
@@ -1317,20 +1316,6 @@ def _should_emit_block_banded(
     # for aligned (divisor) cases that the natural meta-block storage already
     # handles tightly.
     if rp_cost >= dense_cost and cp_cost >= dense_cost:
-        return None
-
-    # Also fall through when the per-batch band is the trivial identity
-    # diagonal (``W=1``, identity offset, square per-batch counts). The
-    # existing 3-D ``val=(N, M_per*B_h, M_per*B_w)`` storage is equivalent to
-    # a per-batch pure block-diagonal and the wrapping doesn't add value at
-    # such granularity.
-    if (
-        W_rp == 1
-        and offset_rp == tuple(range(M_per_a))
-        and M_per_a == M_per_b
-        and W_cp == 1
-        and offset_cp == tuple(range(M_per_b))
-    ):
         return None
 
     # Pick the tighter orientation.

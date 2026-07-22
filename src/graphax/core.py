@@ -596,8 +596,7 @@ def _drain_or_unload_pre(post_val, pre_val, _post_val):
     bijective identity ``post @ apply(pre) == apply_inverse(post) @ pre`` lets us
     instead apply the INVERSE relabel to the cotangent VECTOR ``_post_val`` (free)
     and keep ``pre_val`` diagonal; otherwise densify via ``apply`` (unload), or
-    pass ``pre_val`` through. Shared by ``_eliminate_vertex`` and
-    ``_accumulate_edge_triplet`` so the two contraction paths cannot diverge."""
+    pass ``pre_val`` through. Used only by ``_eliminate_vertex``."""
     _pre_transforms = post_val.pre_transforms
     if (
         len(_pre_transforms) > 0
@@ -688,8 +687,10 @@ def _match_nominal_axes(d_shape, n_out, out_aval_shape, in_aval_shape):
 
 # GRAPHAX_KEEP_BLOCKDIAG=1: keep a pure block-diagonal (Diag) approx edge SPARSE
 # through the per-vertex reconciliation so its next contraction hits the batched
-# block-diagonal (GEMM) kernel rather than a full N x N densify. Sound only with
-# the idempotent produce_diag re-mask (see produce_diag._KEEP_BLOCKDIAG).
+# block-diagonal (GEMM) kernel rather than a full N x N densify. Sound because a
+# later UNIFORM Diag re-mask (micro_actions.apply_diag) is a no-op on an already
+# block-diagonal edge; a non-uniform (non-nestable) factor raises and core.py
+# then skips keeping that edge sparse.
 # Default ON: the sparse block-diagonal (batched-GEMM) path is the default; set
 # GRAPHAX_KEEP_BLOCKDIAG=0 to force the legacy densify path (regression/debug).
 _KEEP_BLOCKDIAG = os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "1") != "0"
@@ -1344,10 +1345,10 @@ def _eliminate_vertex(
                 if _is_approx_cfg and _is_approx(edge_outval):
                     # GRAPHAX_KEEP_BLOCKDIAG: keep a pure block-diagonal edge SPARSE
                     # so the next contraction routes through the batched block-
-                    # diagonal (GEMM) kernel instead of a full N x N densify. The
-                    # idempotent produce_diag re-mask makes a later uniform Diag on
-                    # this edge a sound no-op, so the load-bearing densify is not
-                    # needed here.
+                    # diagonal (GEMM) kernel instead of a full N x N densify. A later
+                    # UNIFORM Diag re-mask (micro_actions.apply_diag) is a sound no-op
+                    # on this already block-diagonal edge, so the load-bearing densify
+                    # is not needed here.
                     # GRAPHAX_KEEP_BLOCKDIAG generalised: keep any block-diagonal
                     # / implicit (val_dim=None) / structural (val=None) edge SPARSE
                     # when it is already at nominal shape — the downstream contraction
@@ -2466,99 +2467,3 @@ def cond_elemental_rule(primal_outs, primals, **params):
 
 
 multi_output_elemental_only_rules[cond_p] = cond_elemental_rule
-
-
-# ---------------------------------------------------------------------------
-# Three-point edge accumulation (work-in-progress)
-#
-# Accumulates a single edge i -> k by combining the partials i -> j and
-# j -> k into the existing graph, without eliminating j wholesale. This is
-# the building block for triplet-based elimination strategies.
-# ---------------------------------------------------------------------------
-
-
-def _accumulate_edge_triplet(
-    v_i,
-    v_j,
-    v_k,
-    graph: ComputationalGraph,
-    transpose_graph: ComputationalGraph,
-) -> None:
-    in_edges_map = transpose_graph.get(v_j)
-    out_edges_map = graph.get(v_j)
-    if not in_edges_map or not out_edges_map:
-        return
-
-    pre_raw = _force(in_edges_map.get(v_i))
-    post_raw = _force(out_edges_map.get(v_k))
-    if pre_raw is None or post_raw is None:
-        return
-
-    pre_val = pre_raw.copy()
-    post_val = post_raw.copy()
-
-    _pre_val = pre_val.copy()
-    _post_val = post_val.copy()
-
-    if len(pre_val.post_transforms) > 0 and post_val.val is not None:
-        _post_val = unload_post_transforms(post_val, pre_val)
-
-    # Seed-aware draining — shared with _eliminate_vertex so the two contraction
-    # paths cannot diverge (the cross-country / triplet schedule that an
-    # alphagrad order-optimiser drives must NOT re-introduce the O(n^2)
-    # densification the draining removes).
-    _post_val, _pre_val = _drain_or_unload_pre(post_val, pre_val, _post_val)
-
-    # Mirror _eliminate_vertex: a val=None operand only acts as a pure-diagonal
-    # identity pass-through when _acts_as_identity holds (else it's a non-identity
-    # structural Jacobian — broadcast/reduction — that must be contracted), and
-    # the pass-through must FOLD the identity operand's scalar_mult (dropping it
-    # was the sum(z*sum(z)) bug — 10·pre became pre).
-    _need_contract = (
-        (pre_val.val is not None and post_val.val is not None)
-        or (post_val.val is None and not _acts_as_identity(_post_val))
-        or (pre_val.val is None and not _acts_as_identity(_pre_val))
-    )
-    if _need_contract:
-        if _is_scalar_st(_post_val) and _is_scalar_st(_pre_val):
-            edge_outval = _post_val * _pre_val
-        else:
-            edge_outval = _post_val @ _pre_val
-    elif pre_val.val is not None:
-        edge_outval = _pre_val.copy(
-            scalar_mult=_scaled_mul_promote(_pre_val.scalar_mult, _post_val.scalar_mult)
-        )
-    else:
-        edge_outval = _post_val.copy(
-            scalar_mult=_scaled_mul_promote(_post_val.scalar_mult, _pre_val.scalar_mult)
-        )
-
-    if len(post_val.post_transforms) > 0:
-        edge_outval = prepend_post_transforms(post_val, edge_outval)
-    if len(pre_val.pre_transforms) > 0:
-        edge_outval = append_pre_transforms(pre_val, edge_outval)
-
-    existing = graph.get(v_i, {}).get(v_k)
-    if existing is not None:
-        _edge = _force(existing)
-        if _edge is not None:
-            edge_outval = _drain_transforms(edge_outval)
-            _edge = _drain_transforms(_edge)
-            edge_outval = edge_outval + _edge
-
-    graph[v_i][v_k] = edge_outval
-    transpose_graph[v_k][v_i] = edge_outval
-
-
-def execute_edge_accumulation(
-    triplets: Sequence[Tuple[int, int, int]],
-    graph: ComputationalGraph,
-    transpose_graph: ComputationalGraph,
-) -> None:
-    """Apply a sequence of triplet edge-accumulations.
-
-    Each triplet is ``(v_i, v_j, v_k)`` and contributes the partial
-    ``i -> j -> k`` to the edge ``i -> k``.
-    """
-    for v_i, v_j, v_k in triplets:
-        _accumulate_edge_triplet(v_i, v_j, v_k, graph, transpose_graph)
