@@ -7,6 +7,7 @@ from .core import (
     set_jit_fallback_order,
     set_pjit_elimination_order,
     value_and_grad,
+    inline_call_primitives,
 )
 
 from .sparse import sparse_tensor_zeros_like

@@ -199,6 +199,21 @@ def _has_recursive_macro_vertex(jaxpr) -> bool:
                for eqn in jaxpr.eqns)
 
 
+def inline_call_primitives(jaxpr, consts):
+    """Public alias of :func:`_inline_call_primitives`.
+
+    Anything that numbers vertices for a jaxpr MUST number them on the inlined
+    form, because that is what ``jacve`` / the AOJ actually eliminate: they
+    splice jit/pjit bodies in, which adds equations. An order built from the
+    raw ``jax.make_jaxpr`` output therefore addresses the wrong vertices and
+    leaves the spliced-in ones un-eliminated -- which the elimination then
+    rejects rather than silently returning a Jacobian missing every path
+    through them. Callers that tokenize a jaxpr or build an elimination order
+    should run it through here first. Returns ``(new_jaxpr, new_consts)``.
+    """
+    return _inline_call_primitives(jaxpr, consts)
+
+
 def _inline_call_primitives(jaxpr, consts):
     """Splice jit/pjit (and nested) bodies into the parent jaxpr so vertex
     elimination only ever sees primitives with registered elemental rules.
