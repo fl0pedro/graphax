@@ -2157,6 +2157,30 @@ def _build_graph(
     return env, graph, transpose_graph, vo_vertices
 
 
+_PRUNE_CACHE = None
+
+
+def prune_enabled() -> bool:
+    """``GRAPHAX_PRUNE=0`` -> skip the dead-vertex / non-argnum sweep.
+
+    Pruning silently removes vertices from the graph before the policy ever
+    sees them: inputs we do not differentiate for, and dead intermediates with
+    no input or no output edges (typically ``stop_gradient`` outputs). That is
+    the right default for plain AD, but for the RL setting it decides part of
+    the problem on the agent's behalf -- those vertices and the paths through
+    them are exactly the kind of structure we may want the policy to learn to
+    drop, or to approximate rather than drop.
+
+    Disabling it leaves the full graph, including edges the eliminator would
+    otherwise have deleted for free. The caller then owns the cost of dealing
+    with them. Lazy + cached so it stays a compile-time constant.
+    """
+    global _PRUNE_CACHE
+    if _PRUNE_CACHE is None:
+        _PRUNE_CACHE = os.environ.get("GRAPHAX_PRUNE", "1") != "0"
+    return _PRUNE_CACHE
+
+
 def _prune_graph(
     graph: ComputationalGraph,
     transpose_graph: ComputationalGraph,
@@ -2431,10 +2455,13 @@ def _get_eliminator(
     Builds the graph with ``argnums`` enabled so dead branches reachable only
     through non-differentiable inputs are pruned during construction. We still
     run ``_prune_graph`` afterward for the dead-intermediate-vertex sweep
-    (e.g. stop_gradient outputs).
+    (e.g. stop_gradient outputs) -- unless ``GRAPHAX_PRUNE=0``, which leaves
+    the full graph so a policy can decide for itself what to drop or
+    approximate (see :func:`prune_enabled`).
     """
     _, graph, transpose_graph, _ = _build_graph(jaxpr, args, consts, argnums)
-    _prune_graph(graph, transpose_graph, jaxpr, argnums)
+    if prune_enabled():
+        _prune_graph(graph, transpose_graph, jaxpr, argnums)
     return VertexEliminator(graph, transpose_graph)
 
 
