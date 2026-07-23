@@ -332,6 +332,7 @@ def jacve(
             Sequence[Union[Diag, Compress, Callable[["SparseTensor"], "SparseTensor"]]],
         ]
     ] = None,
+    face_transforms: dict = None,
 ) -> Callable:
     """
     Jacobian `fun` with respect to the `argnums` using the vertex elimination method.
@@ -391,6 +392,7 @@ def jacve(
             sparse_representation=sparse_representation,
             fresh_eliminator=was_inlined,
             transforms=transforms,
+            face_transforms=face_transforms,
         )
 
         # When count_ops is True, vertex_elimination_jaxpr returns (out, aux).
@@ -2341,6 +2343,7 @@ class VertexEliminator:
         ],
         vo_vertices: Set[core.Var],
         count_ops: bool,
+        face_transforms: dict = None,
     ):
         """Run elimination, reusing any cached prefix in the GraphState tree.
 
@@ -2401,6 +2404,13 @@ class VertexEliminator:
 
         for vertex in order[prefix_length:]:
             v_transforms = t_dict.get(vertex, ())
+            # PER-FACE slots. ``face_transforms`` is {vertex: {face_key:
+            # (lhs, rhs, res)}}; _eliminate_vertex already supports the inner
+            # dict, it was simply never reachable from jacve. lhs/rhs land on
+            # pre_val/post_val BEFORE the contraction, so this is what lets a
+            # policy approximate pre1 differently from pre2 -- something the
+            # per-vertex ``transforms`` list structurally cannot express.
+            _v_faces = (face_transforms or {}).get(vertex)
             _adds, _muls, _fmas, _mem = _eliminate_vertex(
                 vertex,
                 jaxpr,
@@ -2409,6 +2419,7 @@ class VertexEliminator:
                 vo_vertices,
                 count_ops=count_ops,
                 transforms=v_transforms,
+                face_transforms=_v_faces,
                 var_vid=_var_vid,
             )
             adds += _adds
@@ -2481,6 +2492,7 @@ def vertex_elimination_jaxpr(
             Sequence[Union[Diag, Compress, Callable[["SparseTensor"], "SparseTensor"]]],
         ]
     ] = None,
+    face_transforms: dict = None,
 ) -> Sequence[Sequence[jnp.ndarray]]:
     """
     Function that generates a new vertex elimination jaxpression based on the
@@ -2565,7 +2577,8 @@ def vertex_elimination_jaxpr(
     set_approx_active(_approx_on)
     try:
         graph, _, adds, muls, fmas, mem, counts = eliminator.eliminate(
-            order, jaxpr, transforms, vo_vertices, count_ops
+            order, jaxpr, transforms, vo_vertices, count_ops,
+            face_transforms=face_transforms,
         )
     finally:
         set_approx_active(_prev_approx)
