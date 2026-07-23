@@ -978,7 +978,7 @@ class IncrementalPathTokenizer:
     """
 
     def __init__(self, jaxpr, argnums, consts, args, digit_base: int = 10,
-                 track_faces: bool = True):
+                 track_faces: bool = True, vocab_size: int | None = None):
         from graphax.incremental import IncrementalJaxpr
         self.ij = IncrementalJaxpr(jaxpr, argnums, consts, args,
                                    track_faces=track_faces)
@@ -994,7 +994,26 @@ class IncrementalPathTokenizer:
         # able from a variable name (the model must learn the distinction from
         # context: a name after ``fns`` / before ``=...:`` is a function).
         self._names = {}
-        self._namegen = name_gen_python_style(digit_base, digit_base + 400000)
+        # NAME ALPHABET. Names are positional sequences over this alphabet --
+        # a, b, ..., aa, ab, ... -- so a bounded alphabet still spells
+        # unlimited distinct names, it just uses more tokens for later ones.
+        # The old hardcoded 400000 defeated that: with an alphabet that large
+        # every name fits in ONE atom, and since a name atom emits as
+        # ``len(vocab) + atom``, token ids grew without bound and no fixed
+        # embedding table could hold them. Bounding it is what makes the
+        # positional scheme actually do its job.
+        if vocab_size is None:
+            self._name_alphabet = 400000
+        else:
+            self._name_alphabet = int(vocab_size) - self._L - digit_base
+            if self._name_alphabet < 2:
+                raise ValueError(
+                    f"vocab_size={vocab_size} leaves {self._name_alphabet} name "
+                    f"symbols after {self._L} reserved + {digit_base} digits; "
+                    "need at least 2 to spell multi-token names."
+                )
+        self._namegen = name_gen_python_style(
+            digit_base, digit_base + self._name_alphabet)
         # (prim, params-key) -> fn name. EVERY op with non-array parameters is
         # defined as a function (dot_general, reshape, ...); parameterless ops
         # (add, max, ...) are written inline.
@@ -1420,11 +1439,18 @@ class IncrementalPathTokenizer:
         return toks
 
     def max_token_id(self):
-        """Largest token id an emitted stream can currently use: ``len(vocab)``
-        plus the highest name atom allocated so far. Size embeddings from this."""
+        """Largest token id this tokenizer can EVER emit.
+
+        With a bounded name alphabet this is static -- ``len(vocab) +
+        digit_base + alphabet - 1`` -- and independent of graph size, because a
+        longer graph spends more TOKENS per name rather than larger ids. Size
+        embeddings from this. (With the unbounded default it degrades to the
+        running maximum, which is why callers should pass ``vocab_size``.)"""
+        cap = self._L + self.digit_base + self._name_alphabet - 1
         top = max((int(a, 16) for atoms in self._names.values() for a in atoms),
                   default=self.digit_base - 1)
-        return self._L + top
+        return min(cap, self._L + top) if self._name_alphabet >= 400000 \
+            else cap
 
     def decode(self, toks):
         out = []

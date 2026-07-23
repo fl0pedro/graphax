@@ -95,3 +95,55 @@ def test_eliminating_more_only_grows_the_stream():
         lengths.append(lengths[-1] + len(step))
     assert lengths == sorted(lengths), "stream length must be monotone"
     assert lengths[-1] > lengths[0], "eliminations must emit something"
+
+
+# ---------------------------------------------------------------------------
+# Bounded name alphabet
+# ---------------------------------------------------------------------------
+
+def _name_hungry():
+    def big(x, y):
+        v = x
+        for _ in range(12):
+            v = jnp.tanh(v * y) + jnp.sin(v)
+        return jnp.sum(v), jnp.sum(v * y)
+    return big, (jnp.ones((4,)) * 0.5, jnp.ones((4,)) * 0.3)
+
+
+def test_bounded_vocab_keeps_every_id_in_range():
+    """Names are POSITIONAL sequences over the alphabet (a, b, .., aa, ab, ..),
+    so a bounded alphabet still spells unlimited names -- it just spends more
+    tokens on later ones. The ids must therefore stay inside vocab_size no
+    matter how many names the graph needs."""
+    fn, args = _name_hungry()
+    cj = jax.make_jaxpr(fn)(*args)
+    order = list(range(1, len(cj.jaxpr.eqns) + 1))
+    tk = IncrementalPathTokenizer(cj.jaxpr, (0, 1), cj.literals, args,
+                                  vocab_size=512)
+    toks = list(tk.capture_stream(order))
+    assert len(tk._names) > 500, "need a name-hungry graph for this to mean anything"
+    assert max(int(t) for t in toks) < 512
+    assert int(tk.max_token_id()) < 512
+    assert max(len(a) for a in tk._names.values()) >= 2, (
+        "with 500+ names and a 270-symbol alphabet, names MUST go multi-atom")
+
+
+def test_bounded_vocab_costs_tokens_not_ids():
+    """The bound trades id range for sequence length -- that is the whole deal."""
+    fn, args = _name_hungry()
+    cj = jax.make_jaxpr(fn)(*args)
+    order = list(range(1, len(cj.jaxpr.eqns) + 1))
+    a = IncrementalPathTokenizer(cj.jaxpr, (0, 1), cj.literals, args)
+    b = IncrementalPathTokenizer(cj.jaxpr, (0, 1), cj.literals, args,
+                                 vocab_size=512)
+    ta, tb = list(a.capture_stream(order)), list(b.capture_stream(order))
+    assert max(tb) < max(ta), "bounded run must use smaller ids"
+    assert len(tb) > len(ta), "and pay for it in tokens"
+
+
+def test_vocab_too_small_to_spell_names_is_rejected():
+    fn, args = _name_hungry()
+    cj = jax.make_jaxpr(fn)(*args)
+    with pytest.raises(ValueError, match="name symbols"):
+        IncrementalPathTokenizer(cj.jaxpr, (0, 1), cj.literals, args,
+                                 vocab_size=240)
