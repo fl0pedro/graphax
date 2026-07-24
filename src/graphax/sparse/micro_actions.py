@@ -167,41 +167,62 @@ class Compress:
 # env-side translator (looks the int up to construct a ``Quant``) — same
 # convention as :data:`COMPRESS_KINDS`.
 def _get_quant_dtypes():
+    """The candidate dtype catalog — ENUMERATED, not hand-picked.
+
+    Every low-precision float ``ml_dtypes`` ships (``float4`` / ``float6`` /
+    ``float8_*``) plus the standard float/int ladder is listed here as a
+    *candidate*. Which candidates this backend can actually store and contract
+    is decided by the runtime scan (:func:`verify_hardware_compat` /
+    :func:`quant_hardware_masks`), never curated in this list — so a new
+    ml_dtypes release widens the catalog for free and an unsupported type is
+    masked out by the scan rather than silently omitted.
+    """
     import jax
     import jax.numpy as jnp
-    # 64-bit dtypes are only available if explicitly enabled.
-    x64_enabled = jax.config.jax_enable_x64
-    
-    dtypes = []
-    # 64-bit block
-    if x64_enabled:
-        dtypes.extend([jnp.float64, jnp.int64, jnp.uint64])
-        
-    # Standard 32/16 bit
-    dtypes.extend([
+    try:
+        import ml_dtypes
+    except Exception:
+        ml_dtypes = None
+
+    candidates = []
+    # 64-bit only when x64 is enabled (else it silently truncates to 32-bit and
+    # would just duplicate the 32-bit entries).
+    if jax.config.jax_enable_x64:
+        candidates += [jnp.float64, jnp.int64, jnp.uint64]
+    # Standard 32/16-bit floats + the full signed/unsigned integer ladder.
+    candidates += [
         jnp.float32, jnp.float16, jnp.bfloat16,
-        jnp.int32, jnp.uint32,
-        jnp.int16, jnp.uint16,
-        jnp.int8, jnp.uint8,
-    ])
-    
-    # FP8 variants (only include if jax natively supports them to avoid AttributeError)
-    if hasattr(jnp, "float8_e4m3fn"):
-        dtypes.append(jnp.float8_e4m3fn)
-    if hasattr(jnp, "float8_e4m3b11fnuz"):
-        dtypes.append(jnp.float8_e4m3b11fnuz)
-    if hasattr(jnp, "float8_e5m2"):
-        dtypes.append(jnp.float8_e5m2)
-    if hasattr(jnp, "float8_e5m2fnuz"):
-        dtypes.append(jnp.float8_e5m2fnuz)
-        
-    # Sub-byte variants
-    if hasattr(jnp, "int4"):
-        dtypes.append(jnp.int4)
-    if hasattr(jnp, "uint4"):
-        dtypes.append(jnp.uint4)
-        
-    return tuple(jnp.dtype(d).name for d in dtypes)
+        jnp.int32, jnp.uint32, jnp.int16, jnp.uint16, jnp.int8, jnp.uint8,
+    ]
+    # EVERY sub-8-bit / 8-bit float ml_dtypes exposes.
+    if ml_dtypes is not None:
+        for name in sorted(dir(ml_dtypes)):
+            if name.startswith("_"):
+                continue
+            if not name.startswith(("float8", "float6", "float4")):
+                continue
+            obj = getattr(ml_dtypes, name)
+            if isinstance(obj, type):
+                candidates.append(obj)
+    # Sub-byte integers (stored in an int8/uint8 container).
+    for name in ("int4", "uint4", "int2", "uint2"):
+        obj = getattr(ml_dtypes, name, None) if ml_dtypes is not None else None
+        obj = obj if obj is not None else getattr(jnp, name, None)
+        if obj is not None:
+            candidates.append(obj)
+
+    # Keep name-resolvable dtypes only, de-duplicated by canonical name in
+    # first-seen order (this order is the index space the quant head selects).
+    seen, names = set(), []
+    for d in candidates:
+        try:
+            n = jnp.dtype(d).name
+        except Exception:
+            continue
+        if n not in seen:
+            seen.add(n)
+            names.append(n)
+    return tuple(names)
 
 QUANT_DTYPES = _get_quant_dtypes()
 
@@ -234,6 +255,35 @@ def verify_hardware_compat():
                 pass
                 
     return jnp.array(avail_mask, dtype=jnp.float32), compat_matrix
+
+
+_QUANT_HW_MASKS = None
+
+
+def quant_hardware_masks():
+    """The one-time hardware scan ``(avail_mask, compat_matrix)`` — memoized.
+
+    :func:`verify_hardware_compat` probes ``jnp.dot`` for every dtype and every
+    ordered dtype PAIR, a real host-side cost, so it runs ONCE per process and
+    the static tables are cached. Consumers:
+
+    * ``avail_mask`` ``(N,)`` — which :data:`QUANT_DTYPES` this backend can store
+      and self-contract. This is the scan-driven catalog: it masks the quant
+      head's dtype choices (an unsupported type stays in the index space but is
+      never selectable) — the "add" decision.
+    * ``compat_matrix`` ``(N, N)`` — which ordered pairs contract natively. A
+      dtype whose row is self-only (e.g. ``int4`` ↔ ``int4``) is what makes the
+      contraction coupling forced: when ``pre`` picks it, ``post`` inherits it —
+      the "mask / couple" decision.
+
+    Warm this once at build (eagerly, before any ``jit``) so the ``jnp.dot``
+    probes never run under trace.
+    """
+    global _QUANT_HW_MASKS
+    if _QUANT_HW_MASKS is None:
+        _QUANT_HW_MASKS = verify_hardware_compat()
+    return _QUANT_HW_MASKS
+
 
 NUM_QUANT_DTYPES = len(QUANT_DTYPES)
 QUANT_DTYPE_INDEX: dict[str, int] = {d: i for i, d in enumerate(QUANT_DTYPES)}
