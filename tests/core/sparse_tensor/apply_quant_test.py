@@ -191,6 +191,43 @@ def test_quant_scale_sign_must_be_plus_or_minus_one():
         Quant("uint8", scale_sign=0)
 
 
+def test_dtype_attributes_are_a_unique_key_for_usable_dtypes():
+    """The factored quant heads resolve a chosen ``(kind, bits, exp, mantissa,
+    bias, finite, uz)`` tuple back to one dtype, so the tuple must be unique
+    across every dtype this backend can actually use."""
+    from graphax.sparse.micro_actions import (
+        QUANT_DTYPES, QUANT_DTYPE_ATTRS, quant_hardware_masks)
+    avail = np.asarray(quant_hardware_masks()[0])
+    seen: dict = {}
+    for name, attrs, a in zip(QUANT_DTYPES, QUANT_DTYPE_ATTRS, avail):
+        if a <= 0.5:
+            continue
+        assert attrs not in seen, f"{name} and {seen[attrs]} share attrs {attrs}"
+        seen[attrs] = name
+
+
+def test_dtype_attributes_known_values():
+    """Spot-check the decomposition, incl. bias = 1 - minexp and the fp8
+    finite / unsigned-zero suffix parse."""
+    from graphax.sparse.micro_actions import QUANT_DTYPES, QUANT_DTYPE_ATTRS
+    idx = {n: i for i, n in enumerate(QUANT_DTYPES)}
+    expect = {
+        "float32": (0, 32, 8, 23, 127, 0, 0),
+        "bfloat16": (0, 16, 8, 7, 127, 0, 0),
+        "float8_e4m3fn": (0, 8, 4, 3, 7, 1, 0),
+        "float8_e4m3": (0, 8, 4, 3, 7, 0, 0),
+        "float8_e4m3fnuz": (0, 8, 4, 3, 8, 1, 1),
+        "float8_e4m3b11fnuz": (0, 8, 4, 3, 11, 1, 1),
+        "float8_e5m2": (0, 8, 5, 2, 15, 0, 0),
+        "float8_e5m2fnuz": (0, 8, 5, 2, 16, 1, 1),
+        "int8": (1, 8, 0, 0, 0, 1, 0),
+        "uint4": (2, 4, 0, 0, 0, 1, 0),
+    }
+    for n, v in expect.items():
+        if n in idx:
+            assert QUANT_DTYPE_ATTRS[idx[n]] == v, (n, QUANT_DTYPE_ATTRS[idx[n]])
+
+
 def test_quant_signed_target_is_unchanged_by_sign_plus_one():
     """A signed target with the default sign reduces to the old symmetric
     quantizer (guards the no-regression claim for the int path)."""

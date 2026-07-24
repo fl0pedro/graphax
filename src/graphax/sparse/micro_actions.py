@@ -289,6 +289,56 @@ NUM_QUANT_DTYPES = len(QUANT_DTYPES)
 QUANT_DTYPE_INDEX: dict[str, int] = {d: i for i, d in enumerate(QUANT_DTYPES)}
 
 
+# Attribute field indices into a :data:`QUANT_DTYPE_ATTRS` row.
+(QA_KIND, QA_BITS, QA_EXP, QA_MANTISSA, QA_BIAS, QA_FINITE, QA_UZ) = range(7)
+# ``kind`` values.
+QK_FLOAT, QK_INT, QK_UINT = 0, 1, 2
+
+
+def _dtype_attributes(name: str) -> tuple[int, int, int, int, int, int, int]:
+    """Decompose a :data:`QUANT_DTYPES` name into semantic attributes.
+
+    Returns ``(kind, bits, exp, mantissa, bias, finite, unsigned_zero)`` — the
+    factored representation the policy's quant heads select over:
+
+    * ``kind`` ∈ ``{QK_FLOAT, QK_INT, QK_UINT}``.
+    * ``bits`` — the LOGICAL width, i.e. the numeric token in the name
+      (``float8`` → 8, ``int4`` → 4, ``bfloat16`` → 16), not the storage
+      container's size (``int4`` is stored in an int8).
+    * For floats: ``exp`` / ``mantissa`` from ``ml_dtypes.finfo`` and
+      ``bias = 1 - finfo.minexp`` (recovers 7 for e4m3fn, 11 for e4m3b11fnuz,
+      16 for e5m2fnuz, 127 for float32/bfloat16 — the smallest-normal exponent
+      is ``1 - bias``). ``finite`` = 1 when the fp8 name carries an ``fn`` suffix
+      (no infinities); ``unsigned_zero`` = 1 for ``fnuz`` (no negative zero).
+    * Integers carry ``exp = mantissa = bias = 0``, ``finite = 1``,
+      ``unsigned_zero = 0``.
+
+    ``(kind, bits, exp, mantissa, bias, finite, unsigned_zero)`` is a UNIQUE key
+    for every dtype in the catalog (asserted in the tests), so the factored
+    heads can resolve their chosen tuple back to exactly one dtype.
+    """
+    import re
+    m = re.match(r"(u?int|float|bfloat)(\d+)", name)
+    bits = int(m.group(2)) if m else jnp.dtype(name).itemsize * 8
+    if name.startswith("uint"):
+        return (QK_UINT, bits, 0, 0, 0, 1, 0)
+    if name.startswith("int"):
+        return (QK_INT, bits, 0, 0, 0, 1, 0)
+    import ml_dtypes
+    fi = ml_dtypes.finfo(jnp.dtype(name))
+    exp, mantissa = int(fi.nexp), int(fi.nmant)
+    bias = 1 - int(fi.minexp)
+    suffix = re.search(r"e\d+m\d+(.*)$", name)
+    tail = suffix.group(1) if suffix else ""
+    finite = 1 if "fn" in tail else 0
+    unsigned_zero = 1 if "uz" in tail else 0
+    return (QK_FLOAT, bits, exp, mantissa, bias, finite, unsigned_zero)
+
+
+# One attribute row per QUANT_DTYPES entry (same index space).
+QUANT_DTYPE_ATTRS: tuple = tuple(_dtype_attributes(n) for n in QUANT_DTYPES)
+
+
 @dataclass(frozen=True)
 class Quant:
     """Cast :attr:`SparseTensor.val` to a chosen JAX dtype.
