@@ -166,16 +166,75 @@ class Compress:
 # is the wire-format contract between a policy head (samples an int) and the
 # env-side translator (looks the int up to construct a ``Quant``) — same
 # convention as :data:`COMPRESS_KINDS`.
-QUANT_DTYPES: tuple[str, ...] = (
-    "bool",
-    "int2", "int4", "int8", "int16", "int32", "int64",
-    "uint2", "uint4", "uint8", "uint16", "uint32", "uint64",
-    "float4_e2m1fn",
-    "float8_e3m4", "float8_e4m3", "float8_e4m3b11fnuz", "float8_e4m3fn",
-    "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz", "float8_e8m0fnu",
-    "bfloat16", "float16", "float32", "float64",
-    "complex64", "complex128",
-)
+def _get_quant_dtypes():
+    import jax
+    import jax.numpy as jnp
+    # 64-bit dtypes are only available if explicitly enabled.
+    x64_enabled = jax.config.jax_enable_x64
+    
+    dtypes = []
+    # 64-bit block
+    if x64_enabled:
+        dtypes.extend([jnp.float64, jnp.int64, jnp.uint64])
+        
+    # Standard 32/16 bit
+    dtypes.extend([
+        jnp.float32, jnp.float16, jnp.bfloat16,
+        jnp.int32, jnp.uint32,
+        jnp.int16, jnp.uint16,
+        jnp.int8, jnp.uint8,
+    ])
+    
+    # FP8 variants (only include if jax natively supports them to avoid AttributeError)
+    if hasattr(jnp, "float8_e4m3fn"):
+        dtypes.append(jnp.float8_e4m3fn)
+    if hasattr(jnp, "float8_e4m3b11fnuz"):
+        dtypes.append(jnp.float8_e4m3b11fnuz)
+    if hasattr(jnp, "float8_e5m2"):
+        dtypes.append(jnp.float8_e5m2)
+    if hasattr(jnp, "float8_e5m2fnuz"):
+        dtypes.append(jnp.float8_e5m2fnuz)
+        
+    # Sub-byte variants
+    if hasattr(jnp, "int4"):
+        dtypes.append(jnp.int4)
+    if hasattr(jnp, "uint4"):
+        dtypes.append(jnp.uint4)
+        
+    return tuple(d.name if hasattr(d, 'name') else str(d) for d in dtypes)
+
+QUANT_DTYPES = _get_quant_dtypes()
+
+def verify_hardware_compat():
+    """Dynamically verify jnp.dot compatibility across all QUANT_DTYPES."""
+    import jax
+    import jax.numpy as jnp
+    
+    avail_mask = []
+    for dt in QUANT_DTYPES:
+        try:
+            x = jnp.zeros((2, 2), dtype=dt)
+            jnp.dot(x, x)
+            avail_mask.append(1.0)
+        except Exception:
+            avail_mask.append(0.0)
+    
+    N = len(QUANT_DTYPES)
+    compat_matrix = jnp.zeros((N, N), dtype=jnp.float32)
+    for i, dt1 in enumerate(QUANT_DTYPES):
+        for j, dt2 in enumerate(QUANT_DTYPES):
+            if not avail_mask[i] or not avail_mask[j]:
+                continue
+            try:
+                x = jnp.zeros((2, 2), dtype=dt1)
+                y = jnp.zeros((2, 2), dtype=dt2)
+                jnp.dot(x, y)
+                compat_matrix = compat_matrix.at[i, j].set(1.0)
+            except Exception:
+                pass
+                
+    return jnp.array(avail_mask, dtype=jnp.float32), compat_matrix
+
 NUM_QUANT_DTYPES = len(QUANT_DTYPES)
 QUANT_DTYPE_INDEX: dict[str, int] = {d: i for i, d in enumerate(QUANT_DTYPES)}
 
