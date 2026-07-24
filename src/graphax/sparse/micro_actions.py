@@ -201,7 +201,7 @@ def _get_quant_dtypes():
     if hasattr(jnp, "uint4"):
         dtypes.append(jnp.uint4)
         
-    return tuple(d.name if hasattr(d, 'name') else str(d) for d in dtypes)
+    return tuple(jnp.dtype(d).name for d in dtypes)
 
 QUANT_DTYPES = _get_quant_dtypes()
 
@@ -257,15 +257,29 @@ class Quant:
     promotion path; the ops upcast operands to their highest common dtype
     before arithmetic (see :func:`graphax.sparse.ops.utils._compute_dtype`),
     so a quantized ``val`` is stored narrow but computable everywhere.
+
+    ``scale_sign`` ∈ ``{+1, -1}`` selects which arm of the value range fills an
+    UNSIGNED target. The quantizer stays symmetric-about-zero (no zero-point):
+    for ``+1`` the positive half of the values maps onto ``[0, dtype_max]`` and
+    the negative half clips to 0; for ``-1`` the negative half's magnitudes map
+    on and the positive half clips. The chosen sign is folded into
+    ``scalar_mult`` so ``val * scalar_mult`` dequantizes the kept arm exactly.
+    For signed / float targets the sign is a benign symmetry (they already
+    represent both arms), so it only materially changes unsigned quantization.
     """
 
     dtype: str
+    scale_sign: int = 1
 
     def __post_init__(self):
         if self.dtype not in QUANT_DTYPE_INDEX:
             raise ValueError(
                 f"Quant.dtype must be one of {QUANT_DTYPES!r}, "
                 f"got {self.dtype!r}."
+            )
+        if self.scale_sign not in (1, -1):
+            raise ValueError(
+                f"Quant.scale_sign must be +1 or -1, got {self.scale_sign!r}."
             )
 
 
@@ -366,9 +380,20 @@ def apply_diag(st: SparseTensor, action: Diag) -> SparseTensor:
             return _subdivide_coupled_blockdiag(
                 st, is_out1, rel_i, d1, is_out2, rel_j, d2, factor
             )
-        # Coupled but NOT same-factor and NOT a valid finer subdivision (coarser,
-        # non-multiple, or non-divisor block). This is a non-nestable re-mask: the
-        # legacy path would silently return st unchanged (v1==v2 no-op) => UNDER-mask.
+        # COARSER factor on a finer coupled block-diagonal: the existing structure
+        # already satisfies the coarser constraint (blocks of cur_meta automatically
+        # satisfy any factor that divides cur_meta, or factor==1 which is the trivial
+        # "full diagonal" already implied by the coupling). Treat as no-op.
+        if (
+            coupled
+            and cur_meta
+            and factor < cur_meta
+            and (factor == 1 or cur_meta % factor == 0)
+        ):
+            return st
+        # Coupled but NOT same-factor, NOT a valid finer subdivision, and NOT a
+        # coarser-subsumed factor. This is a non-nestable re-mask: the legacy path
+        # would silently return st unchanged (v1==v2 no-op) => UNDER-mask.
         # Reject explicitly so the caller drops it rather than applying a wrong
         # (lighter) approximation. The implicit pure-diagonal pair (axis is None) is
         # NOT rejected here — it is handled as a genuine no-op just below.
@@ -380,9 +405,10 @@ def apply_diag(st: SparseTensor, action: Diag) -> SparseTensor:
         ):
             raise ValueError(
                 f"Diag: cannot re-mask a coupled block-diagonal (meta={cur_meta}) "
-                f"by factor={factor}: not the same factor and not a finer divisor "
-                f"subdivision (factor must be a multiple of the current meta and "
-                f"divide both logical sizes)."
+                f"by factor={factor}: not the same factor, not a finer subdivision "
+                f"(factor must be a multiple of cur_meta and divide both logical "
+                f"sizes), and not a coarser-subsumed factor (cur_meta must be "
+                f"divisible by factor)."
             )
 
     if N1 % factor != 0 or N2 % factor != 0:
@@ -673,26 +699,44 @@ def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
         #     sm' = scalar_mult * s                        # val*sm' ~= val
         # All-zero ``val`` -> s would be 0; guard to a plain astype no-op
         # (the zeros quantize to zeros, scalar_mult unchanged).
-        absmax = jnp.max(jnp.abs(st.val))
-        dmax = _int_dtype_max(target)
+        # Work from the DEQUANTIZED logical value (``val * scalar_mult``) so
+        # re-quantization composes and the sign is authoritative (a val already
+        # narrow from a prior Quant carries its polarity in scalar_mult):
+        #     logical = val * scalar_mult                  # true signed values
+        #     s       = max(|logical|) / dtype_max(target) # scale to the TARGET's
+        #                                                  # max, not the value's
+        #     q       = round(logical * sign / s)          # integer codes
+        #     sm'     = s * sign                            # q * sm' ~= logical
+        # For a SIGNED / float-scaled target ``sign`` is a benign symmetry and
+        # this reduces to the previous symmetric quantizer. For an UNSIGNED
+        # target only the ``sign`` arm of ``logical`` is kept (the other clips to
+        # 0) and ``sign`` folds into ``sm'`` so the kept arm dequantizes with its
+        # original polarity — no zero-point / offset is ever stored.
+        sm = 1.0 if st.scalar_mult is None else st.scalar_mult
+        logical = st.val.astype(jnp.float32) * jnp.asarray(sm, jnp.float32)
+        sign = jnp.float32(action.scale_sign)
+        absmax = jnp.max(jnp.abs(logical))
+        dmax = _int_dtype_max(target)                # target's max magnitude
         s = absmax / dmax
-        # When val is all-zero (absmax==0) keep s=1 so we don't divide by 0 and
-        # the codes stay zeros; scalar_mult is then multiplied by 1 (no-op).
+        # All-zero ``val`` -> absmax 0 -> keep s=1 (codes stay zeros, no div-by-0).
         s_safe = jnp.where(s > 0, s, jnp.ones_like(s))
-        q = jnp.round(st.val.astype(jnp.float32) / s_safe)
-        # Clamp to the representable symmetric range before the narrow cast so a
-        # round-half-away rounding at the extreme can't wrap (e.g. round to +128
-        # for int8). Sub-byte ints are stored in an int8/uint8 container but the
-        # logical range is narrower, so clamp to [-dmax-?, dmax]; use the true
-        # iinfo range of the target's logical dtype.
-        lo, hi = _int_dtype_range(target)
-        # ``q`` is float32; clip with FLOAT bounds. Passing the raw Python ints
-        # (e.g. int64's -9.2e18) as jit args overflows JAX's argument parser
-        # ("OverflowError ... argument path is min"). float() bounds are finite
-        # and exact enough for the clamp (the scale already keeps |q| <= dmax).
-        q = jnp.clip(q, jnp.float32(lo), jnp.float32(hi))
+        if jnp.issubdtype(target, jnp.unsignedinteger):
+            # Sign-flip half-range: keep the arm selected by ``sign``; clip the
+            # other to 0. The magnitudes fill [0, dtype_max].
+            kept = jnp.clip(logical * sign, 0.0, None)
+            q = jnp.round(kept / s_safe)
+            q = jnp.clip(q, 0.0, jnp.float32(dmax))
+        else:
+            q = jnp.round(logical * sign / s_safe)
+            # Clamp to the target's logical range before the narrow cast so a
+            # round-half-away at the extreme can't wrap; use FLOAT bounds (raw
+            # int64 bounds overflow JAX's jit argument parser).
+            lo, hi = _int_dtype_range(target)
+            q = jnp.clip(q, jnp.float32(lo), jnp.float32(hi))
         new_val = q.astype(target)
-        new_scalar_mult = _scaled_mul(st.scalar_mult, s_safe)
+        # sm' REPLACES scalar_mult (its old value is already folded into the
+        # quantized codes via ``logical``).
+        new_scalar_mult = s_safe * sign
     else:
         # Float targets (bfloat16 / float16 / float8_* / float4 / complex) carry
         # a fraction natively — a plain astype preserves relative magnitudes, so

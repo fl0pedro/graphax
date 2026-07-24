@@ -86,6 +86,10 @@ def _scaled_mul(value, scalar_mult):
     if vdt is None or sdt is None:
         return value * scalar_mult
     cdt = _compute_dtype(vdt, sdt)
+    # No zero-point unshift: unsigned Quant targets store the sign-flip
+    # half-range magnitudes with the arm's polarity folded into ``scalar_mult``
+    # (see :func:`graphax.sparse.micro_actions.apply_quant`), so ``val *
+    # scalar_mult`` already dequantizes to the correct signed value.
     return value.astype(cdt) * scalar_mult.astype(cdt)
 
 

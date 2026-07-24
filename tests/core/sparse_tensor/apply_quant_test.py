@@ -87,10 +87,13 @@ def test_quant_sequential_last_wins():
     st, _ = _make_dense_pair_st(4, 4)
     out = apply_micro_actions(st, [Quant("float16"), Quant("int8")])
     assert out.val.dtype == jnp.int8
-    # Last cast wins; the integer truncation is observable: arange(0..15)
-    # cast through float16 and then int8 yields the same integer values.
+    # Last cast wins; since the target is an integer, it undergoes symmetric scaling.
+    # The maximum value is 15, and int8 max is 127. So the scale is 15/127.
+    # We verify that the values match the expected scaled output.
+    s = 15.0 / 127.0
+    expected = np.round(np.arange(16, dtype=np.float32) / s).astype(np.int8).reshape(4, 4)
     np.testing.assert_array_equal(
-        np.asarray(out.val), np.arange(16, dtype=np.int8).reshape(4, 4),
+        np.asarray(out.val), expected,
     )
 
 
@@ -142,3 +145,58 @@ def test_quant_dtype_catalog_resolves_and_roundtrips():
             pytest.skip(
                 f"jnp.dtype({name!r}) not resolvable on this JAX/platform: {e}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Unsigned sign-flip half-range (no zero-point)
+# ---------------------------------------------------------------------------
+
+
+def _signed_st() -> SparseTensor:
+    """A (2, 2) edge whose val straddles zero, max magnitude 4."""
+    return SparseTensor(
+        (DenseIndex(id=0, size=2, axis=0),),
+        (DenseIndex(id=1, size=2, axis=1),),
+        jnp.array([[-4.0, -2.0], [2.0, 4.0]], dtype=jnp.float32),
+    )
+
+
+def _dequant(st: SparseTensor) -> np.ndarray:
+    """The logical value a consumer sees: ``val * scalar_mult``."""
+    return np.asarray(
+        st.val.astype(np.float32) * np.float32(st.scalar_mult)).reshape(-1)
+
+
+def test_quant_uint_sign_flip_keeps_the_chosen_arm():
+    """``scale_sign`` picks which arm of a signed val fills the unsigned range;
+    the other arm clips to 0. No zero-point offset is stored."""
+    st = _signed_st()
+    pos = apply_quant(st, Quant("uint8", scale_sign=1))
+    neg = apply_quant(st, Quant("uint8", scale_sign=-1))
+    assert pos.val.dtype == jnp.uint8 and neg.val.dtype == jnp.uint8
+    # +1 -> positive arm survives ([-4,-2] clip to 0); -1 -> negative arm.
+    np.testing.assert_allclose(_dequant(pos), [0.0, 0.0, 2.0, 4.0], atol=0.05)
+    np.testing.assert_allclose(_dequant(neg), [-4.0, -2.0, 0.0, 0.0], atol=0.05)
+
+
+def test_quant_scales_to_the_target_max_not_the_value_max():
+    """The kept arm's largest magnitude maps onto the TARGET dtype's max code
+    (uint8 -> 255), i.e. the full range of the new type is used."""
+    q = apply_quant(_signed_st(), Quant("uint8", scale_sign=1))
+    assert int(np.asarray(q.val).max()) == 255            # 4 -> 255, scale 4/255
+
+
+def test_quant_scale_sign_must_be_plus_or_minus_one():
+    with pytest.raises(ValueError, match="scale_sign"):
+        Quant("uint8", scale_sign=0)
+
+
+def test_quant_signed_target_is_unchanged_by_sign_plus_one():
+    """A signed target with the default sign reduces to the old symmetric
+    quantizer (guards the no-regression claim for the int path)."""
+    st = _signed_st()
+    out = apply_quant(st, Quant("int8"))          # default scale_sign=1
+    # scale = 4/127; codes are round(val / scale), symmetric about 0.
+    s = 4.0 / 127.0
+    expected = np.round(np.array([-4, -2, 2, 4], np.float32) / s).astype(np.int8)
+    np.testing.assert_array_equal(np.asarray(out.val).reshape(-1), expected)
