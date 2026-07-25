@@ -592,7 +592,11 @@ def _reduce_along_axes(val: jnp.ndarray, axes: tuple[int, ...], kind: str):
         moved = jnp.transpose(val, perm)
         flat_shape = moved.shape[: len(keep)] + (-1,)
         flat = moved.reshape(flat_shape)
-        abs_flat = jnp.abs(flat)
+        # jaxlib >= 0.11 forbids ``abs`` on sub-byte ints (int4/int2/uint4/...),
+        # which a quantized edge can be. The abs is only used to pick the
+        # arg-extremum, so widen to float32 for the comparison; ``take_along_axis``
+        # against the original ``flat`` keeps the value's dtype and sign.
+        abs_flat = jnp.abs(flat.astype(jnp.float32))
         if kind == "abs_min":
             idx = jnp.argmin(abs_flat, axis=-1, keepdims=True)
         else:
