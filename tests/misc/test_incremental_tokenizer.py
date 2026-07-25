@@ -146,4 +146,50 @@ def test_vocab_too_small_to_spell_names_is_rejected():
     cj = jax.make_jaxpr(fn)(*args)
     with pytest.raises(ValueError, match="name symbols"):
         IncrementalPathTokenizer(cj.jaxpr, (0, 1), cj.literals, args,
-                                 vocab_size=240)
+                                 vocab_size=230)
+
+
+# ---------------------------------------------------------------------------
+# Bounded vocab under the INCREMENTAL append path (the per-face/path consumer).
+# The bounded tests above drive the BATCH capture_stream; a policy that extends
+# its token history per action instead drives base_tokens() + eliminate(v)
+# per step -- a DIFFERENT emission path. Its ids must ALSO stay < vocab_size, or
+# the fixed policy embedding overflows mid-episode. These pin that guarantee
+# (the id-safety prerequisite for wiring the tokenizer into the rollout).
+# ---------------------------------------------------------------------------
+
+def _incremental_stream(tk, jaxpr):
+    """base_tokens() then eliminate(v) for every vertex -- the append-only stream
+    a per-action consumer actually sees."""
+    stream = list(tk.base_tokens())
+    for v in range(1, len(jaxpr.eqns) + 1):
+        stream.extend(list(tk.eliminate(v)))
+    return stream
+
+
+def test_bounded_vocab_incremental_append_stays_in_range():
+    """Name-hungry graph, bounded alphabet, tokenized INCREMENTALLY: every id along
+    the whole stream stays < vocab_size, not just the batch capture_stream's."""
+    fn, args = _name_hungry()
+    cj = jax.make_jaxpr(fn)(*args)
+    VS = 512
+    tk = IncrementalPathTokenizer(cj.jaxpr, (0, 1), cj.literals, args, vocab_size=VS)
+    stream = _incremental_stream(tk, cj.jaxpr)
+    assert len(tk._names) > 500, "need a name-hungry graph for the bound to bite"
+    assert max(len(a) for a in tk._names.values()) >= 2, "names must go multi-atom"
+    assert max(int(t) for t in stream) < VS, "an incremental id overflowed vocab_size"
+    assert int(tk.max_token_id()) < VS
+
+
+@pytest.mark.parametrize("name,fn,args", CASES, ids=IDS)
+def test_bounded_incremental_ids_within_max_token_id(name, fn, args):
+    """Across graph shapes, the bounded incremental stream stays within BOTH the
+    static max_token_id() and vocab_size -- the two values a fixed embedding table
+    is sized from."""
+    cj = jax.make_jaxpr(fn)(*args)
+    VS = 512
+    tk = IncrementalPathTokenizer(cj.jaxpr, (0, 1), cj.literals, args, vocab_size=VS)
+    stream = _incremental_stream(tk, cj.jaxpr)
+    cap = int(tk.max_token_id())
+    assert cap < VS
+    assert all(int(t) <= cap for t in stream), f"{name}: id exceeds max_token_id()"
