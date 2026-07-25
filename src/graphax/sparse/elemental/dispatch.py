@@ -53,6 +53,7 @@ SCOPE / FALLBACK POLICY
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import TYPE_CHECKING, Callable
 
@@ -126,8 +127,25 @@ def reset_stats() -> None:
     DISPATCH_FALLBACK_LOG.clear()
 
 
+# Opt-in periodic telemetry: GRAPHAX_DISPATCH_STATS=N prints the running
+# matmul_* tally to stderr every N bumps (zero overhead when unset). Lets a real
+# masked run report how often the composed-dense fallback (forced densify) fires
+# vs the structured kernels — the empirical input to "is the keep-sparse fix
+# worth it?".
+_DISPATCH_DUMP_EVERY = int(os.environ.get("GRAPHAX_DISPATCH_STATS", "0") or "0")
+_bump_total = 0
+
+
 def _bump(key: str) -> None:
+    global _bump_total
     DISPATCH_STATS[key] = DISPATCH_STATS.get(key, 0) + 1
+    if _DISPATCH_DUMP_EVERY:
+        _bump_total += 1
+        if _bump_total % _DISPATCH_DUMP_EVERY == 0:
+            import sys
+
+            _m = {k: v for k, v in DISPATCH_STATS.items() if k.startswith("matmul_") and v}
+            print(f"[DISPATCH_STATS bumps={_bump_total}] {_m}", file=sys.stderr, flush=True)
 
 
 def _bump_fallback(kernel: str, exc: BaseException) -> None:
