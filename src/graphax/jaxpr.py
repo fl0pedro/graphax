@@ -74,7 +74,11 @@ from graphax.sparse.micro_actions import (  # noqa: E402
     QUANT_DTYPES as _QUANT_DTYPES,
 )
 
-APPROX_TYPE_TOKENS = ["DIAG", "COMPRESS", "QUANT"]
+# SKIP is an approximation OUTCOME, not a transform: the policy declined to
+# approximate this path (or nothing was legal on it). It must be tokenized
+# like the others so the encoder sees the decision — a silent skip is
+# indistinguishable from "no decision was made here".
+APPROX_TYPE_TOKENS = ["DIAG", "COMPRESS", "QUANT", "SKIP"]
 # ... and one per STRING argument of Compress (kind) / Quant (dtype). Diag's
 # i/j/factor and Compress's axes stay NUMBERS (the jaxpr.py digit scheme). The
 # ``d#<dtype>`` tokens double as the rendering of ANY dtype-valued op param.
