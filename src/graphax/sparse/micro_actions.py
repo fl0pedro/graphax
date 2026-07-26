@@ -226,16 +226,40 @@ def _get_quant_dtypes():
 
 QUANT_DTYPES = _get_quant_dtypes()
 
+# Narrow dtypes (int4/uint4, float4/6/8, int2) pass a same-dtype ``dot`` but
+# CANNOT implicitly promote against float32 — and a quantized edge is contracted
+# against edges that were not quantized, whose scalar_mult is float32. Using one
+# therefore dies at runtime inside the measurement callback with "no available
+# implicit dtype promotion path" (observed: float4_e2m1fn x float32, job 55449).
+#
+# They are only safe once the CONTRACTION PARTNER is force-cast to match (the
+# "second array in the contraction automatically approximates to the same forced
+# quantization" rule). That partner-cast is NOT implemented yet, so by default
+# the scan requires float32-compatibility and these types are masked out.
+# Set GRAPHAX_QUANT_ALLOW_NARROW=1 to re-admit them once it is.
+_ALLOW_NARROW_QUANT = _os.environ.get("GRAPHAX_QUANT_ALLOW_NARROW", "0") == "1"
+
+
 def verify_hardware_compat():
     """Dynamically verify jnp.dot compatibility across all QUANT_DTYPES."""
     import jax
     import jax.numpy as jnp
     
     avail_mask = []
+    f32 = jnp.zeros((2, 2), dtype=jnp.float32)
     for dt in QUANT_DTYPES:
         try:
             x = jnp.zeros((2, 2), dtype=dt)
             jnp.dot(x, x)
+            # A quantized edge is contracted against edges that were NOT
+            # quantized (still float32) and its scalar_mult is float32, so the
+            # dtype must also survive mixing with float32. Same-dtype dot alone
+            # is not enough: 4-bit floats pass it and then die at runtime with
+            # "no available implicit dtype promotion path"
+            # (float4_e2m1fn x float32) inside the measurement callback.
+            if not _ALLOW_NARROW_QUANT:
+                jnp.dot(x, f32)
+                x * jnp.float32(2.0)
             avail_mask.append(1.0)
         except Exception:
             avail_mask.append(0.0)
