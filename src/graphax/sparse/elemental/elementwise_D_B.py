@@ -275,6 +275,12 @@ def elementwise_dense_block_diagonal(
         B_i = l_pri.block_size or 1
         a = _diag_grid(lhs, l_out, l_pri)  # (N, B_o, B_i, *L)
         b = _diag_grid(rhs, r_out, r_pri)
+        # Partner-cast at the kernel boundary: lax ops (lax.add from
+        # add_w_counts) require IDENTICAL dtypes, and the grids can disagree
+        # even after _unify_operand_dtypes — a narrow Quant'd val meets a
+        # wider fill/partner inside grid construction. No-op when they match.
+        a = a.astype(out_dtype)
+        b = b.astype(out_dtype)
         new_blocks = op(a, b).astype(out_dtype)
         return _emit_block_diagonal(new_blocks, N, B_o, B_i, out_dtype)
 
@@ -288,6 +294,10 @@ def elementwise_dense_block_diagonal(
 
     blocks = _diag_grid(b_t, b_out, b_pri)              # (N, B_o, B_i, *L)
     d_grid, L = _dense_grid(d_t, d_out, d_pri)          # (R, C, *L)
+    # Same partner-cast as the B-op-B branch: op is a lax primitive with no
+    # implicit promotion, and the two grids can carry different dtypes.
+    blocks = blocks.astype(out_dtype)
+    d_grid = d_grid.astype(out_dtype)
     d_sub = _diag_subblocks(d_grid, N, B_o, B_i)        # (N, B_o, B_i, *L)
 
     # Apply op block-by-block IN OPERAND ORDER (op may be non-commutative, e.g.
