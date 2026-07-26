@@ -281,6 +281,20 @@ def try_elemental_matmul(lhs: "SparseTensor", rhs: "SparseTensor", count: bool =
         _bump("matmul_nonzero_fill_skip")
         return None
 
+    # DTYPE UNIFICATION. ``matmul`` unifies operand dtypes (dtype_compute.
+    # _unify_operand_dtypes) so a narrow Quant'd val is never combined with a
+    # float one — JAX gives such pairs no implicit promotion path. But THIS is a
+    # fast path that returns before matmul ever runs, so a quantized edge
+    # contracted against an un-quantized (float32) partner reached the kernels
+    # un-unified and died with
+    #   TypePromotionError: ('float4_e2m1fn', 'float32') have no available
+    #   implicit dtype promotion path
+    # inside the measurement callback (job 55449). Unify here too: this is the
+    # "second array in the contraction inherits the forced quantization"
+    # partner-cast, applied at the one place that knows both operands.
+    from graphax.sparse.dtype_compute import _unify_operand_dtypes
+    lhs, rhs = _unify_operand_dtypes(lhs, rhs)
+
     # Expand any compressed operand into {D, B} so the kernels can consume it.
     lhs_m, rhs_m = _materialize_both(lhs, rhs)
 

@@ -227,17 +227,21 @@ def _get_quant_dtypes():
 QUANT_DTYPES = _get_quant_dtypes()
 
 # Narrow dtypes (int4/uint4, float4/6/8, int2) pass a same-dtype ``dot`` but
-# CANNOT implicitly promote against float32 — and a quantized edge is contracted
-# against edges that were not quantized, whose scalar_mult is float32. Using one
-# therefore dies at runtime inside the measurement callback with "no available
-# implicit dtype promotion path" (observed: float4_e2m1fn x float32, job 55449).
+# cannot implicitly promote against float32 — and a quantized edge is contracted
+# against edges that were NOT quantized, whose scalar_mult is float32. That used
+# to kill a run inside the measurement callback with "no available implicit
+# dtype promotion path" (float4_e2m1fn x float32, job 55449).
 #
-# They are only safe once the CONTRACTION PARTNER is force-cast to match (the
-# "second array in the contraction automatically approximates to the same forced
-# quantization" rule). That partner-cast is NOT implemented yet, so by default
-# the scan requires float32-compatibility and these types are masked out.
-# Set GRAPHAX_QUANT_ALLOW_NARROW=1 to re-admit them once it is.
-_ALLOW_NARROW_QUANT = _os.environ.get("GRAPHAX_QUANT_ALLOW_NARROW", "0") == "1"
+# FIXED AT THE SOURCE: the elemental fast path now unifies operand dtypes
+# (elemental/dispatch.py -> dtype_compute._unify_operand_dtypes), which is the
+# partner-cast — the un-quantized operand is promoted to the common compute
+# dtype at the one place that knows both sides. Verified: float4/int4/float8/int8
+# all contract against an un-quantized float32 partner. The catalog is therefore
+# permissive again; GRAPHAX_QUANT_STRICT_PROMOTION=1 restores the conservative
+# scan (mask out anything that can't mix with float32) as an escape hatch.
+_STRICT_QUANT_PROMOTION = (
+    _os.environ.get("GRAPHAX_QUANT_STRICT_PROMOTION", "0") == "1"
+)
 
 
 def verify_hardware_compat():
@@ -257,7 +261,7 @@ def verify_hardware_compat():
             # is not enough: 4-bit floats pass it and then die at runtime with
             # "no available implicit dtype promotion path"
             # (float4_e2m1fn x float32) inside the measurement callback.
-            if not _ALLOW_NARROW_QUANT:
+            if _STRICT_QUANT_PROMOTION:
                 jnp.dot(x, f32)
                 x * jnp.float32(2.0)
             avail_mask.append(1.0)
