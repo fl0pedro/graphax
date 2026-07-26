@@ -239,9 +239,11 @@ QUANT_DTYPES = _get_quant_dtypes()
 # all contract against an un-quantized float32 partner. The catalog is therefore
 # permissive again; GRAPHAX_QUANT_STRICT_PROMOTION=1 restores the conservative
 # scan (mask out anything that can't mix with float32) as an escape hatch.
-_STRICT_QUANT_PROMOTION = (
-    _os.environ.get("GRAPHAX_QUANT_STRICT_PROMOTION", "0") == "1"
-)
+# Default STRICT: a dtype is only 'available' if it survives contraction and
+# arithmetic against float32 in BOTH operand orders. Set
+# GRAPHAX_QUANT_ALLOW_NARROW=1 to admit narrow dtypes anyway (only safe
+# once every contraction site force-casts the partner).
+_ALLOW_NARROW_QUANT = _os.environ.get("GRAPHAX_QUANT_ALLOW_NARROW", "0") == "1"
 
 
 def verify_hardware_compat():
@@ -254,20 +256,26 @@ def verify_hardware_compat():
     for dt in QUANT_DTYPES:
         try:
             x = jnp.zeros((2, 2), dtype=dt)
+            # Self-dot: can the hardware contract this dtype with itself?
             jnp.dot(x, x)
-            # A quantized edge is contracted against edges that were NOT
-            # quantized (still float32) and its scalar_mult is float32, so the
-            # dtype must also survive mixing with float32. Same-dtype dot alone
-            # is not enough: 4-bit floats pass it and then die at runtime with
-            # "no available implicit dtype promotion path"
-            # (float4_e2m1fn x float32) inside the measurement callback.
-            if _STRICT_QUANT_PROMOTION:
+            # BOTH ORDERS against float32. A quantized edge is contracted with
+            # edges that were NOT quantized (still float32), and its
+            # scalar_mult / fill_value are float32 — and JAX's promotion table
+            # is NOT symmetric in what it reports, so (dt, f32) passing tells
+            # you nothing about (f32, dt). Testing only one order is what let
+            # float4_e2m1fn through: it survived dot(x, f32) and then died at
+            # runtime on ('float32', 'float4_e2m1fn').
+            if not _ALLOW_NARROW_QUANT:
                 jnp.dot(x, f32)
+                jnp.dot(f32, x)
                 x * jnp.float32(2.0)
+                jnp.float32(2.0) * x
+                x + jnp.zeros((2, 2), dtype=jnp.float32)
+                jnp.zeros((2, 2), dtype=jnp.float32) + x
             avail_mask.append(1.0)
         except Exception:
             avail_mask.append(0.0)
-    
+
     N = len(QUANT_DTYPES)
     compat_matrix = jnp.zeros((N, N), dtype=jnp.float32)
     for i, dt1 in enumerate(QUANT_DTYPES):
@@ -277,12 +285,49 @@ def verify_hardware_compat():
             try:
                 x = jnp.zeros((2, 2), dtype=dt1)
                 y = jnp.zeros((2, 2), dtype=dt2)
+                # BOTH orders: a contraction can present the pair either way
+                # round depending on which edge is pre and which is post, and
+                # JAX's promotion rules are not guaranteed symmetric. Admitting
+                # (a,b) on the strength of (a,b) alone leaves (b,a) to fail at
+                # runtime inside the measurement callback.
                 jnp.dot(x, y)
+                jnp.dot(y, x)
                 compat_matrix = compat_matrix.at[i, j].set(1.0)
             except Exception:
                 pass
-                
+
     return jnp.array(avail_mask, dtype=jnp.float32), compat_matrix
+
+
+def report_hardware_scan(verbose: bool = True) -> dict:
+    """Run the scan and return/print a human-readable summary.
+
+    Intended to run ONCE before training so the dtype catalog a run will use is
+    visible up front rather than discovered by a crash 200 episodes in.
+    """
+    avail, compat = quant_hardware_masks()
+    import numpy as _np
+
+    a = _np.asarray(avail)
+    c = _np.asarray(compat)
+    usable = [str(d) for d, m in zip(QUANT_DTYPES, a) if m > 0]
+    blocked = [str(d) for d, m in zip(QUANT_DTYPES, a) if m == 0]
+    n_pairs = int(c.sum())
+    asym = int(((c != c.T)).sum())
+    out = {
+        "usable": usable, "blocked": blocked,
+        "n_usable": len(usable), "n_candidates": len(QUANT_DTYPES),
+        "n_contraction_pairs": n_pairs,
+        "asymmetric_pairs": asym,
+    }
+    if verbose:
+        print(f"[quant-scan] {len(usable)}/{len(QUANT_DTYPES)} dtypes usable "
+              f"(both operand orders vs float32 and self)")
+        print(f"[quant-scan] usable : {usable}")
+        print(f"[quant-scan] blocked: {blocked}")
+        print(f"[quant-scan] {n_pairs} legal contraction pairs "
+              f"(order-symmetric: {'yes' if asym == 0 else f'NO — {asym} asym'})")
+    return out
 
 
 _QUANT_HW_MASKS = None

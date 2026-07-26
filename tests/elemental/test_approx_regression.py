@@ -31,6 +31,11 @@ from graphax.sparse.micro_actions import Compress, Diag
 import _approx_oracle as O
 
 
+@pytest.fixture(autouse=True)
+def _legacy_best_effort(monkeypatch):
+    monkeypatch.setenv("GRAPHAX_BEST_EFFORT_TRANSFORMS", "1")
+
+
 def _flat(j):
     return np.concatenate([np.ravel(np.asarray(l)) for l in tu.tree_leaves(j)])
 

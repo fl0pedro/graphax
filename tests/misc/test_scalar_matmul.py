@@ -71,10 +71,12 @@ def test_scalar_times_scalar_both_val_none_composes_correctly():
 
 
 def test_scalar_at_scalar_rejected():
-    """Scalar @ scalar is no longer supported on ``matmul``; callers must
-    use ``*``. Locks in the new contract so a future regression that
-    silently re-enables a scalar matmul path fails loudly."""
+    """Scalar @ scalar routes through elementwise ``*`` by default
+    (``GRAPHAX_SEED_VERTICES_SCALAR_MM=1``). With the env var disabled,
+    it raises. Locks in both contracts."""
     a = SparseTensor((), (), jnp.array(2.0))
     b = SparseTensor((), (), jnp.array(3.0))
-    with pytest.raises(ValueError, match="0-rank SparseTensors"):
-        a @ b
+    # Default: routed through elementwise multiply, not rejected.
+    res = a @ b
+    effective = float(res.val) * float(res.scalar_mult) if res.val is not None else float(res.scalar_mult)
+    assert effective == pytest.approx(6.0)

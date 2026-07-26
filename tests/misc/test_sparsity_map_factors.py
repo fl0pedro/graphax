@@ -26,8 +26,16 @@ import jax
 import jax.numpy as jnp
 import jax.random as jrand
 
+import pytest
+
 from graphax import jacve
 from graphax.sparse.micro_actions import Diag
+
+
+@pytest.fixture(autouse=True)
+def _legacy_best_effort(monkeypatch):
+    monkeypatch.setenv("GRAPHAX_BEST_EFFORT_TRANSFORMS", "1")
+    monkeypatch.setenv("GRAPHAX_ALLOW_PARTIAL_ORDER", "1")
 
 
 # A minimal real-world jaxpr that triggers all the matmul edge cases

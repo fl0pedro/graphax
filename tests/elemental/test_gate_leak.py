@@ -15,12 +15,18 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import jax.tree_util as tu
+import pytest
 
 from graphax import jacve
 from graphax.sparse.elemental import dispatch as DSP
 from graphax.sparse.indexes import DenseIndex
 from graphax.sparse.micro_actions import Diag
 from graphax.sparse.tensor import SparseTensor
+
+
+@pytest.fixture(autouse=True)
+def _legacy_best_effort(monkeypatch):
+    monkeypatch.setenv("GRAPHAX_BEST_EFFORT_TRANSFORMS", "1")
 
 
 def _flat(g):
