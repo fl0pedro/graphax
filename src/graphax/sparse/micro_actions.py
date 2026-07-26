@@ -825,6 +825,19 @@ def _is_scaled_quant_target(target) -> bool:
     return name.startswith("int") or name.startswith("uint")
 
 
+def _is_narrow_float_target(target) -> bool:
+    """Sub-byte-container float targets (float8_* / float6_* / float4_*).
+
+    Their representable range is tiny (float4_e2m1fn max 6, most float8 max
+    448) and their smallest normal is large, so a bare ``astype`` SATURATES a
+    large-magnitude Jacobian and flushes a small one to subnormals/zero —
+    the same failure the int path's symmetric scale exists to avoid.
+    float16 / bfloat16 / float32 keep the bare cast: their range is ample and
+    a relative-precision format gains nothing from rescaling."""
+    dt = jnp.dtype(target)
+    return jnp.issubdtype(dt, jnp.floating) and dt.itemsize == 1
+
+
 def _int_dtype_range(target) -> tuple[int, int]:
     """(min, max) representable integer values for an int/uint target, including
     the sub-byte ints (int2/int4/uint2/uint4) which JAX exposes via iinfo even
@@ -840,6 +853,16 @@ def _int_dtype_max(target) -> float:
     the full max (uint8 -> 255). Guaranteed >= 1 so the scale is well-defined."""
     ii = jnp.iinfo(jnp.dtype(target))
     return float(max(int(ii.max), 1))
+
+
+def _quant_dtype_max(target) -> float:
+    """Largest representable magnitude of any scaled quant target: ``iinfo``
+    for int/uint, ``finfo`` for the narrow floats (float8_e4m3fn -> 448,
+    float4_e2m1fn -> 6, float8_e8m0fnu -> 2^127)."""
+    dt = jnp.dtype(target)
+    if jnp.issubdtype(dt, jnp.floating):
+        return float(jnp.finfo(dt).max)
+    return _int_dtype_max(dt)
 
 
 @_squeeze_result
@@ -862,8 +885,9 @@ def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
 
     new_val = st.val
     new_scalar_mult = st.scalar_mult
-    if _is_scaled_quant_target(target):
-        # SCALED PER-TENSOR QUANTIZATION (int / uint / sub-byte targets).
+    if _is_scaled_quant_target(target) or _is_narrow_float_target(target):
+        # SCALED PER-TENSOR QUANTIZATION (int / uint / sub-byte / narrow-float
+        # targets).
         # A bare ``val.astype(int8)`` TRUNCATES every fractional Jacobian entry
         # toward zero — a |J|<1 Jacobian collapses to all-zeros (the cossim-0
         # degenerate). Instead store a symmetric per-tensor scale ``s`` and the
@@ -893,31 +917,46 @@ def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
         logical = st.val.astype(jnp.float32) * jnp.asarray(sm, jnp.float32)
         sign = jnp.float32(action.scale_sign)
         absmax = jnp.max(jnp.abs(logical))
-        dmax = _int_dtype_max(target)                # target's max magnitude
+        dmax = _quant_dtype_max(target)              # target's max magnitude
         s = absmax / dmax
         # All-zero ``val`` -> absmax 0 -> keep s=1 (codes stay zeros, no div-by-0).
         s_safe = jnp.where(s > 0, s, jnp.ones_like(s))
-        if jnp.issubdtype(target, jnp.unsignedinteger):
+        # Narrow floats: the cast itself rounds to nearest representable, so no
+        # jnp.round; the range clamp uses the float max. "Unsigned" also covers
+        # sign-less float formats (float8_e8m0fnu: finfo.min > 0) — they get the
+        # same sign-flip half-range arm as uint targets.
+        is_float_target = bool(jnp.issubdtype(target, jnp.floating))
+        unsigned_range = bool(jnp.issubdtype(target, jnp.unsignedinteger)) or (
+            is_float_target and float(jnp.finfo(target).min) >= 0.0
+        )
+        if unsigned_range:
             # Sign-flip half-range: keep the arm selected by ``sign``; clip the
             # other to 0. The magnitudes fill [0, dtype_max].
-            kept = jnp.clip(logical * sign, 0.0, None)
-            q = jnp.round(kept / s_safe)
+            kept = jnp.clip(logical * sign, 0.0, None) / s_safe
+            q = kept if is_float_target else jnp.round(kept)
             q = jnp.clip(q, 0.0, jnp.float32(dmax))
         else:
-            q = jnp.round(logical * sign / s_safe)
-            # Clamp to the target's logical range before the narrow cast so a
-            # round-half-away at the extreme can't wrap; use FLOAT bounds (raw
-            # int64 bounds overflow JAX's jit argument parser).
-            lo, hi = _int_dtype_range(target)
-            q = jnp.clip(q, jnp.float32(lo), jnp.float32(hi))
+            q = logical * sign / s_safe
+            if is_float_target:
+                q = jnp.clip(q, -jnp.float32(dmax), jnp.float32(dmax))
+            else:
+                q = jnp.round(q)
+                # Clamp to the target's logical range before the narrow cast so a
+                # round-half-away at the extreme can't wrap; use FLOAT bounds (raw
+                # int64 bounds overflow JAX's jit argument parser).
+                lo, hi = _int_dtype_range(target)
+                q = jnp.clip(q, jnp.float32(lo), jnp.float32(hi))
         new_val = q.astype(target)
         # sm' REPLACES scalar_mult (its old value is already folded into the
         # quantized codes via ``logical``).
         new_scalar_mult = s_safe * sign
     else:
-        # Float targets (bfloat16 / float16 / float8_* / float4 / complex) carry
-        # a fraction natively — a plain astype preserves relative magnitudes, so
-        # no scale is needed (and ``bool`` has no meaningful scaled form).
+        # WIDE float targets (bfloat16 / float16 / float32-family / complex)
+        # carry a fraction natively over an ample range — a plain astype
+        # preserves relative magnitudes, so no scale is needed (and ``bool``
+        # has no meaningful scaled form). Narrow floats take the scaled path
+        # above: float4's max is 6 — a bare cast saturates any |J| > 6 and
+        # zeroes any |J| below its subnormal floor.
         new_val = st.val.astype(target)
 
     return SparseTensor(
