@@ -405,8 +405,14 @@ def test_diag_in_a_face_slot_approximates_only_that_face(index, slot):
     assert [t for t, _, _, _ in approx[0]] == ["DIAG"], (
         f"the {slot} slot's Diag must be recorded on the targeted face")
     assert approx[1] == []
-    assert not np.array_equal(out[0], ref[0]), "the targeted face is masked"
-    assert np.array_equal(out[1], ref[1]), "the other face stays exact"
+    # "Stays exact" is pinned BITWISE against graphax's own exact path — the
+    # stronger, backend-independent oracle. jacrev's vjp op sequence rounds
+    # differently on x86 XLA CPU (last-ULP, ~2e-07), so it only gets the
+    # allclose sanity check; bitwise-vs-jacrev held on arm64 macOS by luck.
+    exact = _eval(_run(_square, (_X4,), (0,), None, vertex=1)[1], (_X4,))
+    assert not np.array_equal(out[0], exact[0]), "the targeted face is masked"
+    assert np.array_equal(out[1], exact[1]), "the other face stays exact"
+    assert np.allclose(out[1], ref[1], atol=1e-5)
 
 
 def test_compress_in_a_face_rhs_slot_approximates_only_that_face():
@@ -421,8 +427,12 @@ def test_compress_in_a_face_rhs_slot_approximates_only_that_face():
 
     assert approx[0] == []
     assert [t for t, _, _, _ in approx[1]] == ["COMPRESS"]
-    assert np.array_equal(out[0], ref[0]), "the other face stays exact"
-    assert not np.array_equal(out[1], ref[1]), "the targeted face is compressed"
+    # Same oracle repin as the Diag test above: bitwise vs graphax's exact
+    # path, allclose vs jacrev.
+    exact = _eval(_run(_square, (_X4,), (0,), None, vertex=1)[1], (_X4,))
+    assert np.array_equal(out[0], exact[0]), "the other face stays exact"
+    assert not np.array_equal(out[1], exact[1]), "the targeted face is compressed"
+    assert np.allclose(out[0], ref[0], atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
