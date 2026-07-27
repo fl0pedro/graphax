@@ -1230,7 +1230,7 @@ class IncrementalPathTokenizer:
             self._emit_int(params["j"], out)
             self._emit_int(params["factor"], out)
 
-    def eliminate(self, vertex, rules=()):
+    def eliminate(self, vertex, rules=(), face_transforms=None):
         """Eliminate one vertex on the PRESERVED trace and emit its PATH blocks.
 
         There is no ``elim`` header: vertex and face elimination are the same
@@ -1245,7 +1245,7 @@ class IncrementalPathTokenizer:
         (central = the eliminated vertex's variable).
         """
         step_i = len(self.ij.steps)
-        self.ij.eliminate(vertex, rules)
+        self.ij.eliminate(vertex, rules, face_transforms)
         toks = self._emit_step_paths(step_i, self.ij.all_eqns())
         self._n_steps += 1
         return toks

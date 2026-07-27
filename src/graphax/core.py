@@ -970,6 +970,23 @@ def _eqn_count(_face_sink, _xlog) -> int:
     return 0
 
 
+class _SkipFace:
+    """Sentinel ``face_transforms`` VALUE (in place of the ``(lhs, rhs, res)``
+    3-tuple): the SKIP approximation — this path's contraction is NOT
+    performed, so its contribution never reaches the ``(in_edge, out_edge)``
+    accumulation (an absent addend, not a zero edge). Recorded on the face
+    sink as an ``approx SKIP`` block and on the TransformLog, so the token
+    stream and the record stay truthful."""
+
+    __slots__ = ()
+
+    def __repr__(self):
+        return "graphax.SKIP_FACE"
+
+
+SKIP_FACE = _SkipFace()
+
+
 def _record_micro(_t, before, after, vertex, slot, in_edge, out_edge,
                   start, _face_sink, _xlog):
     """Record ONE dispatched micro-action, truthfully.
@@ -1294,10 +1311,15 @@ def _eliminate_vertex(
     # one, so it must arm the same non-shortcut contraction path. Guarded on
     # ``face_transforms`` so the None path keeps the value above.
     if face_transforms:
+        # SKIP_FACE is a bare sentinel value (not a 3-tuple of slots) and a
+        # skipped path deviates from the exact structure at least as much as
+        # a Diag/Compress does — it must arm the approx config (the nominal
+        # shape asserts are exact-only).
         _is_approx_cfg = _is_approx_cfg or any(
-            isinstance(_t, (Diag, Compress))
+            _slots is SKIP_FACE or any(
+                isinstance(_t, (Diag, Compress)) for _t in _slots
+            )
             for _slots in face_transforms.values()
-            for _t in _slots
         )
 
     # Path tokenization sink (None on the exact-AD hot path -> zero overhead,
@@ -1384,6 +1406,19 @@ def _eliminate_vertex(
                     _slots = face_transforms.get(
                         (_vidx.get(in_edge), _vidx.get(out_edge))
                     )
+                    if _slots is SKIP_FACE:
+                        # SKIP: drop this path outright — no contraction, no
+                        # join, no counts. Recorded (and the face CLOSED — the
+                        # ``continue`` bypasses the loop-bottom close) so the
+                        # face renders as ``approx SKIP`` rather than silence.
+                        _n = _eqn_count(_face_sink, _xlog)
+                        if _face_sink is not None:
+                            _face_sink.approx("SKIP", {}, _n, _n)
+                            _face_sink.close_face()
+                        if _xlog is not None:
+                            _xlog.record("transform", vertex, "face", "SKIP",
+                                         {}, in_edge, out_edge, _n, _n, True)
+                        continue
                     if _slots is not None:
                         _lhs_t, _rhs_t, _face_res_t = _unpack_face_slots(
                             _slots, vertex)
@@ -2368,7 +2403,14 @@ class VertexEliminator:
         # (primal_vertex_id, out_vertex_id) resolve during elimination: a
         # produced var takes its eqn-position id (1-based, matching `order`); a
         # graph input takes a negative id -(invar_index+1).
-        _has_perpath = any(isinstance(_x, dict) for _x in t_dict.values())
+        # face_transforms must ALSO disable the prefix cache: its dicts are
+        # unhashable and invisible to the (vertex, v_transforms) cache key, so
+        # a face-transformed call could silently REUSE an exact run's cached
+        # elimination (measured: an all-SKIP jacve returned the exact
+        # Jacobian bit-for-bit because the whole order was a cache hit).
+        _has_perpath = any(
+            isinstance(_x, dict) for _x in t_dict.values()
+        ) or bool(face_transforms)
         _var_vid: Dict[core.Var, int] = {}
         if _has_perpath:
             for _i, _eqn in enumerate(jaxpr.eqns, start=1):

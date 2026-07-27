@@ -1,6 +1,7 @@
 import sys
 
 from .core import (
+    SKIP_FACE,
     faces_of,
     grad,
     jacve,
