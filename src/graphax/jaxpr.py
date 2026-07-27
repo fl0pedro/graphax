@@ -1024,6 +1024,11 @@ class IncrementalPathTokenizer:
         self._fns = {}
         self._n_steps = 0
         self._flatten_uid = 0   # unique id per inlined call (see _flatten)
+        # last_eqn_ids() bookkeeping: stream-global segment counter + the
+        # spans armed per public emission (None outside base_tokens/eliminate).
+        self._eqn_seg = 0
+        self._cur_spans = None
+        self._last_eqn_ids: list = []
         # GRAPH-NODE names: the original jaxpr variables (inputs, then every eqn
         # outvar in order) get stable low names, so a path RE-STATES the actual
         # variables it connects (central = the eliminated vertex's variable).
@@ -1133,6 +1138,7 @@ class IncrementalPathTokenizer:
             out.append(self.vocab["]"])
 
     def _emit_eqns(self, eqns, out):
+        _seg_start = len(out)
         flat = self._flatten(eqns)
         # Pass 1: EVERY parameterized op is a function (defined once, on first
         # sight, from the shared name pool); parameterless ops stay inline.
@@ -1188,6 +1194,12 @@ class IncrementalPathTokenizer:
         if out and out[-1] == self.vocab["\n"]:
             out.pop()
         out.append(self.vocab["}"])
+        # Segment record for last_eqn_ids(): one stream-global id per
+        # _emit_eqns call (one contraction/join group or one approximation's
+        # equations). No-op unless a public wrapper armed _cur_spans.
+        if getattr(self, "_cur_spans", None) is not None and len(out) > _seg_start:
+            self._cur_spans.append((_seg_start, len(out), self._eqn_seg))
+            self._eqn_seg += 1
 
     # ---- public: base + per-step append ------------------------------
     def base_tokens(self):
@@ -1196,13 +1208,34 @@ class IncrementalPathTokenizer:
         # input->output edges produced by the path blocks; a reserved-name list
         # here was never referenced, so it is dropped.
         toks = []
+        self._cur_spans = []
         self._emit_word("inputs", toks)
         for ii in self.argnums:
             v = self.jaxpr.invars[ii]
             self._emit_atoms(self._var_name(v), toks)
             self._emit_atoms(self._format_shape(v.aval.shape), toks)
         self._emit_eqns(self.ij.base_eqns(), toks)
+        self._finish_eqn_ids(toks)
         return toks
+
+    def _finish_eqn_ids(self, toks):
+        """Materialize :meth:`last_eqn_ids` for the block just emitted."""
+        ids = [-1] * len(toks)
+        for a, b, g in self._cur_spans or ():
+            ids[a:b] = [g] * (b - a)
+        self._last_eqn_ids = ids
+        self._cur_spans = None
+
+    def last_eqn_ids(self):
+        """Per-token equation-SEGMENT ids for the LAST block returned by
+        :meth:`base_tokens` / :meth:`eliminate`, aligned 1:1 with it.
+
+        Tokens of one ``_emit_eqns`` call (one contraction/join group or one
+        approximation's equations) share one id from a stream-global running
+        counter; header / def / ``approx``-head tokens are ``-1``. Built for
+        relational consumers that only compare ids (same / earlier / later),
+        so the counter never needs an embedding-table bound."""
+        return list(getattr(self, "_last_eqn_ids", []))
 
     def _format_shape(self, shape):
         if not shape:
@@ -1246,7 +1279,9 @@ class IncrementalPathTokenizer:
         """
         step_i = len(self.ij.steps)
         self.ij.eliminate(vertex, rules, face_transforms)
+        self._cur_spans = []
         toks = self._emit_step_paths(step_i, self.ij.all_eqns())
+        self._finish_eqn_ids(toks)
         self._n_steps += 1
         return toks
 
