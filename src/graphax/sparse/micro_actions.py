@@ -354,7 +354,37 @@ def quant_hardware_masks():
     """
     global _QUANT_HW_MASKS
     if _QUANT_HW_MASKS is None:
-        _QUANT_HW_MASKS = verify_hardware_compat()
+        avail, compat = verify_hardware_compat()
+        # FIDELITY MASK (default ON): unsigned dtypes clamp the negative half
+        # of every quantized block to zero. Jacobian blocks are routinely
+        # all-negative, so one unsigned quant zeroes the block, one zero
+        # block chain-kills the whole product, and the plan lands in the
+        # degenerate-plan sentinel (v13 forensics: ~90 uint quants/plan,
+        # muls=0, cos=0, 16/16 degenerate — the zero-work reward-hack).
+        # Unsigned types only become usable WITH a negate head (spec §quant);
+        # until that head exists they are unrepresentable, not sampled-and-
+        # sentinelled. GRAPHAX_QUANT_ALLOW_UNSIGNED=1 restores them.
+        if _os.environ.get("GRAPHAX_QUANT_ALLOW_UNSIGNED", "0") != "1":
+            import numpy as _np
+            keep = _np.asarray(avail).copy()
+            for _i, _name in enumerate(QUANT_DTYPES):
+                _kind = _dtype_attributes(_name)[QA_KIND]
+                _uf = False
+                if _kind == QK_FLOAT:
+                    try:
+                        import ml_dtypes as _mld
+                        _uf = float(_mld.finfo(_name).min) >= 0.0
+                    except Exception:
+                        _uf = False
+                if _kind == QK_UINT or _uf:
+                    keep[_i] = 0.0
+            n_masked = int(_np.sum(_np.asarray(avail) > 0) - _np.sum(keep > 0))
+            if n_masked:
+                print(f"[quant-scan] fidelity mask: {n_masked} unsigned "
+                      f"dtype(s) removed (no negate head yet; "
+                      f"GRAPHAX_QUANT_ALLOW_UNSIGNED=1 restores)")
+            avail = jnp.asarray(keep, dtype=jnp.float32)
+        _QUANT_HW_MASKS = (avail, compat)
     return _QUANT_HW_MASKS
 
 
