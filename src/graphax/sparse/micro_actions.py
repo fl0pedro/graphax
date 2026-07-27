@@ -364,7 +364,12 @@ def quant_hardware_masks():
         # Unsigned types only become usable WITH a negate head (spec §quant);
         # until that head exists they are unrepresentable, not sampled-and-
         # sentinelled. GRAPHAX_QUANT_ALLOW_UNSIGNED=1 restores them.
-        if _os.environ.get("GRAPHAX_QUANT_ALLOW_UNSIGNED", "0") != "1":
+        # Default ALLOW (user-directed): the negate head (scale_sign arm
+        # select) + continuous scale head now travel the wire and are honored
+        # by apply_quant, so the policy can use unsigned ranges without
+        # zeroing all-negative blocks. GRAPHAX_QUANT_MASK_UNSIGNED=1 re-masks
+        # them (the pre-negate-head safety posture).
+        if _os.environ.get("GRAPHAX_QUANT_MASK_UNSIGNED", "0") == "1":
             import numpy as _np
             keep = _np.asarray(avail).copy()
             for _i, _name in enumerate(QUANT_DTYPES):
@@ -381,8 +386,9 @@ def quant_hardware_masks():
             n_masked = int(_np.sum(_np.asarray(avail) > 0) - _np.sum(keep > 0))
             if n_masked:
                 print(f"[quant-scan] fidelity mask: {n_masked} unsigned "
-                      f"dtype(s) removed (no negate head yet; "
-                      f"GRAPHAX_QUANT_ALLOW_UNSIGNED=1 restores)")
+                      f"dtype(s) removed (GRAPHAX_QUANT_MASK_UNSIGNED=1 "
+                      f"is set; unset to restore — negate+scale heads "
+                      f"handle unsigned now)")
             avail = jnp.asarray(keep, dtype=jnp.float32)
         _QUANT_HW_MASKS = (avail, compat)
     return _QUANT_HW_MASKS
@@ -473,6 +479,13 @@ class Quant:
 
     dtype: str
     scale_sign: int = 1
+    # Policy-chosen quantization magnitude (None = legacy absmax auto-scale).
+    # ``scale_frac`` ∈ [0, 1] selects the pre-round multiplier on a LOG ramp
+    # between 1 and the target's max: m = dtype_max ** scale_frac. The values
+    # are multiplied by m before rounding/clamping and the inverse (1/m, with
+    # the arm sign) folds into ``scalar_mult`` — so the policy controls the
+    # resolution-vs-clipping trade-off instead of the data-dependent absmax.
+    scale_frac: float | None = None
 
     def __post_init__(self):
         if self.dtype not in QUANT_DTYPE_INDEX:
@@ -948,9 +961,19 @@ def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
         sign = jnp.float32(action.scale_sign)
         absmax = jnp.max(jnp.abs(logical))
         dmax = _quant_dtype_max(target)              # target's max magnitude
-        s = absmax / dmax
-        # All-zero ``val`` -> absmax 0 -> keep s=1 (codes stay zeros, no div-by-0).
-        s_safe = jnp.where(s > 0, s, jnp.ones_like(s))
+        if action.scale_frac is not None:
+            # Policy-scaled path: divisor = dtype_max ** (−u), i.e. the values
+            # are multiplied by m = dtype_max**u (u=0 → ×1, u=1 → ×dtype_max)
+            # before rounding; the inverse rides scalar_mult below exactly as
+            # the absmax scale does. Data-independent — the policy owns the
+            # magnitude choice.
+            _u = jnp.clip(jnp.float32(action.scale_frac), 0.0, 1.0)
+            s_safe = jnp.float32(dmax) ** (-_u)
+        else:
+            s = absmax / dmax
+            # All-zero ``val`` -> absmax 0 -> keep s=1 (codes stay zeros,
+            # no div-by-0).
+            s_safe = jnp.where(s > 0, s, jnp.ones_like(s))
         # Narrow floats: the cast itself rounds to nearest representable, so no
         # jnp.round; the range clamp uses the float max. "Unsigned" also covers
         # sign-less float formats (float8_e8m0fnu: finfo.min > 0) — they get the
