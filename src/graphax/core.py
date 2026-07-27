@@ -1637,7 +1637,12 @@ def _eliminate_vertex(
                     # any kind): an approximation (per-path OR legacy list) can
                     # leave an edge sparse/permuted, and the sparse ``+`` reconciles
                     # it — there is no normalization to nominal any more.
-                    if not _perpath and not _is_approx_cfg:
+                    # The GLOBAL approx flag must gate too: under the keep-sparse
+                    # redesign a permuted edge from an approximated vertex legally
+                    # reaches a NON-approx vertex's merge — the per-vertex gate
+                    # alone is stale there (ViT layer_norm case).
+                    from .sparse.elemental.dispatch import approx_active as _aa
+                    if not _perpath and not _is_approx_cfg and not _aa():
                         edge_shape = tuple(
                             list(out_edge.aval.shape) + list(in_edge.aval.shape)
                         )

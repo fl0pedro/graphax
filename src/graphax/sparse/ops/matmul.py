@@ -440,7 +440,16 @@ def _align_contract_indices(lhs_primal, rhs_out, *, embed):
                 if k not in used_r and int(rhs_out[k].logical_size) == sa
             ]
             if len(cand) != 1:
-                break
+                # Duplicate SIZE-1 dims are interchangeable for value
+                # purposes — pair positionally (first unused) instead of
+                # bailing. Without this, a permuted primal side like
+                # (1,17,1) vs nominal (1,1,17) hits two ambiguous size-1
+                # candidates, the repair breaks, and the positional walk's
+                # 1-vs-17 pairing raises "Contraction size mismatch"
+                # (the ViT layer_norm div case). Sizes > 1 still bail —
+                # a wrong contraction is worse than the loud raise.
+                if sa != 1 or not cand:
+                    break
             used_r.add(cand[0])
             full.append((a, cand[0]))
         if len(full) == len(lhs_primal):
