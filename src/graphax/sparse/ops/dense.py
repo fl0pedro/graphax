@@ -61,6 +61,7 @@ densified at every boundary except transpose-as-view.
 
 from __future__ import annotations
 
+import os as _os
 from dataclasses import replace
 from typing import TYPE_CHECKING, Sequence
 
@@ -390,9 +391,38 @@ def _append_primary_dimension(
     return dim
 
 
-def _claim_free_axis(free_axes, size):  # TODO this is a workaround*
+def _claim_free_axis(free_axes, size):
+    """Bind an IMPLICIT dim to an existing val axis — only when that is
+    semantically identical to broadcasting.
+
+    WHAT THIS USED TO DO (and why it was wrong). It looked for any
+    *unreferenced* val axis whose extent happened to equal ``dim.size`` and
+    bound the implicit dim to it. But "unreferenced" means no dim describes
+    that axis, and an implicit dim means *the buffer does not vary along this
+    index*. Matching them by size is a coincidence, not a semantic link: the
+    dim would then read the orphan axis's VARYING contents instead of a
+    constant, silently producing a WRONG Jacobian with no error anywhere.
+    Measured: an implicit size-4 dim over a val carrying an unreferenced
+    size-4 axis densified to that axis's contents rather than a broadcast.
+    ``_squeeze_unreferenced_val_axes`` only drops size-1 orphans, so a size-N
+    orphan survives to be mis-claimed.
+
+    WHAT IT DOES NOW. A size-1 axis carries no varying data, so claiming it is
+    exactly broadcasting and stays available as a shape-preserving
+    optimisation. For any other extent we return ``None``, which makes the
+    caller append a genuinely broadcast axis — the correct materialisation of
+    a broadcast-uniform dim, driven by the dim's own metadata rather than by a
+    shape coincidence.
+
+    A surviving size>1 orphan is an upstream METADATA BUG (val carries data no
+    dim describes). ``GRAPHAX_DENSE_ORPHAN_STRICT=1`` raises on it so it can be
+    found; the default only refuses to consume it.
+    """
     bucket = free_axes.get(size)
-    if bucket:
+    if size == 1 and bucket:
+        return bucket.pop(0)
+    if _os.environ.get("GRAPHAX_DENSE_CLAIM_ORPHAN", "0") == "1" and bucket:
+        # Legacy size-match behaviour, for bisecting only.
         return bucket.pop(0)
     return None
 
@@ -410,7 +440,13 @@ def _append_block_dimension(i, dim, implicit, current_ndim, dims_to_append):
     return dim
 
 
-def _collect_free_val_axes(tensor, val_shape):  # TODO this is a workaround*
+def _collect_free_val_axes(tensor, val_shape):
+    """Val axes that no dim references, bucketed by extent.
+
+    Only size-1 entries are safely claimable (see ``_claim_free_axis``); a
+    size>1 entry means ``val`` carries data no dimension describes, which is a
+    metadata inconsistency rather than a spare axis to hand out.
+    """
     claimed = set()
     for d in tensor.dims:
         if d.axis is not None:
@@ -421,6 +457,15 @@ def _collect_free_val_axes(tensor, val_shape):  # TODO this is a workaround*
     for ax in range(len(val_shape)):
         if ax not in claimed:
             free.setdefault(val_shape[ax], []).append(ax)
+    if _os.environ.get("GRAPHAX_DENSE_ORPHAN_STRICT", "0") == "1":
+        orphans = {sz: ax for sz, ax in free.items() if sz > 1}
+        if orphans:
+            raise ValueError(
+                f"dense(): val has unreferenced axes of extent>1 {orphans} — "
+                f"no dimension describes them. This is a metadata bug "
+                f"upstream; consuming them would bind an implicit "
+                f"(broadcast-uniform) dim to varying data."
+            )
     return free
 
 

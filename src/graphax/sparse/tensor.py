@@ -1041,10 +1041,33 @@ def _apply_block_diagonal(
     d1 = st.out_dims[idx1] if is_out1 else st.primal_dims[idx1]
     d2 = st.out_dims[idx2] if is_out2 else st.primal_dims[idx2]
 
+    # SILENT PATH #1 (was: `return st`) — PARTNER MISMATCH.
+    #
+    # d1 is already half of a sparse pair bonded to some dim OTHER than d2, so
+    # the requested Diag conflicts with an existing pairing. Returning `st`
+    # unchanged made the transform a NO-OP WITH NO SIGNAL: the caller believed
+    # an approximation had been applied, the edge stayed exact, and the run
+    # reported cos = 1.0 for a "100%-skipped" Diag — indistinguishable from a
+    # genuinely perfect approximation. That is the exact failure mode
+    # test_approx_regression.py's docstring warns about.
+    #
+    # It is currently UNREACHABLE from the only caller: apply_diag validates
+    # the same condition and raises "Diag pair conflict" before delegating
+    # here. So converting it to a raise is behaviour-preserving today, and
+    # turns a future routing change into a loud error rather than a silent
+    # under-mask. Under the per-face masked hook a raise is recorded as
+    # `skipped` (telemetry) instead of vanishing.
     if d1.is_sparse and getattr(d1, "other_id", None) != d2.id:
-        return st
+        raise ValueError(
+            f"Diag: dim {d1.id} is already paired with {d1.other_id}, not "
+            f"{d2.id} — refusing to silently no-op (that would report an "
+            f"un-applied approximation as applied)."
+        )
     if d2.is_sparse and getattr(d2, "other_id", None) != d1.id:
-        return st
+        raise ValueError(
+            f"Diag: dim {d2.id} is already paired with {d2.other_id}, not "
+            f"{d1.id} — refusing to silently no-op."
+        )
 
     v1 = getattr(d1, "axis", None)
     v2 = getattr(d2, "axis", None)
@@ -1135,7 +1158,31 @@ def _apply_block_diagonal(
             new_b2_axis = v_present + 1 if b2 > 1 else None
         other_shift_threshold = v_present + 1
     elif v1 == v2:
-        return st
+        # SILENT PATH #2 (was: bare `return st`) — SHARED PHYSICAL AXIS.
+        #
+        # Both dims map to the SAME val axis, which is how an already-coupled
+        # pair is stored. Requesting a Diag here is a RE-MASK of an existing
+        # (block-)diagonal, and only some re-masks are no-ops:
+        #   * same factor, or a coarser factor that divides the current meta
+        #     -> genuinely a no-op (the finer structure already satisfies it);
+        #   * a FINER factor -> should SUBDIVIDE, not be ignored;
+        #   * a non-nestable factor -> should be refused.
+        # Returning `st` for all of them silently UNDER-MASKS the last two.
+        #
+        # apply_diag's _KEEP_BLOCKDIAG branch (default ON) classifies exactly
+        # these cases and subdivides/no-ops/raises before delegating here, so
+        # this is unreachable in the default configuration. It becomes live
+        # under GRAPHAX_KEEP_BLOCKDIAG=0, where the legacy path skipped the
+        # classification entirely — which is precisely when a silent
+        # under-mask would be least noticed. Raise instead.
+        raise ValueError(
+            f"Diag: dims {d1.id} and {d2.id} already share physical axis "
+            f"{v1} (an existing coupled diagonal). Re-masking it by "
+            f"factor={size} is handled by apply_diag's block-diagonal "
+            f"classifier; reaching _apply_block_diagonal means that "
+            f"classifier was bypassed (GRAPHAX_KEEP_BLOCKDIAG=0?). Refusing "
+            f"to silently no-op."
+        )
     else:
         new_shape = list(val.shape)
         if v1 < v2:
