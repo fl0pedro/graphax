@@ -392,38 +392,21 @@ def _append_primary_dimension(
 
 
 def _claim_free_axis(free_axes, size):
-    """Bind an IMPLICIT dim to an existing val axis — only when that is
-    semantically identical to broadcasting.
+    """MUST NEVER FIRE. Kept only so the call sites read naturally.
 
-    WHAT THIS USED TO DO (and why it was wrong). It looked for any
-    *unreferenced* val axis whose extent happened to equal ``dim.size`` and
-    bound the implicit dim to it. But "unreferenced" means no dim describes
-    that axis, and an implicit dim means *the buffer does not vary along this
-    index*. Matching them by size is a coincidence, not a semantic link: the
-    dim would then read the orphan axis's VARYING contents instead of a
-    constant, silently producing a WRONG Jacobian with no error anywhere.
-    Measured: an implicit size-4 dim over a val carrying an unreferenced
-    size-4 axis densified to that axis's contents rather than a broadcast.
-    ``_squeeze_unreferenced_val_axes`` only drops size-1 orphans, so a size-N
-    orphan survives to be mis-claimed.
-
-    WHAT IT DOES NOW. A size-1 axis carries no varying data, so claiming it is
-    exactly broadcasting and stays available as a shape-preserving
-    optimisation. For any other extent we return ``None``, which makes the
-    caller append a genuinely broadcast axis — the correct materialisation of
-    a broadcast-uniform dim, driven by the dim's own metadata rather than by a
-    shape coincidence.
-
-    A surviving size>1 orphan is an upstream METADATA BUG (val carries data no
-    dim describes). ``GRAPHAX_DENSE_ORPHAN_STRICT=1`` raises on it so it can be
-    found; the default only refuses to consume it.
+    ``_collect_free_val_axes`` raises on EVERY orphan, so ``free_axes`` is
+    always empty here and this always returns ``None`` (⇒ the caller
+    broadcasts, which is the correct materialisation of a broadcast-uniform
+    dim). Reaching here with anything to hand out means that invariant was
+    bypassed — report it rather than binding an implicit dim to unrelated data.
     """
-    bucket = free_axes.get(size)
-    if size == 1 and bucket:
-        return bucket.pop(0)
-    if _os.environ.get("GRAPHAX_DENSE_CLAIM_ORPHAN", "0") == "1" and bucket:
-        # Legacy size-match behaviour, for bisecting only.
-        return bucket.pop(0)
+    if free_axes:
+        raise RuntimeError(
+            f"_claim_free_axis reached with unreferenced val axes "
+            f"{dict(free_axes)} for a dim of size {size} — "
+            f"_collect_free_val_axes should already have raised. Fix the "
+            f"SparseTensor/Index metadata that produced an orphan axis."
+        )
     return None
 
 
@@ -443,9 +426,11 @@ def _append_block_dimension(i, dim, implicit, current_ndim, dims_to_append):
 def _collect_free_val_axes(tensor, val_shape):
     """Val axes that no dim references, bucketed by extent.
 
-    Only size-1 entries are safely claimable (see ``_claim_free_axis``); a
-    size>1 entry means ``val`` carries data no dimension describes, which is a
-    metadata inconsistency rather than a spare axis to hand out.
+    There is no such thing as a legitimately-unreferenced val axis — not even
+    an extent-1 one. A singleton orphan means somebody padded ``val`` beyond
+    the rank its dims describe; the fix is to not create it. So this RAISES on
+    any orphan and always returns an empty dict, which makes implicit dims
+    materialise by broadcasting: the behaviour their metadata specifies.
     """
     claimed = set()
     for d in tensor.dims:
@@ -453,20 +438,32 @@ def _collect_free_val_axes(tensor, val_shape):
             claimed.add(d.axis)
         if d.is_sparse and d.block_axis is not None:
             claimed.add(d.block_axis)
-    free = {}
-    for ax in range(len(val_shape)):
-        if ax not in claimed:
-            free.setdefault(val_shape[ax], []).append(ax)
-    if _os.environ.get("GRAPHAX_DENSE_ORPHAN_STRICT", "0") == "1":
-        orphans = {sz: ax for sz, ax in free.items() if sz > 1}
-        if orphans:
-            raise ValueError(
-                f"dense(): val has unreferenced axes of extent>1 {orphans} — "
-                f"no dimension describes them. This is a metadata bug "
-                f"upstream; consuming them would bind an implicit "
-                f"(broadcast-uniform) dim to varying data."
-            )
-    return free
+    orphans = [ax for ax in range(len(val_shape)) if ax not in claimed]
+    if orphans and _os.environ.get(
+            "GRAPHAX_ALLOW_ORPHAN_VAL_AXES", "0") != "1":
+        detail = ", ".join(
+            f"dim(id={d.id}, size={d.size}, axis={d.axis}, "
+            f"other_id={getattr(d, 'other_id', None)}, "
+            f"block_size={getattr(d, 'block_size', None)}, "
+            f"block_axis={getattr(d, 'block_axis', None)})"
+            for d in tensor.dims
+        )
+        raise ValueError(
+            f"SparseTensor invariant violated: val axes {orphans} of shape "
+            f"{tuple(val_shape)} are referenced by NO dimension.\n"
+            f"  dims: {detail}\n"
+            f"Every val axis must be described by some dim's `axis` or "
+            f"`block_axis`. This is a malformed tensor, not a spare axis: a "
+            f"val of rank>needed usually means singleton padding that should "
+            f"never have been created (e.g. arange(4).reshape(4,1,1) where "
+            f"no dim declares a block_size — it should be arange(4)), or a "
+            f"transform that dropped a dim without dropping its axis. "
+            f"Materialising an implicit (broadcast-uniform) dim against an "
+            f"orphan would silently bind it to unrelated data. Fix the "
+            f"producer. GRAPHAX_ALLOW_ORPHAN_VAL_AXES=1 restores the legacy "
+            f"silent behaviour, for bisecting only."
+        )
+    return {}
 
 
 def _broadcast_and_append_dimensions(tensor, values, implicit):

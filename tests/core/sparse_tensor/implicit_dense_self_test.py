@@ -49,7 +49,12 @@ class TestSelfDenseNones(unittest.TestCase):
         )
 
     def st_4d_val_sparse_1(self):
-        x = jnp.arange(3).reshape(3, 1, 1)
+        # val is (3,), NOT (3, 1, 1): no dim here declares a block_size, so the
+        # only real axis is axis 0. The trailing singletons were copy-paste
+        # padding from the bst_* block-diagonal fixtures below (whose dims DO
+        # carry block_size, hence a genuinely rank-3 val). They left two val
+        # axes that no dimension referenced, which is a malformed SparseTensor.
+        x = jnp.arange(3)
         return SparseTensor(
             (DiagonalIndex(0, 3, 0, 2), DiagonalIndex(1, 4, None, 3)),
             (DiagonalIndex(2, 3, 0, 0), DiagonalIndex(3, 4, None, 1)),
@@ -57,7 +62,8 @@ class TestSelfDenseNones(unittest.TestCase):
         )
 
     def st_4d_val_sparse_2(self):
-        x = jnp.arange(4).reshape(4, 1, 1)
+        # val is (4,) — see st_4d_val_sparse_1.
+        x = jnp.arange(4)
         return SparseTensor(
             (DiagonalIndex(0, 3, None, 2), DiagonalIndex(1, 4, 0, 3)),
             (DiagonalIndex(2, 3, None, 0), DiagonalIndex(3, 4, 0, 1)),
