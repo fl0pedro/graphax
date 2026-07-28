@@ -1067,10 +1067,59 @@ def _apply_block_diagonal(
         # block_axis=None ⇒ a malformed, un-densifiable dim). Signal it as a
         # per-edge geometry miss so the caller's best-effort loop skips this
         # transform instead of fabricating a corrupt edge.
+        # BOTH IMPLICIT, NOT COUPLED — representable, and metadata-only.
+        #
+        # Two implicit DENSE dims mean the buffer is constant over both of
+        # these logical indices, i.e. the base structure is FULL. Masking it to
+        # a block diagonal is therefore a genuine TIGHTENING (not the widening
+        # that re-labelling a coupled pure diagonal would be), and it needs no
+        # val touch at all: there is no data to carve, only structure to
+        # declare. Emitting DiagonalIndex(size=factor, axis=None,
+        # block_size=b, block_axis=None) on both sides says "factor identical
+        # blocks on the meta-diagonal, each block constant" — which dense.py's
+        # _is_dimension_implicit already consumes (it tests exactly
+        # `is_sparse and block_size and block_axis is None`).
+        #
+        # Measured: hand-constructed dims of this shape densify bit-identically
+        # to the dense block-mask oracle (maxdiff 0.0), including with
+        # val=None + scalar_mult, and survive matmul against a dense operand.
+        #
+        # The COUPLED case is deliberately excluded: a coupled implicit pair is
+        # already a pure diagonal (c*I), and re-labelling it with blocks would
+        # WIDEN its support to c*blockdiag(ones) — silently wrong. It is
+        # intercepted upstream in apply_diag as a no-op; if one ever reaches
+        # here we still raise.
         if size > 1 and (b1 > 1 or b2 > 1):
+            if not d1.is_sparse and not d2.is_sparse:
+                new_d1 = DiagonalIndex(
+                    d1.id, size, None, d2.id,
+                    b1 if b1 > 1 else None, None,
+                )
+                new_d2 = DiagonalIndex(
+                    d2.id, size, None, d1.id,
+                    b2 if b2 > 1 else None, None,
+                )
+                out_dims = list(st.out_dims)
+                primal_dims = list(st.primal_dims)
+                if is_out1:
+                    out_dims[rel_i] = new_d1
+                else:
+                    primal_dims[rel_i] = new_d1
+                if is_out2:
+                    out_dims[rel_j] = new_d2
+                else:
+                    primal_dims[rel_j] = new_d2
+                return SparseTensor(
+                    out_dims, primal_dims, st.val,
+                    scalar_mult=st.scalar_mult,
+                    fill_value=st.fill_value,
+                    pre_transforms=st.pre_transforms,
+                    post_transforms=st.post_transforms,
+                )
             raise ValueError(
                 "Diag: cannot block-diagonalise an implicit (axis=None) pair "
-                "that is not a pure diagonal — no physical axis to carve blocks."
+                "that is already coupled — a coupled implicit pair is a pure "
+                "diagonal (c*I) and blocking it would WIDEN its support."
             )
     elif v1 is None or v2 is None:
         v_present = v1 if v1 is not None else v2

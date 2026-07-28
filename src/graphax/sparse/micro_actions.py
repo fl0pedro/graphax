@@ -657,19 +657,35 @@ def apply_diag(st: SparseTensor, action: Diag) -> SparseTensor:
     ):
         return st
 
-    # AUDIT FIX: a mixed implicit/physical (or both-implicit non-paired) Diag
-    # cannot be represented by _apply_block_diagonal, which assumes BOTH sides
-    # are materialized val axes. Applying it anyway corrupts the dim list
-    # (physical-axis collision -> downstream transpose/IndexError crash).
-    # Raise ValueError so the per-vertex best-effort handler skips this
-    # transform on this edge (leaves it exact).
-    if getattr(d1, "axis", None) is None or getattr(d2, "axis", None) is None:
-        raise ValueError(
-            "Diag: cannot block-diagonalise a pair involving an implicit "
-            "(axis=None) dim — its physical axis was dropped (e.g. by a prior "
-            "Compress) and _apply_block_diagonal requires materialized axes."
-        )
-
+    # COMPRESS -> DIAG IS LEGAL. (The former "AUDIT FIX" guard lived here and
+    # rejected every pair with an implicit (axis=None) side. It was wrong on
+    # both of its stated grounds:
+    #
+    #   1. "_apply_block_diagonal assumes BOTH sides are materialized val
+    #      axes" — false: it has a dedicated MIXED branch. For a mixed pair the
+    #      physical side's axis splits N -> (factor, b), that new meta axis is
+    #      SHARED by both dims (as every coupled pair's is), and the implicit
+    #      side keeps block_axis=None, which means "constant within the block"
+    #      — exactly true of data that a Compress made uniform. No
+    #      materialisation of the implicit side is needed.
+    #   2. "block_size>1 with block_axis=None is unrepresentable /
+    #      un-densifiable" — false: dense.py's _is_dimension_implicit accepts
+    #      precisely that shape, and _subdivide_coupled_blockdiag documents and
+    #      relies on it.
+    #
+    # Measured with the guard removed: dense() vs a dense block-mask oracle is
+    # bit-identical (maxdiff 0.0) for mixed pairs at rank 2 and 4, both
+    # orientations, rectangular blocks and factor==N; matmul / elementwise /
+    # transpose / jit round-trips all 0.0; a fuzz over 78 admitted
+    # (i, j, factor) actions on 9 post-Compress shapes gave 0 mismatches; and
+    # end-to-end jacve with [Compress, Diag] matches the dense oracle at
+    # cos = 1.000000000000 on mlp8 and chain8, fwd and rev.
+    #
+    # The genuinely-degenerate case — an already-COUPLED implicit pure diagonal
+    # — is intercepted ABOVE this point and returned unchanged. That no-op is
+    # the real ViT (2,3,1,16,...) fix and is untouched: re-labelling it
+    # size=factor/block_size=b would WIDEN c*I to c*blockdiag(ones), a silently
+    # larger-support Jacobian.
     return _apply_block_diagonal(
         st, is_out1, rel_i, is_out2, rel_j, factor, b1, b2,
     )
