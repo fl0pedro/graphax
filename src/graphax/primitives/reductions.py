@@ -90,25 +90,29 @@ def _reduce_sum_elementals(primals, val_out_ndim, **params):
         # to run before this list existed -> UnboundLocalError (latent: jnp.sum
         # always lowers explicit axes, never None).
         axes = tuple(range(primal.ndim))
-        new_out_dims.append(DenseIndex(0, 1, 0))
+        # axis=None: with val=None below there is no physical axis to point at.
+        new_out_dims.append(DenseIndex(0, 1, None))
     elif isinstance(axes, int):
         axes = (axes,)
 
     l = val_out_ndim
     base = 1 if reduce_all else l  # contiguous ids; see _reduce_extremum_elementals
-    count = 0
     for i, size in enumerate(get_shape(primal)):
         if i in axes:
-            new_primal_dims.append(DenseIndex(base + i, size, count))
-            shape.append(size)
-            count += 1
+            # d(sum)/d(x_k) == 1 for EVERY reduced element, so this partial is
+            # broadcast-UNIFORM along the reduced axis. Mark the dim implicit
+            # (axis=None) and let val=None carry the all-ones structure --
+            # dense_for_matmul already reads val=None as "all ones (x
+            # scalar_mult)". Materialising jnp.ones(shape) stored one float per
+            # reduced element for a tensor that is a single constant: measured
+            # 16x on a (16,) partial and 256x on (16,16).
+            new_primal_dims.append(DenseIndex(base + i, size, None))
         else:
             ll = len(new_out_dims)
             new_out_dims.append(DiagonalIndex(ll, size, None, l + i))
             new_primal_dims.append(DiagonalIndex(l + i, size, None, ll))
 
-    val = jnp.ones(shape, dtype=jnp.float32)
-    return [SparseTensor(new_out_dims, new_primal_dims, val)]
+    return [SparseTensor(new_out_dims, new_primal_dims, None)]
 
 
 def reduce_sum_elemental_rule(primals, **params):
