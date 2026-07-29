@@ -28,6 +28,7 @@ from __future__ import annotations
 from typing import Any
 
 import jax.numpy as jnp
+import numpy as _np
 
 
 # Each narrow dtype JAX won't promote -> the smallest STANDARD dtype that
@@ -52,6 +53,74 @@ _NARROW_PROMOTION_REP: dict[str, Any] = {
 }
 
 
+def _full_float_dtype() -> Any:
+    """The full-precision scalar dtype: float64 when ``jax_enable_x64`` is
+    enabled, float32 otherwise. ``jnp.result_type(float)`` reports exactly
+    JAX's configured default, so this needs no ``jax.config`` import (which
+    would create a cycle from ``tensor.py``)."""
+    return jnp.dtype(jnp.result_type(float))
+
+
+def _is_narrow(dt) -> bool:
+    """True for the dtypes JAX refuses to promote (every float8/float4 and the
+    sub-byte ints) -- i.e. the ones only reachable via a ``Quant``."""
+    try:
+        return jnp.dtype(dt).name in _NARROW_PROMOTION_REP
+    except Exception:
+        return False
+
+
+def _scalar_store_dtype(val_dtype) -> Any:
+    """At-rest dtype for ``scalar_mult`` / ``fill_value``.
+
+    ONLY ``val`` is allowed to be narrow. For float or quantized tensors the
+    scalars are kept at full precision so the quantization is a property of the
+    stored buffer alone and densification can choose its output precision.
+    Genuine integer / bool tensors keep their own dtype -- forcing those to
+    float would change integer arithmetic.
+    """
+    dt = jnp.dtype(val_dtype)
+    if _is_narrow(dt) or jnp.issubdtype(dt, jnp.floating):
+        return _full_float_dtype()
+    return dt
+
+
+def _check_downcast_safe(value, target_dtype, *, what="value") -> None:
+    """Raise ``OverflowError`` if CONCRETE ``value`` is not representable in
+    ``target_dtype``.
+
+    Checked on magnitude, not on dtype ranges: a static range comparison would
+    reject every float32->bfloat16 downcast (same exponent range, far less
+    mantissa) while waving through genuinely lossy ones. Under jit the operand
+    is a tracer, no static check is possible, and IEEE saturation applies -- so
+    this is a best-effort guard on the eager path, which is where Quant scales
+    are actually built.
+    """
+    tdt = jnp.dtype(target_dtype)
+    if not (jnp.issubdtype(tdt, jnp.floating) or _is_narrow(tdt)):
+        return
+    try:
+        arr = _np.asarray(value, dtype=_np.float64)
+    except Exception:
+        return  # tracer / unconvertible: nothing static to check
+    if arr.size == 0:
+        return
+    finite = arr[_np.isfinite(arr)]
+    if finite.size == 0:
+        return
+    try:
+        lim = float(jnp.finfo(tdt).max)
+    except Exception:
+        return
+    peak = float(_np.max(_np.abs(finite)))
+    if peak > lim:
+        raise OverflowError(
+            f"{what}: magnitude {peak:.6g} exceeds {tdt.name} max {lim:.6g}. "
+            f"Refusing to silently overflow to inf. Densify with "
+            f"keep_quantization=False to read this tensor in full precision."
+        )
+
+
 def _compute_dtype(*dtypes) -> Any:
     """Highest common arithmetic dtype of ``dtypes``.
 
@@ -68,8 +137,18 @@ def _compute_dtype(*dtypes) -> Any:
         return jnp.result_type(*reps)
 
 
-def _scaled_mul(value, scalar_mult):
-    """``value * scalar_mult`` at their highest common dtype.
+def _scaled_mul(value, scalar_mult, *, keep_narrow: bool = False):
+    """``value * scalar_mult``.
+
+    ``keep_narrow=False`` (default) combines at the highest common dtype, which
+    -- now that ``scalar_mult`` is stored at full precision -- yields a
+    full-precision result: the safe, lossless read.
+
+    ``keep_narrow=True`` instead broadcasts ``scalar_mult`` DOWN into ``value``'s
+    (narrow) dtype and multiplies there, so a Quant survives densification.
+    Guarded by :func:`_check_downcast_safe`.
+
+    Original contract below.
 
     Upcasts both operands to ``_compute_dtype(value, scalar_mult)`` first (via
     the native ``astype``), so a narrow (Quant'd) ``value`` never trips JAX's
@@ -85,6 +164,9 @@ def _scaled_mul(value, scalar_mult):
     sdt = getattr(scalar_mult, "dtype", None)
     if vdt is None or sdt is None:
         return value * scalar_mult
+    if keep_narrow and jnp.dtype(vdt) != jnp.dtype(sdt):
+        _check_downcast_safe(scalar_mult, vdt, what="scalar_mult")
+        return value * jnp.asarray(scalar_mult).astype(vdt)
     cdt = _compute_dtype(vdt, sdt)
     # No zero-point unshift: unsigned Quant targets store the sign-flip
     # half-range magnitudes with the arm's polarity folded into ``scalar_mult``

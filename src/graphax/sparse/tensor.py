@@ -256,11 +256,23 @@ class SparseTensor(SparseMathMixin):
         if val is not None and not hasattr(val, "dtype"):
             val = jnp.asarray(val)
 
+        from graphax.sparse.dtype_compute import (
+            _full_float_dtype, _is_narrow, _scalar_store_dtype)
+
         if dtype is None:
-            dtype = val.dtype if val is not None else jnp.dtype("float32")
+            dtype = val.dtype if val is not None else _full_float_dtype()
+
+        # ONLY ``val`` may be narrow. ``scalar_mult`` / ``fill_value`` are kept
+        # at full precision (float64 under jax_enable_x64, else float32) so a
+        # Quant is a property of the stored buffer alone -- densification then
+        # chooses its own output precision instead of being forced wide by the
+        # scalar. Genuine int/bool tensors keep their own dtype.
+        _scalar_dtype = _scalar_store_dtype(dtype)
 
         if scalar_mult is None:
-            scalar_mult = jnp.array(1, dtype=dtype)
+            scalar_mult = jnp.array(1, dtype=_scalar_dtype)
+        elif _is_narrow(getattr(scalar_mult, "dtype", None)):
+            scalar_mult = jnp.asarray(scalar_mult).astype(_scalar_dtype)
 
         if pre_transforms is None:
             pre_transforms = ()
@@ -450,7 +462,7 @@ class SparseTensor(SparseMathMixin):
     def size(self) -> int:
         return prod(self.shape)
 
-    def dense(self) -> Array:
+    def dense(self, *, keep_quantization: bool = False) -> Array:
         # ``dense_for_matmul`` is the single Array-producing densifier (fusion
         # fast paths, with a ``dense(hard=True)`` fallback for shapes they don't
         # cover) — see the densification map in ``ops/dense.py``. It consumes
@@ -458,8 +470,12 @@ class SparseTensor(SparseMathMixin):
         # SetIndex) dims (no-op when there are none).
         from graphax.sparse.ops.dense import dense_for_matmul
         from graphax.sparse.ops.utils import _compressed_dims, _densify_compressed_dims
+        # ``keep_quantization=False`` (default): promote to the full
+        # mul-capable dtype and return full precision -- lossless.
+        # ``True``: broadcast scalar_mult down and multiply in val's narrow
+        # dtype, so the Quant survives (raises on concrete overflow).
         t = _densify_compressed_dims(self) if _compressed_dims(self) else self
-        return dense_for_matmul(t)
+        return dense_for_matmul(t, keep_quantization=keep_quantization)
 
     @property
     def T(self) -> SparseTensor:
