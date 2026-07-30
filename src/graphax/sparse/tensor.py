@@ -1141,13 +1141,13 @@ def _apply_block_diagonal(
                 out_dims = list(st.out_dims)
                 primal_dims = list(st.primal_dims)
                 if is_out1:
-                    out_dims[rel_i] = new_d1
+                    out_dims[idx1] = new_d1
                 else:
-                    primal_dims[rel_i] = new_d1
+                    primal_dims[idx1] = new_d1
                 if is_out2:
-                    out_dims[rel_j] = new_d2
+                    out_dims[idx2] = new_d2
                 else:
-                    primal_dims[rel_j] = new_d2
+                    primal_dims[idx2] = new_d2
                 return SparseTensor(
                     out_dims, primal_dims, st.val,
                     scalar_mult=st.scalar_mult,
