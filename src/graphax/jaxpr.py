@@ -1215,6 +1215,7 @@ class IncrementalPathTokenizer:
             self._emit_atoms(self._var_name(v), toks)
             self._emit_atoms(self._format_shape(v.aval.shape), toks)
         self._emit_eqns(self.ij.base_eqns(), toks)
+        self._cur_face_segments = []
         self._finish_eqn_ids(toks)
         return toks
 
@@ -1308,18 +1309,44 @@ class IncrementalPathTokenizer:
         self._emit_atoms(self._var_name(fr.out_edge), out)
 
     def _emit_face(self, fr, eqns, out):
+        """Emit one face; return the index in ``out`` where its CONTRACTION
+        ends and its approximations begin (== ``len(out)`` when the face was
+        not approximated)."""
         self._emit_face_header(fr, out)
         elim, approx = self._split_face_eqns(fr, eqns)
         self._emit_eqns(elim, out)
+        split = len(out)
         for atype, params, sub in approx:
             self._emit_approx_head(atype, params, out)
             self._emit_eqns(sub, out)
+        return split
 
     def _emit_step_paths(self, step_i, eqns):
         toks = []
+        segs = []
         for fr in self.ij.step_faces(step_i):
-            self._emit_face(fr, eqns, toks)
+            start = len(toks)
+            split = self._emit_face(fr, eqns, toks)
+            segs.append((start, split, len(toks)))
+        self._cur_face_segments = segs
         return toks
+
+    def last_face_segments(self):
+        """``[(start, split, end)]`` per EMITTED face of the last
+        :meth:`eliminate` block, as indices into the token list it returned.
+
+        ``[start:split]`` is the face header plus its contraction/join
+        equations; ``[split:end]`` is the ``approx`` heads and the equations
+        the approximations produced (empty when the face ran exact). This is
+        the split an autoregressive per-face loop needs: it reads
+        ``[start:split]`` of face f, decides, and then reads
+        ``[split:end]`` of face f followed by ``[start:split]`` of face f+1.
+
+        Faces the caller SKIPPED (``graphax.SKIP_FACE``) emit nothing and so
+        have no entry -- the list indexes EMITTED faces, not the face keys
+        :meth:`~graphax.incremental.IncrementalJaxpr.faces` enumerates.
+        """
+        return list(getattr(self, "_cur_face_segments", []))
 
     # ---- raw-jaxpr (human) rendering of the same structure ----------
     def _pp_name(self, v):
