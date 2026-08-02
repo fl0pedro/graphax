@@ -1920,19 +1920,85 @@ def _einsum_matmul_general(lhs, rhs, count: bool = False):
     ):
         return None
 
-    from graphax.sparse.lower.matmul import _NoRule, _lower
+    from graphax.sparse.lower.matmul import _NoRule, _bump, _lower
 
+    # LOWER_STATS is the totality ledger: every hit, every named fallthrough.
+    # (This entry point used to import _lower directly and bypass the lower
+    # module's own stats wrapper — the ledger read empty in production.)
     try:
         out, counts, _tags = _lower(lhs, rhs)
-    except _NoRule:
-        # No rule yet for this geometry — fall through to the existing path.
+    except _NoRule as _e:
+        # SPILL: a named gap. Materialize only THIS contraction's operands and
+        # replan — dense x dense always has a rule, so the planner is total by
+        # construction and every spill is counted, never hidden.
+        if _spill_enabled():
+            try:
+                out, counts, _tags = _lower(_spill_dense(lhs), _spill_dense(rhs))
+            except Exception as _e2:
+                _bump(
+                    "fallthrough:post_spill:"
+                    f"{getattr(_e2, 'reason', type(_e2).__name__)}"
+                )
+                return None
+            _bump(f"spill:{_e.reason}")
+            for _t in _tags:
+                _bump(_t)
+            if count:
+                return out, counts
+            return out
+        _bump(f"fallthrough:{_e.reason}")
         return None
-    except Exception:
-        # Any unexpected planner error is a fall-through, never a wrong result.
+    except Exception as _e:
+        _bump(f"fallthrough:unexpected:{type(_e).__name__}")
         return None
+    _bump("hit")
+    for _t in _tags:
+        _bump(_t)
     if count:
         return out, counts
     return out
+
+
+def _spill_enabled() -> bool:
+    import os
+
+    return os.environ.get("GRAPHAX_SPILL", "1") == "1"
+
+
+def _spill_dense(st):
+    """Materialize a structured operand into the fully-dense lattice element.
+
+    The SPILL rule's one job: when the planner has no rule for a structured
+    pairing, densifying JUST the two offending operands (never the whole
+    graph) always lands on the dense x dense contraction rule — totality by
+    construction, and the cost is local to the gap. Dim ids are preserved so
+    ``_align_tensor_ids`` / ``_build_output_tensor`` topology is unchanged;
+    ``dense()`` folds ``scalar_mult`` into the buffer, so the spilled tensor
+    carries the neutral multiplier; deferred-transform queues ride through
+    (they act on the ``.dense()`` form, which is exactly what this is).
+    """
+    from graphax.sparse.indexes import DenseIndex
+    from graphax.sparse.tensor import SparseTensor
+
+    sizes = [d.logical_size for d in (*st.out_dims, *st.primal_dims)]
+    arr = jnp.reshape(st.dense(), sizes)
+    n_out = len(st.out_dims)
+    out = tuple(
+        DenseIndex(d.id, d.logical_size, i) for i, d in enumerate(st.out_dims)
+    )
+    primal = tuple(
+        DenseIndex(d.id, d.logical_size, n_out + i)
+        for i, d in enumerate(st.primal_dims)
+    )
+    return SparseTensor(
+        out,
+        primal,
+        arr,
+        fill_value=st.fill_value,
+        pre_transforms=st.pre_transforms,
+        post_transforms=st.post_transforms,
+        check_consistency=False,
+    )
 
 
 # --- Late-densification escape hatch for non-zero fill_value --------------
