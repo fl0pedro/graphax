@@ -154,6 +154,69 @@ def dense(
     )
 
 
+# --------------------------------------------------------------------------- #
+# Structured-densification audit (GRAPHAX_STRUCT_AUDIT).
+#
+# Every densification in the library funnels through ``dense_for_matmul`` (or
+# ``SparseTensor.dense()`` which calls it), so ONE hook here sees each event:
+# which call site expanded a STRUCTURED tensor to its dense form, what the
+# structure was, and how many bytes the expansion cost over the stored form.
+# This is the empirical input to "which closure rule is missing" -- the
+# blocker list for making the sparse algebra total instead of falling back.
+#
+# Off (env unset): a single module-level bool check per call, no allocation.
+# --------------------------------------------------------------------------- #
+import os as _os
+import sys as _sys
+
+_STRUCT_AUDIT = _os.environ.get("GRAPHAX_STRUCT_AUDIT", "0") not in (
+    "", "0", "false", "False")
+STRUCT_AUDIT_LOG: list = []   # (site, signature, dense_bytes, stored_bytes)
+_AUDIT_LOG_CAP = 100_000
+
+
+def reset_struct_audit() -> None:
+    STRUCT_AUDIT_LOG.clear()
+
+
+def _dim_sig(d) -> str:
+    """Compact one-dim signature: D<n> dense, I<n> implicit, or a coupled pair
+    member P<id>~<other>:<meta>x<block> (covers plain diagonal block=1)."""
+    if getattr(d, "other_id", None) is not None:
+        return (f"P{d.id}~{d.other_id}:{d.size}x{d.block_size or 1}"
+                + ("i" if getattr(d, "axis", None) is None else ""))
+    n = int(getattr(d, "logical_size", getattr(d, "size", 0)) or 0)
+    return (f"I{n}" if getattr(d, "axis", None) is None else f"D{n}")
+
+
+def _audit_densify(tensor) -> None:
+    if len(STRUCT_AUDIT_LOG) >= _AUDIT_LOG_CAP:
+        return
+    try:
+        import numpy as _np
+        itm = tensor.dtype.itemsize if tensor.val is not None else 4
+        dense_b = int(_np.prod(tensor.shape)) * itm if tensor.shape else 0
+        stored_b = (int(tensor.val.size) * itm
+                    if tensor.val is not None else 0)
+        # short caller chain OUTSIDE the densify plumbing (dense.py and the
+        # ``SparseTensor.dense`` wrapper) = the actual densifying site(s)
+        f = _sys._getframe(2)
+        chain = []
+        while f is not None and len(chain) < 4:
+            fn = f.f_code.co_filename.rsplit("/", 1)[-1]
+            if not (fn == "dense.py"
+                    or (fn == "tensor.py" and f.f_code.co_name == "dense")):
+                chain.append(f"{fn}:{f.f_lineno}:{f.f_code.co_name}")
+            f = f.f_back
+        site = " <- ".join(chain) if chain else "?"
+        sig = ("out[" + ",".join(_dim_sig(d) for d in tensor.out_dims)
+               + "]x[" + ",".join(_dim_sig(d) for d in tensor.primal_dims)
+               + "]")
+        STRUCT_AUDIT_LOG.append((site, sig, dense_b, stored_b))
+    except Exception:
+        pass
+
+
 def dense_for_matmul(tensor: SparseTensor, *,
                      keep_quantization: bool = False) -> Array:
     """Fusion-friendly dense form (broadcast+select; no scatter / no gather where possible).
@@ -161,6 +224,10 @@ def dense_for_matmul(tensor: SparseTensor, *,
     See module docstring. Falls back to the scatter-based ``dense()`` for shapes the
     simple builder doesn't cover.
     """
+    if _STRUCT_AUDIT and any(
+            d.is_sparse or getattr(d, "axis", None) is None
+            for d in tensor.dims):
+        _audit_densify(tensor)
     # Fast path: fully-dense tensor — val IS the dense form (modulo permutation).
     if all(not d.is_sparse for d in tensor.dims):
         if tensor.val is None:
