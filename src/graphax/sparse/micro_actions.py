@@ -738,9 +738,50 @@ def _reduce_along_axes(val: jnp.ndarray, axes: tuple[int, ...], kind: str):
     raise ValueError(f"Unknown Compress.kind {kind!r}")
 
 
+def canonical_axis_order(st: SparseTensor) -> tuple[int | None, ...]:
+    """Per-SLOT physical ``val`` axis (or ``None``) for micro-action addressing.
+
+    Slots are LOGICAL COMPONENTS, derived from dims metadata alone, in
+    ``(*out_dims, *primal_dims)`` traversal order:
+
+      * a dense dim contributes one slot — its extent component;
+      * a coupled pair contributes, at its FIRST appearance, a meta slot and
+        (iff ``block_size is not None``) a block slot; the partner dim is
+        skipped (shared storage);
+      * a compressed band buffer's structural axes are NOT addressable.
+
+    Slot ``k`` holds the physical axis storing that component, or ``None``
+    when the component is implicit (not stored). Because both engines produce
+    identical dims metadata for the same logical tensor, the slot list —
+    count, order, and meaning — is layout- and engine-invariant; only the
+    physical axis each slot resolves to differs. Reducing an implicit or
+    extent-1 slot is the identity, which is exactly the right semantics for a
+    component one engine stores broadcast and another leaves implicit.
+    """
+    slots: list[int | None] = []
+    seen_pairs: set[frozenset] = set()
+    for d in (*st.out_dims, *st.primal_dims):
+        if getattr(d, "other_id", None) is not None:
+            key = frozenset((d.id, d.other_id))
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            slots.append(d.axis)
+            if d.block_size is not None:
+                slots.append(d.block_axis)
+        else:
+            slots.append(getattr(d, "axis", None))
+    return tuple(slots)
+
+
 @_squeeze_result
 def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
-    """Reduce the listed physical axes via ``action.kind`` (default ``mean``).
+    """Reduce the listed CANONICAL axis slots via ``action.kind`` (default ``mean``).
+
+    ``action.axes`` are logical component slots (see
+    :func:`canonical_axis_order`), NOT raw physical positions. For the common
+    fully-dense canonical layout, slot ``k`` == physical axis ``k``, so
+    existing callers and recorded actions keep their meaning there.
 
     The reduction happens as a single ``jnp.<reduce>(val, axis=sorted_axes)``
     call — multi-axis Compress is the efficient form because all axes are
@@ -767,11 +808,12 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
     if not action.axes:
         return st
 
-    val_ndim = st.val.ndim
+    _canon = canonical_axis_order(st)
     for a in action.axes:
-        if a >= val_ndim:
+        if a >= len(_canon):
             raise ValueError(
-                f"Compress.axes entry {a} out of range for val.ndim = {val_ndim}."
+                f"Compress.axes entry {a} out of range: tensor has "
+                f"{len(_canon)} logical component slots."
             )
 
     # COMPRESS may only reduce FREE physical axes. A *structural* axis — the
@@ -794,7 +836,11 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
     # already handles block_axis -> None. Measured: -50% storage, .dense() identical to the
     # uncompressed edge (logical_size NOT stale), zero added downstream contraction failures,
     # 153/153 axes fine unguarded. Invalid actions must be masked UP FRONT by the caller.
-    drops = sorted(set(action.axes))
+    drops = sorted({_canon[a] for a in action.axes if _canon[a] is not None})
+    if not drops:
+        # Every addressed component is implicit — already uniform along it, so
+        # the reduction is the identity by construction.
+        return st
     new_val = _reduce_along_axes(st.val, tuple(drops), action.kind)
 
     drop_set = set(drops)
