@@ -1286,6 +1286,15 @@ def _apply_block_diagonal(
         v_present = v1 if v1 is not None else v2
         b_present = b1 if v1 is not None else b2
         new_shape = list(val.shape)
+        if int(val.shape[v_present]) != size * b_present:
+            # The rule fits the NOMINAL axis but not THIS operand's stored
+            # extent (e.g. a Diag factor proposed on a 28-extent axis as
+            # 3x8). The documented best-effort contract is a ValueError so
+            # the dispatch skips the transform; letting jnp.reshape raise
+            # TypeError instead crashed the whole trace (ConvNet DIAG v2f0).
+            raise ValueError(
+                f"block-diagonal split {size}x{b_present} does not fit val "
+                f"axis {v_present} of extent {val.shape[v_present]}")
         new_shape[v_present] = size
         new_shape.insert(v_present + 1, b_present)
         val = val.reshape(new_shape)
