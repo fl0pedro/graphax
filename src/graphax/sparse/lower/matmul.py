@@ -188,10 +188,72 @@ def try_lower_matmul(lhs: "SparseTensor", rhs: "SparseTensor", count: bool = Fal
 # --------------------------------------------------------------------------- #
 # Planner + executor
 # --------------------------------------------------------------------------- #
+def _canon_degenerate(st):
+    """Canonicalization: a coupled pair with meta size 1 is ONE full block --
+    it carries zero sparsity information, but its bookkeeping (a block equal to
+    the whole logical extent) trips every downstream rule that reads
+    ``(size, block_size)`` as genuine structure (measured: the split rules
+    minted a phantom output pair of logical N*N from a ``1xN`` operand -- the
+    wrong-shaped-Jacobian bug). Rewrite such pairs to plain dense dims before
+    planning; for meta 1 the materialization is a squeeze, so this costs
+    nothing at runtime. Failures fall through as _NoRule (never a wrong plan).
+    """
+    deg = [d for d in st.dims
+           if getattr(d, "other_id", None) is not None
+           and int(getattr(d, "size", 0) or 0) == 1]
+    if not deg:
+        return st
+    try:
+        from dataclasses import replace as _replace
+
+        from graphax.sparse.indexes import DenseIndex
+        from graphax.sparse.tensor import SparseTensor
+
+        val = st.val
+        # squeeze each PHYSICAL size-1 meta axis (shared by both members)
+        drop = sorted({d.axis for d in deg if d.axis is not None}, reverse=True)
+        if val is not None:
+            for ax in drop:
+                val = val.squeeze(ax)
+
+        def _shift(a):
+            if a is None:
+                return None
+            return a - sum(1 for ax in drop if ax < a)
+
+        deg_ids = {d.id for d in deg}
+
+        def _map(d):
+            if d.id in deg_ids:
+                # the block IS the whole extent: a plain dense dim of the
+                # block size, on the (shifted) block axis (None stays implicit)
+                return DenseIndex(d.id, int(d.block_size or 1),
+                                  axis=_shift(d.block_axis))
+            if d.is_sparse:
+                return _replace(d, axis=_shift(d.axis),
+                                block_axis=_shift(d.block_axis))
+            return _replace(d, axis=_shift(d.axis))
+
+        return SparseTensor(
+            tuple(_map(d) for d in st.out_dims),
+            tuple(_map(d) for d in st.primal_dims),
+            val,
+            scalar_mult=st.scalar_mult, fill_value=st.fill_value,
+            pre_transforms=st.pre_transforms,
+            post_transforms=st.post_transforms,
+            check_consistency=False,
+        )
+    except Exception:
+        raise _NoRule("canon_degenerate")
+
+
 def _lower(lhs, rhs):
     from graphax.sparse.dtype_compute import _scaled_mul
     from graphax.sparse.ops.matmul import _align_tensor_ids, _build_matmul_topology
     from graphax.sparse.tensor import SparseTensor
+
+    lhs = _canon_degenerate(lhs)
+    rhs = _canon_degenerate(rhs)
 
     tags: list[str] = []
 
