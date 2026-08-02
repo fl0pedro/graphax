@@ -1858,13 +1858,18 @@ def _einsum_matmul_general(lhs, rhs, count: bool = False):
     one genuine structural disagreement and is excluded below.
     Gate: ``GRAPHAX_EINSUM_GENERAL`` (read by the caller) plus the guards below.
     """
-    # EXACT-AD firewall: only an elimination carrying a Diag/Compress/Quant
-    # transform (approx_active) may be re-associated. An exact-AD contraction
-    # (transforms=()) never enters here, so the exact path is byte-identical
-    # whether the flag is on or off.
+    # EXACT-AD firewall: by default only an elimination carrying a
+    # Diag/Compress/Quant transform (approx_active) may be re-associated, so
+    # the exact path stays byte-identical to tiled whether the planner flag is
+    # on or off. GRAPHAX_PLANNER_EXACT=1 (L4) lifts the firewall: exact AD
+    # goes through the planner too, and the invariant becomes VALUE-identity
+    # to the dense oracle — reduction-order non-associativity vs tiled is
+    # expected and correct (two correct implementations).
     from graphax.sparse.elemental.dispatch import approx_active
 
-    if not approx_active():
+    if not approx_active() and _os.environ.get(
+        "GRAPHAX_PLANNER_EXACT", "0"
+    ) in ("", "0", "false", "False"):
         return None
     from graphax.sparse.ops.utils import _is_approx, _is_zero_fill
 
