@@ -87,6 +87,15 @@ def set_approx_active(active: bool) -> None:
     _approx_state.active = bool(active)
 
 
+# Default OFF (2026-08-02): with the face-transform gate armed, this layer
+# fired in production for the first time and was measured pathological on the
+# nn256 single-face ablation (runs killed on time/memory; COMPRESS +256 ms
+# mean), while the general planner + tiled path handle every case it owned.
+# GRAPHAX_ELEMENTAL=1 restores it for comparison.
+_ELEMENTAL_ENABLED = os.environ.get("GRAPHAX_ELEMENTAL", "0") not in (
+    "", "0", "false", "False")
+
+
 def approx_active() -> bool:
     return getattr(_approx_state, "active", False)
 
@@ -271,7 +280,11 @@ def try_elemental_matmul(lhs: "SparseTensor", rhs: "SparseTensor", count: bool =
     # EXACT-AD GUARD: no approximation active -> defer entirely to the existing
     # (block-diagonal/zero-fill-efficient) path so reverse/forward stay exact and
     # byte-identical. The elemental kernels only handle approximation edges.
-    if not approx_active():
+    # GRAPHAX_ELEMENTAL=0 disables the whole kernel layer (the general planner
+    # or the tiled path then own every structured contraction) — the separable
+    # control that lets measurements attribute costs to THIS layer vs the
+    # approx_active signal itself.
+    if not approx_active() or not _ELEMENTAL_ENABLED:
         _bump("matmul_pure_dense_skip")
         return None
 
@@ -537,7 +550,7 @@ def try_elemental_elementwise(
     owns it).
     """
     # EXACT-AD GUARD (see try_elemental_matmul): no-op unless approximation active.
-    if not approx_active():
+    if not approx_active() or not _ELEMENTAL_ENABLED:
         _bump("elementwise_pure_dense_skip")
         return None
     if not (_is_zero_fill(lhs) and _is_zero_fill(rhs)):

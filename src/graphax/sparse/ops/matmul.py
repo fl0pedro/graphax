@@ -1712,11 +1712,18 @@ def _struct_lower_enabled() -> bool:
 
 
 def _einsum_general_enabled() -> bool:
-    """New einsum general-path gate (GRAPHAX_EINSUM_GENERAL, default OFF).
-    Read per call so the differential harness can toggle it without
-    re-importing the module. When OFF, ``matmul`` is byte-identical to the
-    incumbent waterfall."""
-    return _os.environ.get("GRAPHAX_EINSUM_GENERAL", "0") != "0"
+    """New einsum general-path gate (GRAPHAX_EINSUM_GENERAL, default ON since
+    2026-08-02). Read per call so the differential harness can toggle it
+    without re-importing the module. When OFF, ``matmul`` is byte-identical
+    to the incumbent waterfall.
+
+    Default flipped after the nn256 single-face ablation (106 variants):
+    planner vs tiled = mean latency -15.3% vs -8.5%, memory reduced on 61/92
+    variants vs 4/92, cosines unchanged, and all Jacobian shapes verified
+    against the exact reference (the degenerate meta-1 pair canonicalization
+    closed the one wrong-shape family). Exact AD never enters (approx_active
+    firewall), so this changes APPROX-mode lowering only."""
+    return _os.environ.get("GRAPHAX_EINSUM_GENERAL", "1") != "0"
 # Two-scalar matmul -> elementwise multiply (seed-vertex aggregation). Default on.
 _SEED_SCALAR_MM = _os.environ.get("GRAPHAX_SEED_VERTICES_SCALAR_MM", "1") != "0"
 

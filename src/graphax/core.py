@@ -1322,6 +1322,12 @@ def _eliminate_vertex(
             for _slots in face_transforms.values()
         )
 
+    # Output vars of the whole jaxpr: edges stored onto these heads feed the
+    # output boundary's mandatory densify (demand-driven materialization).
+    _demand_dense_vars = (
+        set(jaxpr.outvars) if _is_approx_cfg else frozenset()
+    )
+
     # Path tokenization sink (None on the exact-AD hot path -> zero overhead,
     # every contraction/accumulation runs inline exactly as before).
     # Face sink: records per-face edge identities + equation ranges into the
@@ -1824,6 +1830,32 @@ def _eliminate_vertex(
                 # squeezed), so it never perturbs exact Jacobians.
                 if os.environ.get("GX_NO_SQUEEZE", "0") != "1":
                     edge_outval = _squeeze_unreferenced_val_axes(edge_outval)
+
+                # DEMAND-DRIVEN MATERIALIZATION (approx mode only). An edge
+                # whose head is a GRAPH OUTPUT is materialized dense by the
+                # output boundary regardless -- its dense extent is a hard
+                # demand. Materializing HERE lets XLA fuse the expansion into
+                # the producing contraction's epilogue instead of carrying
+                # block form to the boundary and paying peak memory for BOTH
+                # forms (measured +46 MB avg DIAG coexistence on nn256 with
+                # the sparse planner). ``dense(hard=False)`` expands coupled
+                # pairs only (implicit broadcast dims stay implicit -- the
+                # boundary broadcast fuses fine); scalar_mult stays deferred.
+                # Exact AD is untouched: exact edges carry no coupled pairs
+                # here beyond what the boundary already handles, and the gate
+                # requires the approx config.
+                if (
+                    _is_approx_cfg
+                    and edge_outval.val is not None
+                    and out_edge in _demand_dense_vars
+                    and any(d.is_sparse for d in edge_outval.dims)
+                ):
+                    from .sparse.ops.dense import dense as _dense_st
+                    try:
+                        edge_outval = _dense_st(edge_outval)
+                        _assert_sparse_tensor_consistency(edge_outval)
+                    except Exception:
+                        pass  # keep the sparse form; boundary handles it
 
                 _set_inner(graph, in_edge, out_edge, edge_outval)
                 _set_inner(transpose_graph, out_edge, in_edge, edge_outval)
@@ -2620,6 +2652,27 @@ def vertex_elimination_jaxpr(
         for _spec in (transforms or ())
         for _t in (_spec[1] if isinstance(_spec, (tuple, list)) and len(_spec) == 2 else ())
     )
+    # PER-FACE transforms approximate exactly as much as per-vertex ones, so
+    # they arm the dispatch flag by the SAME rule (Diag/Compress instance, the
+    # documented callable escape hatch, or a SKIP_FACE sentinel). Without this
+    # no approx-mode machinery (elemental kernels, einsum_general planner,
+    # struct_lower) can ever see a face-hook elimination — the flag lied about
+    # what the elimination carries. Handles both the nested
+    # {vertex: {face_key: slots}} and the per-vertex flat layout.
+    if not _approx_on and face_transforms:
+        def _face_slot_iter(ft):
+            for _v in ft.values():
+                if isinstance(_v, dict):
+                    yield from _v.values()
+                else:
+                    yield _v
+        _approx_on = any(
+            _slots is SKIP_FACE or any(
+                isinstance(_t, (Diag, Compress)) or callable(_t)
+                for _t in (_slots if isinstance(_slots, (tuple, list)) else ())
+            )
+            for _slots in _face_slot_iter(face_transforms)
+        )
     _prev_approx = approx_active()
     set_approx_active(_approx_on)
     try:
