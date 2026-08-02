@@ -290,7 +290,18 @@ def _lower(lhs, rhs):
         val = sts[side].val
         if val is None:
             raise _NoRule("axis_without_val")
-        if axis >= val.ndim or int(val.shape[axis]) != f.size:
+        if axis >= val.ndim:
+            raise _NoRule("axis_shape_mismatch")
+        if int(val.shape[axis]) == 1 and f.size != 1:
+            # BROADCAST-STORED axis: the buffer is constant along this factor
+            # on this side (a keepdims/broadcast representation — the dominant
+            # ViT/MoE/Encoder fallthrough family, 3.3k events). Leave the
+            # factor implicit here: the einsum-build loop squeezes the
+            # undescribed 1-axis and einsum's missing-label semantics ARE
+            # broadcast (batch) / constant-times-sum (contract).
+            tags.append("rule:broadcast_axis")
+            return
+        if int(val.shape[axis]) != f.size:
             raise _NoRule("axis_shape_mismatch")
         if axis in ax_maps[side] or axis in split_maps[side]:
             raise _NoRule("axis_collision")
@@ -298,6 +309,14 @@ def _lower(lhs, rhs):
         f.axes[side] = axis
 
     def assign_split(side: int, axis, f1: _Fac, f2: _Fac) -> None:
+        if axis is not None and sts[side].val is not None \
+                and axis < sts[side].val.ndim \
+                and int(sts[side].val.shape[axis]) == 1 \
+                and f1.size * f2.size != 1:
+            # broadcast-stored axis under a split: both parts stay implicit
+            # on this side (see assign()).
+            tags.append("rule:broadcast_axis")
+            return
         if axis is None:
             return  # fully implicit on this side
         val = sts[side].val
