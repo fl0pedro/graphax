@@ -2571,6 +2571,12 @@ def matmul(lhs, rhs, count: bool = False):
     shape/topology — pure Python ints, jit-friendly. When ``K <= 1``
     (scalar matmul / outer product), ``muls = output_size`` and ``fmas = 0``.
     """
+    # Edge-level LowRank (L3): unwrap FIRST — the factored closure lives in
+    # graphax.sparse.lowrank and every path below assumes SparseTensor.
+    if getattr(lhs, "_is_lowrank", False) or getattr(rhs, "_is_lowrank", False):
+        from graphax.sparse.lowrank import lowrank_matmul
+
+        return lowrank_matmul(lhs, rhs, count=count)
     _record_path(None)
     if not _is_sparse(lhs) and not _is_sparse(rhs):
         _record_path("dense_dense")

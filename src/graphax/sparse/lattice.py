@@ -33,6 +33,16 @@ class L(Enum):
     BLOCKDIAG = "blockdiag"
     DEGENERATE = "degenerate"
     COMPRESSED = "compressed"
+    LOWRANK = "lowrank"  # EDGE-level (whole tensor factored), not per-dim
+
+
+def classify_edge(t) -> L | None:
+    """Edge-level lattice class, or ``None`` for a per-dim classified tensor.
+
+    ``LowRankTensor`` is the one edge-level class: the factored storage
+    couples the out side with the primal side, so no single dim carries it.
+    """
+    return L.LOWRANK if getattr(t, "_is_lowrank", False) else None
 
 
 def classify(d) -> L:
@@ -107,3 +117,26 @@ for _k in list(ADD):
         if _b == L.DENSE:
             ADD[(_a, L.DEGENERATE)] = ADD[_k]
 ADD[(L.DEGENERATE, L.DEGENERATE)] = "dense"
+
+
+# --------------------------------------------------------------------------- #
+# EDGE-level closure — LowRank (L3). Keys name the operand kinds ("lowrank"
+# vs "sparse" = any per-dim classified SparseTensor); values name the rule
+# family, property-tested in lowrank_property_test.py. Every non-listed
+# combination spills (materialize U @ V through the proven matmul entry and
+# delegate) — total by construction, counted in lowrank.LOWRANK_STATS.
+# Measured basis for LowRank being formal-only (no production constructor):
+# the 2026-08-03 censuses — intermediates are never low-rank on any model
+# family and the nn256 final Jacobian blocks are globally full-rank.
+# --------------------------------------------------------------------------- #
+LOWRANK_CONTRACT = {
+    ("lowrank", "sparse"): "factor_right",   # (U V) @ B = U (V @ B)
+    ("sparse", "lowrank"): "factor_left",    # A @ (U V) = (A U) V
+    ("lowrank", "lowrank"): "middle_fold",   # U1 ((V1 U2) V2), middle r1 x r2
+}
+LOWRANK_ADD = {
+    ("lowrank", "lowrank"): "rank_concat_or_spill",  # concat if same dims,
+    # dense-stored factors, r1+r2 <= GRAPHAX_LOWRANK_MAX_RANK; else spill
+    ("lowrank", "sparse"): "spill_dense",            # dense absorbs (union)
+    ("sparse", "lowrank"): "spill_dense",
+}

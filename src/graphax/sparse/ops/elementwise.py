@@ -834,6 +834,14 @@ def elementwise(
     ``add_w_counts`` / ``mul_w_counts`` package ``(out, n_ops)`` into the
     ``(adds, muls, fmas)`` triple the cost model expects.
     """
+    # Edge-level LowRank (L3): unwrap FIRST (before normalization — the
+    # wrapper is not a SparseTensor).
+    if getattr(lhs, "_is_lowrank", False) or getattr(rhs, "_is_lowrank", False):
+        from graphax.sparse.lowrank import lowrank_elementwise
+
+        return lowrank_elementwise(
+            lhs, rhs, op, is_intersection=is_intersection, count=count
+        )
     _record_path(None)
     lhs, rhs = _normalize_inputs(lhs, rhs)
     # Sparsity-retaining general path (GRAPHAX_EINSUM_GENERAL, default OFF):
