@@ -17,7 +17,6 @@ import unittest
 import numpy as np
 
 import jax
-jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from graphax.sparse.indexes import DenseIndex, DiagonalIndex
@@ -30,6 +29,22 @@ from graphax.sparse.elemental.dispatch import set_approx_active
 N_CASES = int(os.environ.get("LATTICE_CASES", "60"))
 BASE_SEED = int(os.environ.get("LATTICE_SEED", "20260802"))
 TOL = 1e-9  # float64
+
+_X64_PREV = None
+
+
+def setUpModule():
+    # x64 only while THIS module runs. Setting it at import time poisoned
+    # co-collected float32 tests (pytest imports every module during
+    # collection, before any test executes).
+    global _X64_PREV
+    _X64_PREV = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+
+
+def tearDownModule():
+    jax.config.update("jax_enable_x64", _X64_PREV)
+
 
 
 def _mk(rng, out_specs, primal_specs):
