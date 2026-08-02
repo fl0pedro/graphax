@@ -842,7 +842,14 @@ def elementwise(
     # instead of broadcasting implicit dims to physical. Returns None on any
     # signature it can't yet represent ⇒ falls through UNCHANGED. When OFF this
     # block is a single env-dict lookup, so the op is byte-identical to today.
-    if os.environ.get("GRAPHAX_EINSUM_GENERAL", "0") not in ("", "0", "false", "False"):
+    # OWN flag (GRAPHAX_EINSUM_EW, default OFF), deliberately DECOUPLED from
+    # the matmul planner's GRAPHAX_EINSUM_GENERAL: the EW einsum path is
+    # UNPROVEN — with the shared flag, enabling the (proven) matmul planner
+    # silently armed this block, and the float64 model diff caught it
+    # diverging up to 0.8 on ViT COMPRESS variants (matmul calls all
+    # oracle-exact). Prove it against the lattice property suite before ever
+    # flipping this default.
+    if os.environ.get("GRAPHAX_EINSUM_EW", "0") not in ("", "0", "false", "False"):
         _eg = _einsum_ew_general(
             lhs, rhs, op, is_intersection=is_intersection, count=count
         )
