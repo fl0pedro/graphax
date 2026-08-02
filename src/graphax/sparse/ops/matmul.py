@@ -2420,6 +2420,42 @@ def _execute_tiled(ctx, rhs_dims):
 
 
 
+
+_RECONCILE_BD_METAS = _os.environ.get(
+    "GRAPHAX_RECONCILE_BLOCKDIAG_METAS", "0"
+) not in ("", "0", "false", "False")
+
+def _reconcile_blockdiag_metas(lhs, rhs):
+    """Coarsen mismatched-meta coupled block-diagonal contracted pairs of
+    ``lhs @ rhs`` to their shared meta ``gcd`` (see ``matmul`` entry comment).
+    Best-effort: any resolution failure returns the operands unchanged."""
+    l_sparse = any(getattr(d, "is_sparse", False)
+                   for d in getattr(lhs, "dims", ()))
+    r_sparse = any(getattr(d, "is_sparse", False)
+                   for d in getattr(rhs, "dims", ()))
+    if not (l_sparse and r_sparse):
+        return lhs, rhs
+    try:
+        from graphax.sparse.elemental.dispatch import (
+            _contracted_pairs, _classify_pair, _coarsen_operand_pair)
+
+        pairs = _contracted_pairs(lhs, rhs)
+        for ld, rd in pairs:
+            if _classify_pair(ld, rd) != "B_B" or ld.size == rd.size:
+                continue
+            import math
+
+            g = math.gcd(int(ld.size), int(rd.size))
+            new_l = _coarsen_operand_pair(lhs, ld, g)
+            new_r = _coarsen_operand_pair(rhs, rd, g)
+            if new_l is None or new_r is None:
+                continue
+            lhs, rhs = new_l, new_r
+    except Exception:
+        return lhs, rhs
+    return lhs, rhs
+
+
 def matmul(lhs, rhs, count: bool = False):
     """Sparse matmul dispatcher. Runs a cascade of paths, first-applicable
     wins, falling back to the general tiled algorithm; each path either
@@ -2494,6 +2530,27 @@ def matmul(lhs, rhs, count: bool = False):
             "matmul of two 0-rank SparseTensors is not supported; "
             "use ``lhs * rhs`` (elementwise) instead"
         )
+    # META RECONCILIATION (exact, engine-independent; GRAPHAX_RECONCILE_
+    # BLOCKDIAG_METAS, default OFF). Two coupled block-diagonal factorings of
+    # the SAME contracted logical axis with different meta counts -- a pure
+    # diagonal (meta N, block 1) meeting a Diag(factor) edge (meta M, block
+    # L/M) -- are commensurable: both re-factor losslessly to the shared meta
+    # ``gcd(N, M)`` via ``_coarsen_coupled_blockdiag`` (off-sub-diagonal zeros
+    # become explicit; storage grows by N/G resp. M/G, never the dense outer
+    # product). Without this the pair is irreconcilable and every engine
+    # materializes the full logical extent for that contraction.
+    #
+    # DEFAULT OFF because keeping the edge sparse is NOT automatically
+    # cheaper: measured on nn256-xent (single-face ablation, 2026-08-02) the
+    # reconciled sparse chain was STRICTLY WORSE than the early densify
+    # (worst face +115.6 MB -> +179.8 MB, dLat +2.5% -> +94%) -- the Jacobian
+    # output extent must materialize dense anyway, so block + dense forms
+    # coexist, and XLA fuses the dense chain better than blocked einsums at
+    # these sizes. Flip ON for targets whose diagonalized edges stay interior
+    # (never forced dense downstream); numerics are exact either way
+    # (dense-oracle diff at float32 eps, exact-AD paths untouched).
+    if _RECONCILE_BD_METAS:
+        lhs, rhs = _reconcile_blockdiag_metas(lhs, rhs)
     # New einsum general path (GRAPHAX_EINSUM_GENERAL, default OFF): the
     # sparsity-retaining contraction. Tried FIRST after normalize/scalar, before
     # the elemental cascade and the tiled path. Emits ONE einsum over physical

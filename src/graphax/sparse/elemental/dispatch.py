@@ -332,6 +332,30 @@ def try_elemental_matmul(lhs: "SparseTensor", rhs: "SparseTensor", count: bool =
     return result
 
 
+def _coarsen_operand_pair(st, dim, new_meta):
+    """Coarsen the coupled block-diagonal pair of ``st`` that ``dim`` belongs
+    to, down to ``new_meta`` (see ``_coarsen_coupled_blockdiag``). Locates the
+    partner by ``other_id`` and both slots\' (is_out, rel) positions. Returns
+    ``None`` when the pair cannot be resolved or coarsening fails -- the caller
+    then falls back to the existing (always-correct) paths."""
+    from graphax.sparse.tensor import _coarsen_coupled_blockdiag
+
+    slots = None, None
+    for is_out, dims in ((True, st.out_dims), (False, st.primal_dims)):
+        for rel, d in enumerate(dims):
+            if d.id == dim.id:
+                slots = (is_out, rel, d), slots[1]
+            elif d.id == getattr(dim, "other_id", None):
+                slots = slots[0], (is_out, rel, d)
+    if slots[0] is None or slots[1] is None:
+        return None
+    (o1, r1, d1), (o2, r2, d2) = slots
+    try:
+        return _coarsen_coupled_blockdiag(st, o1, r1, d1, o2, r2, d2, new_meta)
+    except (ValueError, NotImplementedError):
+        return None
+
+
 def _dispatch_matmul(lhs, rhs, pairs, kinds):
     """Pick the kernel / composition for a structured contraction."""
     structured_idx = [i for i, k in enumerate(kinds) if k != "dense"]

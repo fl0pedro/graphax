@@ -1026,6 +1026,128 @@ def _subdivide_coupled_blockdiag(
     return _rebuild(new_d1, new_d2, new_val, moved=moved, n_lead=n_lead)
 
 
+def _coarsen_coupled_blockdiag(st, is_out1, rel_i, d1, is_out2, rel_j, d2,
+                               new_meta):
+    """EXACT dual of :func:`_subdivide_coupled_blockdiag`: re-factor an ALREADY
+    coupled block-diagonal pair ``(d1, d2)`` from meta ``N`` to a COARSER meta
+    ``G`` (``G | N``).
+
+    Lossless: with ``k = N // G`` each new ``G``-block holds its ``k`` finer
+    blocks on the sub-diagonal and the off-sub-diagonal positions become
+    EXPLICIT stored zeros. Storage grows by exactly ``k`` per coupled pair --
+    always bounded by the block-diagonal form itself, never the dense outer
+    product. This is what makes two commensurable factorings of the same
+    logical axis contractible against each other without densifying either
+    operand (the ``N != M`` meta-mismatch case at the contraction boundary).
+
+    Zero-fill only: the positions this makes explicit are structural zeros,
+    which is the meaning of ``fill_value is None`` -- a non-zero fill would be
+    silently rewritten to 0, so it raises.
+    """
+    N = d1.size
+    G = int(new_meta)
+    if G == N:
+        return st
+    if G < 1 or N % G != 0:
+        raise ValueError(
+            f"coarsen: new meta {G} must divide the current meta {N}")
+    if st.fill_value is not None:
+        raise ValueError("coarsen: only zero-fill (fill_value=None) supported")
+    k = N // G
+    b1 = d1.block_size or 1
+    b2 = d2.block_size or 1
+    B1, B2 = b1 * k, b2 * k
+
+    meta_ax = d1.axis if d1.axis is not None else d2.axis
+    b1_ax = d1.block_axis
+    b2_ax = d2.block_axis
+
+    def _rebuild(new_d1, new_d2, new_val, *, moved=None, n_lead=3):
+        def _shift(p_):
+            if p_ is None or moved is None:
+                return p_
+            n_before = sum(1 for a in range(p_) if a not in moved)
+            return n_lead + n_before
+
+        def _map(d, slot_is_out, slot_rel):
+            if slot_is_out == is_out1 and slot_rel == rel_i:
+                return new_d1
+            if slot_is_out == is_out2 and slot_rel == rel_j:
+                return new_d2
+            if moved is None:
+                return d
+            na = _shift(getattr(d, "axis", None))
+            if d.is_sparse:
+                nb = _shift(getattr(d, "block_axis", None))
+                return replace(d, axis=na, block_axis=nb)
+            return replace(d, axis=na)
+
+        new_out = tuple(_map(d, True, p_) for p_, d in enumerate(st.out_dims))
+        new_primal = tuple(
+            _map(d, False, p_) for p_, d in enumerate(st.primal_dims))
+        return SparseTensor(
+            new_out, new_primal, new_val,
+            scalar_mult=st.scalar_mult, fill_value=st.fill_value,
+            pre_transforms=st.pre_transforms,
+            post_transforms=st.post_transforms,
+            check_consistency=False,
+        )
+
+    # ``k > 1`` here (G != N), so both coarsened block sides are > 1 and
+    # therefore PHYSICAL: axes (0=meta, 1=B1, 2=B2).
+    new_d1 = DiagonalIndex(
+        id=d1.id, size=G, axis=0, other_id=d2.id,
+        block_size=B1, block_axis=1,
+    )
+    new_d2 = DiagonalIndex(
+        id=d2.id, size=G, axis=0, other_id=d1.id,
+        block_size=B2, block_axis=2,
+    )
+
+    if st.val is None:
+        # Uniform-ones structure: the off-sub-diagonal zeros inside the new
+        # blocks must become explicit, so the pattern materializes (all OTHER
+        # dims stay implicit -- a ``val is None`` tensor has no physical axes).
+        dt = getattr(st.scalar_mult, "dtype", None) or jnp.float32
+        eye = jnp.eye(k, dtype=dt)
+        blk = jnp.einsum("ij,ab->iajb", eye, jnp.ones((b1, b2), dt))
+        new_val = jnp.broadcast_to(blk.reshape(B1, B2)[None], (G, B1, B2))
+        return _rebuild(new_d1, new_d2, new_val)
+
+    val = st.val
+    moved = (meta_ax, b1_ax, b2_ax)
+    front = [a for a in moved if a is not None]
+    rest = [a for a in range(val.ndim) if a not in front]
+    v = jnp.transpose(val, front + rest)         # ([N], [b1], [b2], *rest)
+    rest_shape = list(v.shape[len(front):])
+    pm = meta_ax is not None
+    p1 = b1_ax is not None
+    p2 = b2_ax is not None
+    if not pm:
+        # Implicit meta: N identical blocks -- materialize the meta axis.
+        v = jnp.broadcast_to(v[None, ...], (N,) + v.shape)
+    # Materialize implicit block sides (constant over the block axis): the
+    # coarsened block mixes block and meta indices, so both must be physical.
+    if p1 and p2:
+        pass
+    elif p1:
+        v = jnp.broadcast_to(
+            v.reshape([N, b1, 1] + rest_shape), [N, b1, b2] + rest_shape)
+    elif p2:
+        v = jnp.broadcast_to(
+            v.reshape([N, 1, b2] + rest_shape), [N, b1, b2] + rest_shape)
+    else:
+        v = jnp.broadcast_to(
+            v.reshape([N, 1, 1] + rest_shape), [N, b1, b2] + rest_shape)
+
+    v = v.reshape([G, k, b1, b2] + rest_shape)
+    eye = jnp.eye(k, dtype=v.dtype)
+    # new[g, i, a, j, b, *rest] = eye[i, j] * v[g, i, a, b, *rest]
+    nv = jnp.einsum("ij,giab...->giajb...", eye, v)
+    new_val = nv.reshape([G, B1, B2] + rest_shape)
+    return _rebuild(new_d1, new_d2, new_val, moved=moved, n_lead=3)
+
+
 def _apply_block_diagonal(
     st: SparseTensor,
     is_out1: bool,
