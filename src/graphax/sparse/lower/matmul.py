@@ -59,7 +59,11 @@ if TYPE_CHECKING:
 # --------------------------------------------------------------------------- #
 LOWER_STATS: dict[str, int] = {}
 
-_LETTER_POOL = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+# Factor labels are INTEGERS consumed by jnp.einsum's interleaved
+# (operand, sublist, ..., out_sublist) API — no alphabet, no cap. The string
+# pool (52 letters -> _NoRule("letters_exhausted")) died here 2026-08-02; a
+# ~10-logical-dim fully-coupled contraction needed ~30-40 labels and ViT-with-
+# approximations brushed the cap. dot_general has no alphabet either.
 
 
 def _bump(key: str, n: int = 1) -> None:
@@ -94,7 +98,7 @@ class _Fac:
     (``None`` = implicit on that side; a ``("split", axis, part)`` marker =
     physical via an axis split)."""
 
-    letter: str
+    letter: int  # integer einsum label (interleaved-API sublists)
     size: int
     axes: list  # [lhs, rhs]
     in_output: bool = False
@@ -266,15 +270,13 @@ def _lower(lhs, rhs):
     rhs_dims = rhs_out_dims + rhs_primal_dims
 
     # ---- factor allocation ------------------------------------------------ #
-    letters = iter(_LETTER_POOL)
+    import itertools as _it
+
+    labels = _it.count()
     facs: list[_Fac] = []
 
     def fac(size) -> _Fac:
-        try:
-            L = next(letters)
-        except StopIteration:
-            raise _NoRule("letters_exhausted")
-        f = _Fac(L, int(size), [None, None])
+        f = _Fac(next(labels), int(size), [None, None])
         facs.append(f)
         return f
 
@@ -646,14 +648,18 @@ def _lower(lhs, rhs):
         if changed:
             val = val.reshape(new_shape)
         ins.append(val)
-        subs.append("".join(sub))
+        subs.append(list(sub))
 
     out_letters = [f for f in slot_facs if f.phys]
     forced = [f for f in slot_facs if not f.phys]
     values = None
     if ins:
-        eq = ",".join(subs) + "->" + "".join(f.letter for f in out_letters)
-        values = jnp.einsum(eq, *ins)
+        # interleaved integer-label form: einsum(op0, sub0[, op1, sub1], out)
+        _args = []
+        for _v, _sub in zip(ins, subs):
+            _args += [_v, _sub]
+        _args.append([f.letter for f in out_letters])
+        values = jnp.einsum(*_args)
         if values.ndim == 0 and not forced:
             # fully-contracted physical part: fold the scalar into scalar_mult
             pass  # handled below
