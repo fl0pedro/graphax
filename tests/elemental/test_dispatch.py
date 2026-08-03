@@ -13,6 +13,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+# The elemental kernel zoo is default-off (GRAPHAX_ELEMENTAL=0 since 685049c,
+# pathological perf) and slated for deletion together with this file; the
+# routing/kernel behavior asserted here only exists with the flag on.
+import os as _os
+
+pytestmark = pytest.mark.skipif(
+    _os.environ.get("GRAPHAX_ELEMENTAL", "0") == "0",
+    reason="elemental kernel zoo default-off; slated for deletion",
+)
+
 from graphax.sparse.elemental import dispatch as DSP
 from graphax.sparse.indexes import DenseIndex, DiagonalIndex
 from graphax.sparse.ops.elementwise import elementwise

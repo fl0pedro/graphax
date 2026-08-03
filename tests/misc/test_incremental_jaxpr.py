@@ -582,19 +582,17 @@ def test_step_transform_records_are_scoped_to_their_step():
                                                   (3, True), (4, True),
                                                   (5, True)])
 def test_early_vertex_quant_is_lossless_not_lost(vertex, expect_change):
-    """DOCUMENTS a reported "the quant is applied but never reaches the compiled
-    Jacobian" for Helmholtz vertices 1 and 2.
+    """DOCUMENTS the early-vertex quant contract under the keep-sparse redesign.
 
-    It is NOT lost -- it is EXACT. Those vertices' face results are the
-    CONSTANT structural Jacobian ``-1`` (``reduce_sum`` -> all-ones, ``neg`` ->
-    -1, ``add 1.0`` -> +1). Symmetric per-tensor int8 quantization of a tensor
-    whose entries share one magnitude is bit-exact: ``s = absmax/127``,
-    ``round(val/s) = ±127`` and ``±127 * s == val``. So an unchanged Jacobian
-    (cosine similarity exactly 1.0) is the CORRECT answer there, and the log
-    honestly reports ``applied=True`` -- the cast really happened.
+    Vertices 1 and 2 carry the SYMBOLIC constant edge (``val=None`` with
+    ``scalar_mult`` -- ``reduce_sum`` -> all-ones, ``neg`` -> -1, ``add 1.0``
+    -> +1). There is no buffer to cast, the quant is a structural no-op, the
+    Jacobian is EXACT, and the log HONESTLY reports ``applied=False``.
+    (Pre-redesign these edges were normalized dense and int8 round-tripped
+    them bit-exactly with ``applied=True`` -- same Jacobian, different log.)
 
-    From vertex 3 on the edge is data-dependent, the cast is lossy, and the
-    Jacobian moves. See also
+    From vertex 3 on the edge is data-dependent, the cast fires
+    (``applied=True``), is lossy, and the Jacobian moves. See also
     ``test_early_vertex_quant_is_constant_folded_so_flops_are_unchanged``.
     """
     args, argnums = (_XH,), (0,)
@@ -606,8 +604,9 @@ def test_early_vertex_quant_is_lossless_not_lost(vertex, expect_change):
     got, _ = _recover(ij, args)
 
     recs = [r for r in ij.transform_records() if r.kind == "transform"]
-    assert len(recs) == 1 and recs[0].applied is True, (
-        "the cast genuinely fires and genuinely changes the tensor")
+    assert len(recs) == 1
+    assert recs[0].applied is expect_change, (
+        "applied must track whether a real buffer cast happened")
 
     changed = not np.array_equal(got[0], ref[0])
     assert changed is expect_change
@@ -617,10 +616,10 @@ def test_early_vertex_quant_is_lossless_not_lost(vertex, expect_change):
 
 
 def test_early_vertex_quant_is_constant_folded_so_flops_are_unchanged():
-    """The second half of the report: unchanged compiled FLOPS for vertices 1
-    and 2. The pre-quant edge there does not depend on the input (it is the
-    constant ``-1``), so XLA constant-folds the whole quantize/dequantize chain
-    away. The equations ARE emitted into the jaxpr -- they simply cost nothing.
+    """The second half: unchanged compiled FLOPS for vertices 1 and 2. Under
+    the keep-sparse redesign the vertex-1 edge stays SYMBOLIC (``val=None``),
+    the cast is structurally skipped, and NO quant equations are emitted at
+    all -- stronger than the old constant-folding story (``eqns == base``).
     """
     args, argnums = (_XH,), (0,)
 
@@ -639,6 +638,6 @@ def test_early_vertex_quant_is_constant_folded_so_flops_are_unchanged():
     v1_flops, v1_eqns = _flops(1)
     v3_flops, _ = _flops(3)
 
-    assert v1_eqns > base_eqns, "the quant equations ARE in the jaxpr"
-    assert v1_flops == base_flops, "but they constant-fold to nothing"
+    assert v1_eqns == base_eqns, "no quant equations for a symbolic edge"
+    assert v1_flops == base_flops, "and identical flops"
     assert v3_flops > base_flops, "a data-dependent quant does cost flops"
