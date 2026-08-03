@@ -1324,9 +1324,27 @@ def _eliminate_vertex(
 
     # Output vars of the whole jaxpr: edges stored onto these heads feed the
     # output boundary's mandatory densify (demand-driven materialization).
+    # The per-vertex approx gate is VACUOUS for edges that reach the output
+    # head during a LATER (exact) elimination -- the dominant case: a pair
+    # made at the approximated vertex rides passthrough/add into the
+    # boundary. Under GRAPHAX_DEMAND_EMIT the store-time densify below
+    # therefore keys on the GLOBAL approx arming instead. Exact AD stays
+    # untouched: flag off (default), or no approx anywhere in the jacve call.
+    if os.environ.get("GRAPHAX_DEMAND_EMIT", "0") == "1":
+        from .sparse.elemental.dispatch import approx_active as _aa_demand
+        _demand_store = _is_approx_cfg or _aa_demand()
+    else:
+        _demand_store = _is_approx_cfg
     _demand_dense_vars = (
-        set(jaxpr.outvars) if _is_approx_cfg else frozenset()
+        set(jaxpr.outvars) if _demand_store else frozenset()
     )
+    # L5 demand-emit channel: output-headed is a property of the EDGE, not of
+    # whether THIS vertex elimination carries the approx config -- a pair
+    # created at an approximated vertex is contracted onto the output head
+    # during a LATER (exact) elimination. Unconditional; the planner-side
+    # gate (GRAPHAX_DEMAND_EMIT + planner engagement + surviving pairs)
+    # makes it a no-op everywhere else.
+    _demand_head_vars = set(jaxpr.outvars)
 
     # Path tokenization sink (None on the exact-AD hot path -> zero overhead,
     # every contraction/accumulation runs inline exactly as before).
@@ -1543,14 +1561,18 @@ def _eliminate_vertex(
                         if count_ops:
                             muls += 1
                     elif count_ops:
-                        edge_outval, (_a, _m, _f) = sparse_matmul(
-                            _post_val, _pre_val, count=True
+                        edge_outval, (_a, _m, _f) = _with_demand_dense(
+                            out_edge in _demand_head_vars,
+                            lambda: sparse_matmul(_post_val, _pre_val, count=True),
                         )
                         adds += int(_a)
                         muls += int(_m)
                         fmas += int(_f)
                     else:
-                        edge_outval = _post_val @ _pre_val
+                        edge_outval = _with_demand_dense(
+                            out_edge in _demand_head_vars,
+                            lambda: _post_val @ _pre_val,
+                        )
                     if count_ops:
                         post_size = (
                             _post_val.val.size if _post_val.val is not None else 0
@@ -1845,7 +1867,7 @@ def _eliminate_vertex(
                 # here beyond what the boundary already handles, and the gate
                 # requires the approx config.
                 if (
-                    _is_approx_cfg
+                    _demand_store
                     and edge_outval.val is not None
                     and out_edge in _demand_dense_vars
                     and any(d.is_sparse for d in edge_outval.dims)
@@ -1875,6 +1897,22 @@ def _eliminate_vertex(
             transpose_graph.pop(central_var, None)
 
     return adds, muls, fmas, mem
+
+
+def _with_demand_dense(active, thunk):
+    """L5 demand channel: contractions run via the ``@`` operator (no kwargs
+    can travel), so an output-headed edge's hard dense demand reaches the
+    einsum planner as a contextvar; ``_lower`` then emits the dense layout
+    directly from the single einsum (no block/dense buffer coexistence).
+    Gated inside the planner by GRAPHAX_DEMAND_EMIT (default off)."""
+    if not active:
+        return thunk()
+    from .sparse.lower import matmul as _lm
+    tok = _lm._DEMAND_DENSE.set(True)
+    try:
+        return thunk()
+    finally:
+        _lm._DEMAND_DENSE.reset(tok)
 
 
 def _is_persistent(obj) -> bool:

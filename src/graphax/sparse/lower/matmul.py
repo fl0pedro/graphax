@@ -79,6 +79,25 @@ def enabled() -> bool:
     return os.environ.get("GRAPHAX_STRUCT_LOWER", "0") != "0"
 
 
+# --------------------------------------------------------------------------- #
+# L5 demand channel. An edge whose head is a GRAPH OUTPUT is materialized
+# dense by the output boundary regardless -- a hard demand. Core sets this
+# contextvar around output-headed contractions (they run via the ``@``
+# operator, so no kwarg can travel); the demand-emit block in ``_lower``
+# reads it and emits the DENSE layout directly from the single einsum, so
+# the block form never coexists with the dense output buffer.
+# --------------------------------------------------------------------------- #
+import contextvars as _contextvars
+
+_DEMAND_DENSE = _contextvars.ContextVar("gx_demand_dense", default=False)
+
+
+def _demand_emit_on() -> bool:
+    return _DEMAND_DENSE.get() and os.environ.get(
+        "GRAPHAX_DEMAND_EMIT", "0"
+    ) == "1"
+
+
 class _NoRule(Exception):
     """Planning found no rule for this case — the caller falls through to the
     existing matmul path unchanged (and the reason is counted)."""
@@ -589,6 +608,74 @@ def _lower(lhs, rhs):
     n_out = len(out_specs)
     id_map = {s.id: i for i, s in enumerate(ordered)}
 
+    # ---- DEMAND-EMIT (L5): output-headed edge -> dense layout from the ONE
+    # einsum. Each surviving coupled pair (meta M, blocks b1/b2) contracts an
+    # extra eye(M) operand under a fresh partner label: the delta places the
+    # off-diagonal zeros inside the einsum itself, and both pair sides become
+    # plain dense dims (merged meta*block, row-major = the DiagonalIndex
+    # ``n*block + r`` convention). No block-form buffer is ever emitted, so
+    # the boundary's post-hoc dense() (kept as the non-planner fallback)
+    # finds nothing left to expand.
+    demand_eyes: list = []
+    demand_ones: list = []
+    if (
+        _demand_emit_on()
+        and (lhs.val is not None or rhs.val is not None)
+        and (
+            any(s.kind == "pair" for s in ordered)
+            or any(
+                s.kind == "dense"
+                and any(not f.phys and f.size > 1 for f in s.letters)
+                for s in ordered
+            )
+        )
+    ):
+        _pair_m2: dict = {}
+        _new_specs: list = []
+        for s in ordered:
+            if s.kind != "pair":
+                _new_specs.append(s)
+                continue
+            _key = tuple(sorted((s.id, s.other_id)))
+            if _key not in _pair_m2:
+                _m = s.meta_fac
+                _m.in_output = True
+                if not _m.phys:
+                    # rides only on the eye operand (implicit/broadcast meta)
+                    _m.axes[0] = "__eye__"
+                _m2 = fac(_m.size)
+                _m2.in_output = True
+                _m2.axes[0] = "__eye__"
+                _pair_m2[_key] = _m2
+                demand_eyes.append((_m.size, _m, _m2))
+                _meta = _m
+            else:
+                _meta = _pair_m2[_key]
+            _grp = [_meta]
+            if s.block_fac is not None and s.block_fac.size > 1:
+                s.block_fac.in_output = True
+                _grp.append(s.block_fac)
+            _new_specs.append(
+                _DimSpec(
+                    s.is_out, s.id, "dense",
+                    int(s.size * s.block_size), letters=_grp,
+                )
+            )
+        # Every non-physical output letter rides a ones(N) operand: the
+        # broadcast happens INSIDE the single einsum (fused epilogue), never
+        # as a post-hoc forced_broadcast / boundary broadcast temp. Covers
+        # implicit Compress dims and non-stored pair blocks alike.
+        for s in _new_specs:
+            if s.kind != "dense":
+                continue
+            for f in s.letters:
+                if not f.phys and f.size > 1:
+                    f.in_output = True
+                    f.axes[0] = "__ones__"
+                    demand_ones.append(f)
+        ordered = _new_specs
+        tags.append("out:demand_emit")
+
     # ---- physicality decisions -------------------------------------------- #
     base_val = any(f.in_output and f.phys for f in facs)
     final_phys: dict[str, bool] = {}
@@ -668,6 +755,15 @@ def _lower(lhs, rhs):
             val = val.reshape(new_shape)
         ins.append(val)
         subs.append(list(sub))
+
+    if (demand_eyes or demand_ones) and ins:
+        _eye_dt = jnp.result_type(*[_v.dtype for _v in ins])
+        for _M, _u, _u2 in demand_eyes:
+            ins.append(jnp.eye(_M, dtype=_eye_dt))
+            subs.append([_u.letter, _u2.letter])
+        for _f in demand_ones:
+            ins.append(jnp.ones((_f.size,), dtype=_eye_dt))
+            subs.append([_f.letter])
 
     out_letters = [f for f in slot_facs if f.phys]
     forced = [f for f in slot_facs if not f.phys]
