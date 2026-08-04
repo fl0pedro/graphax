@@ -1330,11 +1330,24 @@ def _eliminate_vertex(
     # boundary. Under GRAPHAX_DEMAND_EMIT the store-time densify below
     # therefore keys on the GLOBAL approx arming instead. Exact AD stays
     # untouched: flag off (default), or no approx anywhere in the jacve call.
+    # PLANNER-ONLY (2026-08-04). On the TILED path this store-time densify
+    # was the 12-826x approx blow-up: ``dense()`` expands COUPLED pairs, and
+    # a vmapped graph's output-headed edges carry the BATCH DiagonalIndex
+    # pair (per-sample block-diagonal, val ``(B, 10, ...)``). Expanding it
+    # materialises the full cross-batch tensor (``(B, 10, B, 256)`` — 512x
+    # at batch 512, off-diagonal blocks exact zeros) and every consumer
+    # contraction then drags BOTH batch axes. The "boundary materialises it
+    # dense anyway" premise below is planner-specific: on tiled, later
+    # eliminations CONTRACT the pair away as a batched GEMM and the boundary
+    # never sees it. The +46 MB coexistence win this channel encodes was
+    # measured on the sparse planner only, so it keys on the planner gate;
+    # exact AD is untouched either way (requires the approx arming).
+    from .sparse.ops.matmul import _einsum_general_enabled as _egen
     if os.environ.get("GRAPHAX_DEMAND_EMIT", "0") == "1":
         from .sparse.elemental.dispatch import approx_active as _aa_demand
-        _demand_store = _is_approx_cfg or _aa_demand()
+        _demand_store = (_is_approx_cfg or _aa_demand()) and _egen()
     else:
-        _demand_store = _is_approx_cfg
+        _demand_store = _is_approx_cfg and _egen()
     _demand_dense_vars = (
         set(jaxpr.outvars) if _demand_store else frozenset()
     )
@@ -1853,7 +1866,9 @@ def _eliminate_vertex(
                 if os.environ.get("GX_NO_SQUEEZE", "0") != "1":
                     edge_outval = _squeeze_unreferenced_val_axes(edge_outval)
 
-                # DEMAND-DRIVEN MATERIALIZATION (approx mode only). An edge
+                # DEMAND-DRIVEN MATERIALIZATION (approx mode, PLANNER path
+                # only — see ``_demand_store`` above; on tiled this decoupled
+                # the vmap batch pair: the 12-826x blow-up). An edge
                 # whose head is a GRAPH OUTPUT is materialized dense by the
                 # output boundary regardless -- its dense extent is a hard
                 # demand. Materializing HERE lets XLA fuse the expansion into
