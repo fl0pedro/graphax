@@ -1348,29 +1348,35 @@ def _apply_block_diagonal(
         lo_K, lo_b_pos = lo, lo + 1
         hi_K, hi_b_pos = hi + 1, hi + 2
 
-        val = jnp.diagonal(val, axis1=lo_K, axis2=hi_K)
-        diag_pos = val.ndim - 1
+        # GATHER-FREE diagonal (2026-08-04). ``jnp.diagonal`` on a >2-D
+        # input lowers through advanced indexing to iota + concatenate +
+        # lax.gather — fusion-hostile, CSE-defeating, and a Triton-GEMM
+        # fusion breaker if the result ever feeds a dot. Same values and
+        # the SAME final axis layout via adjacency transpose + K*K merge +
+        # stride-(K+1) lax.slice: element k*(K+1) of the merged axis IS
+        # (k, k), and the surviving diag axis lands directly at ``lo_K``
+        # (the old path appended it LAST and permuted it back). Axis
+        # bookkeeping, proved against the old ``_shift_for_permute``
+        # formulas: axes in (lo_K, hi_K) gain +1 from the adjacency
+        # transpose and lose -1 in the merge (net 0); axes beyond hi_K
+        # lose -1 in the merge — exactly ``jnp.diagonal``'s -1/-2 followed
+        # by the old reinsert's +1. The old ``diag_pos == target_K``
+        # branch was unreachable: diag_pos >= hi > lo = target_K.
+        _perm = list(range(val.ndim))
+        _perm.pop(hi_K)
+        _perm.insert(lo_K + 1, hi_K)
+        val = jnp.transpose(val, _perm)
+        _mshape = list(val.shape)
+        _mshape[lo_K:lo_K + 2] = [size * size]
+        val = val.reshape(_mshape)
+        _limits = list(val.shape)
+        _limits[lo_K] = (size - 1) * (size + 1) + 1
+        _strides = [1] * val.ndim
+        _strides[lo_K] = size + 1
+        val = jax.lax.slice(val, [0] * val.ndim, _limits, _strides)
         target_K = lo
-        lo_b_post_diag = lo_b_pos - 1
-        hi_b_post_diag = hi_b_pos - 2
-        if diag_pos != target_K:
-            perm = list(range(val.ndim))
-            perm.pop(diag_pos)
-            perm.insert(target_K, diag_pos)
-            val = jnp.transpose(val, perm)
-
-            def _shift_for_permute(p):
-                if p < target_K:
-                    return p
-                if p < diag_pos:
-                    return p + 1
-                return target_K
-
-            lo_b_final = _shift_for_permute(lo_b_post_diag)
-            hi_b_final = _shift_for_permute(hi_b_post_diag)
-        else:
-            lo_b_final = lo_b_post_diag
-            hi_b_final = hi_b_post_diag
+        lo_b_final = lo_b_pos      # in (lo_K, hi_K): +1 then -1
+        hi_b_final = hi_b_pos - 1  # beyond hi_K: -1 in the merge
 
         new_K_axis = target_K
         if lo_is_v1:
