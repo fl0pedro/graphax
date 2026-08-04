@@ -729,6 +729,22 @@ def _reduce_along_axes(val: jnp.ndarray, axes: tuple[int, ...], kind: str):
         # arg-extremum, so widen to float32 for the comparison; ``take_along_axis``
         # against the original ``flat`` keeps the value's dtype and sign.
         abs_flat = jnp.abs(flat.astype(jnp.float32))
+        if jnp.issubdtype(flat.dtype, jnp.inexact):
+            # GATHER-FREE (#52, 2026-08-04): argmin/argmax + take_along_axis
+            # emitted a lax.gather. Selecting the FIRST entry attaining the
+            # extremum of |v| (cumsum==1 on the match mask == arg*'s
+            # first-occurrence tie-break) via where+sum is one fusable
+            # reduction chain with a deterministic result.
+            if kind == "abs_min":
+                ext = jnp.min(abs_flat, axis=-1, keepdims=True)
+            else:
+                ext = jnp.max(abs_flat, axis=-1, keepdims=True)
+            hit = abs_flat == ext
+            first = jnp.logical_and(hit, jnp.cumsum(hit, axis=-1) == 1)
+            return jnp.sum(jnp.where(first, flat, jnp.zeros((), flat.dtype)),
+                           axis=-1)
+        # Integer (incl. sub-byte Quant) vals: ``sum`` is unsupported for
+        # int4-class dtypes — keep the legacy gather-based pick.
         if kind == "abs_min":
             idx = jnp.argmin(abs_flat, axis=-1, keepdims=True)
         else:

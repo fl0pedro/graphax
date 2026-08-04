@@ -381,7 +381,9 @@ def _emit_block_diagonal(blocks, N, B_o, B_i, dtype) -> "SparseTensor":
     else:
         # B_i axis sits right after the (already-maybe-dropped) B_o axis.
         drop = 2 if has_o else 1
-        val = jnp.take(val, 0, axis=drop)
+        # lax.index_in_dim is a slice+squeeze; jnp.take with a scalar
+        # index lowers to a gather (#52).
+        val = jax.lax.index_in_dim(val, 0, axis=drop, keepdims=False)
 
     out_dim = DiagonalIndex(
         0, N, axis=axis, other_id=1,
