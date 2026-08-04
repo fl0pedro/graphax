@@ -682,11 +682,28 @@ def _reduce_grid(res_view, pairs, shared, total, lhs_block_lens, rhs_block_lens)
     # produces collisions in adjacent r values, and the mixed-radix combination across
     # multiple pairs preserves those collisions. ``segment_sum`` handles both pure-
     # permutation and true-collision cases correctly, so we always fall through here.
-    res = jax.ops.segment_sum(
-        res_view.reshape(math.prod(total), math.prod(extra)),
-        jnp.array(flat_arr),
-        num_segments=math.prod(per_num),
-    )
+    # ONE-HOT DOT (#51, revived 2026-08-04): ``segment_sum`` is an unsorted
+    # scatter-add — GPU atomics, a fusion barrier — driven here by a STATIC
+    # numpy index map. Contract against a constant one-hot instead:
+    # identical groups, deterministic order, and the dot fuses. VALUE-
+    # identical within float reordering (the first attempt passed every
+    # allclose); the _PIN_LAYOUT byte-identity replicas in
+    # explicit_matmul_test.py mirror this same reduction. A >4M-entry
+    # safety valve keeps segment_sum for pathological grids.
+    _n_src = math.prod(total)
+    _n_seg = math.prod(per_num)
+    if _n_src * _n_seg <= 4_000_000:
+        _onehot = np.zeros((_n_seg, _n_src), dtype=np.float32)
+        _onehot[flat_arr, np.arange(_n_src)] = 1.0
+        _rv = res_view.reshape(_n_src, math.prod(extra))
+        _oh = jnp.asarray(_onehot, dtype=_rv.dtype)
+        res = jax.lax.dot_general(_oh, _rv, (((1,), (0,)), ((), ())))
+    else:
+        res = jax.ops.segment_sum(
+            res_view.reshape(math.prod(total), math.prod(extra)),
+            jnp.array(flat_arr),
+            num_segments=math.prod(per_num),
+        )
     return res.reshape(*per_num, *extra)
 
 
@@ -2058,7 +2075,16 @@ def _matmul_via_densify(lhs, rhs):
     n_lhs_out = len(lhs.out_dims)
     n_rhs_out = len(rhs.out_dims)
 
-    lhs_dense, rhs_dense = dense_for_matmul(lhs), dense_for_matmul(rhs)
+    # Deferred scale (#49): densify UNSCALED so the dense builders fuse
+    # straight into the GEMM (an eager ``* scalar_mult`` producer cannot fuse
+    # into the cuBLAS custom call and materializes scaled HBM copies of both
+    # operands); ``s_l * s_r`` is folded into the result's ``scalar_mult``
+    # below, mirroring the tiled path. Bool operands keep the legacy eager
+    # fold (``&``/``|`` semantics do not scale linearly).
+    _defer = not (jnp.issubdtype(jnp.dtype(lhs.dtype), jnp.bool_)
+                  or jnp.issubdtype(jnp.dtype(rhs.dtype), jnp.bool_))
+    lhs_dense = dense_for_matmul(lhs, defer_scale=_defer)
+    rhs_dense = dense_for_matmul(rhs, defer_scale=_defer)
 
     # Contraction axes: the size-1-aware alignment (``_align_contract_indices``)
     # decides which ``lhs.primal`` axis pairs with which ``rhs.out`` axis — the
@@ -2112,9 +2138,13 @@ def _matmul_via_densify(lhs, rhs):
         if ls == rs:
             continue
         if ls == 1 and _is_implicit_block_dim(ld):
-            lhs_dense = _pad_axis_to(lhs_dense, la, rs, _scaled_fill(lhs))
+            lhs_dense = _pad_axis_to(
+                lhs_dense, la, rs,
+                lhs._eff_fill if _defer else _scaled_fill(lhs))
         elif rs == 1 and _is_implicit_block_dim(rd):
-            rhs_dense = _pad_axis_to(rhs_dense, ra, ls, _scaled_fill(rhs))
+            rhs_dense = _pad_axis_to(
+                rhs_dense, ra, ls,
+                rhs._eff_fill if _defer else _scaled_fill(rhs))
 
     result = _gx_dot_general(
         lhs_dense,
@@ -2169,6 +2199,27 @@ def _matmul_via_densify(lhs, rhs):
     # transforms intentionally not propagated through matmul; callers in
     # core.py unload pre/post transforms before the matmul and reattach
     # fresh ones to the result.
+    if _defer:
+        # Fold the deferred operand scales into the output, exactly like the
+        # tiled path's _build_output_tensor. Promote mixed scalar dtypes to
+        # their common compute dtype first (a narrow-Quant sm has no implicit
+        # promotion path against f32).
+        _sl, _sr = lhs.scalar_mult, rhs.scalar_mult
+        if isinstance(_sl, (int, float)) and isinstance(_sr, (int, float)):
+            _sm_out = _sl * _sr
+        else:
+            from graphax.sparse.dtype_compute import _compute_dtype
+            _a, _b = jnp.asarray(_sl), jnp.asarray(_sr)
+            _cdt = _compute_dtype(_a.dtype, _b.dtype)
+            _sm_out = _a.astype(_cdt) * _b.astype(_cdt)
+        return SparseTensor(
+            out_dims,
+            primal_dims,
+            result,
+            fill_value=None,  # densified output is fully dense → no fill cells
+            scalar_mult=_sm_out,
+            check_consistency=False,
+        )
     return SparseTensor(
         out_dims,
         primal_dims,

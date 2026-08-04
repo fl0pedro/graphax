@@ -12,6 +12,24 @@ _PIN_LAYOUT = os.environ.get("GRAPHAX_PLANNER_EXACT", "0") in (
     "", "0", "false", "False"
 )
 
+def _engine_reduce(view, flat_idx, num_segments):
+    """Mirror of the engine's _reduce_grid reduction (#51): constant one-hot
+    dot with the same <=4M valve, so the _PIN_LAYOUT byte-identity asserts
+    keep comparing like-for-like emissions. Accepts (src, *trailing)."""
+    import numpy as _np
+    flat_idx = _np.asarray(flat_idx)
+    n_src = int(view.shape[0])
+    if n_src * int(num_segments) <= 4_000_000:
+        oh = _np.zeros((int(num_segments), n_src), dtype=_np.float32)
+        oh[flat_idx, _np.arange(n_src)] = 1.0
+        v2 = view.reshape(n_src, -1)
+        res = jax.lax.dot_general(
+            jnp.asarray(oh, dtype=v2.dtype), v2, (((1,), (0,)), ((), ())))
+        return res.reshape((int(num_segments),) + tuple(view.shape[1:]))
+    return jax.ops.segment_sum(view, jnp.asarray(flat_idx),
+                               num_segments=num_segments)
+
+
 from graphax.sparse.indexes import DiagonalIndex, DenseIndex
 from graphax.sparse.tensor import SparseTensor, _arr2st
 import math
@@ -493,8 +511,8 @@ class TestExplicit(unittest.TestCase):
         C_view = jax.lax.dot_general(A_view, B_view, (((2,), (1,)), ((0,), (0,))))
 
         flat_idx, num_seg = get_routing_idx(a, b, l, k)
-        C_reduced = jax.ops.segment_sum(
-            C_view.reshape(l, -1), flat_idx, num_segments=num_seg
+        C_reduced = _engine_reduce(
+            C_view.reshape(l, -1), flat_idx, num_seg
         )
 
         R = (
@@ -698,8 +716,8 @@ class TestExplicit(unittest.TestCase):
         C_view_flat = C_view.reshape(4 * 12, *C_view.shape[2:])
         idx_flat = idx1[:, None] * num_seg2 + idx2[None, :]
 
-        C_reduced_flat = jax.ops.segment_sum(
-            C_view_flat, idx_flat.flatten(), num_segments=num_seg1 * num_seg2
+        C_reduced_flat = _engine_reduce(
+            C_view_flat, idx_flat.flatten(), num_seg1 * num_seg2
         )
         C_reduced = C_reduced_flat.reshape(num_seg1, num_seg2, *C_view.shape[2:])
 
@@ -760,7 +778,7 @@ class TestExplicit(unittest.TestCase):
         )
 
         idx1, num_seg1 = get_routing_idx(4, 6, 12, 2)
-        C_reduced = jax.ops.segment_sum(C_view, idx1, num_segments=num_seg1)
+        C_reduced = _engine_reduce(C_view, idx1, num_seg1)
 
         C_grid = C_reduced.reshape(2, 2, 3, 3, 4, 2, 5)
         R = C_grid.transpose(0, 1, 4, 3, 5, 2, 6).reshape(2, 8, 6, 15)
@@ -914,8 +932,8 @@ class TestExplicit(unittest.TestCase):
         C_view_flat = C_view.reshape(4 * 12, *C_view.shape[2:])
         idx_flat = idx1[:, None] * num_seg2 + idx2[None, :]
 
-        C_reduced_flat = jax.ops.segment_sum(
-            C_view_flat, idx_flat.flatten(), num_segments=num_seg1 * num_seg2
+        C_reduced_flat = _engine_reduce(
+            C_view_flat, idx_flat.flatten(), num_seg1 * num_seg2
         )
         C_reduced = C_reduced_flat.reshape(num_seg1, num_seg2, *C_view.shape[2:])
 

@@ -218,12 +218,27 @@ def _audit_densify(tensor) -> None:
 
 
 def dense_for_matmul(tensor: SparseTensor, *,
-                     keep_quantization: bool = False) -> Array:
+                     keep_quantization: bool = False,
+                     defer_scale: bool = False) -> Array:
     """Fusion-friendly dense form (broadcast+select; no scatter / no gather where possible).
 
     See module docstring. Falls back to the scatter-based ``dense()`` for shapes the
     simple builder doesn't cover.
+
+    ``defer_scale=True`` (the densify-GEMM path, #49): return the UNSCALED
+    dense array -- every ``* scalar_mult`` application is skipped, including
+    the where-fill (``where(mask, v, f)`` scales linearly, so scaling the
+    caller's result by ``scalar_mult`` afterwards is identical) -- and the
+    caller folds the scale into its output's ``scalar_mult`` exactly as the
+    tiled path's ``_build_output_tensor`` does. An elementwise ``*`` producer
+    cannot fuse into a cuBLAS GEMM custom call, so the eager fold
+    materialized scaled HBM copies of both operands.
     """
+    if defer_scale:
+        _one = jnp.array(1.0, dtype=tensor.dtype)
+        _sm = _one  # identity: every _scaled_mul below becomes a no-op cast
+    else:
+        _sm = tensor.scalar_mult
     if _STRUCT_AUDIT and any(
             d.is_sparse or getattr(d, "axis", None) is None
             for d in tensor.dims):
@@ -237,7 +252,7 @@ def dense_for_matmul(tensor: SparseTensor, *,
             # dense()/dense_for_matmul inconsistency: it materialised 0 instead
             # of 1 for a fully-dense val=None operand.)
             return jnp.broadcast_to(
-                _scaled_mul(jnp.array(1.0, dtype=tensor.dtype), tensor.scalar_mult, keep_narrow=keep_quantization),
+                _scaled_mul(jnp.array(1.0, dtype=tensor.dtype), _sm, keep_narrow=keep_quantization),
                 tensor.shape,
             )
         v = tensor.val
@@ -253,7 +268,7 @@ def dense_for_matmul(tensor: SparseTensor, *,
         if perm and len(set(perm)) == len(perm) and len(perm) < v.ndim:
             extra = [ax for ax in range(v.ndim) if ax not in perm]
             if all(int(v.shape[ax]) == 1 for ax in extra):
-                v = _scaled_mul(jnp.transpose(v, perm + extra), tensor.scalar_mult, keep_narrow=keep_quantization)
+                v = _scaled_mul(jnp.transpose(v, perm + extra), _sm, keep_narrow=keep_quantization)
                 v = v.reshape(v.shape[: len(perm)])  # drop trailing size-1 extras
                 built, v_iter = [], iter(v.shape)
                 for d in tensor.dims:
@@ -266,7 +281,7 @@ def dense_for_matmul(tensor: SparseTensor, *,
             and perm != list(range(len(perm)))
         ):
             v = v.transpose(perm)
-        v = _scaled_mul(v, tensor.scalar_mult, keep_narrow=keep_quantization)
+        v = _scaled_mul(v, _sm, keep_narrow=keep_quantization)
         # Broadcast back up to the logical shape: a SparseTensor can carry a
         # rank-0 (or otherwise rank-reduced) ``val`` while its dims advertise
         # a larger structural shape (e.g. concat-transformed Jacobians where
@@ -307,7 +322,7 @@ def dense_for_matmul(tensor: SparseTensor, *,
         logical_outer, logical_inner = N * B_o, N * B_i
         gather_axes = [d_o.axis, d_o.block_axis, d_i.block_axis]
         if all(a is not None for a in gather_axes):
-            v = _scaled_mul(tensor.val, tensor.scalar_mult, keep_narrow=keep_quantization)
+            v = _scaled_mul(tensor.val, _sm, keep_narrow=keep_quantization)
             leftover = [a for a in range(v.ndim) if a not in gather_axes]
             v = v.transpose(gather_axes + leftover)
             # v.shape: (N, B_o, B_i, *leftover_sizes). Collapse (N, B_o) → logical_outer
@@ -325,7 +340,7 @@ def dense_for_matmul(tensor: SparseTensor, *,
             mask = blk_o[:, None] == blk_i[None, :]
             mask_b = mask[(..., *((None,) * len(leftover_sizes)))]
             dense_pair = jnp.where(
-                mask_b, gathered, _scaled_mul(tensor._eff_fill, tensor.scalar_mult, keep_narrow=keep_quantization)
+                mask_b, gathered, _scaled_mul(tensor._eff_fill, _sm, keep_narrow=keep_quantization)
             )
             # Reorder dense_pair's axes to match tensor.dims order. ``target_axes[i]`` is
             # the dense_pair axis that should land at result position ``i``, so the
@@ -396,10 +411,10 @@ def dense_for_matmul(tensor: SparseTensor, *,
         # Purely structural after hard densify ⇒ all-ones × scalar_mult (val=None
         # semantics; see the fully-dense branch above).
         return jnp.broadcast_to(
-            _scaled_mul(jnp.array(1.0, dtype=tensor.dtype), tensor.scalar_mult, keep_narrow=keep_quantization),
+            _scaled_mul(jnp.array(1.0, dtype=tensor.dtype), _sm, keep_narrow=keep_quantization),
             densified.shape,
         )
-    return _scaled_mul(val, tensor.scalar_mult, keep_narrow=keep_quantization)
+    return _scaled_mul(val, _sm, keep_narrow=keep_quantization)
 
 
 # --- Internals -----------------------------------------------------------
