@@ -122,6 +122,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Callable
 
+import jax
 import jax.numpy as jnp
 
 from graphax.sparse.elemental._common import (
@@ -182,16 +183,24 @@ def _diag_subblocks(dense_grid, N, B_o, B_i):
     """Extract the ``N`` meta-diagonal ``(B_o, B_i)`` sub-blocks of a dense
     ``(R=N*B_o, C=N*B_i, *L)`` grid as ``(N, B_o, B_i, *L)``.
 
-    Pure reshape + ``jnp.diagonal`` (a strided view — no gather): reshape to
-    ``(N, B_o, N, B_i, *L)`` then take the diagonal over the two ``N`` meta axes.
-    ``jnp.diagonal`` appends the diagonalized axis last, so move it back to front.
+    GATHER-FREE (2026-08-04): the old ``jnp.diagonal`` here was NOT a
+    strided view — jnp.diagonal lowers through advanced indexing to
+    iota+concatenate+lax.gather in every configuration (the gather hides
+    inside a pjit wrapper). Same values via adjacency transpose + N*N
+    merge + stride-(N+1) lax.slice, and the diag axis lands at the FRONT
+    directly, so the old trailing moveaxis disappears too.
     """
     L = dense_grid.shape[2:]
     g4 = dense_grid.reshape((N, B_o, N, B_i) + L)
-    # diagonal over the two meta axes (0 and 2) -> (B_o, B_i, *L, N)
-    diag = jnp.diagonal(g4, axis1=0, axis2=2)
-    # move the trailing diag (N) axis to the front -> (N, B_o, B_i, *L)
-    return jnp.moveaxis(diag, -1, 0)
+    # meta axis 2 adjacent to meta axis 0 -> (N, N, B_o, B_i, *L)
+    g4 = jnp.transpose(g4, (0, 2, 1, 3) + tuple(range(4, g4.ndim)))
+    merged = g4.reshape((N * N,) + g4.shape[2:])
+    limits = list(merged.shape)
+    limits[0] = (N - 1) * (N + 1) + 1
+    strides = [1] * merged.ndim
+    strides[0] = N + 1
+    # element k*(N+1) of the merged axis IS (k, k) -> (N, B_o, B_i, *L)
+    return jax.lax.slice(merged, [0] * merged.ndim, limits, strides)
 
 
 def _scatter_blocks_onto_grid(dense_grid, new_blocks, N, B_o, B_i):
