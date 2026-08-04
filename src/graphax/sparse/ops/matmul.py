@@ -805,7 +805,7 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
     )
     lhs_leftover = list(lhs_view.shape[3 * N :])
     rhs_leftover = list(rhs_view.shape[3 * N :])
-    res_raw = jax.lax.dot_general(lhs_view, rhs_view, _dot_general_axes(N, pairs))
+    res_raw = _gx_dot_general(lhs_view, rhs_view, _dot_general_axes(N, pairs))
     nc_len = sum(1 for p in pairs if p.pairing_type != "contract")
     dg_perm = (
         list(range(2 * N + nc_len))
@@ -1728,6 +1728,36 @@ def _einsum_general_enabled() -> bool:
 _SEED_SCALAR_MM = _os.environ.get("GRAPHAX_SEED_VERTICES_SCALAR_MM", "1") != "0"
 
 
+def _quant_narrow_gemm_enabled() -> bool:
+    """GRAPHAX_QUANT_NARROW_GEMM (default ON): when BOTH contraction
+    operands are bf16 (both edges were Quant'd -- a mixed {bf16, f32} pair
+    still upcasts, so quantizing one edge never approximates its exact
+    partner), run the dot on the bf16 inputs with float32 accumulation
+    (preferred_element_type) instead of a native bf16-out dot. Scope:
+    the tiled dot sites (_gx_dot_general) + the _scaled_mul
+    keep-narrow read (an already-bf16 edge is not re-promoted by its
+    scalar drain). Exact AD never carries narrow vals -- byte-identical
+    under either setting."""
+    return _os.environ.get("GRAPHAX_QUANT_NARROW_GEMM", "1") != "0"
+
+
+def _gx_dot_general(a, b, dims):
+    """``lax.dot_general`` with f32 accumulation whenever both operand
+    views are bf16 (only Quant produces them): tensor-core inputs, f32
+    product/accumulate, f32 result — downstream edges keep the dtype the
+    legacy upcast path produced. Any other dtype takes the plain call, so
+    the EXACT-AD path is byte-identical."""
+    if (
+        _quant_narrow_gemm_enabled()
+        and jnp.dtype(a.dtype) == jnp.dtype(jnp.bfloat16)
+        and jnp.dtype(b.dtype) == jnp.dtype(jnp.bfloat16)
+    ):
+        return jax.lax.dot_general(
+            a, b, dims, preferred_element_type=jnp.float32
+        )
+    return jax.lax.dot_general(a, b, dims)
+
+
 def _both_implicit_contract_pairs(lhs, rhs):
     """Contracting pairs where BOTH dims are IMPLICIT (``axis is None``, no stored
     physical axis) and share the same logical size N. Contracting a broadcast axis
@@ -2086,7 +2116,7 @@ def _matmul_via_densify(lhs, rhs):
         elif rs == 1 and _is_implicit_block_dim(rd):
             rhs_dense = _pad_axis_to(rhs_dense, ra, ls, _scaled_fill(rhs))
 
-    result = jax.lax.dot_general(
+    result = _gx_dot_general(
         lhs_dense,
         rhs_dense,
         (
@@ -2264,6 +2294,10 @@ def _normalize_inputs(lhs, rhs):
     # Mixed-precision upcast: a narrow (Quant) val and a float val have no
     # implicit promotion path, so dot_general would raise; combine both at
     # their highest common compute dtype. No-op when dtypes already match.
+    # DELIBERATE (2026-08-04): a {bf16, f32} MIXED pair UPCASTS -- quantizing
+    # one edge must never silently approximate its exact partner. The bf16
+    # narrow GEMM engages only when BOTH operands were made bf16 (the policy
+    # quantizes both incident edges); see _gx_dot_general.
     from graphax.sparse.dtype_compute import _unify_operand_dtypes
     lhs, rhs = _unify_operand_dtypes(lhs, rhs)
     return lhs, rhs

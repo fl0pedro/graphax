@@ -164,6 +164,13 @@ def _scaled_mul(value, scalar_mult, *, keep_narrow: bool = False):
     sdt = getattr(scalar_mult, "dtype", None)
     if vdt is None or sdt is None:
         return value * scalar_mult
+    # bf16 narrow-compute mode implies keep_narrow for a bf16 value: the
+    # densify/materialize read (val * f32 scalar_mult) was re-promoting the
+    # Quant'd array to f32 right BEFORE the contraction consumed it, so the
+    # heavyweight dots never ran bf16 (see _quant_narrow_bf16_pair).
+    if not keep_narrow and _quant_narrow_bf16_pair(jnp.dtype(vdt),
+                                                   jnp.dtype(sdt))             and jnp.dtype(vdt) == jnp.dtype(jnp.bfloat16):
+        keep_narrow = True
     if keep_narrow and jnp.dtype(vdt) != jnp.dtype(sdt):
         _check_downcast_safe(scalar_mult, vdt, what="scalar_mult")
         return value * jnp.asarray(scalar_mult).astype(vdt)
@@ -203,8 +210,31 @@ def _unify_operand_dtypes(lhs, rhs):
         # (Two same-narrow operands also take the native path; the op runs in
         # that narrow dtype, matching the stored precision.)
         return lhs, rhs
+    # DELIBERATE (2026-08-04): a {bf16, f32} MIXED pair UPCASTS to f32 --
+    # quantizing one edge must never silently approximate its exact partner
+    # (user decision; an earlier draft downcast the pair). The bf16 fast
+    # path exists only when BOTH edges were made bf16: same-dtype pairs
+    # return above unchanged, and the tiled dot sites then run the bf16
+    # GEMM with f32 accumulation (matmul._gx_dot_general). The companion
+    # keep-narrow read in _scaled_mul stops a lone scalar drain from
+    # re-promoting an already-bf16 edge before that both-bf16 meeting.
     cdt = _compute_dtype(ldt, rdt)
     return _cast_operand(lhs, cdt), _cast_operand(rhs, cdt)
+
+
+def _quant_narrow_bf16_pair(ldt, rdt) -> bool:
+    """True iff bf16 narrow-compute handling applies to this dtype pair
+    (consumed by _scaled_mul's keep-narrow read; the operand unify above
+    deliberately does NOT use it -- mixed pairs upcast). Env read per call:
+    GRAPHAX_QUANT_NARROW_GEMM default ON, and the einsum_general planner
+    must be OFF -- the planner emits its own contractions with no
+    f32-accumulate plumbing, so narrow vals must not leak into it."""
+    import os as _os
+    if _os.environ.get("GRAPHAX_QUANT_NARROW_GEMM", "1") == "0":
+        return False
+    if _os.environ.get("GRAPHAX_EINSUM_GENERAL", "1") != "0":
+        return False
+    return {ldt, rdt} == {jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)}
 
 
 def _cast_operand(t, cdt):
