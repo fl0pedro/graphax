@@ -1004,7 +1004,12 @@ def _record_micro(_t, before, after, vertex, slot, in_edge, out_edge,
     end = _eqn_count(_face_sink, _xlog)
     _atype, _params = _approx_meta(_t)
     if _face_sink is not None and applied:
-        _face_sink.approx(_atype, _params, start, end)
+        # SLOT-TAGGED. ``slot`` says WHICH OPERAND of the face was approximated
+        # ("lhs" / "rhs" / "res", or "vertex" for a per-vertex transform, which
+        # hits the contraction result -- the same operand as "res"). A slot that
+        # declined records nothing at all, so the emitter cannot recover the
+        # slot from the ORDER of the records; it has to be carried here.
+        _face_sink.approx(_atype, _params, start, end, slot)
     if _xlog is not None:
         _xlog.record("transform", vertex, slot, _atype, _params,
                      in_edge, out_edge, start, end, applied)

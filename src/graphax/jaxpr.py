@@ -73,6 +73,14 @@ from graphax.sparse.micro_actions import (  # noqa: E402
     COMPRESS_KINDS as _COMPRESS_KINDS,
     QUANT_DTYPES as _QUANT_DTYPES,
 )
+# The per-face approximation slots are DEFINED by the sink that records them
+# (``FaceSink.approx`` tags every record with its operand slot); the tokenizer
+# only renders them, so it must not re-declare the contract.
+from graphax.sparse.tracer import (  # noqa: E402
+    FACE_SLOT_NAMES as _FACE_SLOT_NAMES,
+    N_FACE_SLOTS as _N_FACE_SLOTS,
+    face_slot_index as _face_slot_index,
+)
 
 # SKIP is an approximation OUTCOME, not a transform: the policy declined to
 # approximate this path (or nothing was legal on it). It must be tokenized
@@ -110,6 +118,16 @@ EXTRA_OP_NAMES = [
     "inf", "nan",
 ]
 
+# The per-face approximation SLOT SEPARATOR. One ``approx`` header covers all
+# three operand slots of a face and separates them with this token, so a slot
+# that declined contributes no tokens yet the slot COUNT stays fixed: position,
+# not presence, identifies the operand. ``&`` (the path header's separator) is
+# a different structural role and is deliberately NOT reused -- a token must
+# mean one thing. Appended at the VERY END of the vocabulary, after every list
+# above, so no existing token id moves.
+SLOT_SEPARATOR = "^"
+EXTRA_STRUCTURE_TOKENS = [SLOT_SEPARATOR]
+
 
 @functools.lru_cache(maxsize=None)
 def _build_vocab(digit_base):
@@ -122,6 +140,7 @@ def _build_vocab(digit_base):
         + APPROX_ARG_TOKENS
         + EXTRA_PARAM_KEYS
         + EXTRA_OP_NAMES
+        + EXTRA_STRUCTURE_TOKENS
     )
     # DEDUPE (keep first occurrence): several EXTRA_OP_NAMES also appear in
     # ``elemental_rules``; duplicate keys would inflate the enumerate() id range
@@ -1250,9 +1269,12 @@ class IncrementalPathTokenizer:
         return res
 
     # ---- unified PATH emission (vertex- and face-elimination agnostic) ----
-    def _emit_approx_head(self, atype, params, out):
-        self._emit_word("approx", out)
-        self._emit_word(atype, out)               # DIAG / COMPRESS / QUANT
+    def _emit_approx_args(self, atype, params, out):
+        """``<TYPE> <args>`` for ONE recorded approximation -- the PAYLOAD of an
+        ``approx`` header, WITHOUT the header word: a face emits a single header
+        covering all three of its operand slots (see
+        :meth:`_emit_slot_approx_head`), so the word cannot live here."""
+        self._emit_word(atype, out)        # DIAG / COMPRESS / QUANT / SKIP
         if atype == "QUANT":
             self._emit_word("d#" + params["dtype"], out)
         elif atype == "COMPRESS":
@@ -1263,6 +1285,31 @@ class IncrementalPathTokenizer:
             self._emit_int(params["i"], out)
             self._emit_int(params["j"], out)
             self._emit_int(params["factor"], out)
+        # SKIP takes NO arguments -- it drops the whole contraction, so there is
+        # nothing to parameterize (and no operand slots either; see _emit_face).
+
+    def _emit_slot_approx_head(self, slots, out):
+        """ONE ``approx`` header covering ALL THREE operand slots of a face::
+
+            approx <TYPE args>_pre ^ <TYPE args>_post ^ <TYPE args>_new
+
+        ``slots`` is the 3-list of per-slot record lists (pre/lhs, post/rhs,
+        new/res); any entry whose ``[0]`` is the type and ``[1]`` the params
+        works -- an :class:`~graphax.sparse.tracer.ApproxRecord` or the
+        ``(atype, params, eqns)`` triple :meth:`_split_face_eqns` builds.
+
+        A slot that declined contributes NO tokens -- just nothing between two
+        separators -- so the separator count is invariantly 2 and the slot a
+        record belongs to is given by POSITION, never by presence. That is the
+        whole point: ``approx DIAG 1 2 4 ^ ^`` (pre), ``approx ^ DIAG 1 2 4 ^``
+        (post) and ``approx ^ ^ DIAG 1 2 4`` (new) are three DIFFERENT streams,
+        where the old one-header-per-record form made all three IDENTICAL."""
+        self._emit_word("approx", out)
+        for i, recs in enumerate(slots):
+            if i:
+                out.append(self.vocab[SLOT_SEPARATOR])
+            for rec in recs:
+                self._emit_approx_args(rec[0], rec[1], out)
 
     def eliminate(self, vertex, rules=(), face_transforms=None):
         """Eliminate one vertex on the PRESERVED trace and emit its PATH blocks.
@@ -1273,7 +1320,10 @@ class IncrementalPathTokenizer:
         face elimination emits a single path. Each path is:
 
             path <central> , <pred> , <succ>   { contraction+join eqns }
-            [ approx <TYPE> <args>             { approx eqns } ]*
+            [ approx <pre> ^ <post> ^ <new>    {pre} {post} {new} ]
+
+        The ``approx`` head is emitted at most ONCE per path and covers all
+        three operand slots at fixed positions (see :meth:`_emit_face`).
 
         ``central`` / ``pred`` / ``succ`` are the actual graph VARIABLE names
         (central = the eliminated vertex's variable).
@@ -1287,17 +1337,48 @@ class IncrementalPathTokenizer:
         return toks
 
     @staticmethod
+    def _group_face_approx(fr):
+        """A face's approximation records -> ``(slots, unslotted)``.
+
+        ``slots`` is a list of ``N_FACE_SLOTS`` lists -- the records applied to
+        the pre/lhs, post/rhs and new/res operand respectively, in application
+        order; an EMPTY list means that slot declined. ``unslotted`` holds the
+        records with no operand slot, i.e. ``SKIP`` (it drops the whole
+        contraction, so there are no pre/post/new operands to approximate).
+
+        The slot comes from the RECORD (``ApproxRecord.slot``), never from the
+        record's position: a declining slot records nothing, so order alone
+        cannot tell ``pre`` from ``post`` from ``new``."""
+        slots = [[] for _ in range(_N_FACE_SLOTS)]
+        unslotted = []
+        for rec in fr.approx:
+            k = _face_slot_index(rec.slot)
+            (unslotted if k is None else slots[k]).append(rec)
+        return slots, unslotted
+
+    @staticmethod
     def _split_face_eqns(fr, eqns):
-        """A face -> ``(elim_eqns, [(atype, params, approx_eqns)])``: the
-        contraction+join equations (the face range MINUS the approx sub-ranges)
-        and each approximation's own equations. Single source of truth for both
-        the token and pretty renderers."""
-        aranges = [(s, e) for (_, _, s, e) in fr.approx]
+        """A face -> ``(elim_eqns, slots, unslotted)``:
+
+        * ``elim_eqns`` -- the contraction+join equations, i.e. the face range
+          MINUS every approximation's sub-range;
+        * ``slots`` -- ``N_FACE_SLOTS`` lists of ``(atype, params, approx_eqns)``
+          keyed by OPERAND SLOT (pre/lhs, post/rhs, new/res), empty where the
+          slot declined;
+        * ``unslotted`` -- the same triples for records without an operand slot
+          (``SKIP``).
+
+        Single source of truth for both the token and pretty renderers."""
+        aranges = [(rec.start, rec.end) for rec in fr.approx]
         elim = [eqns[i] for i in range(fr.start, fr.end)
                 if not any(s <= i < e for s, e in aranges)]
-        approx = [(atype, params, [eqns[i] for i in range(s, e)])
-                  for (atype, params, s, e) in fr.approx]
-        return elim, approx
+
+        def _blocks(recs):
+            return [(r.atype, r.params, [eqns[i] for i in range(r.start, r.end)])
+                    for r in recs]
+
+        slots, unslotted = IncrementalPathTokenizer._group_face_approx(fr)
+        return elim, [_blocks(r) for r in slots], _blocks(unslotted)
 
     def _emit_face_header(self, fr, out):
         """``path <central> & <pred> & <succ>`` (central is the eliminated var)."""
@@ -1313,19 +1394,41 @@ class IncrementalPathTokenizer:
         ends and its approximations begin (== ``len(out)`` when the face was
         not approximated).
 
+        The approximation part is ONE ``approx`` header covering all THREE
+        operand slots, followed by the three slots' equation blocks in slot
+        order::
+
+            approx <pre> ^ <post> ^ <new>  {pre eqns} {post eqns} {new eqns}
+
+        A slot that declined contributes NO tokens to the header (nothing
+        between two separators) and an EMPTY ``{}`` block, so a face emits
+        exactly 2 separators and exactly 3 blocks whenever it emits a header at
+        all: slot identity is STRUCTURAL and cannot be destroyed by absence.
+        When all three slots declined, NO ``approx`` header is emitted (an
+        exact face is silent, as before).
+
         A SKIPPED face (``graphax.SKIP_FACE``) reaches here like any other: the
         sink recorded it with an EMPTY equation range and a single ``SKIP``
         approximation, so it emits its normal ``path`` header, an empty
-        contraction block, and an ``approx SKIP`` head. Skips are visible and
-        do not shift the face indices -- see :meth:`last_face_segments`.
+        contraction block, and an ``approx SKIP`` head. ``SKIP`` takes NO slots
+        -- the skip drops the whole contraction, so there are no pre/post/new
+        operands -- hence a face emits either the SKIP form or the three-slot
+        form, never both. Skips are visible and do not shift the face indices
+        -- see :meth:`last_face_segments`.
         """
         self._emit_face_header(fr, out)
-        elim, approx = self._split_face_eqns(fr, eqns)
+        elim, slots, unslotted = self._split_face_eqns(fr, eqns)
         self._emit_eqns(elim, out)
         split = len(out)
-        for atype, params, sub in approx:
-            self._emit_approx_head(atype, params, out)
+        for atype, params, sub in unslotted:      # SKIP: own head, no slots
+            self._emit_word("approx", out)
+            self._emit_approx_args(atype, params, out)
             self._emit_eqns(sub, out)
+        if any(slots):
+            self._emit_slot_approx_head(slots, out)
+            for recs in slots:                    # ALWAYS three blocks
+                self._emit_eqns(
+                    [e for _atype, _params, sub in recs for e in sub], out)
         return split
 
     def _emit_step_paths(self, step_i, eqns):
@@ -1343,11 +1446,22 @@ class IncrementalPathTokenizer:
         :meth:`eliminate` block, as indices into the token list it returned.
 
         ``[start:split]`` is the face header plus its contraction/join
-        equations; ``[split:end]`` is the ``approx`` heads and the equations
-        the approximations produced (empty when the face ran exact). This is
-        the split an autoregressive per-face loop needs: it reads
-        ``[start:split]`` of face f, decides, and then reads
+        equations; ``[split:end]`` is the face's APPROXIMATION part (empty when
+        the face ran exact). This is the split an autoregressive per-face loop
+        needs: it reads ``[start:split]`` of face f, decides, and then reads
         ``[split:end]`` of face f followed by ``[start:split]`` of face f+1.
+
+        ``[split:end]`` of an approximated (non-skipped) face is ONE ``approx``
+        head covering all three operand slots followed by the three slots'
+        equation blocks::
+
+            approx <pre> ^ <post> ^ <new>  {pre eqns} {post eqns} {new eqns}
+
+        A slot that declined contributes no header tokens and an empty ``{}``
+        block, so the head always carries exactly 2 ``^`` separators and the
+        tail always 3 blocks: WHICH operand was approximated is given by the
+        position between the separators, not by the presence of a record. When
+        all three slots declined, ``split == end`` (nothing is emitted).
 
         A face the caller SKIPPED (``graphax.SKIP_FACE``) IS emitted and DOES
         get an entry, so index ``f`` is face ``f``: the list is keyed to FACES,
@@ -1363,6 +1477,9 @@ class IncrementalPathTokenizer:
         i.e. NO accumulation (the skip dropped the contraction, so the block is
         empty) plus exactly one ``approx`` head. The empty block is not itself
         the marker -- an exact face can emit ``{}`` too -- the ``SKIP`` token is.
+        ``SKIP`` takes NO operand slots (it drops the whole contraction, so
+        there are no pre/post/new operands): the SKIP form and the three-slot
+        form never appear on the same face.
 
         CAVEAT (pre-existing, independent of skips):
         :func:`graphax.faces_of` lists faces OPTIMISTICALLY -- a face whose edge
@@ -1436,11 +1553,21 @@ class IncrementalPathTokenizer:
         for fr in self.ij.all_faces():
             L.append(f"path {self._pp_name(fr.central)} & "
                      f"{self._pp_name(fr.in_edge)} & {self._pp_name(fr.out_edge)}")
-            elim, approx = self._split_face_eqns(fr, all_eqns)
+            elim, slots, unslotted = self._split_face_eqns(fr, all_eqns)
             self._pp_eqns(elim, "  ", L)
-            for atype, params, sub in approx:
+            for atype, params, sub in unslotted:
                 L.append(f"  approx {atype} {self._pp_approx_args(atype, params)}")
                 self._pp_eqns(sub, "    ", L)
+            if any(slots):
+                # Same shape as the token stream: ONE head, three ``^``-
+                # separated slots (pre/post/new), then the three eqn blocks.
+                L.append("  approx " + " ^ ".join(
+                    " ".join(f"{t} {self._pp_approx_args(t, p)}".strip()
+                             for t, p, _sub in recs) for recs in slots))
+                for name, recs in zip(_FACE_SLOT_NAMES, slots):
+                    L.append(f"    [{name}]")
+                    self._pp_eqns([e for _t, _p, sub in recs for e in sub],
+                                  "      ", L)
         return "\n".join(L)
 
     def _pp_approx_args(self, atype, params):
@@ -1454,17 +1581,23 @@ class IncrementalPathTokenizer:
 
     def order_tokens(self, order, transforms=None, per_line=False):
         """The elimination ORDER alone -- one ``path <central> & <pred> & <succ>``
-        per face (plus any ``approx <TYPE> <args>`` heads), with NO equation
-        bodies / fn definitions. This is the compact action sequence. With
-        ``per_line`` a newline token separates paths (for readable decoding)."""
+        per face (plus its ``approx`` head, in the SAME slot-indexed form
+        :meth:`_emit_face` uses -- ``approx <pre> ^ <post> ^ <new>``, or the
+        slot-less ``approx SKIP``), with NO equation bodies / fn definitions.
+        This is the compact action sequence. With ``per_line`` a newline token
+        separates paths (for readable decoding)."""
         self.ij.eliminate_order(order, transforms)
         toks = []
         for fr in self.ij.all_faces():
             if per_line and toks:
                 toks.append(self.vocab["\n"])
             self._emit_face_header(fr, toks)
-            for (atype, params, s, e) in fr.approx:
-                self._emit_approx_head(atype, params, toks)
+            slots, unslotted = self._group_face_approx(fr)
+            for rec in unslotted:                 # SKIP: own head, no slots
+                self._emit_word("approx", toks)
+                self._emit_approx_args(rec.atype, rec.params, toks)
+            if any(slots):
+                self._emit_slot_approx_head(slots, toks)
         return toks
 
     def _collect_jac_vars(self, eqns):

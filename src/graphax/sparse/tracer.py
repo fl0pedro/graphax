@@ -29,6 +29,63 @@ def get_transform_log():
 FaceRecord = namedtuple(
     "FaceRecord", ["vertex", "in_edge", "central", "out_edge",
                    "start", "end", "approx"])
+FaceRecord.__doc__ = """One FACE (one ``in_edge -> central -> out_edge``
+contraction) of one vertex elimination.
+
+``start`` / ``end`` bound the equations the whole face appended to the
+persistent frame; ``approx`` is the list of :class:`ApproxRecord` for the
+approximations applied INSIDE that range, in application order."""
+
+
+# ---------------------------------------------------------------------------
+# per-face approximation SLOTS
+# ---------------------------------------------------------------------------
+#
+# A face is ``res = contract(lhs, rhs)``: two contraction operands and one
+# result, so an approximation applied on a face lands in exactly ONE of three
+# operand slots. alphagrad names them ``(pre, post, new)``, graphax names them
+# ``(lhs, rhs, res)`` -- same order, same operands:
+#
+#     slot 0   lhs / pre    the in_edge Jacobian    (before the contraction)
+#     slot 1   rhs / post   the out_edge Jacobian   (before the contraction)
+#     slot 2   res / new    the contraction result  (after it)
+#
+# The slot is RECORDED, never inferred from the order the records arrive in: a
+# slot that declined records NOTHING, so a lone record's position says nothing
+# about which operand it hit. That is the same defect class the ``SKIP`` marker
+# fixed for whole faces -- identity recoverable only by position, and position
+# destroyed by absence.
+FACE_SLOT_NAMES = ("lhs", "rhs", "res")
+N_FACE_SLOTS = len(FACE_SLOT_NAMES)
+
+# ``"vertex"`` is a per-vertex ``transforms`` entry (uniform over every face of
+# the vertex, not a per-face choice). It is applied to the contraction RESULT,
+# at the same site as ``res`` and immediately before it, so it hits the SAME
+# operand and shares its slot.
+FACE_SLOT_INDEX = {"lhs": 0, "rhs": 1, "res": 2, "vertex": 2}
+
+
+def face_slot_index(slot):
+    """Operand-slot index (``0`` / ``1`` / ``2``) of a recorded approximation,
+    or ``None`` when it has NO operand slot -- i.e. ``SKIP``, which drops the
+    whole contraction, so there is no pre/post/new operand to approximate."""
+    return FACE_SLOT_INDEX.get(slot)
+
+
+ApproxRecord = namedtuple(
+    "ApproxRecord", ["atype", "params", "start", "end", "slot"])
+ApproxRecord.__doc__ = """One approximation applied inside an open face.
+
+Fields:
+    atype (str): ``"DIAG"`` / ``"COMPRESS"`` / ``"QUANT"`` / ``"SKIP"``.
+    params (dict): the micro-action's parameters (``core._approx_meta``).
+    start / end (int): the equation-index range it appended to the persistent
+        frame. ``start == end`` => it emitted no jax equations (``SKIP``).
+    slot (str | None): the operand it was applied to -- ``"lhs"`` / ``"rhs"`` /
+        ``"res"`` for a per-face slot, ``"vertex"`` for a per-vertex transform
+        (same operand as ``res``), ``None`` for ``SKIP``. Map it to an index
+        with :func:`face_slot_index`.
+"""
 
 
 class FaceSink:
@@ -53,9 +110,16 @@ class FaceSink:
         self._open = [int(vertex), in_edge, central, out_edge,
                       self.n_eqns(), []]
 
-    def approx(self, atype, params, start, end):
+    def approx(self, atype, params, start, end, slot=None):
+        """Record ONE approximation on the currently open face.
+
+        ``slot`` names the OPERAND it was applied to (see
+        :data:`FACE_SLOT_INDEX`); ``None`` for ``SKIP``, which has no operand.
+        It must be carried explicitly -- a declining slot records nothing, so
+        the emitter cannot recover it from the record order."""
         if self._open is not None:
-            self._open[5].append((atype, params, start, end))
+            self._open[5].append(
+                ApproxRecord(atype, params, start, end, slot))
 
     def close_face(self):
         if self._open is not None:

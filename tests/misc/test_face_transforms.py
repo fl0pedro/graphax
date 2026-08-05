@@ -158,10 +158,11 @@ def test_face_transform_hits_exactly_one_face_of_two():
     assert len(keys) == 2
     assert approx[0] == [], "untargeted face must stay exact"
     assert len(approx[1]) == 1, "targeted face must carry exactly one approx"
-    atype, params, start, end = approx[1][0]
-    assert atype == "QUANT"
-    assert params == {"dtype": "bfloat16"}
-    assert end > start, "the recorded approx range must cover real equations"
+    rec = approx[1][0]
+    assert rec.atype == "QUANT"
+    assert rec.params == {"dtype": "bfloat16"}
+    assert rec.end > rec.start, "the recorded approx range must cover real equations"
+    assert rec.slot == "res", "the slot it was applied to is RECORDED, not inferred"
 
 
 def test_face_transform_hits_exactly_one_face_of_four():
@@ -361,10 +362,13 @@ def test_res_slot_runs_after_the_per_vertex_transforms():
     ij.eliminate(1, (Quant("float16"),), ft)
 
     approx = [fr.approx for fr in ij.step_faces(0)]
-    assert [t for t, _, _, _ in approx[0]] == ["QUANT", "QUANT"]
-    assert [p["dtype"] for _, p, _, _ in approx[0]] == ["float16", "bfloat16"]
+    assert [r.atype for r in approx[0]] == ["QUANT", "QUANT"]
+    assert [r.params["dtype"] for r in approx[0]] == ["float16", "bfloat16"]
+    # BOTH land on the contraction RESULT -- the per-vertex transform is applied
+    # to it one step before the ``res`` slot -- so both record the same operand.
+    assert [r.slot for r in approx[0]] == ["vertex", "res"]
     # the untargeted face keeps ONLY the per-vertex transform
-    assert [p["dtype"] for _, p, _, _ in approx[1]] == ["float16"]
+    assert [r.params["dtype"] for r in approx[1]] == ["float16"]
 
 
 def test_every_slot_is_recorded_on_the_open_face():
@@ -378,8 +382,10 @@ def test_every_slot_is_recorded_on_the_open_face():
     _, ij, step = _run(_fanout, (_X3,), (0,), _ft, vertex=1)
     approx = [fr.approx for fr in ij.step_faces(step)]
 
-    assert [p["dtype"] for _, p, _, _ in approx[0]] == [
+    assert [r.params["dtype"] for r in approx[0]] == [
         "bfloat16", "float16", "bfloat16"]
+    assert [r.slot for r in approx[0]] == ["lhs", "rhs", "res"], (
+        "each slot records WHICH operand it approximated")
     assert approx[1] == []
 
 
@@ -402,8 +408,9 @@ def test_diag_in_a_face_slot_approximates_only_that_face(index, slot):
     out = _eval(ij, (_X4,))
     approx = [fr.approx for fr in ij.step_faces(step)]
 
-    assert [t for t, _, _, _ in approx[0]] == ["DIAG"], (
+    assert [r.atype for r in approx[0]] == ["DIAG"], (
         f"the {slot} slot's Diag must be recorded on the targeted face")
+    assert [r.slot for r in approx[0]] == [slot]
     assert approx[1] == []
     # "Stays exact" is pinned BITWISE against graphax's own exact path — the
     # stronger, backend-independent oracle. jacrev's vjp op sequence rounds
@@ -426,7 +433,8 @@ def test_compress_in_a_face_rhs_slot_approximates_only_that_face():
     approx = [fr.approx for fr in ij.step_faces(step)]
 
     assert approx[0] == []
-    assert [t for t, _, _, _ in approx[1]] == ["COMPRESS"]
+    assert [r.atype for r in approx[1]] == ["COMPRESS"]
+    assert [r.slot for r in approx[1]] == ["rhs"]
     # Same oracle repin as the Diag test above: bitwise vs graphax's exact
     # path, allclose vs jacrev.
     exact = _eval(_run(_square, (_X4,), (0,), None, vertex=1)[1], (_X4,))

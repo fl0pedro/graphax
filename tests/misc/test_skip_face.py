@@ -102,8 +102,11 @@ def test_skip_is_recorded_and_tokenized():
     skip_entries = [a for fr in tk.ij.step_faces(0) for a in fr.approx
                     if a[0] == "SKIP"]
     assert len(skip_entries) == 1
-    _atype, _params, s, e = skip_entries[0]
-    assert s == e
+    rec = skip_entries[0]
+    assert rec.start == rec.end
+    assert rec.slot is None, (
+        "SKIP has NO operand slot -- it drops the whole contraction, so there "
+        "is no pre/post/new operand to approximate")
 
 
 def test_skip_all_faces_of_a_vertex_zeroes_the_jacobian():
