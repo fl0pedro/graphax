@@ -1311,7 +1311,14 @@ class IncrementalPathTokenizer:
     def _emit_face(self, fr, eqns, out):
         """Emit one face; return the index in ``out`` where its CONTRACTION
         ends and its approximations begin (== ``len(out)`` when the face was
-        not approximated)."""
+        not approximated).
+
+        A SKIPPED face (``graphax.SKIP_FACE``) reaches here like any other: the
+        sink recorded it with an EMPTY equation range and a single ``SKIP``
+        approximation, so it emits its normal ``path`` header, an empty
+        contraction block, and an ``approx SKIP`` head. Skips are visible and
+        do not shift the face indices -- see :meth:`last_face_segments`.
+        """
         self._emit_face_header(fr, out)
         elim, approx = self._split_face_eqns(fr, eqns)
         self._emit_eqns(elim, out)
@@ -1342,9 +1349,26 @@ class IncrementalPathTokenizer:
         ``[start:split]`` of face f, decides, and then reads
         ``[split:end]`` of face f followed by ``[start:split]`` of face f+1.
 
-        Faces the caller SKIPPED (``graphax.SKIP_FACE``) emit nothing and so
-        have no entry -- the list indexes EMITTED faces, not the face keys
-        :meth:`~graphax.incremental.IncrementalJaxpr.faces` enumerates.
+        A face the caller SKIPPED (``graphax.SKIP_FACE``) IS emitted and DOES
+        get an entry, so index ``f`` is face ``f``: the list is keyed to FACES,
+        not to "faces that produced equations". A skip is therefore visible
+        (never silence) AND never re-indexes the stream -- consumers must NOT
+        compensate for skips by shifting the index.
+
+        A skipped face reads::
+
+            [start:split]  path <central> & <pred> & <succ> {}
+            [split:end]    approx SKIP {}
+
+        i.e. NO accumulation (the skip dropped the contraction, so the block is
+        empty) plus exactly one ``approx`` head. The empty block is not itself
+        the marker -- an exact face can emit ``{}`` too -- the ``SKIP`` token is.
+
+        CAVEAT (pre-existing, independent of skips):
+        :func:`graphax.faces_of` lists faces OPTIMISTICALLY -- a face whose edge
+        Jacobian turns out to force to ``None`` (e.g. ``stop_gradient``) is
+        never visited and never emitted -- so the key list is a SUPERSET of this
+        list. Index ``f`` is key ``f`` exactly when no face was dropped that way.
         """
         return list(getattr(self, "_cur_face_segments", []))
 
