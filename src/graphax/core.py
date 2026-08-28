@@ -52,6 +52,99 @@ ComputationalGraph = Dict[core.Var, Dict[core.Var, jnp.ndarray]]
 ENABLE_CACHE = os.environ.get("GX_ENABLE_CACHE", "1") != "0"
 
 
+# ---------------------------------------------------------------------------
+# STORED-BYTE ACCOUNTING for the accumulated Jacobians.
+#
+# WHAT IT COUNTS. Every accumulated-Jacobian edge this elimination WRITES back
+# into the graph -- ``edge_outval`` at the single store site in
+# ``_eliminate_vertex``, read AFTER ``_squeeze_unreferenced_val_axes`` so the
+# number is the buffer that is really carried, not the pre-squeeze shape. A
+# SKIPped face stores nothing and so contributes nothing, which is the point.
+# The base elemental partials built by ``_build_graph`` are NOT counted: they
+# are identical in an exact and an approximated run of the same order, so
+# including them would only dilute a ratio between the two.
+#
+# WHY STORED BYTES AND NOT A DECLARED CLASS. A dim can DECLARE itself sparse
+# and still materialize dense, and ``val is None`` declares nothing while
+# storing nothing, so counting declared classes overstates sparsity in both
+# directions. ``val.size * itemsize`` is what is actually allocated -- the same
+# definition the offline structure audit uses. ``_structural_val_size`` is
+# tallied beside it as the on-structure CELL count so a ``val is None`` edge is
+# visible as structure instead of silently absent.
+#
+# WHEN IT FIRES. ``_eliminate_vertex`` is plain Python that runs while
+# ``jacve`` is TRACED, so the tally fills once per trace and costs nothing at
+# runtime. Callers must reset-and-read around ONE trace: alphagrad traces the
+# same order three or four times per measurement (count pass, face-enum replay,
+# tokenizer replay, the measured lower()), and an ungated sink would report
+# several times the truth -- the trap ``masks.arm_face_counts`` documents.
+#
+# COST WHEN DISARMED: one dict lookup and a branch per edge store. The tally
+# reads shapes, never values, and mutates no tensor, so an armed trace and a
+# disarmed trace emit the same jaxpr.
+_STORE_ACCT: Dict[str, int] = {
+    "armed": 0, "bytes": 0, "cells": 0, "elems": 0, "edges": 0,
+    "logical": 0,
+    # ELIMINATION WALKS performed while armed. This is what says "the
+    # tally is a measurement", NOT `edges`: an all-SKIP plan walks the
+    # whole order and stores nothing, and a caller that read `edges == 0`
+    # as "nothing walked" would refuse to record the very plan the
+    # sparsity channel most needs to score.
+    "walks": 0,
+}
+
+
+def arm_store_accounting() -> None:
+    """Enter a scope whose edge stores ARE the tally. Depth-counted, so a
+    nested scope cannot disarm an outer one."""
+    _STORE_ACCT["armed"] += 1
+
+
+def disarm_store_accounting() -> None:
+    _STORE_ACCT["armed"] = max(0, _STORE_ACCT["armed"] - 1)
+
+
+def store_accounting_armed() -> bool:
+    return _STORE_ACCT["armed"] > 0
+
+
+def reset_store_accounting() -> None:
+    for _k in ("bytes", "cells", "elems", "edges", "logical", "walks"):
+        _STORE_ACCT[_k] = 0
+
+
+def store_accounting_totals() -> Dict[str, int]:
+    """The tally since the last reset. ``bytes`` is the headline number."""
+    return {_k: int(_v) for _k, _v in _STORE_ACCT.items() if _k != "armed"}
+
+
+def _record_edge_store(t) -> None:
+    """Tally ONE accumulated-Jacobian edge write. Inert unless armed."""
+    if not _STORE_ACCT["armed"] or t is None:
+        return
+    if isinstance(t, DeferredOutputProduct):
+        # #46 deferred outputs: the edge IS the factor pair, so the pair is
+        # what is stored. Counting it as one unmeasurable edge would make a
+        # FACTORED_OUTPUTS run look free.
+        _record_edge_store(t.post)
+        _record_edge_store(t.pre)
+        return
+    try:
+        _v = getattr(t, "val", None)
+        _it = int(np.dtype(t.dtype).itemsize)
+        _n = int(_v.size) if _v is not None else 0
+        _STORE_ACCT["elems"] += _n
+        _STORE_ACCT["bytes"] += _n * _it
+        _STORE_ACCT["cells"] += int(t._structural_val_size)
+        _STORE_ACCT["logical"] += int(t.size)
+    except Exception:
+        # An edge we cannot measure must never kill an elimination. It is
+        # still counted as an edge, so ``edges`` vs the measurable tallies
+        # says how much of the graph the number actually covers.
+        pass
+    _STORE_ACCT["edges"] += 1
+
+
 def _leaf_cache_key(leaf):
     """Hashable cache key for one pytree leaf.
 
@@ -1899,6 +1992,7 @@ def _eliminate_vertex(
                     except Exception:
                         pass  # keep the sparse form; boundary handles it
 
+                _record_edge_store(edge_outval)
                 _set_inner(graph, in_edge, out_edge, edge_outval)
                 _set_inner(transpose_graph, out_edge, in_edge, edge_outval)
                 if _face_sink is not None:
@@ -2520,7 +2614,16 @@ class VertexEliminator:
         # prefix here would report muls/adds=0 and an empty per-step breakdown.
         # Re-run the full order so the counts are honest (count_ops is an
         # analysis path, not the hot path); the graph result is identical.
-        if ENABLE_CACHE and not count_ops and not _has_perpath:
+        # The STORED-BYTE tally must see every vertex of the order. A
+        # replayed prefix skips `_eliminate_vertex` entirely, so an
+        # exact run (no face transforms => cache eligible) would tally
+        # only its suffix while the approximated run (perpath =>
+        # ineligible) tallied all of it, and the ratio between them
+        # would be an artifact of the cache. Armed runs re-walk the
+        # order; the graph result is identical, exactly as it is for
+        # `count_ops` on the line above.
+        if (ENABLE_CACHE and not count_ops and not _has_perpath
+                and not store_accounting_armed()):
             for vertex in order:
                 v_transforms = t_dict.get(vertex, ())
                 key = (vertex, v_transforms)
@@ -2538,6 +2641,8 @@ class VertexEliminator:
         counts: list = []
         m_graph = node.graph.mutate()
         m_transpose_graph = node.transpose_graph.mutate()
+        if _STORE_ACCT["armed"]:
+            _STORE_ACCT["walks"] += 1
 
         for vertex in order[prefix_length:]:
             v_transforms = t_dict.get(vertex, ())
