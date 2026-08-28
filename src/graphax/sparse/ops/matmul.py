@@ -1758,6 +1758,14 @@ def _quant_narrow_gemm_enabled() -> bool:
     return _os.environ.get("GRAPHAX_QUANT_NARROW_GEMM", "1") != "0"
 
 
+def _quant_pet_enabled() -> bool:
+    """GRAPHAX_QUANT_PET (default ON): gate for the ``preferred_element_type``
+    kwarg ALONE, split out of GRAPHAX_QUANT_NARROW_GEMM so that the kwarg and
+    the ``_scaled_mul`` keep-narrow read can be measured independently.
+    Default-on == the shipped behaviour, byte-identical."""
+    return _os.environ.get("GRAPHAX_QUANT_PET", "1") != "0"
+
+
 def _gx_dot_general(a, b, dims):
     """``lax.dot_general`` with f32 accumulation whenever both operand
     views are bf16 (only Quant produces them): tensor-core inputs, f32
@@ -1769,9 +1777,15 @@ def _gx_dot_general(a, b, dims):
         and jnp.dtype(a.dtype) == jnp.dtype(jnp.bfloat16)
         and jnp.dtype(b.dtype) == jnp.dtype(jnp.bfloat16)
     ):
-        return jax.lax.dot_general(
-            a, b, dims, preferred_element_type=jnp.float32
-        )
+        if _quant_pet_enabled():
+            return jax.lax.dot_general(
+                a, b, dims, preferred_element_type=jnp.float32
+            )
+        # PET dropped: a native bf16-out dot. XLA still accumulates the
+        # products in f32 internally; what changes is the STORED width of the
+        # result, which is what lets the narrow representation persist into
+        # the next contraction instead of being re-promoted here.
+        return jax.lax.dot_general(a, b, dims)
     return jax.lax.dot_general(a, b, dims)
 
 
