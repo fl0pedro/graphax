@@ -959,6 +959,55 @@ def _is_narrow_float_target(target) -> bool:
     return jnp.issubdtype(dt, jnp.floating) and dt.itemsize == 1
 
 
+# ---------------------------------------------------------------------------#
+# POLICY-REACHABLE QUANT DTYPES
+# ---------------------------------------------------------------------------#
+# ``QUANT_DTYPES`` above is the full CATALOG and must NOT be trimmed: it builds
+# the append-only token vocabulary (``graphax/jaxpr.py`` APPROX_ARG_TOKENS, the
+# ``d#<dtype>`` words), so dropping an entry would shift every token id after
+# it.
+#
+# What an RL POLICY can actually emit is a far smaller set: alphagrad's unified
+# face head draws a single Bernoulli over {float32, bfloat16} (its ``S_DTYPE``).
+# BOTH of those take the plain-``astype`` branch of :func:`apply_quant` -- no
+# scale is computed, ``scalar_mult`` is passed through untouched, and a
+# JOIN/ADD of two bf16 edges therefore introduces no rescale. This constant
+# pins that contract as a REGRESSION GUARD: widening it to an int / float8
+# target silently re-enables the scaled quantizer, which folds a per-tensor
+# scale into ``scalar_mult``.
+POLICY_QUANT_DTYPES: tuple = ("float32", "bfloat16")
+
+
+def _policy_quant_strict() -> bool:
+    """GRAPHAX_QUANT_POLICY_STRICT=1 makes :func:`apply_quant` reject any
+    target outside :data:`POLICY_QUANT_DTYPES`. Default OFF so the catalog
+    stays usable for tests / ablations / the strict-promotion scan -- the
+    guard is opt-in, not a behaviour change."""
+    return _os.environ.get("GRAPHAX_QUANT_POLICY_STRICT", "0") == "1"
+
+
+def check_policy_quant_dtype(dtype):
+    """Raise ``ValueError`` unless ``dtype`` is policy-reachable. Always
+    callable as an explicit assertion; only wired into :func:`apply_quant`
+    when GRAPHAX_QUANT_POLICY_STRICT=1."""
+    name = jnp.dtype(dtype).name
+    if name not in POLICY_QUANT_DTYPES:
+        raise ValueError(
+            f"Quant dtype {name!r} is not policy-reachable: the policy head "
+            f"emits only {POLICY_QUANT_DTYPES}. Those two take the UNSCALED "
+            f"astype branch of apply_quant; anything else stores a per-tensor "
+            f"scale in scalar_mult. (GRAPHAX_QUANT_POLICY_STRICT=1)"
+        )
+    return name
+
+
+def unscaled_quant_target(target) -> bool:
+    """True iff :func:`apply_quant` takes the plain-``astype`` branch for
+    ``target`` -- i.e. nothing is folded into ``scalar_mult``."""
+    return not (_is_scaled_quant_target(target)
+                or _is_narrow_float_target(target))
+
+
 def _int_dtype_range(target) -> tuple[int, int]:
     """(min, max) representable integer values for an int/uint target, including
     the sub-byte ints (int2/int4/uint2/uint4) which JAX exposes via iinfo even
@@ -1001,6 +1050,8 @@ def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
     if st.val is None:
         return st
     target = jnp.dtype(action.dtype)
+    if _policy_quant_strict():
+        check_policy_quant_dtype(target)
     if st.val.dtype == target:
         return st
 
