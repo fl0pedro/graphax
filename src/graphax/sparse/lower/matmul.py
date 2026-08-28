@@ -270,6 +270,53 @@ def _canon_degenerate(st):
         raise _NoRule("canon_degenerate")
 
 
+def _einsum_accum_dtype(dtypes):
+    """``preferred_element_type`` for the planner einsum, or None to keep
+    ``jnp.einsum``'s own default. OFF unless GRAPHAX_PLANNER_F32_ACCUM=1.
+
+    The intent mirrors ``ops.matmul._gx_dot_general``: when every operand is
+    bfloat16 -- which only a ``Quant`` produces, since a mixed {bf16, f32}
+    pair is upcast by ``dtype_compute._unify_operand_dtypes`` before it gets
+    here -- ask for float32 product/accumulate, giving a bf16-in / f32-out
+    dot. Every other dtype combination returns None, so the EXACT-AD path
+    emits a byte-identical einsum.
+
+    DEFAULT OFF, and this is a MEASURED decision, not caution. ``jnp.einsum``
+    honours ``preferred_element_type`` as a genuine bf16-in / f32-out
+    ``dot_general`` only for the plain ``ij,jk->ik`` form. Every einsum the
+    planner actually emits carries BATCH letters and size-1 axes -- e.g.
+    ``(4,8)[0,3] x (4,1,8,8)[0,1,3,7] -> [0,3,7]`` -- and for those forms
+    ``jnp.einsum`` implements the request by CONVERTING both operands to f32
+    up front. Measured on mlp2 / mlp4_multimatmul / attn with both faces of
+    every contraction quantized to bf16 (per-face ``lhs``/``rhs`` slots):
+
+        flag off  mlp2  dots {f32:4, bf16:6}   converts 22
+        flag on   mlp2  dots {f32:10}          converts 33
+        flag off  mlp4  dots {f32:8, bf16:16}  converts 56
+        flag on   mlp4  dots {f32:24}          converts 85
+
+    i.e. it DELETES every bf16 dot and adds ~50% more converts, while the
+    error against the exact f32 Jacobian is unchanged (relerr 4.207e-3 on
+    mlp2 and 4.103e-3 on mlp4 either way -- XLA already accumulates a bf16
+    dot in f32 internally and only rounds the output). Getting real bf16-in /
+    f32-out accumulation out of the planner needs the contraction lowered to
+    ``lax.dot_general`` with explicit dimension numbers (what
+    ``_gx_dot_general`` does for the tiled path), not an einsum kwarg.
+
+    GRAPHAX_QUANT_NARROW_GEMM=0 also disables it, same knob as the dot sites.
+    """
+    if os.environ.get("GRAPHAX_PLANNER_F32_ACCUM", "0") != "1":
+        return None
+    if os.environ.get("GRAPHAX_QUANT_NARROW_GEMM", "1") == "0":
+        return None
+    if not dtypes:
+        return None
+    _bf16 = jnp.dtype(jnp.bfloat16)
+    if all(jnp.dtype(d) == _bf16 for d in dtypes):
+        return jnp.float32
+    return None
+
+
 def _lower(lhs, rhs):
     from graphax.sparse.dtype_compute import _scaled_mul
     from graphax.sparse.ops.matmul import _align_tensor_ids, _build_matmul_topology
@@ -774,7 +821,13 @@ def _lower(lhs, rhs):
         for _v, _sub in zip(ins, subs):
             _args += [_v, _sub]
         _args.append([f.letter for f in out_letters])
-        values = jnp.einsum(*_args)
+        # OPT-IN f32 accumulation for an all-bf16 contraction
+        # (GRAPHAX_PLANNER_F32_ACCUM=1; see _einsum_accum_dtype for the
+        # measurement that keeps it off). Default and every other dtype mix
+        # take the bare call, byte-identical to before.
+        _pet = _einsum_accum_dtype([_v.dtype for _v in ins])
+        values = (jnp.einsum(*_args, preferred_element_type=_pet)
+                  if _pet is not None else jnp.einsum(*_args))
         if values.ndim == 0 and not forced:
             # fully-contracted physical part: fold the scalar into scalar_mult
             pass  # handled below

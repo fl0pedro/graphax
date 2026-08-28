@@ -228,7 +228,26 @@ def _quant_narrow_bf16_pair(ldt, rdt) -> bool:
     deliberately does NOT use it -- mixed pairs upcast). Env read per call:
     GRAPHAX_QUANT_NARROW_GEMM default ON, and the einsum_general planner
     must be OFF -- the planner emits its own contractions with no
-    f32-accumulate plumbing, so narrow vals must not leak into it."""
+    f32-accumulate plumbing, so narrow vals must not leak into it.
+
+    2026-08 MEASURED (G3): the stated rationale above is FALSE. The planner
+    already receives both-bf16 operand pairs -- whenever BOTH faces of a
+    contraction were quantized (the per-face ``lhs``/``rhs`` slots) -- and it
+    lowers them to genuine bf16 dots (6 on mlp2, 16 on mlp4, 26 on attn).
+    Narrow vals do not need this guard to stay out of the planner, because
+    they were never kept out of it.
+
+    Relaxing the exclusion was tried and measured. On the CONTRACTION side it
+    buys nothing: with the toggle isolated on mlp2 the lowered dot census and
+    convert count are unchanged ({f32:4, bf16:6}, 22 converts either way),
+    and the per-vertex plan's error against exact f32 gets slightly WORSE
+    (relerr 2.93e-3 -> 3.17e-3). It is NOT a no-op, though: it changes the
+    elementwise JOIN. With the exclusion removed, ``bf16 + bf16`` keeps its
+    bf16 storage (the bit-exact bf16 add, ``scalar_mult`` stored bf16);
+    with it in place the f32 ``scalar_mult`` drain re-promotes both addends
+    and the sum comes back f32. Neither introduces a rescale. That is a real
+    precision/storage trade with no measured contraction benefit, so the
+    exclusion stays until someone wants the trade deliberately."""
     import os as _os
     if _os.environ.get("GRAPHAX_QUANT_NARROW_GEMM", "1") == "0":
         return False
