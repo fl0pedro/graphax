@@ -1081,7 +1081,7 @@ SKIP_FACE = _SkipFace()
 
 
 def _record_micro(_t, before, after, vertex, slot, in_edge, out_edge,
-                  start, _face_sink, _xlog):
+                  start, _face_sink, _xlog, log_slot=None):
     """Record ONE dispatched micro-action, truthfully.
 
     Writes to the always-on :class:`TransformLog` (installed by
@@ -1090,6 +1090,16 @@ def _record_micro(_t, before, after, vertex, slot, in_edge, out_edge,
     action really changed the tensor — to the opt-in :class:`FaceSink`'s
     ``approx`` block list, so the tokenizer never renders an empty block for a
     no-op. Both sinks are optional; with neither installed this is a no-op.
+
+    ``log_slot`` (default: ``slot``) is the tag written to the TRANSFORM LOG
+    only. The two sinks read the slot differently: the FaceSink's tag is a
+    POSITION in a fixed-width per-face layout (``FACE_SLOT_INDEX`` is closed —
+    an unknown tag would be rendered in ``SKIP``'s slot-less position and shift
+    the whole stream), while the transform log's tag is free-form text nothing
+    matches on. So the two-op join sites, which all act on the ``"res"``
+    operand, keep ``slot="res"`` for the sink and pass a finer
+    ``log_slot="res:jr"`` etc. here — distinguishable in the log, invisible to
+    the tokenizer. See :func:`_unpack_face_slots`.
     """
     if _face_sink is None and _xlog is None:
         return
@@ -1104,7 +1114,9 @@ def _record_micro(_t, before, after, vertex, slot, in_edge, out_edge,
         # slot from the ORDER of the records; it has to be carried here.
         _face_sink.approx(_atype, _params, start, end, slot)
     if _xlog is not None:
-        _xlog.record("transform", vertex, slot, _atype, _params,
+        _xlog.record("transform", vertex,
+                     slot if log_slot is None else log_slot,
+                     _atype, _params,
                      in_edge, out_edge, start, end, applied)
 
 
@@ -1159,24 +1171,122 @@ def _known_none_edge(edge) -> bool:
     return edge is None
 
 
+def _is_two_op_slots(slots) -> bool:
+    """Is this ``face_transforms`` entry the TWO-OP form (a pair of triples)?
+
+    The single predicate both :func:`_unpack_face_slots` and the elimination
+    loop dispatch on, so "which form is this" is decided in exactly one place.
+    """
+    return (isinstance(slots, (tuple, list)) and len(slots) == 2
+            and all(isinstance(_s, (tuple, list)) and len(_s) == 3
+                    for _s in slots))
+
+
+def _iter_face_hooks(slots):
+    """Every hook object inside one ``face_transforms`` entry, flattened.
+
+    The TWO-OP form nests its hooks one level deep
+    (``((lhs, rhs, new), (jl, jr, jres))``), so a naive ``for _t in slots``
+    sees TUPLES — which are neither ``Diag``/``Compress`` nor callable — and an
+    "is this an approximation?" test built on it silently answers *no* for a
+    two-op entry that carries the very same micro-action a flat 3-tuple would
+    arm. Both arming sites (the per-vertex ``_is_approx_cfg`` and the global
+    dispatch flag in :func:`jacve`) iterate through here so they cannot drift.
+    """
+    for _t in (slots if isinstance(slots, (tuple, list)) else ()):
+        if isinstance(_t, (tuple, list)):
+            yield from _t
+        else:
+            yield _t
+
+
 def _unpack_face_slots(slots, vertex):
-    """Validate one ``face_transforms`` entry -> ``(lhs, rhs, res)``.
+    """Validate one ``face_transforms`` entry -> ``(lhs, rhs, res, new, join)``.
+
+    TWO forms are accepted:
+
+    * the FLAT ``(lhs, rhs, res)`` triple — ``lhs``/``rhs`` hook the two
+      contraction operands, ``res`` hooks the edge at the POST-JOIN site
+      (returned as ``(lhs, rhs, res, None, None)``);
+    * the TWO-OP ``((lhs, rhs, new), (jl, jr, jres))`` pair of triples, which
+      splits the single legacy ``res`` slot into the four sites a face's
+      result actually passes through::
+
+          contract = op(lhs(pre_val), rhs(post_val))     # the contraction
+          fresh    = new(contract)                       # PRE-join
+          old      = jr(old) + jl(fresh)                 # the MERGE
+          old      = jres(old)                           # post-join (== res)
+
+      i.e. the join semantics ``old = approx(old) + approx(new)``: BOTH
+      addends of a merge are hooked, which a flat triple cannot express (its
+      ``res`` lands on the SUM, approximating the two addends' merge instead
+      of the addends).
+
+    Returned as ``(lhs, rhs, jres, new, (jl, jr))`` so the elimination loop's
+    ``res``-slot variable carries ``jres`` unchanged and the flat path needs no
+    branch of its own.
+
+    MERGE-FREE FACES (documented, pinned by
+    ``tests/misc/test_face_two_op_form.py``). ``jl``/``jr`` are applied ONLY
+    inside the ``graph[in_edge][out_edge] is not None`` branch, so a face whose
+    contraction creates a BRAND-NEW edge degenerates to ``jres(new(contract))``
+    with both join hooks skipped and NO record emitted. That is
+    correct-by-construction, not an oversight:
+
+    * ``jr`` hooks the EXISTING edge. There is no existing edge, so it has no
+      operand at all — applying it to anything else would be a fabrication.
+    * ``jl`` hooks the fresh contribution *as it enters the merge*. With no
+      merge, the tensor at that site is bit-identical to the one ``new``
+      already hooked, with no intervening op — so anything ``jl`` could
+      express on a merge-free face is expressible via ``new``, and no
+      expressive power is lost. Applying it anyway would make the SAME face's
+      effective approximation depend on whether a sibling contribution
+      happened to be stored first, i.e. on elimination order — which would
+      make a plan's measured cost irreproducible across replays.
+    * The silence is truthful under this module's recording contract: a slot
+      that did not run records nothing (see :func:`_record_micro`), so the
+      telemetry never claims an approximation that never happened.
+
+    SLOT TAGS. ``new``/``jl``/``jr``/``jres`` all report the ``"res"`` operand
+    slot to a :class:`~graphax.sparse.tracer.FaceSink`, so the sink cannot tell
+    them apart. That is DELIBERATE: ``FACE_SLOT_INDEX`` is a closed map and the
+    tokenizer emits exactly ``N_FACE_SLOTS`` equation blocks per face at FIXED
+    positions, so an unknown tag would be classed "unslotted" and rendered in
+    ``SKIP``'s slot-less position, corrupting the stream every downstream head
+    reads by position. All four sites act on the same operand of the local path
+    (``res``/``new``, the contraction result and its merge), so slot 2 is the
+    correct index for every one of them; within it the records are ordered by
+    application (``new`` -> ``jl`` -> ``jr`` -> ``jres``). The always-on
+    :class:`~graphax.sparse.tracer.TransformLog`, which has no positional
+    consumer, receives the FINE-GRAINED tags ``"res:new"`` / ``"res:jl"`` /
+    ``"res:jr"`` / ``"res:jres"`` instead, so the four are distinguishable
+    there (the flat form keeps a bare ``"res"``).
 
     A malformed entry is a structural programming error, so it raises
     ``TypeError`` — which the per-face dispatch deliberately does NOT catch.
     """
+    if _is_two_op_slots(slots):
+        # TWO-OP form ((lhs, rhs, new), (jl, jr, jres)) -- the join
+        # semantics ``new = approx(new_existing) + approx(contract)``:
+        # triple 1 hooks this face's operands and its contraction result
+        # PRE-join; triple 2 hooks the JOIN (jl -> new contribution,
+        # jr -> the EXISTING edge, jres -> the merged sum, landing at the
+        # same post-site the legacy ``res`` uses).
+        (lhs, rhs, new), (jl, jr, jres) = slots
+        return lhs, rhs, jres, new, (jl, jr)
     try:
         lhs, rhs, res = slots
     except (TypeError, ValueError):
         raise TypeError(
             f"face_transforms entry at vertex {vertex} must be a 3-tuple "
-            f"(lhs, rhs, res); got {slots!r}."
+            f"(lhs, rhs, res) or a pair of 3-tuples "
+            f"((lhs, rhs, new), (jl, jr, jres)); got {slots!r}."
         ) from None
-    return lhs, rhs, res
+    return lhs, rhs, res, None, None
 
 
 def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
-                          out_edge=None, _xlog=None):
+                          out_edge=None, _xlog=None, log_slot=None):
     """Apply ONE per-face slot transform to ONE Jacobian operand.
 
     Mirrors the per-vertex ``transforms`` dispatch in :func:`_eliminate_vertex`
@@ -1190,6 +1300,9 @@ def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
     fit THIS operand's geometry — so the transform is skipped, the operand is
     returned unchanged, and NOTHING is recorded, which keeps the record
     truthful. ``TypeError`` is deliberately NOT caught (see the per-vertex loop).
+
+    ``slot`` is the FaceSink's positional tag; ``log_slot`` (default: ``slot``)
+    the transform log's finer one — see :func:`_record_micro`.
     """
     if _t is None:
         return val
@@ -1198,7 +1311,7 @@ def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
             _as = _eqn_count(_face_sink, _xlog)
             out = _apply_micro(val, _t)
             _record_micro(_t, val, out, vertex, slot, in_edge, out_edge,
-                          _as, _face_sink, _xlog)
+                          _as, _face_sink, _xlog, log_slot)
         elif callable(_t):
             # A slot callable may act as a CHOOSER: handed the live operand, it
             # returns the micro-action it picked (or None to skip) instead of a
@@ -1216,7 +1329,7 @@ def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
                 _as = _eqn_count(_face_sink, _xlog)
                 out = _apply_micro(val, _chosen)
                 _record_micro(_chosen, val, out, vertex, slot, in_edge,
-                              out_edge, _as, _face_sink, _xlog)
+                              out_edge, _as, _face_sink, _xlog, log_slot)
             else:
                 out = _chosen
         else:
@@ -1299,6 +1412,63 @@ def faces_of(graph, transpose_graph, vertex, jaxpr):
     return keys
 
 
+import math
+
+
+def _factored_outputs_enabled() -> bool:
+    """GRAPHAX_FACTORED_OUTPUTS (default OFF): store the FINAL contraction
+    onto a pure output head as a factor pair instead of materializing the
+    (batch-wise rank-1) product. Read per call so alphagrad can scope it to
+    the sparse cost executable's trace only."""
+    return os.environ.get("GRAPHAX_FACTORED_OUTPUTS", "0") == "1"
+
+
+DEFERRED_OUTPUT_STATS: dict = {}
+
+
+class DeferredOutputProduct:
+    """An unevaluated ``post @ pre`` on an (input -> output) edge.
+
+    Only two operations can ever touch it (guaranteed by the deferral
+    guards: in_edge is a graph input, out_edge a pure output — neither is
+    ever eliminated): a MERGE, which spills via :meth:`materialize`, and
+    the output drain — dense drains spill; the sparse drain returns this
+    object, whose pytree leaves are the factor vals (the measured form).
+    """
+
+    _is_deferred_output = True
+
+    def __init__(self, post, pre):
+        self.post = post
+        self.pre = pre
+
+    def materialize(self):
+        DEFERRED_OUTPUT_STATS["spill"] = (
+            DEFERRED_OUTPUT_STATS.get("spill", 0) + 1)
+        return sparse_matmul(self.post, self.pre)
+
+    def dense(self):
+        return self.materialize().dense()
+
+    def copy(self):
+        return self
+
+    def tree_flatten(self):
+        return (self.post, self.pre), None
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        return cls(*children)
+
+
+from jax import tree_util as _jtu  # noqa: E402
+_jtu.register_pytree_node(
+    DeferredOutputProduct,
+    lambda t: t.tree_flatten(),
+    DeferredOutputProduct.tree_unflatten,
+)
+
+
 def _eliminate_vertex(
     vertex: int,
     jaxpr: core.Jaxpr,
@@ -1374,6 +1544,17 @@ def _eliminate_vertex(
             silently unused. ``None`` (the default) leaves the exact-AD /
             per-vertex path byte-identical.
 
+            An entry may instead be the TWO-OP form
+            ``((lhs, rhs, new), (jl, jr, jres))``, which splits the single
+            ``res`` slot into the four sites the result passes through —
+            ``new`` (the fresh contraction, pre-join), ``jl``/``jr`` (the two
+            addends of the merge into an EXISTING edge) and ``jres`` (the
+            merged sum, exactly where ``res`` lands). It exists to express
+            ``old = approx(old) + approx(new)``, which a flat triple cannot:
+            its ``res`` approximates the SUM, not the two addends. See
+            :func:`_unpack_face_slots` for the full semantics, the merge-free
+            degeneration, and the slot tags the sinks see.
+
     Returns:
         Tuple[int, int, int, int]: ``(adds, muls, fmas, mem)`` accumulated
             during this vertex elimination, all zero unless ``count_ops``.
@@ -1413,9 +1594,18 @@ def _eliminate_vertex(
         # skipped path deviates from the exact structure at least as much as
         # a Diag/Compress does — it must arm the approx config (the nominal
         # shape asserts are exact-only).
+        #
+        # Iterated through ``_iter_face_hooks`` so the TWO-OP form
+        # ``((lhs, rhs, new), (jl, jr, jres))`` arms this exactly as its flat
+        # equivalent does: without the flatten the loop sees the two TRIPLES,
+        # neither of which is a Diag/Compress, so the identical approximation
+        # armed the approx config in one form and not the other — and this
+        # flag gates the reconciler peel and the pre-Diag drain, so the two
+        # forms took DIFFERENT code paths for the same request.
         _is_approx_cfg = _is_approx_cfg or any(
             _slots is SKIP_FACE or any(
-                isinstance(_t, (Diag, Compress)) for _t in _slots
+                isinstance(_t, (Diag, Compress))
+                for _t in _iter_face_hooks(_slots)
             )
             for _slots in face_transforms.values()
         )
@@ -1469,6 +1659,12 @@ def _eliminate_vertex(
     # ``track_faces``. One thread-local lookup per vertex elimination; ``None``
     # (zero cost) unless a builder installed one.
     _xlog = _get_transform_log()
+
+    # #46 deferred outputs: static per-call sets for the deferral guard.
+    _FACTORED = _factored_outputs_enabled()
+    if _FACTORED:
+        _graph_input_vars = frozenset(jaxpr.invars)
+        _pure_out_vars = frozenset(jaxpr.outvars) - set(vo_vertices)
 
     # In tokenize mode, iterate the edge maps in a STABLE order (they are keyed
     # by id-hashed core.Var, so their native iteration order varies per trace,
@@ -1536,6 +1732,12 @@ def _eliminate_vertex(
                 # The whole block is skipped when ``face_transforms is None``,
                 # so the exact-AD / per-vertex path is untouched.
                 _face_res_t = None
+                _face_new_t = None
+                _face_join_t = None
+                # Transform-LOG tag for the ``res``-site hook: the flat form's
+                # own ``res``, or the two-op form's ``jres`` (same site, same
+                # FaceSink slot -- see _unpack_face_slots "SLOT TAGS").
+                _face_res_log = "res"
                 if face_transforms is not None:
                     post_val = _post_raw
                     _slots = face_transforms.get(
@@ -1555,8 +1757,10 @@ def _eliminate_vertex(
                                          {}, in_edge, out_edge, _n, _n, True)
                         continue
                     if _slots is not None:
-                        _lhs_t, _rhs_t, _face_res_t = _unpack_face_slots(
-                            _slots, vertex)
+                        (_lhs_t, _rhs_t, _face_res_t, _face_new_t,
+                         _face_join_t) = _unpack_face_slots(_slots, vertex)
+                        if _is_two_op_slots(_slots):
+                            _face_res_log = "res:jres"
                         pre_val = _apply_face_transform(
                             pre_val, _lhs_t, "lhs", vertex, _face_sink,
                             in_edge, out_edge, _xlog)
@@ -1662,6 +1866,53 @@ def _eliminate_vertex(
                         or (_pre_val.val is None
                             and not _acts_as_identity(_pre_val))
                     )
+                if (
+                    _FACTORED
+                    and _need_contract
+                    and not count_ops
+                    and out_edge in _pure_out_vars
+                    and in_edge in _graph_input_vars
+                    and graph.get(in_edge).get(out_edge) is None
+                    and _post_val.val is not None
+                    and _pre_val.val is not None
+                    and not (_post_val.pre_transforms or _post_val.post_transforms)
+                    and not (_pre_val.pre_transforms or _pre_val.post_transforms)
+                    and not _pre_reattach
+                    and not _post_reattach
+                    and _h_new is None
+                    and _h_lhs is None
+                    and _h_res is None
+                    and _face_res_t is None
+                    and _face_new_t is None
+                    # NOTE: ``_face_join_t`` (the two-op ``jl``/``jr``) is
+                    # deliberately NOT tested here. Those two hooks run ONLY
+                    # in the merge branch below, which needs an existing
+                    # ``graph[in_edge][out_edge]`` -- and this fast path
+                    # already requires that edge to be None (above). So on
+                    # every face this branch can fire, the join hooks would
+                    # not have run on the slow path either: deferring is
+                    # behaviour-preserving, and adding the test would only
+                    # disable the optimisation for hooks that are dead here.
+                    and (_perpath or not transforms)
+                    and math.prod(out_edge.aval.shape)
+                    * math.prod(in_edge.aval.shape)
+                    >= 8 * (_post_val.val.size + _pre_val.val.size)
+                ):
+                    # DEFERRED FINAL CONTRACTION (#46): this (input -> pure
+                    # output) edge can only be merged (spills) or drained.
+                    # Store the factor pair; the sparse drain returns it, the
+                    # dense drain materializes byte-identically. Operand
+                    # hooks (_h_pre/_h_post) were already applied above, so
+                    # the deferred product IS the hooked contraction.
+                    DEFERRED_OUTPUT_STATS["defer"] = (
+                        DEFERRED_OUTPUT_STATS.get("defer", 0) + 1)
+                    _dp = DeferredOutputProduct(_post_val, _pre_val)
+                    _record_edge_store(_dp)
+                    _set_inner(graph, in_edge, out_edge, _dp)
+                    _set_inner(transpose_graph, out_edge, in_edge, _dp)
+                    if _face_sink is not None:
+                        _face_sink.close_face()
+                    continue
                 if _need_contract:
                     # A scalar × scalar contraction is an elementwise multiply:
                     # ``sparse_matmul`` rejects 0-rank operands, so it must NEVER
@@ -1749,12 +2000,25 @@ def _eliminate_vertex(
                 if _perpath and _h_new is not None:
                     edge_outval = _h_new(edge_outval)
                     _assert_sparse_tensor_consistency(edge_outval)
+                # PER-FACE two-op form: this face's ``new`` hook on the
+                # fresh contraction BEFORE any join -- the
+                # ``approx(contract)`` half of
+                # ``new = approx(new) + approx(contract)``.
+                if _face_new_t is not None:
+                    edge_outval = _apply_face_transform(
+                        edge_outval, _face_new_t, "res", vertex,
+                        _face_sink, in_edge, out_edge, _xlog,
+                        log_slot="res:new")
 
                 _assert_sparse_tensor_consistency(edge_outval)
                 # If there is already an edge between the two vertices, add the new
                 # edge to the existing one
                 if graph.get(in_edge).get(out_edge) is not None:
                     _edge = _force(transpose_graph[out_edge][in_edge])
+                    if getattr(_edge, "_is_deferred_output", False):
+                        # a later contribution reached a deferred output
+                        # edge: spill (always correct) and merge densely.
+                        _edge = _edge.materialize()
                     _assert_sparse_tensor_consistency(_edge)
 
                     # Offload the remaining Jacobian transforms to each tensor
@@ -1771,6 +2035,26 @@ def _eliminate_vertex(
                         edge_outval = _h_lhs(edge_outval)
                     if _perpath and _h_rhs is not None:
                         _edge = _h_rhs(_edge)
+                    # PER-FACE two-op form JOIN hooks: ``jl`` on the new
+                    # contribution (usually None -- hooked pre-join),
+                    # ``jr`` on the EXISTING edge: the ``approx(new)``
+                    # half of ``new = approx(new) + approx(contract)``.
+                    # BOTH live inside this ``existing edge`` branch on
+                    # purpose -- a merge-free face has no operand for ``jr``
+                    # and no site for ``jl`` distinct from ``new``'s (see
+                    # _unpack_face_slots, "MERGE-FREE FACES").
+                    if _face_join_t is not None:
+                        _jl_t, _jr_t = _face_join_t
+                        if _jl_t is not None:
+                            edge_outval = _apply_face_transform(
+                                edge_outval, _jl_t, "res", vertex,
+                                _face_sink, in_edge, out_edge, _xlog,
+                                log_slot="res:jl")
+                        if _jr_t is not None:
+                            _edge = _apply_face_transform(
+                                _edge, _jr_t, "res", vertex,
+                                _face_sink, in_edge, out_edge, _xlog,
+                                log_slot="res:jr")
 
                     # Nominal-shape asserts hold only for EXACT AD (no approx of
                     # any kind): an approximation (per-path OR legacy list) can
@@ -1935,7 +2219,7 @@ def _eliminate_vertex(
                 if _face_res_t is not None:
                     edge_outval = _apply_face_transform(
                         edge_outval, _face_res_t, "res", vertex, _face_sink,
-                        in_edge, out_edge, _xlog)
+                        in_edge, out_edge, _xlog, log_slot=_face_res_log)
 
                 # Post-transform edges stay SPARSE: normalization to nominal dense
                 # form was deleted with the rest of the norm. A freshly Diag-split /
@@ -2150,6 +2434,9 @@ def _build_graph(
     args: Sequence[jnp.ndarray],
     consts: Sequence[core.Literal],
     argnums: Tuple[int, ...] = None,
+    *,
+    eqn_provenance=None,
+    n_eqns_fn=None,
 ) -> Tuple[Dict, ComputationalGraph, ComputationalGraph, Set[core.Var]]:
     """
     This function performs the `tracing` of the jaxpression into a computational
@@ -2219,7 +2506,15 @@ def _build_graph(
     # tracing system with lift etc. for better compatibility with JAX
     # Loop though elemental partials and create an abstract representation of
     # the computational graph
-    for eqn in jaxpr.eqns:
+    # PROVENANCE (optional). Every traced base equation is emitted while
+    # processing exactly one ORIGINAL equation, and original equation i is
+    # vertex i+1 (1-based, as everywhere else). Recording the traced-equation
+    # index at the START of each iteration yields consecutive spans that a
+    # consumer can invert into `traced eqn index -> vertex`. Costs one list
+    # append per equation and nothing at all when the hooks are absent.
+    for _vidx0, eqn in enumerate(jaxpr.eqns):
+        if eqn_provenance is not None and n_eqns_fn is not None:
+            eqn_provenance.append((int(n_eqns_fn()), _vidx0 + 1))
         # Detect intermediate variables that are also final outputs
         for invar in eqn.invars:
             if invar in jaxpr._outvars:
@@ -2608,6 +2903,17 @@ class VertexEliminator:
             for _j, _iv in enumerate(jaxpr.invars):
                 _var_vid.setdefault(_iv, -(_j + 1))
 
+        # #46 deferred outputs: the flag changes what a cached GraphState
+        # CONTAINS (DeferredOutputProduct edges vs materialized products), and
+        # it is read per call so alphagrad can scope it to one trace. Fold it
+        # into the prefix-cache key: flag-off runs keep the historic 2-tuple
+        # key (byte-identical behaviour and warm-cache reuse), flag-on runs
+        # key a DISJOINT subtree -- neither state can leak into the other.
+        # Without this, a flag-off prefix was silently reused by a flag-on
+        # call (deferral never fired) and a flag-on prefix would hand
+        # DeferredOutputProduct edges to a flag-off caller.
+        _f46_on = _factored_outputs_enabled()
+
         # When counting, never reuse the cached prefix: a node's stored counts
         # are only real if the run that created it had count_ops=True. A prior
         # count_ops=False run caches zeros (GraphState defaults), so reusing the
@@ -2626,7 +2932,8 @@ class VertexEliminator:
                 and not store_accounting_armed()):
             for vertex in order:
                 v_transforms = t_dict.get(vertex, ())
-                key = (vertex, v_transforms)
+                key = ((vertex, v_transforms) if not _f46_on
+                       else (vertex, v_transforms, "#46-factored"))
                 with node.lock:
                     if key in node.children:
                         node = node.children[key]
@@ -2674,7 +2981,8 @@ class VertexEliminator:
             # Per-path transform dicts are unhashable and path-specific, so they
             # are never memoized in the prefix tree (like the count path).
             if ENABLE_CACHE and not _has_perpath:
-                key = (vertex, v_transforms)
+                key = ((vertex, v_transforms) if not _f46_on
+                       else (vertex, v_transforms, "#46-factored"))
                 with node.lock:
                     if key not in node.children:
                         cur_graph = m_graph.finish()
@@ -2832,7 +3140,9 @@ def vertex_elimination_jaxpr(
         _approx_on = any(
             _slots is SKIP_FACE or any(
                 isinstance(_t, (Diag, Compress)) or callable(_t)
-                for _t in (_slots if isinstance(_slots, (tuple, list)) else ())
+                # two-op form nests triples one level deep -- flatten, or the
+                # dispatch flag lies (tuples are neither Diag nor callable).
+                for _t in _iter_face_hooks(_slots)
             )
             for _slots in _face_slot_iter(face_transforms)
         )
@@ -2896,6 +3206,8 @@ def vertex_elimination_jaxpr(
             tensor = _force(edge)
             if tensor is None:
                 continue  # null edge (e.g. stop_gradient); treat as zero
+            if getattr(tensor, "_is_deferred_output", False):
+                continue  # deferred factor pair: no queued transforms by construction
             tensor = _drain_transforms(tensor.copy(), post_first=False)
             m_inner[outvar] = tensor
             updated = True
@@ -3008,6 +3320,12 @@ def extract_jaxpr(
     )
 
     cache_key = (jaxpr, tuple(argnums), _order, _transforms, sparse_representation)
+    # #46 deferred outputs: the traced VEJaxpr BAKES IN the flag state (its
+    # outputs are factor leaves vs the materialized product), and the flag is
+    # toggled per trace by alphagrad. Flag-on topologies key a disjoint entry;
+    # flag-off keys keep their historic shape.
+    if _factored_outputs_enabled():
+        cache_key = cache_key + ("#46-factored-topo",)
 
     # A per-path transforms entry is a dict of opaque per-path hook callables;
     # ``tuple(ts)`` above captures only its (primal_id, out_id) KEYS, never the

@@ -1090,7 +1090,7 @@ class IncrementalPathTokenizer:
     _CALL_PRIMS = {"pjit", "jit", "closed_call", "core_call", "remat_call",
                    "remat2", "custom_jvp_call", "custom_vjp_call", "checkpoint"}
 
-    def _flatten(self, eqns, subst=None, depth=0):
+    def _flatten(self, eqns, subst=None, depth=0, _src=0, src_out=None):
         """Normalize eqns to ``(outs, prim, params, ins)`` tuples, inlining call
         primitives (their sub-jaxpr's inner ops) so nothing renders as an opaque
         ``jit`` wrapper. ``subst`` remaps a call's inner invars/outvars to the
@@ -1106,7 +1106,15 @@ class IncrementalPathTokenizer:
             return subst.get(v, v) if isinstance(v, core.Var) else v
 
         result = []
-        for eqn in eqns:
+        # `src_out`, when given, is filled in LOCKSTEP with `result` with
+        # the index of the TOP-LEVEL input equation each emitted tuple came
+        # from. A call primitive inlines into many tuples, so this is not
+        # the position in `result`. It is what lets a consumer attribute
+        # emitted TOKENS back to the traced equation -- and hence the
+        # vertex -- that produced them. Optional so every existing caller
+        # is unaffected.
+        for _top_i, eqn in enumerate(eqns):
+            _src_i = _top_i if depth == 0 else _src
             prim = eqn.primitive.name
             sub = eqn.params.get("jaxpr") or eqn.params.get("call_jaxpr")
             if prim in self._CALL_PRIMS and sub is not None and depth < 24:
@@ -1127,8 +1135,11 @@ class IncrementalPathTokenizer:
                                 and not isinstance(v, core.DropVar)
                                 and v not in inner):
                             inner[v] = (uid, v)
-                result.extend(self._flatten(jx.eqns, inner, depth + 1))
+                result.extend(self._flatten(
+                    jx.eqns, inner, depth + 1, _src_i, src_out))
             else:
+                if src_out is not None:
+                    src_out.append(_src_i)
                 result.append(([_sub(v) for v in eqn.outvars], prim,
                                eqn.params, [_sub(v) for v in eqn.invars]))
         return result
@@ -1158,7 +1169,9 @@ class IncrementalPathTokenizer:
 
     def _emit_eqns(self, eqns, out):
         _seg_start = len(out)
-        flat = self._flatten(eqns)
+        _src_out = [] if getattr(self, "_cur_eqn_spans", None) is not None \
+            else None
+        flat = self._flatten(eqns, src_out=_src_out)
         # Pass 1: EVERY parameterized op is a function (defined once, on first
         # sight, from the shared name pool); parameterless ops stay inline.
         render = []          # per eqn: None | ('op', prim) inline | ('fn', name)
@@ -1189,9 +1202,11 @@ class IncrementalPathTokenizer:
         # Equation forms:
         #   parameterless : out op arg0 _ arg1              (op is one token)
         #   fn reference  : out = F : arg0 _ arg1           (=/: mark a CALL)
-        for (outs, prim, params, ins), r in zip(flat, render):
+        for _fi, ((outs, prim, params, ins), r) in enumerate(
+                zip(flat, render)):
             if r is None:
                 continue
+            _eq_start = len(out)
             keep = [v for v in outs if not isinstance(v, core.DropVar)]
             for i, ov in enumerate(keep):
                 if i:
@@ -1210,6 +1225,9 @@ class IncrementalPathTokenizer:
                     out.append(self.vocab["_"])
                 self._emit_atom(iv, out)
             out.append(self.vocab["\n"])
+            if _src_out is not None and _fi < len(_src_out):
+                self._cur_eqn_spans.append(
+                    (_eq_start, len(out), _src_out[_fi]))
         if out and out[-1] == self.vocab["\n"]:
             out.pop()
         out.append(self.vocab["}"])
@@ -1228,6 +1246,9 @@ class IncrementalPathTokenizer:
         # here was never referenced, so it is dropped.
         toks = []
         self._cur_spans = []
+        # Arm the per-equation span recorder for this block only. Every
+        # other emitter leaves it None, so nothing else pays for it.
+        self._cur_eqn_spans = []
         self._emit_word("inputs", toks)
         for ii in self.argnums:
             v = self.jaxpr.invars[ii]
@@ -1236,6 +1257,7 @@ class IncrementalPathTokenizer:
         self._emit_eqns(self.ij.base_eqns(), toks)
         self._cur_face_segments = []
         self._finish_eqn_ids(toks)
+        self._finish_owner_ids(toks)
         return toks
 
     def _finish_eqn_ids(self, toks):
@@ -1245,6 +1267,39 @@ class IncrementalPathTokenizer:
             ids[a:b] = [g] * (b - a)
         self._last_eqn_ids = ids
         self._cur_spans = None
+
+    def _finish_owner_ids(self, toks):
+        """Materialize :meth:`last_owner_ids` for the base block.
+
+        Each recorded span is (token_start, token_end, flattened source
+        index). The source index is a position in the equation list handed
+        to ``_emit_eqns`` -- for the base block that is ``ij.base_eqns()``,
+        whose positions ARE traced-equation indices -- so
+        ``ij.base_owner_of_eqn`` maps it to a vertex.
+        """
+        ids = [0] * len(toks)
+        owner_of = getattr(self.ij, "base_owner_of_eqn", None)
+        if owner_of is not None:
+            for a, b, src in self._cur_eqn_spans or ():
+                v = owner_of(int(src))
+                if v:
+                    ids[a:b] = [v] * (b - a)
+        self._last_owner_ids = ids
+        self._cur_eqn_spans = None
+
+    def last_owner_ids(self):
+        """Per-token OWNING VERTEX (1-based) for the last ``base_tokens``.
+
+        0 means 'no owner' -- headers, the input list, and any token not
+        emitted from an equation. Distinct from :meth:`last_eqn_ids`, which
+        returns stream-global SEGMENT ids that carry no vertex information
+        and must never be read as vertex indices (doing so credited the
+        entire base stream to vertex 1 in alphagrad).
+
+        Only meaningful directly after ``base_tokens()``; the delta blocks
+        already know their owner (the eliminated vertex) without this.
+        """
+        return list(getattr(self, "_last_owner_ids", []))
 
     def last_eqn_ids(self):
         """Per-token equation-SEGMENT ids for the LAST block returned by

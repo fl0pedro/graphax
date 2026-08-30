@@ -83,11 +83,27 @@ class IncrementalJaxpr:
                                for a in args]
             # base = primal forward + elemental edge partials, traced into the
             # persistent jaxpr once.
+            # `_base_prov` collects (traced_eqn_index, vertex) at the start
+            # of each original equation, so the base block's traced
+            # equations can be attributed to the vertex that produced them.
+            # See `base_owner_of_eqn`.
+            _base_prov = []
             self.env, self.graph, self.tgraph, self.vo = _build_graph(
-                jaxpr, self.in_tracers, self.consts, self.argnums)
+                jaxpr, self.in_tracers, self.consts, self.argnums,
+                eqn_provenance=_base_prov, n_eqns_fn=self._n_eqns)
             _prune_graph(self.graph, self.tgraph, jaxpr, self.argnums)
 
         self.n_base = self._n_eqns()
+        # traced base equation index -> vertex (1-based), densified from
+        # the (start, vertex) spans. Equations traced before the first
+        # original equation (there are none today, but the guard is free)
+        # map to 0 = 'no owner'.
+        self._base_owner = [0] * self.n_base
+        for _k, (_start, _vtx) in enumerate(_base_prov):
+            _end = (_base_prov[_k + 1][0] if _k + 1 < len(_base_prov)
+                    else self.n_base)
+            for _j in range(max(0, _start), min(_end, self.n_base)):
+                self._base_owner[_j] = _vtx
         # per eliminated vertex, in elimination order:
         #   (vertex, rules, eqn_start, eqn_end, face_start, face_end,
         #    face_transforms, xlog_start, xlog_end)
@@ -111,6 +127,21 @@ class IncrementalJaxpr:
 
     def base_eqns(self):
         return list(self.trace.frame.get_eqns()[:self.n_base])
+
+    def base_owner_of_eqn(self, i: int) -> int:
+        """Vertex (1-based) that produced base equation ``i``; 0 if none.
+
+        The base block is the primal forward plus the elemental edge
+        partials, traced once by ``_build_graph`` as it walks
+        ``jaxpr.eqns``. Every traced equation therefore belongs to exactly
+        one original equation, and original equation k is vertex k+1. That
+        correspondence was always implied by the construction; it is now
+        recorded so consumers do not have to guess it from token ids (which
+        are stream-global SEGMENT ids and carry no vertex information).
+        """
+        if 0 <= i < len(self._base_owner):
+            return int(self._base_owner[i])
+        return 0
 
     def step_eqns(self, i):
         s, e = self.steps[i][2:4]
