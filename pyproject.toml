@@ -26,3 +26,18 @@ dependencies = [
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Naming the root DELIBERATELY drops ./test_dtype_compat.py, which a bare
+# `pytest` used to collect: it is a device capability probe (prints a
+# dtype/GEMM availability table, zero assertions, cannot fail), not a
+# regression test. Run it directly when checking a new machine.
+# Both naming styles are in use across the suites.
+python_files = ["test_*.py", "*_test.py"]
+# -ra prints the reason for every skip, so a module that cannot run says why.
+addopts = "-ra"
+# Default `prepend` import mode is REQUIRED, not incidental:
+# tests/core/sparse_tensor/dense_and_transpose_self_test.py imports its helper
+# bare (`from utils import matmul_reference`), which only resolves because
+# pytest puts each test file's own directory on sys.path.
