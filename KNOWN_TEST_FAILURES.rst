@@ -25,9 +25,6 @@ their validity**. They now set ``GRAPHAX_BEST_EFFORT_TRANSFORMS=1`` via a
 pytest ``monkeypatch`` fixture to restore the legacy silent-skip contract that
 these test scenarios were written against.
 
-Additionally, ``test_sparsity_map_factors.py`` tests use partial elimination
-orders and now set ``GRAPHAX_ALLOW_PARTIAL_ORDER=1``.
-
 The ``apply_diag`` re-mask logic was also extended: a **coarser** block factor
 on an already-finer coupled block-diagonal is now treated as a no-op (the
 finer structure already satisfies any coarser constraint).
