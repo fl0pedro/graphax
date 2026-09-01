@@ -171,7 +171,16 @@ def _leaf_cache_key(leaf):
         # negligible for caching.
         buf = np.asarray(leaf).tobytes()
         return (leaf.shape, str(leaf.dtype), hash(buf))
-    return hash(leaf)
+    # Non-array leaf: the key is the LEAF ITSELF, not ``hash(leaf)``. For
+    # identity-hashed objects (``core.Jaxpr`` above all) ``hash(leaf)`` is
+    # ``id(leaf)//16``, and CPython recycles addresses -- a later jaxpr
+    # allocated where a dead one lived reused its key and the cache returned
+    # the dead jaxpr's eliminator: a silently WRONG JACOBIAN, reproduced at
+    # ~8/20 on tests/core/{named_activation,prune}_test.py. Keeping the leaf
+    # in the key pins it (an entry's id can never be recycled while the entry
+    # lives) and dict equality falls back to ``==`` -- identity for jaxprs,
+    # value equality for ints/strings/argnums -- so a stale hit is impossible.
+    return leaf
 
 
 def pytree_hash_cache(maxsize: int | None = None):
@@ -202,7 +211,11 @@ def pytree_hash_cache(maxsize: int | None = None):
             if any(isinstance(leaf, core.Tracer) for leaf in leaves):
                 return func(*args, **kwargs)
             leaf_hashes = tuple(_leaf_cache_key(leaf) for leaf in leaves)
-            key = hash((hash(treedef), leaf_hashes))
+            # The TUPLE is the key, never ``hash(tuple)``: an int key gives
+            # the dict no ``==`` to fall back on, so any hash collision --
+            # including the id-reuse one _leaf_cache_key documents -- returned
+            # a stale entry instead of missing.
+            key = (treedef, leaf_hashes)
 
             must_compute = False
             event = None
