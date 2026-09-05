@@ -989,8 +989,15 @@ def _build_pair_dims(pm, i, sa, la, ra, res, next_id):
         out_pres = getattr(pm.rhs, "block_axis", None) is not None
         out_dim = DenseIndex(r_id, final_r, axis=ra if out_pres else None)
     elif pt == "spatial_primal_lhs":
+        # A one-sided PRIMAL dim rides in ``PairData.shared_block_len``, which
+        # ``_finalize_output`` folds into the RHS half of the grid (``split`` ->
+        # ``ss_out`` -> ``final_rhs_lens``); the LHS half is 1 for this pairing.
+        # Reading ``final_l`` / ``la`` here collapsed the extent to 1 and took
+        # slice 0 of the values — finding 61, verdict 6: NeuralNetwork, reverse
+        # order, Reduce on slot ``new``, where the chain ends in ``X @ scalar``
+        # and every primal dim of ``X`` is such a pair.
         prim_pres = pm.lhs.shared_block_axis is not None
-        primal_dim = DenseIndex(ls_id, final_l, axis=la if prim_pres else None)
+        primal_dim = DenseIndex(ls_id, final_r, axis=ra if prim_pres else None)
     elif pt == "spatial_primal_rhs":
         primal_dim = DenseIndex(rs_id, final_r, axis=ra if pres_rhs else None)
     elif pt == "batch_sparse":
