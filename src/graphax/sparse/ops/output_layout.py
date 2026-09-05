@@ -28,25 +28,27 @@ from dataclasses import replace
 from graphax.sparse.indexes import CompressedIndex
 
 
-def _materialized_axes(st) -> list[tuple[int, int, int]]:
-    """``(dim position, 0 for axis / 1 for block_axis, val axis)`` for every
-    pointer into ``val``, in the order the parameter layout wants them."""
-    out = []
-    for pos, d in enumerate(st.dims):
-        if d.axis is not None:
-            out.append((pos, 0, int(d.axis)))
-        if getattr(d, "is_sparse", False) and d.block_axis is not None:
-            out.append((pos, 1, int(d.block_axis)))
-    return out
+def _materialized_axes(st) -> list[int]:
+    """The DISTINCT val axes the dims point to, in the order of first
+    appearance along ``out_dims + primal_dims`` (a dim's ``axis`` before its
+    ``block_axis``). The two members of a diagonal pair share their axes, so
+    a pair contributes each axis once; an implicit dim contributes nothing."""
+    seen: list[int] = []
+    for d in st.dims:
+        for a in (d.axis, getattr(d, "block_axis", None) if getattr(d, "is_sparse", False) else None):
+            if a is not None and int(a) not in seen:
+                seen.append(int(a))
+    return seen
 
 
 def is_parameter_layout(st) -> bool:
-    """True iff the materialized axes read ``0, 1, 2, ...`` along the dims."""
+    """True iff the distinct materialized axes read ``0, 1, 2, ...`` along
+    the dims and cover ``val``."""
     val = getattr(st, "val", None)
     if val is None:
         return True
-    axes = [a for _, _, a in _materialized_axes(st)]
-    return axes == list(range(len(axes))) and len(axes) == val.ndim
+    axes = _materialized_axes(st)
+    return axes == list(range(val.ndim))
 
 
 def canonical_output_layout(st):
@@ -63,8 +65,7 @@ def canonical_output_layout(st):
         return st
     if any(isinstance(d, CompressedIndex) for d in st.dims):
         return st
-    ptrs = _materialized_axes(st)
-    old_axes = [a for _, _, a in ptrs]
+    old_axes = _materialized_axes(st)
     if sorted(old_axes) != list(range(val.ndim)):
         return st
     if old_axes == list(range(val.ndim)):

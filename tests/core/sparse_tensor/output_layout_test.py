@@ -192,3 +192,27 @@ def test_approximated_sparse_equals_its_dense_oracle(order_name, engine, plan):
     for a, b in zip(sp, dn):
         assert a.shape == b.shape
         np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-6)
+
+
+def test_a_diagonal_pair_output_passes_the_contract():
+    """A full Jacobian (non-scalar target) of an elementwise op is a plain
+    diagonal pair: both members point to val axis 0. The contract counts a
+    pair's shared axis once, so the tensor is in parameter layout as it is."""
+    def f(x):
+        return jnp.tanh(x) * 2.0
+    x = jnp.arange(4.0) + 0.5
+    for engine in ENGINES:
+        saved = {k: os.environ.get(k) for k in ENGINES[engine]}
+        os.environ.update(ENGINES[engine])
+        try:
+            out = jax.jit(jacve(f, [1, 2], argnums=(0,), sparse_representation=True))(x)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        t = out[0]
+        assert isinstance(t, SparseTensor)
+        assert is_parameter_layout(t), (engine, t.dims, t.val.shape)
+        np.testing.assert_allclose(np.asarray(t.dense()), np.asarray(jax.jacfwd(f)(x)), rtol=1e-6)
