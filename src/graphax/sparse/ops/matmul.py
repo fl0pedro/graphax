@@ -596,8 +596,31 @@ def _as_shape(view, target_shape, *, mode):
     )
 
 
-def _prepare_contraction_views(lhs_val, rhs_val, pairs, shared, total, split):
+def _prepare_contraction_views(
+    lhs_val,
+    rhs_val,
+    pairs,
+    shared,
+    total,
+    split,
+    keep_l=None,
+    keep_r=None,
+    keep_sl=None,
+    keep_sr=None,
+):
+    """``keep_l[i]`` False means the lhs stores nothing along pair ``i``'s meta
+    axis, so that axis stays at length 1 on the lhs instead of being broadcast
+    to ``total[i]``. The caller then demotes it out of the dot's batch list
+    (ticket dsnn-3qm.67). ``keep_sl`` / ``keep_sr`` do the same for the
+    CONTRACTED axis, where the caller sums the storing side instead. With every
+    keep True this is the incumbent frame."""
     N = len(pairs)
+    keep_l = [True] * N if keep_l is None else keep_l
+    keep_r = [True] * N if keep_r is None else keep_r
+    keep_sl = [True] * N if keep_sl is None else keep_sl
+    keep_sr = [True] * N if keep_sr is None else keep_sr
+    split_l = [split[i] if keep_sl[i] else 1 for i in range(N)]
+    split_r = [split[i] if keep_sr[i] else 1 for i in range(N)]
     lhs_leftover, rhs_leftover = (
         list(lhs_val.shape[3 * N :]),
         list(rhs_val.shape[3 * N :]),
@@ -634,27 +657,33 @@ def _prepare_contraction_views(lhs_val, rhs_val, pairs, shared, total, split):
         [
             v
             for i, p in enumerate(pairs)
-            for v in (p.lhs.outer_len, total[i] // p.lhs.outer_len)
+            for v in (
+                (p.lhs.outer_len, total[i] // p.lhs.outer_len) if keep_l[i] else (1, 1)
+            )
         ]
         + [p.lhs.block_len for p in pairs]
-        + split
+        + split_l
         + lhs_leftover
     )
     rhs_unmerged = (
         [
             v
             for i, p in enumerate(pairs)
-            for v in (p.rhs.outer_len, total[i] // p.rhs.outer_len)
+            for v in (
+                (p.rhs.outer_len, total[i] // p.rhs.outer_len) if keep_r[i] else (1, 1)
+            )
         ]
-        + split
+        + split_r
         + [p.rhs.shared_block_len for p in pairs]
         + rhs_leftover
     )
     lhs_view = _as_shape(lhs_view, lhs_unmerged, mode="broadcast")
     rhs_view = _as_shape(rhs_view, rhs_unmerged, mode="broadcast")
-    lhs_merged = list(total) + [p.lhs.block_len for p in pairs] + split + lhs_leftover
+    lhs_meta = [total[i] if keep_l[i] else 1 for i in range(N)]
+    rhs_meta = [total[i] if keep_r[i] else 1 for i in range(N)]
+    lhs_merged = lhs_meta + [p.lhs.block_len for p in pairs] + split_l + lhs_leftover
     rhs_merged = (
-        list(total) + split + [p.rhs.shared_block_len for p in pairs] + rhs_leftover
+        rhs_meta + split_r + [p.rhs.shared_block_len for p in pairs] + rhs_leftover
     )
     lhs_view = _as_shape(lhs_view, lhs_merged, mode="reshape")
     rhs_view = _as_shape(rhs_view, rhs_merged, mode="reshape")
@@ -915,12 +944,15 @@ def _lazy_frame(lhs_val, rhs_val, pairs):
         # What each side physically contributes to the merged meta axis.
         m_l = lo_p * ((T // ol) if ls_p != 1 else 1)
         m_r = ro_p * ((T // orr) if rb_p != 1 else 1)
-        meta_lazy = dem = False
+        meta_lazy = False
+        dem = None
         if can and aligned and T > 1:
             if m_l == 1 and m_r == 1:
                 meta_lazy = True
-            elif (m_l == T and m_r == 1) or (m_r == T and m_l == 1):
-                dem = True
+            elif m_l == T and m_r == 1:
+                dem = "r"       # the rhs stores nothing along this meta axis
+            elif m_r == T and m_l == 1:
+                dem = "l"
         nl, nr = l, r
         if meta_lazy:
             nl = nl._replace(outer_len=1)
@@ -943,20 +975,20 @@ def _lazy_frame(lhs_val, rhs_val, pairs):
                 and rb_p == 1 and int(r.block_len) > 1:
             nr = nr._replace(block_len=1)
             rhs_lazy = True
-        # A contracted extent neither side stores -> analytic scale. Only on a
-        # pair with no meta grid, where ``logical_element_count`` IS that
-        # extent (with a meta grid the contraction spans ``split`` alone).
-        if (
-            can
-            and p.pairing_type == "contract"
-            and T == 1
-            and ls_p == 1
-            and rb_p == 1
-            and builtins.max(int(l.shared_block_len), int(r.block_len)) > 1
-        ):
-            nl = nl._replace(shared_block_len=1)
-            nr = nr._replace(block_len=1)
-        eff.append(p._replace(lhs=nl, rhs=nr) if (nl is not l or nr is not r) else p)
+        # A contracted extent no operand stores is an analytic scale, but that
+        # is decided on the CONTRACTED axis in the driver, not here — see the
+        # ``split`` loop of _execute_block_sparse_contraction.
+        np_ = p
+        if nl is not l or nr is not r:
+            np_ = p._replace(lhs=nl, rhs=nr)
+        if meta_lazy:
+            # ``_contraction_factors``'s scalar rule reads a contract pair with
+            # both outer lens 1 as "the contracted extent exists only in the
+            # metadata, fold logical_element_count". Shrinking the meta above
+            # makes that condition true by accident: here the meta is a real
+            # diagonal RIDING THROUGH to the output, not a summed axis.
+            np_ = np_._replace(logical_element_count=1)
+        eff.append(np_)
         lazy.append(_Lazy(meta_lazy, lhs_lazy, rhs_lazy))
         demote.append(dem)
     return eff, lazy, demote
@@ -973,13 +1005,17 @@ def _lazy_raw_perm(N, pairs, demote, n_ll, n_rl):
     the incumbent ``dg_perm`` exactly."""
     nc = [i for i in range(N) if pairs[i].pairing_type != "contract"]
     dem = [i for i in range(N) if demote[i]]
+    # ``demote[i] == "r"`` means the rhs stores nothing there, so the LHS free
+    # block carries the real meta axis and the rhs free block a size-1 twin.
+    lhs_dem = [("m", i) if demote[i] == "r" else ("d", i) for i in dem]
+    rhs_dem = [("d", i) if demote[i] == "r" else ("m", i) for i in dem]
     src = (
         [("m", i) for i in range(N) if not demote[i]]
         + [("s", i) for i in nc]
-        + [("m", i) for i in dem]
+        + lhs_dem
         + [("b", i) for i in range(N)]
         + [("ll", k) for k in range(n_ll)]
-        + [("d", i) for i in dem]
+        + rhs_dem
         + [("f", i) for i in range(N)]
         + [("rl", k) for k in range(n_rl)]
     )
@@ -1001,9 +1037,55 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
     pairs, lazy, demote = _lazy_frame(lhs_val, rhs_val, pairs)
     is_lazy = pairs != true_pairs or any(demote)
     shared, total, split, scalar = _contraction_factors(pairs)
+    if is_lazy:
+        # The CONTRACTED length is a property of the operands, not of the frame:
+        # shrinking a meta axis must not re-read a diagonal's meta as extra
+        # contraction depth. Take it from the logical topology.
+        _, _, split_true, _ = _contraction_factors(true_pairs)
+        split = [
+            split_true[i] if pairs[i].pairing_type == "contract" else split[i]
+            for i in range(N)
+        ]
+    # The contracted axis of a pair only one operand stores: summing the
+    # storing side is the same number and costs nothing, where broadcasting the
+    # other side up to it costs the whole buffer (the planner's "a contracted
+    # pair implicit on ONE side is a plain SUM over the physical side"). Stored
+    # by neither: an analytic scale.
+    keep_sl, keep_sr = [True] * N, [True] * N
+    reduce_l, reduce_r, split_fold = [], [], 1
+    for i, p in enumerate(pairs):
+        if p.pairing_type != "contract" or split[i] <= 1:
+            continue
+        st_l = int(lhs_val.shape[3 * i + 2]) != 1
+        st_r = int(rhs_val.shape[3 * i + 1]) != 1
+        if st_l and not st_r:
+            keep_sr[i] = False
+            reduce_l.append(2 * N + i)
+        elif st_r and not st_l:
+            keep_sl[i] = False
+            reduce_r.append(N + i)
+        elif not st_l and not st_r:
+            keep_sl[i] = keep_sr[i] = False
+            split_fold *= split[i]
     lhs_view, rhs_view, lhs_bc, rhs_bc = _prepare_contraction_views(
-        lhs_val, rhs_val, pairs, shared, total, split
+        lhs_val,
+        rhs_val,
+        pairs,
+        shared,
+        total,
+        split,
+        keep_l=[d != "l" for d in demote],
+        keep_r=[d != "r" for d in demote],
+        keep_sl=keep_sl,
+        keep_sr=keep_sr,
     )
+    if reduce_l:
+        lhs_view = jnp.sum(lhs_view, axis=tuple(reduce_l), keepdims=True)
+    if reduce_r:
+        rhs_view = jnp.sum(rhs_view, axis=tuple(reduce_r), keepdims=True)
+    if split_fold != 1:
+        scalar *= float(split_fold)
+        is_lazy = True
     lhs_leftover = list(lhs_view.shape[3 * N :])
     rhs_leftover = list(rhs_view.shape[3 * N :])
     res_raw = _gx_dot_general(
