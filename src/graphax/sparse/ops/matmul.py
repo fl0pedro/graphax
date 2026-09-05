@@ -1035,7 +1035,11 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
     N = len(pairs)
     true_pairs = pairs
     pairs, lazy, demote = _lazy_frame(lhs_val, rhs_val, pairs)
-    is_lazy = pairs != true_pairs or any(demote)
+    # ``frame_changed`` means the OUTPUT geometry moved, so the band probes
+    # (which read that geometry) sit this one out. A demotion or a summed
+    # contracted axis leaves the geometry alone and only changes the buffers.
+    frame_changed = pairs != true_pairs
+    is_lazy = frame_changed or any(demote)
     shared, total, split, scalar = _contraction_factors(pairs)
     if is_lazy:
         # The CONTRACTED length is a property of the operands, not of the frame:
@@ -1112,7 +1116,7 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
         rhs_leftover,
     )
     banded_geom = None
-    if not is_lazy:
+    if not frame_changed:
         banded_geom = _should_emit_block_banded(
             ctx,
             pairs,
