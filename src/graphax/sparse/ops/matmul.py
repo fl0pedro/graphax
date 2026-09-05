@@ -482,6 +482,40 @@ def _align_contract_indices(lhs_primal, rhs_out, *, embed):
         if len(full) == len(lhs_primal):
             full.sort()
             return full
+    # UNEQUAL-LENGTH size bijection (ticket dsnn-3qm.67). The two sides factor
+    # the same logical extent into a different NUMBER of dims once the tiled
+    # path stops collapsing a one-sided implicit dim to 1 (finding 61 verdict
+    # 6): the Hessian of the vmapped MLP reaches here with lhs.primal sizes
+    # (1,8,1,1,1,1,16,1,1) against rhs.out (16,8,1,1,1,1,1,1). Neither the
+    # positional walk nor the equal-length repair above can pair the 16.
+    # Every size > 1 dim needs exactly one partner of its own size; the size-1
+    # dims then pair from the right and the surplus rides through as a free
+    # dim. Only reachable when the positional result already carries a size
+    # mismatch, which raises today — so this can only turn a raise into a
+    # correct pairing, never change a working one. ``embed=True`` callers keep
+    # their mismatches, which is how they route a metadata embed to densify.
+    if not embed:
+        l_big = [a for a in range(len(lhs_primal))
+                 if int(lhs_primal[a].logical_size) != 1]
+        r_big = [b for b in range(len(rhs_out))
+                 if int(rhs_out[b].logical_size) != 1]
+        if len(l_big) == len(r_big):
+            taken, big, ok = set(), [], True
+            for a in l_big:
+                sa = int(lhs_primal[a].logical_size)
+                cand = [b for b in r_big
+                        if b not in taken and int(rhs_out[b].logical_size) == sa]
+                if len(cand) != 1:
+                    ok = False
+                    break
+                taken.add(cand[0])
+                big.append((a, cand[0]))
+            if ok:
+                l_ones = [a for a in range(len(lhs_primal)) if a not in l_big]
+                r_ones = [b for b in range(len(rhs_out)) if b not in r_big]
+                big += list(zip(l_ones[::-1], r_ones[::-1]))
+                big.sort()
+                return big
     return out
 
 
@@ -900,6 +934,18 @@ _LAZY_PAIRINGS = frozenset(
 )
 
 
+def _lazy_rules() -> str:
+    """RACE-ONLY diagnostic knob ``GRAPHAX_TILED_LAZY`` (ticket dsnn-3qm.67).
+
+    ``full`` (the default) is the candidate. ``nodemote`` keeps the incumbent's
+    broadcast for a meta axis only one side stores. ``nosum`` keeps it for a
+    contracted axis only one side stores. ``off`` keeps the incumbent frame
+    everywhere. The landing test uses the three restricted values to say WHICH
+    rule carries a cost on which device. Step 3 of the .28 design note deletes
+    the knob with the losing engine."""
+    return _os.environ.get("GRAPHAX_TILED_LAZY", "full")
+
+
 def _slot_phys(val, i):
     return (
         int(val.shape[3 * i]),
@@ -930,6 +976,9 @@ def _lazy_frame(lhs_val, rhs_val, pairs):
 
     Anything this cannot prove (a genuine LCM grid, a spatial-sparse pair, a
     partially stored extent) keeps the incumbent frame slot for slot."""
+    mode = _lazy_rules()
+    if mode == "off":
+        return list(pairs), [_NO_LAZY] * len(pairs), [None] * len(pairs)
     eff, lazy, demote = [], [], []
     for i, p in enumerate(pairs):
         lo_p, lb_p, ls_p = _slot_phys(lhs_val, i)
@@ -949,9 +998,9 @@ def _lazy_frame(lhs_val, rhs_val, pairs):
         if can and aligned and T > 1:
             if m_l == 1 and m_r == 1:
                 meta_lazy = True
-            elif m_l == T and m_r == 1:
+            elif mode != "nodemote" and m_l == T and m_r == 1:
                 dem = "r"       # the rhs stores nothing along this meta axis
-            elif m_r == T and m_l == 1:
+            elif mode != "nodemote" and m_r == T and m_l == 1:
                 dem = "l"
         nl, nr = l, r
         if meta_lazy:
@@ -1057,8 +1106,9 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
     # by neither: an analytic scale.
     keep_sl, keep_sr = [True] * N, [True] * N
     reduce_l, reduce_r, split_fold = [], [], 1
+    _sum_rules = _lazy_rules() not in ("off", "nosum")
     for i, p in enumerate(pairs):
-        if p.pairing_type != "contract" or split[i] <= 1:
+        if not _sum_rules or p.pairing_type != "contract" or split[i] <= 1:
             continue
         st_l = int(lhs_val.shape[3 * i + 2]) != 1
         st_r = int(rhs_val.shape[3 * i + 1]) != 1
