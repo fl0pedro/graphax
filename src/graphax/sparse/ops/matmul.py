@@ -97,6 +97,33 @@ class CRes(NamedTuple):
     rhs_block_lens: list[int]
     scalar_mult: float
     banded_geom: "BandedLayout | MultiAxisBandedLayout | None" = None
+    # --- lazy frame (ticket dsnn-3qm.67) ---------------------------------
+    # ``grid`` is built on the EFFECTIVE frame: every extent that neither
+    # operand stores is 1 there instead of broadcast to its logical length.
+    # The three fields above therefore describe the BUFFER. The output DIMS
+    # need the logical lengths, which is what these carry; ``eff_pairs`` is
+    # the Pair list the buffer was built from and ``lazy`` says which of each
+    # pair's three output slots has no physical axis. All None on the eager
+    # frame, where buffer and logic agree.
+    eff_pairs: "list[Pair] | None" = None
+    lazy: "list[_Lazy] | None" = None
+    true_shared_factors: "list[int] | None" = None
+    true_lhs_block_lens: "list[int] | None" = None
+    true_rhs_block_lens: "list[int] | None" = None
+
+
+class _Lazy(NamedTuple):
+    """Which of a Pair's three output slots stayed symbolic: the shared
+    (meta / diagonal) slot, the lhs (out-side) slot, the rhs (primal-side)
+    slot. A True slot keeps its logical extent and gets ``axis=None`` —
+    the planner's ``out:implicit_kept`` / ``out:pair_retained``."""
+
+    shared: bool = False
+    lhs: bool = False
+    rhs: bool = False
+
+
+_NO_LAZY = _Lazy()
 
 
 # --- Topology resolution ---------------------------------------------------
@@ -707,9 +734,19 @@ def _reduce_grid(res_view, pairs, shared, total, lhs_block_lens, rhs_block_lens)
     return res.reshape(*per_num, *extra)
 
 
-def _dot_general_axes(N, pairs):
+def _dot_general_axes(N, pairs, demote=None):
+    """Dimension numbers for the frame contraction.
+
+    ``demote[i]`` drops pair ``i``'s meta axis from the BATCH lists. A batch
+    axis needs the same length on both operands, so a meta axis only one side
+    stores forces the other side to be broadcast up to it — the tiled path's
+    single largest materialization (finding 61: 56.9 MB against 378 KB on
+    TLM/CPU). Demoted, it rides as the storing side's FREE axis: the same
+    result, no broadcast. ``_execute_block_sparse_contraction`` puts the axis
+    back where the rest of the pipeline expects it."""
     contract_l, contract_r = [], []
-    batch_l, batch_r = list(range(N)), list(range(N))
+    batch_l = [i for i in range(N) if not (demote and demote[i])]
+    batch_r = list(batch_l)
     for i, p in enumerate(pairs):
         if p.pairing_type == "contract":
             contract_l.append(2 * N + i)
@@ -814,26 +851,170 @@ def _finalize_output(
     return res, final_lhs_lens, final_rhs_lens
 
 
+# --- Lazy frame (ticket dsnn-3qm.67) ---------------------------------------
+# The physical extents a Pair slot may claim, read off the PREPARED operand
+# arrays: slot ``3*i + k`` of a prepared array is 1 exactly when no val axis
+# backs it. ``_prepare_contraction_views`` used to broadcast every such 1 up
+# to the logical length before the dot, which is where the output structure
+# died (finding 61, verdicts 3, 5 and 6) and where the CPU temp went.
+_LAZY_PAIRINGS = frozenset(
+    {
+        "contract",
+        "batch_out",
+        "batch_primal",
+        "batch_sparse",
+        "spatial_out_lhs",
+        "spatial_out_rhs",
+        "spatial_primal_lhs",
+        "spatial_primal_rhs",
+    }
+)
+
+
+def _slot_phys(val, i):
+    return (
+        int(val.shape[3 * i]),
+        int(val.shape[3 * i + 1]),
+        int(val.shape[3 * i + 2]),
+    )
+
+
+def _lazy_frame(lhs_val, rhs_val, pairs):
+    """Shrink every frame slot that neither operand stores.
+
+    Returns ``(pairs_eff, lazy, demote)``.
+
+    * ``pairs_eff`` — the Pair list with each unstored extent set to 1, so the
+      whole existing pipeline (``_contraction_factors`` down to
+      ``_final_grid``) builds the SMALL physical grid and no
+      ``_as_shape(mode="broadcast")`` grows a buffer.
+    * ``lazy[i]`` — which of pair ``i``'s three output slots therefore has no
+      physical axis. ``_build_pair_dims`` gives those the logical extent and
+      ``axis=None``: a free implicit dim stays implicit, a surviving diagonal
+      pair stays a pair, a fully implicit result keeps ``val=None``.
+    * ``demote[i]`` — the meta axis is stored on exactly one side; it leaves
+      the dot's batch list instead of broadcasting the other side.
+
+    A contracted extent neither side stores is an analytic scale: setting both
+    of its lens to 1 makes ``_contraction_factors``'s existing scalar rule fold
+    ``logical_element_count`` into ``scalar_mult`` — no dot over a broadcast.
+
+    Anything this cannot prove (a genuine LCM grid, a spatial-sparse pair, a
+    partially stored extent) keeps the incumbent frame slot for slot."""
+    eff, lazy, demote = [], [], []
+    for i, p in enumerate(pairs):
+        lo_p, lb_p, ls_p = _slot_phys(lhs_val, i)
+        ro_p, rb_p, rs_p = _slot_phys(rhs_val, i)
+        l, r = p.lhs, p.rhs
+        ol, orr = int(l.outer_len), int(r.outer_len)
+        T, G = math.lcm(ol, orr), math.gcd(ol, orr)
+        # ``_tiled_index`` is the identity only on an aligned grid; a genuine
+        # LCM grid (both sizes > 1 and unequal) keeps the incumbent path.
+        aligned = T == G or ol == 1 or orr == 1
+        can = p.pairing_type in _LAZY_PAIRINGS
+        # What each side physically contributes to the merged meta axis.
+        m_l = lo_p * ((T // ol) if ls_p != 1 else 1)
+        m_r = ro_p * ((T // orr) if rb_p != 1 else 1)
+        meta_lazy = dem = False
+        if can and aligned and T > 1:
+            if m_l == 1 and m_r == 1:
+                meta_lazy = True
+            elif (m_l == T and m_r == 1) or (m_r == T and m_l == 1):
+                dem = True
+        nl, nr = l, r
+        if meta_lazy:
+            nl = nl._replace(outer_len=1)
+            nr = nr._replace(outer_len=1)
+        # Surviving own-side extents nobody stores.
+        lhs_lazy = can and int(l.block_len) > 1 and lb_p == 1
+        rhs_lazy = can and int(r.shared_block_len) > 1 and rs_p == 1
+        if lhs_lazy:
+            nl = nl._replace(block_len=1)
+        if rhs_lazy:
+            nr = nr._replace(shared_block_len=1)
+        # The two one-sided pairings park their extent in the OTHER slot of the
+        # triple, from where ``_finalize_output`` folds it through ``split`` and
+        # ``ss_out`` into the rhs half of the grid.
+        if can and p.pairing_type == "spatial_primal_lhs" \
+                and ls_p == 1 and int(l.shared_block_len) > 1:
+            nl = nl._replace(shared_block_len=1)
+            rhs_lazy = True
+        if can and p.pairing_type == "spatial_out_rhs" \
+                and rb_p == 1 and int(r.block_len) > 1:
+            nr = nr._replace(block_len=1)
+            rhs_lazy = True
+        # A contracted extent neither side stores -> analytic scale. Only on a
+        # pair with no meta grid, where ``logical_element_count`` IS that
+        # extent (with a meta grid the contraction spans ``split`` alone).
+        if (
+            can
+            and p.pairing_type == "contract"
+            and T == 1
+            and ls_p == 1
+            and rb_p == 1
+            and builtins.max(int(l.shared_block_len), int(r.block_len)) > 1
+        ):
+            nl = nl._replace(shared_block_len=1)
+            nr = nr._replace(block_len=1)
+        eff.append(p._replace(lhs=nl, rhs=nr) if (nl is not l or nr is not r) else p)
+        lazy.append(_Lazy(meta_lazy, lhs_lazy, rhs_lazy))
+        demote.append(dem)
+    return eff, lazy, demote
+
+
+def _lazy_raw_perm(N, pairs, demote, n_ll, n_rl):
+    """Source axis of every canonical raw-output axis, plus the axes to drop.
+
+    The dot's output is ``(batch..., lhs free..., rhs free...)``. Demoting a
+    meta axis moves it out of the batch block into the lhs free block (and its
+    size-1 twin into the rhs free block). This rebuilds the layout the rest of
+    the pipeline expects: metas, the non-contract splits, the lhs blocks, the
+    rhs shared blocks, then the two leftovers. With no demotion it reproduces
+    the incumbent ``dg_perm`` exactly."""
+    nc = [i for i in range(N) if pairs[i].pairing_type != "contract"]
+    dem = [i for i in range(N) if demote[i]]
+    src = (
+        [("m", i) for i in range(N) if not demote[i]]
+        + [("s", i) for i in nc]
+        + [("m", i) for i in dem]
+        + [("b", i) for i in range(N)]
+        + [("ll", k) for k in range(n_ll)]
+        + [("d", i) for i in dem]
+        + [("f", i) for i in range(N)]
+        + [("rl", k) for k in range(n_rl)]
+    )
+    pos = {lab: a for a, lab in enumerate(src)}
+    want = (
+        [("m", i) for i in range(N)]
+        + [("s", i) for i in nc]
+        + [("b", i) for i in range(N)]
+        + [("f", i) for i in range(N)]
+        + [("ll", k) for k in range(n_ll)]
+        + [("rl", k) for k in range(n_rl)]
+    )
+    return [pos[lab] for lab in want], tuple(pos[("d", i)] for i in dem)
+
+
 def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
     N = len(pairs)
+    true_pairs = pairs
+    pairs, lazy, demote = _lazy_frame(lhs_val, rhs_val, pairs)
+    is_lazy = pairs != true_pairs or any(demote)
     shared, total, split, scalar = _contraction_factors(pairs)
     lhs_view, rhs_view, lhs_bc, rhs_bc = _prepare_contraction_views(
         lhs_val, rhs_val, pairs, shared, total, split
     )
     lhs_leftover = list(lhs_view.shape[3 * N :])
     rhs_leftover = list(rhs_view.shape[3 * N :])
-    res_raw = _gx_dot_general(lhs_view, rhs_view, _dot_general_axes(N, pairs))
-    nc_len = sum(1 for p in pairs if p.pairing_type != "contract")
-    dg_perm = (
-        list(range(2 * N + nc_len))
-        + list(
-            range(
-                2 * N + nc_len + len(lhs_leftover), 3 * N + nc_len + len(lhs_leftover)
-            )
-        )
-        + list(range(2 * N + nc_len, 2 * N + nc_len + len(lhs_leftover)))
-        + list(range(3 * N + nc_len + len(lhs_leftover), res_raw.ndim))
+    res_raw = _gx_dot_general(
+        lhs_view, rhs_view, _dot_general_axes(N, pairs, demote)
     )
+    dg_perm, drop = _lazy_raw_perm(
+        N, pairs, demote, len(lhs_leftover), len(rhs_leftover)
+    )
+    if drop:
+        res_raw = jnp.squeeze(res_raw, axis=drop)
+        dg_perm = [a - sum(1 for d in drop if d < a) for a in dg_perm]
     if dg_perm != list(range(len(dg_perm))):
         res_raw = jnp.transpose(res_raw, dg_perm)
     grid, final_lhs_lens, final_rhs_lens = _finalize_output(
@@ -848,20 +1029,9 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
         lhs_leftover,
         rhs_leftover,
     )
-    banded_geom = _should_emit_block_banded(
-        ctx,
-        pairs,
-        shared,
-        total,
-        final_lhs_lens,
-        final_rhs_lens,
-        lhs_leftover,
-        rhs_leftover,
-    )
-    if banded_geom is None:
-        # Fall through to the K>1 multi-axis probe when the K=1 single-pair
-        # probe didn't fire (typically because ``len(pairs) != 1``).
-        banded_geom = _should_emit_multi_axis_banded(
+    banded_geom = None
+    if not is_lazy:
+        banded_geom = _should_emit_block_banded(
             ctx,
             pairs,
             shared,
@@ -871,17 +1041,62 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
             lhs_leftover,
             rhs_leftover,
         )
-    return grid, shared, final_lhs_lens, final_rhs_lens, scalar, banded_geom
+        if banded_geom is None:
+            # Fall through to the K>1 multi-axis probe when the K=1 single-pair
+            # probe didn't fire (typically because ``len(pairs) != 1``).
+            banded_geom = _should_emit_multi_axis_banded(
+                ctx,
+                pairs,
+                shared,
+                total,
+                final_lhs_lens,
+                final_rhs_lens,
+                lhs_leftover,
+                rhs_leftover,
+            )
+    if not is_lazy:
+        return grid, shared, final_lhs_lens, final_rhs_lens, scalar, banded_geom, None
+    true_shared, true_total, true_split, _ = _contraction_factors(true_pairs)
+    true_fll, true_frl = _compact_block_lens(
+        true_pairs, true_shared, true_total, true_split
+    )
+    # A slot may only stay symbolic when its EFFECTIVE grid axis really is 1;
+    # otherwise the axis carries content and dropping it would take slice 0 of
+    # live data. This is the safety net for every rule above.
+    checked = []
+    for i in range(N):
+        z = lazy[i]
+        f_l = (pairs[i].lhs.outer_len // shared[i]) * final_lhs_lens[i]
+        f_r = (pairs[i].rhs.outer_len // shared[i]) * final_rhs_lens[i]
+        checked.append(
+            _Lazy(
+                z.shared and shared[i] == 1,
+                z.lhs and f_l == 1,
+                z.rhs and f_r == 1,
+            )
+        )
+    return (
+        grid,
+        shared,
+        final_lhs_lens,
+        final_rhs_lens,
+        scalar,
+        banded_geom,
+        (pairs, checked, true_shared, true_fll, true_frl),
+    )
 
 
 # --- Output tensor build --------------------------------------------------
 def _resolve_output_shape(ctx, res):
+    # The grid was built on the EFFECTIVE pairs when the lazy frame fired, so
+    # the shape must be read off those, not off the logical topology.
+    pairs = ctx.pairs if res.eff_pairs is None else res.eff_pairs
     shape, sh_map, lhs_map, rhs_map, squeeze, ax = [], {}, {}, {}, [], 0
     for i, factor in enumerate(res.shared_factors):
         shape.append(factor)
         sh_map[i] = ax
         ax += 1
-    for i, p in enumerate(ctx.pairs):
+    for i, p in enumerate(pairs):
         factor = p.lhs.outer_len // res.shared_factors[i]
         if p.pairing_type == "spatial_sparse_lhs":
             shape.extend([factor, res.lhs_block_lens[i]])
@@ -894,7 +1109,7 @@ def _resolve_output_shape(ctx, res):
             shape.append(factor * res.lhs_block_lens[i])
             lhs_map[i] = ax
             ax += 1
-    for i, p in enumerate(ctx.pairs):
+    for i, p in enumerate(pairs):
         factor = p.rhs.outer_len // res.shared_factors[i]
         if p.pairing_type == "spatial_sparse_rhs":
             shape.extend([factor, res.rhs_block_lens[i]])
@@ -928,9 +1143,17 @@ def _build_sparse(
 
 def _build_pair_dims(pm, i, sa, la, ra, res, next_id):
     """Build (out_dim, primal_dim, next_id) for one pair, dispatching on pairing_type."""
-    sf = res.shared_factors[i]
-    final_l = (pm.lhs.outer_len // sf) * res.lhs_block_lens[i]
-    final_r = (pm.rhs.outer_len // sf) * res.rhs_block_lens[i]
+    # Sizes come from the LOGICAL topology; the axis maps come from the buffer.
+    # On the eager frame the two agree and ``true_*`` is None.
+    sf = (res.shared_factors if res.true_shared_factors is None
+          else res.true_shared_factors)[i]
+    _lbl = res.lhs_block_lens if res.true_lhs_block_lens is None \
+        else res.true_lhs_block_lens
+    _rbl = res.rhs_block_lens if res.true_rhs_block_lens is None \
+        else res.true_rhs_block_lens
+    final_l = (pm.lhs.outer_len // sf) * _lbl[i]
+    final_r = (pm.rhs.outer_len // sf) * _rbl[i]
+    z = _NO_LAZY if res.lazy is None else res.lazy[i]
     pres_shared = pm.lhs.outer_axis is not None or pm.rhs.outer_axis is not None
     pres_lhs = pm.lhs.outer_axis is not None or pm.lhs.block_axis is not None
     pres_rhs = (
@@ -948,6 +1171,12 @@ def _build_pair_dims(pm, i, sa, la, ra, res, next_id):
         pres_shared = pres_shared or sf > 1
         pres_lhs = pres_lhs or final_l > 1
         pres_rhs = pres_rhs or final_r > 1
+    # The lazy frame never built a physical axis for these slots, so the
+    # ``any_val`` forcing above must not claim one: the extent stays symbolic
+    # (the planner's ``out:implicit_kept`` / ``out:pair_retained``).
+    pres_shared = pres_shared and not z.shared
+    pres_lhs = pres_lhs and not z.lhs
+    pres_rhs = pres_rhs and not z.rhs
 
     def gen(v):
         nonlocal next_id
@@ -2603,7 +2832,7 @@ def _execute_tiled(ctx, rhs_dims):
         return _legacy_execute_tiled(ctx, rhs_dims)
     lhs_val, rhs_val = _val_or_one(ctx.lhs), _val_or_one(ctx.rhs)
     lhs_val, rhs_val = _prepare_physical_arrays(lhs_val, rhs_val, ctx.pairs)
-    grid, shared, lhs_lens, rhs_lens, scalar, banded_geom = (
+    grid, shared, lhs_lens, rhs_lens, scalar, banded_geom, lazy_info = (
         _execute_block_sparse_contraction(lhs_val, rhs_val, ctx.pairs, ctx)
     )
     res = CRes(
@@ -2614,6 +2843,15 @@ def _execute_tiled(ctx, rhs_dims):
         scalar_mult=scalar,
         banded_geom=banded_geom,
     )
+    if lazy_info is not None:
+        eff_pairs, lazy, t_shared, t_fll, t_frl = lazy_info
+        res = res._replace(
+            eff_pairs=eff_pairs,
+            lazy=lazy,
+            true_shared_factors=t_shared,
+            true_lhs_block_lens=t_fll,
+            true_rhs_block_lens=t_frl,
+        )
     return _build_output_tensor(ctx, rhs_dims, res)
 
 
