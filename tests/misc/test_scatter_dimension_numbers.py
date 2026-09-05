@@ -37,11 +37,11 @@ def test_no_obsolete_scatter_index_numbers_in_transforms():
     assert not bad, f"Obsolete ScatterIndexNumbers in: {bad}"
 
 
-@pytest.mark.xfail(
-    reason="pre-existing (predates the lattice campaign): scalar-output concat\n"
-    "micro-case returns a wrong Jacobian on the incumbent exact path",
-    strict=True,
-)
+# The strict xfail here is GONE (ticket dsnn-3qm.67): the scalar-output
+# micro-case is the "X @ scalar" contraction whose one-sided primal dims
+# the tiled path used to collapse to size 1 (finding 61, verdict 6). With
+# _build_pair_dims reading spatial_primal_lhs from the rhs half of the
+# grid, the Jacobian is right and this test passes.
 def test_concatenate_with_complex_structure_via_jacve():
     """Exercise the concatenate transforms that use ScatterDimensionNumbers."""
     import jax
