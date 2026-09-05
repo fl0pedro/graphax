@@ -2576,10 +2576,24 @@ def _execute_compact(ctx, rhs_dims, count=False):
 
 
 
+def _tiled_legacy_enabled() -> bool:
+    """RACE-ONLY knob ``GRAPHAX_TILED_LEGACY`` (default OFF, ticket
+    dsnn-3qm.67): route every tiled contraction through the verbatim copy of
+    the incumbent executor in ``matmul_legacy_tiled``. The landing test of the
+    .28 race pairs the lazy candidate against the untouched engine of 1f3d404
+    inside ONE process, which needs both reachable at once. Read per call.
+    Step 3 of the .28 design note deletes this knob and that module."""
+    return _os.environ.get("GRAPHAX_TILED_LEGACY", "0") != "0"
+
+
 def _execute_tiled(ctx, rhs_dims):
     """Fallback: full tiled algorithm. Handles every case the fast paths
     bail on, including LCM-mismatched outer sizes, spatial sparse pairs,
     and broadcast / unmaterialized val axes."""
+    if _tiled_legacy_enabled():
+        from .matmul_legacy_tiled import _execute_tiled as _legacy_execute_tiled
+
+        return _legacy_execute_tiled(ctx, rhs_dims)
     lhs_val, rhs_val = _val_or_one(ctx.lhs), _val_or_one(ctx.rhs)
     lhs_val, rhs_val = _prepare_physical_arrays(lhs_val, rhs_val, ctx.pairs)
     grid, shared, lhs_lens, rhs_lens, scalar, banded_geom = (
