@@ -937,13 +937,21 @@ _LAZY_PAIRINGS = frozenset(
 def _lazy_rules() -> str:
     """RACE-ONLY diagnostic knob ``GRAPHAX_TILED_LAZY`` (ticket dsnn-3qm.67).
 
-    ``full`` (the default) is the candidate. ``nodemote`` keeps the incumbent's
-    broadcast for a meta axis only one side stores. ``nosum`` keeps it for a
-    contracted axis only one side stores. ``off`` keeps the incumbent frame
-    everywhere. The landing test uses the three restricted values to say WHICH
-    rule carries a cost on which device. Step 3 of the .28 design note deletes
+    ``nodemote`` is the DEFAULT and the candidate: every lazy rule except the
+    demotion of a meta axis only one side stores, which keeps the incumbent's
+    broadcast there. Measured on TLM/GPU at the campaign shape (jobs 63802,
+    63803, 63805 against 63795): demoting costs 11 percent on the exact, Quant
+    and Diag classes, because XLA on GPU FUSES that broadcast into the batched
+    dot and loses the fusion once the axis leaves the batch list. XLA on CPU
+    allocates it instead, which is the 56.9 MB against 378 KB of finding 61, so
+    ``full`` (demotion on) is the leaner CPU frame. That makes the demotion a
+    device-dependent lowering choice, and the owner decides it.
+
+    ``full`` turns the demotion on, ``nosum`` keeps the incumbent's broadcast on
+    a contracted axis only one side stores (measured free on GPU), and ``off``
+    keeps the incumbent frame everywhere. Step 3 of the .28 design note deletes
     the knob with the losing engine."""
-    return _os.environ.get("GRAPHAX_TILED_LAZY", "full")
+    return _os.environ.get("GRAPHAX_TILED_LAZY", "nodemote")
 
 
 def _slot_phys(val, i):
