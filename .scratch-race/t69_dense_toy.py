@@ -19,6 +19,11 @@ For the exact plan all three equal jax.grad. For an approximated plan the first
 two stay bit-identical (they are the same contractions packed two ways) while
 `dense` differs by the approximation.
 
+This file is the RECORD of deliverable (b): the standalone prototype that showed
+the mode was needed BEFORE the mode existed. The landed implementation is
+``graphax.dense_edges`` (``jacve(..., dense_edges=True)``); this prototype is
+kept unchanged as the evidence, not as a second implementation to maintain.
+
 Run: JAX_PLATFORMS=cpu PYTHONPATH=$LANE/graphax/src python t69_dense_toy.py
 """
 from __future__ import annotations
