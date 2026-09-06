@@ -13,8 +13,6 @@ This test pins the new signature and exercises a transform that goes through
 
 import inspect
 
-import pytest
-
 import jax
 import jax.numpy as jnp
 
@@ -30,13 +28,14 @@ def test_dense_signature_takes_no_extra_args():
     assert list(sig.parameters.keys()) == ["self", "keep_quantization"]
 
 
-@pytest.mark.xfail(
-    reason="pre-existing (predates the lattice campaign, identical at its baseline):\n"
-    "scalar-output reshape micro-case crashes in the queued-embed drain",
-    strict=True,
-)
 def test_reshape_jacobian_via_jacve_does_not_crash():
-    """reshape's transform internally calls pre.dense() — exercise it end-to-end."""
+    """reshape's transform internally calls pre.dense() — exercise it end-to-end.
+
+    Used to xfail: the scalar-output (``.sum()``) case is ``X @ scalar``,
+    which the tiled engine's ``_build_pair_dims`` collapsed to a size-1 slice
+    of X instead of the scaled tensor (dsnn-3qm.68, finding 61 verdict 6).
+    Fixed in ``_build_pair_dims`` and, independently, by ``matmul`` routing
+    any single-0-rank-operand contraction to an elementwise scale."""
     def f(x):
         return jnp.reshape(x, (6,)).sum()
 
@@ -46,13 +45,11 @@ def test_reshape_jacobian_via_jacve_does_not_crash():
     assert bool(tree_allclose(veres, refres))
 
 
-@pytest.mark.xfail(
-    reason="pre-existing (predates the lattice campaign): scalar-output slice\n"
-    "micro-case returns a wrong Jacobian on the incumbent exact path",
-    strict=True,
-)
 def test_slice_jacobian_via_jacve_does_not_crash():
-    """slice's transform internally calls pre.dense() — exercise it end-to-end."""
+    """slice's transform internally calls pre.dense() — exercise it end-to-end.
+
+    Used to xfail for the same rank-0-operand reason as the reshape test
+    above (dsnn-3qm.68)."""
     def f(x):
         return jax.lax.slice(x, (0,), (3,)).sum()
 
