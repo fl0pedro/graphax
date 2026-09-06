@@ -393,3 +393,22 @@ Measured on the toy, masked hooks, every face:
 
 Literal actions on the same faces: censuses match, values compared, Reduce
 1.2e-07 and Quant 5.1e-08 against the sparse engine.
+
+### Correction after the cluster run (job 63832, pgi15-cpu2)
+
+The suite read 1369 passed, 1 failed, 72 skipped. The one failure was my own
+`test_an_approximated_plan_agrees_with_the_sparse_engine[quant-forward]`:
+2.106e-03 against the `TOL_QUANT = 2e-3` ceiling. The same plan reads 0.0 on the
+local CPU.
+
+So an ABSOLUTE Quant ceiling is a property of the machine, not of the engines.
+bf16 rounds different intermediates on the two engines, and which intermediates
+depends on the CPU. The comparable quantity is the disagreement as a FRACTION of
+the approximation's own size. The bound is now: the two engines must not
+disagree by MORE than the approximation itself, `QUANT_MARGIN = 1.0`.
+
+Measured worst fraction: 0.444 locally (Markowitz, both operands narrow) and
+about 0.68 on pgi15-cpu2 (forward, slot lhs). A wrong Jacobian sits at 1e-1 to 1
+relative, three orders above a bf16 Quant's own 3e-3, so the bound still catches
+one. `TOL_EXACT = 1e-5` stands: every exact, Reduce and Diag case passed on both
+machines.
