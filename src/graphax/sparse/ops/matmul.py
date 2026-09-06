@@ -1922,8 +1922,11 @@ def _einsum_matmul_general(lhs, rhs, count: bool = False):
     applies the correctness firewall and routes it under the new flag. On
     normalized inputs (``matmul`` always normalizes before this hook) the
     differential harness proves the planner byte-exact vs the incumbent for
-    every structured contraction except a rank-0 (scalar) operand, which is the
-    one genuine structural disagreement and is excluded below.
+    every structured contraction. A rank-0 (scalar) operand used to be the one
+    family the two paths disagreed on -- now moot: ``matmul`` routes any
+    single-0-rank-operand case to an elementwise scale BEFORE this function is
+    ever called (dsnn-3qm.68), so ``lhs``/``rhs`` here are never rank-0 and
+    the old rank-0 fallthrough guard was removed as dead code.
     Gate: ``GRAPHAX_EINSUM_GENERAL`` (read by the caller) plus the guards below.
     """
     # EXACT-AD firewall: by default only an elimination carrying a
@@ -1974,24 +1977,18 @@ def _einsum_matmul_general(lhs, rhs, count: bool = False):
     if _has_implicit_block_contraction(lhs, rhs):
         return None
 
-    # A RANK-0 (scalar) operand has no dim to contract: ``X @ scalar`` is a
-    # broadcast/scale, not a contraction, and the two paths genuinely DISAGREE on
-    # its semantics — the incumbent collapses the unpaired contracted dim to
-    # size 1, the einsum planner rides it through — so this is not float noise
-    # but a real structural mismatch. The incumbent path owns this degenerate
-    # case (a Compress-fully-reduced scalar edge contracting a matrix), so fall
-    # through. (Two-scalar matmul is already handled earlier in ``matmul``.)
-    # This is the ONLY family the differential harness proves ``_lower`` gets
-    # WRONG; every structured contraction — plain/block diagonal, implicit,
-    # block-refine, forced-broadcast — is byte-exact vs the incumbent on CPU.
-    # (On GPU those structured cases can differ from the tiled path by ~1e-3 in
+    # A rank-0 (scalar) operand used to reach here and disagree with the
+    # incumbent (the incumbent collapsed X's one-sided primal dim to a size-1
+    # slice -- a real bug, fixed in ``_build_pair_dims``; the einsum planner
+    # rode the dim through at its full extent, which was already the correct
+    # answer). ``matmul`` (dsnn-3qm.68) now routes EVERY single-0-rank-operand
+    # case to an elementwise scale before either engine ever sees it, so this
+    # function is never called with a rank-0 ``lhs``/``rhs`` any more -- the
+    # guard that used to fall through here was removed as dead code.
+    # (On GPU structured cases can differ from the tiled path by ~1e-3 in
     # float32 — normal reduction-order non-associativity between two correct
     # implementations, well inside the approximation regime this runs in and
     # confirmed by the cosine-based anchors — so they are NOT gated.)
-    if (not lhs.out_dims and not lhs.primal_dims) or (
-        not rhs.out_dims and not rhs.primal_dims
-    ):
-        return None
 
     from graphax.sparse.lower.matmul import _NoRule, _bump, _lower
 
@@ -2648,7 +2645,10 @@ def matmul(lhs, rhs, count: bool = False):
 
     Dispatch order (first applicable wins), in body order:
       1. ``dense_dense``        -- both operands are plain arrays (no SparseTensor).
-      2. ``scalar_elementwise`` -- both 0-rank scalars, routed through ``*``.
+      2. ``scalar_elementwise`` -- either operand is a 0-rank (scalar)
+                                  SparseTensor (one or both), routed through
+                                  ``*``: no shared dim to contract, so the
+                                  contraction is a scale.
       3. ``einsum_general``     -- opt-in (``GRAPHAX_EINSUM_GENERAL``): opt_einsum
                                   lowering that retains sparsity.
       4. ``struct_lower``       -- opt-in (``GRAPHAX_STRUCT_LOWER``): structure-
@@ -2666,9 +2666,13 @@ def matmul(lhs, rhs, count: bool = False):
       8. ``tiled``              -- general LCM/topology/finalize pipeline; the
                                   sparsity-preserving fallback for everything else.
 
-    Scalar @ scalar (both 0-rank SparseTensors) is rejected — use
-    ``lhs * rhs`` (elementwise) instead. Vertex elimination routes scalar
-    edges through ``*`` since core-v2.
+    Scalar @ scalar (both 0-rank SparseTensors) is, by default, routed through
+    ``lhs * rhs`` (elementwise); set ``GRAPHAX_SEED_VERTICES_SCALAR_MM=0`` to
+    restore the legacy raise. A single 0-rank operand against a real-rank
+    partner (``X @ scalar`` or ``scalar @ X``) is ALWAYS routed through ``*``
+    -- ``X @ scalar == scalar * X`` (owner ruling, dsnn-3qm.68) -- with no
+    flag to opt out. Vertex elimination routes scalar edges through ``*``
+    since core-v2.
 
     With ``count=True`` returns ``(result, (adds, muls, fmas))``. Per output
     element the dot product decomposes into 1 plain multiply (no
@@ -2696,6 +2700,12 @@ def matmul(lhs, rhs, count: bool = False):
             return out, _compute_matmul_count(lhs, rhs, out)
         return out
     lhs, rhs = _normalize_inputs(lhs, rhs)
+    _lhs_scalar = (
+        getattr(lhs, "out_dims", ()) == () and getattr(lhs, "primal_dims", ()) == ()
+    )
+    _rhs_scalar = (
+        getattr(rhs, "out_dims", ()) == () and getattr(rhs, "primal_dims", ()) == ()
+    )
     # Two 0-rank (scalar) SparseTensors: the contraction is a scalar product =
     # an ELEMENTWISE multiply (scalar . X == scale). This is what the AGGREGATION
     # step needs when a Compress-reduced / seed-vertex scalar edge contracts
@@ -2704,12 +2714,7 @@ def matmul(lhs, rhs, count: bool = False):
     # both-implicit reduction, a merge of two scalar edges) land here; do the
     # mathematically-correct multiply rather than raise. Set
     # GRAPHAX_SEED_VERTICES_SCALAR_MM=0 to restore the legacy raise.
-    if (
-        getattr(lhs, "out_dims", ()) == ()
-        and getattr(lhs, "primal_dims", ()) == ()
-        and getattr(rhs, "out_dims", ()) == ()
-        and getattr(rhs, "primal_dims", ()) == ()
-    ):
+    if _lhs_scalar and _rhs_scalar:
         if _SEED_SCALAR_MM:
             out = lhs * rhs
             _record_path("scalar_elementwise")
@@ -2720,6 +2725,44 @@ def matmul(lhs, rhs, count: bool = False):
             "matmul of two 0-rank SparseTensors is not supported; "
             "use ``lhs * rhs`` (elementwise) instead"
         )
+    # Exactly ONE 0-rank (scalar) operand, the other of any real rank: ``X @
+    # scalar`` (or ``scalar @ X``) has no shared dimension to contract, so the
+    # contraction IS a scale -- ``scalar * X`` -- not a degenerate matmul.
+    # Owner ruling (dsnn-3qm.68, 2026-09-06): ``X @ scalar == scalar * X``,
+    # ALWAYS, on every engine; unlike the two-scalar case above this has no
+    # legacy-raise flag -- any caller that depended on the tiled engine's old
+    # behaviour (collapsing X's one-sided primal dim to a size-1 slice, see
+    # ``_build_pair_dims``'s ``spatial_primal_lhs`` branch, fixed separately)
+    # was wrong and is fixed, not accommodated. Routing here also makes that
+    # tiled branch (and the planner's rank-0 fallthrough guard below) dead for
+    # this family: neither engine ever contracts against a rank-0 operand.
+    if _lhs_scalar or _rhs_scalar:
+        _record_path("scalar_elementwise")
+        # ``elementwise``/``*`` requires equal SHAPES (its own
+        # ``_normalize_inputs`` raises "Shape mismatch" on ``() != tensor.shape``)
+        # -- it broadcasts a raw array up to its SparseTensor partner, but a
+        # rank-0 SparseTensor is already sparse, so that broadcast never
+        # triggers. Materializing a full-shape broadcast copy of the scalar
+        # just to go through ``elementwise`` would defeat the point (a real
+        # buffer for what is analytically a pure scale). Instead fold the
+        # scalar operand's own effective value -- its on-structure value
+        # (``_stored_val()``, ``1`` when ``val is None``) times its own
+        # ``scalar_mult`` -- into the TENSOR operand's ``scalar_mult`` via
+        # ``_scaled_mul``, the same "apply this operand's scale" primitive
+        # ``ops/utils._apply_scalar_mult`` uses everywhere else. This keeps
+        # the tensor operand's own ``val`` / ``fill_value`` / dims untouched
+        # (an elementwise SCALE, not a contraction) and does no per-element
+        # compute now: the scale is deferred into ``scalar_mult``, exactly
+        # like the both-implicit fold's ``factor`` above.
+        tensor, scalar = (rhs, lhs) if _lhs_scalar else (lhs, rhs)
+        from graphax.sparse.dtype_compute import _scaled_mul
+
+        factor = _scaled_mul(scalar._stored_val(), scalar.scalar_mult)
+        factor = jnp.asarray(factor, dtype=tensor.scalar_mult.dtype)
+        out = tensor.copy(scalar_mult=_scaled_mul(tensor.scalar_mult, factor))
+        if count:
+            return out, (0, out.size, 0)
+        return out
     # META RECONCILIATION (exact, engine-independent; GRAPHAX_RECONCILE_
     # BLOCKDIAG_METAS, default OFF). Two coupled block-diagonal factorings of
     # the SAME contracted logical axis with different meta counts -- a pure
