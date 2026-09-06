@@ -317,3 +317,79 @@ budget, the census wiring, the error paths, and the tests.
    target? See section 8.
 5. Per-class tolerances for oracle B: about 1e-6 for exact, Reduce and Diag, about 1e-2 for
    Quant. Agreed? See section 6.3.
+
+---
+
+## 11. Implementation, after the owner's rulings (2026-09-06)
+
+Rulings D5 to D10 were given as proposed, with two changes. There is no
+`on_illegal` flag: an illegal action always raises (D8). The Quant tolerance is
+measured, not chosen (D10).
+
+Landed:
+
+* `src/graphax/dense_edges.py`, new. The adapter (`wrap`, `unwrap`,
+  `apply_slot`), the census (`ActionCensus`, `census_plan`, `compare_censuses`),
+  and the engine (`dense_vertex_elimination`).
+* `src/graphax/core.py`: `dense_edges` and `dense_max_bytes` on `jacve` and on
+  `vertex_elimination_jaxpr`, the `ValueError` on the True/True combination, and
+  an early return into the new module. No existing line changed.
+* `src/graphax/__init__.py`: the five census names.
+* `tests/core/dense_edges_test.py`, new. 36 tests pass, 1 skips.
+
+### Measured tolerances (D10)
+
+40 literal Quant bf16 plans on the toy, every census matched
+(`.scratch-race/t69_quant_bound.py`):
+
+* Quant on ONE contraction operand: the contraction stays f32 and the two
+  engines agree to 1.1e-07 or better.
+* Quant on BOTH operands of every face: **1.507e-03**, the largest of the 40.
+  bf16 rounds different intermediates there. The approximation itself is
+  3.391e-03 from `jax.grad`, so the disagreement is 44 percent of the effect.
+* Quant on all three slots: 0.0. The `res` cast erases the difference.
+
+So `TOL_QUANT = 2e-3` on this toy. It must be re-measured per target.
+
+Exact, Reduce and Diag: the worst over the three orders is **1.0e-06**, on the
+forward order with Reduce on every face. So `TOL_EXACT = 1e-5`. The
+approximation is 0.57 relative, so the margin is five orders wide.
+
+### A second divergence, found during implementation
+
+The legality gap is NOT limited to a masked hook. `core._apply_face_transform`
+catches `ValueError` and leaves the operand exact. So a LITERAL `Diag` is
+dropped by the sparse engine on a face whose edge already carries a coupled
+pair, while the dense mode applies it. Measured on the Markowitz order: 5 of 6
+planned Diag faces on the sparse side against 6 on the dense side.
+
+This does not weaken the design; it widens the reason for the census. Oracle B
+must therefore probe each Diag site on BOTH engines and keep only the sites
+where the censuses agree. `tests/core/dense_edges_test.py::_both_engines_apply`
+is that probe, and
+`test_a_literal_action_the_sparse_engine_silently_skips_is_caught` pins the
+failure mode.
+
+### The census, as built
+
+`census_plan(face_transforms, census)` wraps every slot hook. Both engines then
+run the SAME wrapped plan and the recorded facts come from the same code.
+`applied` reads differently by hook kind, on purpose:
+
+* a TYPED action records applied whenever it was dispatched and did not raise.
+  Whether the buffer changed is not comparable: `apply_quant` is a no-op on a
+  `val is None` sparse edge and a real cast on its dense wrap.
+* a CALLABLE records applied only when it returned a different object. That is
+  the only comparable fact about a chooser, and it is the one the masked-hook
+  divergence turns on.
+
+Measured on the toy, masked hooks, every face:
+
+| rule | sparse applied | dense applied | verdict |
+| --- | --- | --- | --- |
+| Reduce mean axis 0, slot lhs | 4 | 11 | CensusMismatch |
+| Diag, slot res | 2 | 6 | CensusMismatch |
+| Quant bf16, slot lhs | 10 | 11 | CensusMismatch |
+
+Literal actions on the same faces: censuses match, values compared, Reduce
+1.2e-07 and Quant 5.1e-08 against the sparse engine.

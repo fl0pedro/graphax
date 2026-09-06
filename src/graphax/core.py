@@ -432,6 +432,8 @@ def jacve(
     has_aux: bool = False,
     count_ops: bool = False,
     sparse_representation: bool = False,
+    dense_edges: bool = False,
+    dense_max_bytes: int = None,
     transforms: Sequence[
         Tuple[
             int,
@@ -468,10 +470,30 @@ def jacve(
                                     just ``jacobian``. Defaults to False.
         sparse_representation (bool, optional): Return the Jacobian in a sparse
                                             representation. Defaults to `False`.
+        dense_edges (bool, optional): Run the DENSE-CONTRACTION mode of
+            :mod:`graphax.dense_edges` instead of the sparse engine: every edge
+            is a plain array of shape ``out_shape + primal_shape`` and every
+            contraction is a ``jnp.tensordot`` over the eliminated variable's
+            axes. This is the VALUE ORACLE for an approximated plan
+            (ticket dsnn-3qm.69) -- ``sparse_representation`` changes the return
+            form only, so it cannot serve as one. Independent of
+            ``sparse_representation``, whose ``True`` setting has nothing to
+            return here and therefore raises. Not a measurement path: a dense
+            edge is ``out_size * primal_size`` numbers. Defaults to `False`.
+        dense_max_bytes (int, optional): Ceiling on the total bytes of the live
+            dense edges under ``dense_edges=True``; ``None`` takes
+            :data:`graphax.dense_edges.DEFAULT_MAX_BYTES` (2 GiB). Over the
+            ceiling raises instead of letting the job be killed.
 
     Returns:
         Callable: The function that returns the Jacobian of `fun`.
     """
+    if dense_edges and sparse_representation:
+        raise ValueError(
+            "dense_edges=True with sparse_representation=True: the dense mode "
+            "has no SparseTensor to return, every edge is a plain array. "
+            "Silently ignoring the requested return form is how a measurement "
+            "lies, so this combination raises. Drop sparse_representation.")
 
     @wraps(fun)
     def jacfun(*args, **kwargs):
@@ -496,6 +518,8 @@ def jacve(
             argnums=argnums,
             count_ops=count_ops,
             sparse_representation=sparse_representation,
+            dense_edges=dense_edges,
+            dense_max_bytes=dense_max_bytes,
             fresh_eliminator=was_inlined,
             transforms=transforms,
             face_transforms=face_transforms,
@@ -3048,6 +3072,8 @@ def vertex_elimination_jaxpr(
     argnums: Sequence[int] = (0,),
     count_ops: bool = False,
     sparse_representation: bool = False,
+    dense_edges: bool = False,
+    dense_max_bytes: int = None,
     fresh_eliminator: bool = False,
     transforms: Sequence[
         Tuple[
@@ -3097,6 +3123,35 @@ def vertex_elimination_jaxpr(
                                         reassambled into the correct PyTree
                                         by `jacve`.
     """
+
+    # THE DENSE-CONTRACTION MODE (ticket dsnn-3qm.69). A whole separate engine
+    # in ``graphax.dense_edges``: every edge a plain array, every contraction a
+    # ``jnp.tensordot``. It is the VALUE ORACLE for an approximated plan, and an
+    # oracle that shared the contraction code with the engine would prove only
+    # the output packing (finding 61 verdict 4) -- so this is an early return,
+    # not a flag threaded through ``_eliminate_vertex``. Nothing below runs, and
+    # no line below changed, so ``dense_edges=False`` is bit-identical by
+    # construction.
+    if dense_edges:
+        if sparse_representation:
+            raise ValueError(
+                "dense_edges=True with sparse_representation=True: the dense "
+                "mode has no SparseTensor to return, every edge is a plain "
+                "array. Drop sparse_representation.")
+        from .dense_edges import dense_vertex_elimination
+
+        return dense_vertex_elimination(
+            jaxpr,
+            order,
+            consts,
+            *args,
+            has_aux=has_aux,
+            argnums=argnums,
+            count_ops=count_ops,
+            transforms=transforms,
+            face_transforms=face_transforms,
+            max_bytes=dense_max_bytes,
+        )
 
     jaxpr_invars = [invar for i, invar in enumerate(jaxpr.invars) if i in argnums]
     env, _, _, vo_vertices = _build_graph(jaxpr, args, consts)

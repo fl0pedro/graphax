@@ -11,6 +11,14 @@ from .core import (
     inline_call_primitives,
 )
 
+from .dense_edges import (
+    ActionCensus,
+    CensusMismatch,
+    DenseBudgetExceeded,
+    census_plan,
+    compare_censuses,
+)
+
 from .sparse import sparse_tensor_zeros_like
 from .utils import tree_allclose
 
