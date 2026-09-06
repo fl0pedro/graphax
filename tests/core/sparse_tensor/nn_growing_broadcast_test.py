@@ -85,11 +85,12 @@ def _as_shape_growth_census(env, order, *, tiled_legacy, lazy_rules="nodemote"):
 
 
 def test_neuralnetwork_exact_plan_full_rules_has_zero_growing_broadcasts():
-    """``GRAPHAX_TILED_LAZY=full`` (demote ON) reaches ZERO growing
-    ``_as_shape(mode="broadcast")`` calls on the NeuralNetwork(mnist) exact
-    plan — matching T28B-RESULT.md section 3's "15 calls / 50258 elements to
-    ZERO" claim exactly. That claim was measured under ``full``, not under
-    the landed default (see the next test)."""
+    """``GRAPHAX_TILED_LAZY=full`` (keeps the meta axis on the storing
+    operand instead of broadcasting it inside the contraction) reaches ZERO
+    growing ``_as_shape(mode="broadcast")`` calls on the NeuralNetwork(mnist)
+    exact plan — matching T28B-RESULT.md section 3's "15 calls / 50258
+    elements to ZERO" claim exactly. That claim was measured under ``full``,
+    not under the landed default (see the next test)."""
     env, order = _build()
     calls, elems = _as_shape_growth_census(env, order, tiled_legacy=False, lazy_rules="full")
     assert calls == 0, (
@@ -99,18 +100,20 @@ def test_neuralnetwork_exact_plan_full_rules_has_zero_growing_broadcasts():
 
 
 def test_neuralnetwork_exact_plan_default_rules_grow_fewer_than_the_incumbent():
-    """The LANDED DEFAULT (nodemote, demote OFF — the GPU-favoring choice of
-    T28B-RESULT.md section 4) does NOT reach zero on this target either: 10
-    calls / 49 353 elements remain (all from the one-sided meta axis the
-    demote rule would otherwise take out of the dot_general batch list), down
-    from 15 calls / 49 398 elements on the incumbent. Still a strict
-    improvement, never a regression; not zero."""
+    """The LANDED DEFAULT (``GRAPHAX_TILED_LAZY=nodemote`` — the
+    GPU-favoring choice of T28B-RESULT.md section 4) does NOT reach zero on
+    this target either: 10 calls / 49 353 elements remain (all from the
+    one-sided meta axis that broadcasting inside the contraction, instead of
+    keeping it on the storing operand, would otherwise take out of the
+    dot_general batch list), down from 15 calls / 49 398 elements on the
+    incumbent. Still a strict improvement, never a regression; not zero."""
     env, order = _build()
     lazy_calls, lazy_elems = _as_shape_growth_census(
         env, order, tiled_legacy=False, lazy_rules="nodemote")
     legacy_calls, legacy_elems = _as_shape_growth_census(env, order, tiled_legacy=True)
     assert lazy_calls < legacy_calls, (
-        f"NeuralNetwork exact, nodemote (default): {lazy_calls} growing "
+        f"NeuralNetwork exact, GRAPHAX_TILED_LAZY=nodemote (default): "
+        f"{lazy_calls} growing "
         f"_as_shape(mode='broadcast') call(s) ({lazy_elems} elements grown); "
         f"incumbent has {legacy_calls} ({legacy_elems} elements grown) — "
         "expected the default lazy frame to grow strictly fewer, even though not zero"

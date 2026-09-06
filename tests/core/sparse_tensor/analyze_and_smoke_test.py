@@ -1513,9 +1513,11 @@ class TestSmokeScreen(unittest.TestCase):
         # ``sparse_matmul(a, b)`` shows exactly ONE growing ``broadcast_in_dim``
         # (a scalar placeholder broadcast across a's fully-degenerate meta+dense
         # frame slots) under GRAPHAX_TILED_LEGACY=1 *and* under both
-        # GRAPHAX_TILED_LAZY settings — lane B's demote/nodemote rules target a
-        # meta axis stored by exactly ONE side; they do not touch this
-        # zero-sided (fully-None) case. The final ``val`` is bit-identical to
+        # GRAPHAX_TILED_LAZY settings — lane B's rule that keeps a meta axis
+        # on the storing operand instead of broadcasting it (GRAPHAX_TILED_LAZY
+        # =full vs =nodemote) targets a meta axis stored by exactly ONE side;
+        # it does not touch this zero-sided (fully-None) case. The final
+        # ``val`` is bit-identical to
         # ``b.val`` in every mode (the storage check above passes), so this
         # broadcast produces a value nothing downstream keeps — a trace-level
         # artifact the compiled HLO may still fold away, not a proven
