@@ -2745,19 +2745,34 @@ def matmul(lhs, rhs, count: bool = False):
         # triggers. Materializing a full-shape broadcast copy of the scalar
         # just to go through ``elementwise`` would defeat the point (a real
         # buffer for what is analytically a pure scale). Instead fold the
-        # scalar operand's own effective value -- its on-structure value
-        # (``_stored_val()``, ``1`` when ``val is None``) times its own
-        # ``scalar_mult`` -- into the TENSOR operand's ``scalar_mult`` via
-        # ``_scaled_mul``, the same "apply this operand's scale" primitive
-        # ``ops/utils._apply_scalar_mult`` uses everywhere else. This keeps
-        # the tensor operand's own ``val`` / ``fill_value`` / dims untouched
-        # (an elementwise SCALE, not a contraction) and does no per-element
-        # compute now: the scale is deferred into ``scalar_mult``, exactly
-        # like the both-implicit fold's ``factor`` above.
+        # scalar operand's own effective value -- its 0-d ``val`` (``1`` when
+        # ``val is None``) times its own ``scalar_mult`` -- into the TENSOR
+        # operand's ``scalar_mult`` via ``_scaled_mul``, the same "apply this
+        # operand's scale" primitive ``ops/utils._apply_scalar_mult`` uses
+        # everywhere else. This keeps the tensor operand's own ``val`` /
+        # ``fill_value`` / dims untouched (an elementwise SCALE, not a
+        # contraction) and does no per-element compute now: the scale is
+        # deferred into ``scalar_mult``, exactly like the both-implicit
+        # fold's ``factor`` above.
+        #
+        # NOT ``scalar._stored_val()``: that returns a FLAT array sized
+        # ``_structural_val_size`` (``jnp.ones(N)``, shape ``(N,)`` even for
+        # ``N == 1``) for reduction callers that don't care about rank -- it
+        # silently added a size-1 axis to ``scalar_mult`` on every fold, and a
+        # SECOND single-scalar contraction later in the same elimination
+        # chain compounded it to ``(1, 1)``, breaking an unrelated downstream
+        # broadcast (finding: Perceptron / multihead-attention / concat-same-
+        # primal all regressed this way on first cluster run). A rank-0
+        # tensor's own ``val``, when present, is genuinely 0-d.
         tensor, scalar = (rhs, lhs) if _lhs_scalar else (lhs, rhs)
         from graphax.sparse.dtype_compute import _scaled_mul
 
-        factor = _scaled_mul(scalar._stored_val(), scalar.scalar_mult)
+        sval = (
+            scalar.val
+            if scalar.val is not None
+            else jnp.ones((), dtype=scalar.scalar_mult.dtype)
+        )
+        factor = _scaled_mul(sval, scalar.scalar_mult)
         factor = jnp.asarray(factor, dtype=tensor.scalar_mult.dtype)
         out = tensor.copy(scalar_mult=_scaled_mul(tensor.scalar_mult, factor))
         if count:
