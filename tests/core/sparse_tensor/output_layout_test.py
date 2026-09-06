@@ -10,9 +10,10 @@ approximated gradient had different pytree structure (finding 60). Now:
 
   * every returned SparseTensor is in parameter layout (axis == position),
   * the two engines return the SAME pytree structure for the same plan,
-  * the exact gradient equals ``jax.grad`` (the dense oracle, owner Q12),
+  * the exact gradient equals ``jax.grad`` (the one oracle),
   * an approximated gradient equals its own ``sparse_representation=False``
-    run (the dense oracle for approximations).
+    run. That flag changes the RETURN form only (core.py:453, :3199), so
+    this is an output-packing check, not an oracle (grill 2026-09-06).
 """
 from __future__ import annotations
 
@@ -184,7 +185,7 @@ def test_exact_gradient_equals_jax_grad(order_name, engine):
 @pytest.mark.parametrize("order_name", sorted(ORDERS))
 @pytest.mark.parametrize("engine", sorted(ENGINES))
 @pytest.mark.parametrize("plan", ["quant_lhs", "compress_lhs"])
-def test_approximated_sparse_equals_its_dense_oracle(order_name, engine, plan):
+def test_approximated_sparse_equals_its_dense_return_form(order_name, engine, plan):
     order = ORDERS[order_name]
     ft = _plans(order)[plan]
     sp = _dense(_run(order, ft, engine, True))
