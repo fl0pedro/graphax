@@ -226,10 +226,13 @@ class TransformerTest(unittest.TestCase):
 
         self.assertTrue(tree_allclose(veres, revres))
 
-    # pre-existing (predates the lattice campaign): exact-AD merge
-    # shape assert fires on the 2-block multihead case -- the one
-    # UNEXPLAINED member of the contraction size-mismatch family.
-    @unittest.expectedFailure
+    # Used to xfail (predates the lattice campaign): the chain ends in
+    # ``x[:, 0].sum()`` -- a scalar output, so the final adjoint contraction
+    # is ``X @ scalar``, which the tiled engine's ``_build_pair_dims``
+    # collapsed to a size-1 slice of X instead of the scaled tensor (the
+    # "contraction size-mismatch family", dsnn-3qm.68, finding 61 verdict 6).
+    # Fixed in ``_build_pair_dims`` and, independently, by ``matmul`` routing
+    # any single-0-rank-operand contraction to an elementwise scale.
     def test_multihead_attention_2_blocks(self):
         batch_size = 3
         num_heads = 4
