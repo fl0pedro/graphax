@@ -502,6 +502,13 @@ def _should_emit_divisor_remainder(lhs, rhs, op, is_intersection):
     structural-identity detection (drop a provably-zero side) is a future
     refinement.
     """
+    # DELETED CLASS (ruling 2026-09-07): `SparseTensor` has exactly two index
+    # classes, DenseIndex and DiagonalIndex, each axis explicit or implicit.
+    # Measured over 88 runs on 17 targets, both engines, both orders, exact and
+    # approximated, no target ever constructed one of these (finding 67). The
+    # probe is kept as a stub returning None so the caller's fall-through is
+    # the single path; the body goes with the class in step C.
+    return None
     if op not in _ZERO_PRESERVING_OPS:
         return None
     # SetIndex carries no per-side fill (hashable aux_data), so densify uses
