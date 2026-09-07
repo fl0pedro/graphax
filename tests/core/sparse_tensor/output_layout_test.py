@@ -17,6 +17,7 @@ approximated gradient had different pytree structure (finding 60). Now:
 """
 from __future__ import annotations
 
+import math
 import os
 
 import jax
@@ -217,3 +218,115 @@ def test_a_diagonal_pair_output_passes_the_contract():
         assert isinstance(t, SparseTensor)
         assert is_parameter_layout(t), (engine, t.dims, t.val.shape)
         np.testing.assert_allclose(np.asarray(t.dense()), np.asarray(jax.jacfwd(f)(x)), rtol=1e-6)
+
+
+# --- Growing-broadcast census (ticket dsnn-3qm.28.1, deliverable b) --------
+# Turns lane B's ad hoc probe (.scratch/trustworthy-approx-search/probes/
+# t28b/broadcast_census.py) into an asserted test. That probe wraps
+# ``matmul._as_shape`` and counts every ``mode="broadcast"`` call whose
+# target has more elements than its input — the exact site
+# ``_prepare_contraction_views`` uses to materialize an implicit axis (F2,
+# grill2). A whole-program ``jax.make_jaxpr`` walk (as ``analyze_and_smoke_
+# test.py``'s helper does for one isolated matmul call) is too blunt here:
+# ``loss_fn`` itself broadcasts (the bias-add ``x @ w1 + b1``), and that
+# broadcast has nothing to do with the tiled contraction frame. Wrapping
+# ``_as_shape`` counts only what the frame itself asks XLA to materialize.
+import importlib as _importlib
+
+_mm = _importlib.import_module("graphax.sparse.ops.matmul")
+_mm_legacy = _importlib.import_module("graphax.sparse.ops.matmul_legacy_tiled")
+
+
+def _as_shape_growth_census(order, ft, *, tiled_legacy, lazy_rules="nodemote"):
+    saved = {k: os.environ.get(k) for k in
+             ("GRAPHAX_TILED_LEGACY", "GRAPHAX_TILED_LAZY",
+              "GRAPHAX_EINSUM_GENERAL", "GRAPHAX_PLANNER_EXACT")}
+    os.environ["GRAPHAX_TILED_LEGACY"] = "1" if tiled_legacy else "0"
+    os.environ["GRAPHAX_TILED_LAZY"] = lazy_rules
+    os.environ["GRAPHAX_EINSUM_GENERAL"] = "0"
+    os.environ["GRAPHAX_PLANNER_EXACT"] = "0"
+    orig_as_shape = _mm._as_shape
+    grew = {"calls": 0, "elems": 0}
+
+    def _wrapped(view, target_shape, *, mode):
+        out = orig_as_shape(view, target_shape, mode=mode)
+        if mode == "broadcast":
+            in_n = math.prod(view.shape) if view.shape else 1
+            target = tuple(target_shape)
+            out_n = math.prod(target) if target else 1
+            if out_n > in_n:
+                grew["calls"] += 1
+                grew["elems"] += out_n - in_n
+        return out
+
+    # ``matmul_legacy_tiled.py`` does ``from .matmul import (..., _as_shape,
+    # ...)`` — a name binding taken at import time. Patching
+    # ``matmul._as_shape`` alone does not touch that already-bound name in
+    # the legacy module, so the incumbent path (GRAPHAX_TILED_LEGACY=1)
+    # would silently read 0 calls. Patch both module-level names to the same
+    # wrapper so either engine's calls are counted.
+    _mm._as_shape = _wrapped
+    _mm_legacy._as_shape = _wrapped
+    try:
+        fn = jacve(loss_fn, list(order), argnums=ARGNUMS,
+                   sparse_representation=True,
+                   transforms=[], face_transforms=ft)
+        jax.eval_shape(fn, *ARGS)
+    finally:
+        _mm._as_shape = orig_as_shape
+        _mm_legacy._as_shape = orig_as_shape
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return grew["calls"], grew["elems"]
+
+
+@pytest.mark.parametrize("order_name", sorted(ORDERS))
+@pytest.mark.parametrize("plan", ["exact", "quant_lhs", "compress_lhs"])
+def test_lazy_tiled_frame_full_rules_has_zero_growing_broadcasts(order_name, plan):
+    """``GRAPHAX_TILED_LAZY=full`` (ticket dsnn-3qm.67; keeps the meta axis on
+    the storing operand instead of broadcasting it inside the contraction)
+    reaches ZERO growing ``_as_shape(mode="broadcast")`` calls on this MLP
+    toy, on both orders and every plan (exact, Quant, Reduce) — the same
+    claim T28B-RESULT.md section 3 made for NeuralNetwork/TransformerLM. This
+    is the leaner-CPU setting; the LANDED DEFAULT is
+    ``GRAPHAX_TILED_LAZY=nodemote`` (broadcasts the meta axis inside the
+    contraction instead, chosen for GPU fusion — see the next test), which
+    does not reach zero here. Both are "the lazy frame"; only one env value
+    differs."""
+    order = ORDERS[order_name]
+    ft = _plans(order)[plan]
+    calls, elems = _as_shape_growth_census(order, ft, tiled_legacy=False, lazy_rules="full")
+    assert calls == 0, (
+        f"{order_name}/{plan}: GRAPHAX_TILED_LAZY=full has {calls} growing "
+        f"_as_shape(mode='broadcast') call(s) ({elems} elements grown), expected zero"
+    )
+
+
+@pytest.mark.parametrize("order_name", sorted(ORDERS))
+@pytest.mark.parametrize("plan", ["exact", "quant_lhs", "compress_lhs"])
+def test_lazy_tiled_frame_default_rules_grow_fewer_than_the_incumbent(order_name, plan):
+    """The LANDED DEFAULT (``GRAPHAX_TILED_LAZY=nodemote`` — the
+    device-dependent tradeoff of T28B-RESULT.md section 4: broadcasting the
+    meta axis inside the contraction instead of keeping it on the storing
+    operand keeps the GPU fusion, at the cost of the CPU broadcast this test
+    measures) does NOT reach zero growing broadcasts on this toy, unlike
+    ``GRAPHAX_TILED_LAZY=full`` (previous test). It IS a strict improvement
+    over the incumbent on every (order, plan) cell. Do not read "zero" into
+    this test name — the zero claim belongs to ``full``, not to the landed
+    default. See findings/62-implicit-axis-small-case.md for the full count
+    table."""
+    order = ORDERS[order_name]
+    ft = _plans(order)[plan]
+    lazy_calls, lazy_elems = _as_shape_growth_census(
+        order, ft, tiled_legacy=False, lazy_rules="nodemote")
+    legacy_calls, legacy_elems = _as_shape_growth_census(order, ft, tiled_legacy=True)
+    assert lazy_calls < legacy_calls, (
+        f"{order_name}/{plan}: GRAPHAX_TILED_LAZY=nodemote (default) has "
+        f"{lazy_calls} growing "
+        f"_as_shape(mode='broadcast') call(s) ({lazy_elems} elements grown); "
+        f"incumbent has {legacy_calls} ({legacy_elems} elements grown) — "
+        "expected the default lazy frame to grow strictly fewer, even though not zero"
+    )

@@ -61,6 +61,44 @@ def _expect_path(core_fn, *args, expected_path: str) -> None:
         )
 
 
+def _count_growing_broadcasts(jaxpr):
+    """Count ``broadcast_in_dim`` equations, anywhere in ``jaxpr`` (walking
+    nested jaxprs of call/cond/scan-like params too), whose output has
+    strictly more elements than its operand — a "growing broadcast": the
+    trace-level signature of materializing an implicit axis. Returns
+    ``(count, total_grown_elements)``.
+
+    A jaxpr the caller passes may be a ``ClosedJaxpr`` (what
+    ``jax.make_jaxpr`` returns) or a bare ``Jaxpr``; both are accepted.
+    """
+
+    def _nelem(aval):
+        return math.prod(aval.shape) if aval.shape else 1
+
+    count = 0
+    grown = 0
+
+    def _walk(jx):
+        nonlocal count, grown
+        for eqn in jx.eqns:
+            if eqn.primitive.name == "broadcast_in_dim":
+                in_n = _nelem(eqn.invars[0].aval)
+                out_n = _nelem(eqn.outvars[0].aval)
+                if out_n > in_n:
+                    count += 1
+                    grown += out_n - in_n
+            for param in eqn.params.values():
+                if hasattr(param, "jaxpr"):
+                    _walk(param.jaxpr)
+                elif isinstance(param, (list, tuple)):
+                    for sub in param:
+                        if hasattr(sub, "jaxpr"):
+                            _walk(sub.jaxpr)
+
+    _walk(jaxpr.jaxpr if hasattr(jaxpr, "jaxpr") else jaxpr)
+    return count, grown
+
+
 def core_plus(a, b):
     return elementwise(a, b, jax.lax.add)
 
@@ -757,7 +795,7 @@ class TestSmokeScreen(unittest.TestCase):
             return jr.normal(key, shape) > 0.0
         return jr.normal(key, shape).astype(dtype)
 
-    def _assert_equivalence(self, res, res_dense, res_manual):
+    def _assert_equivalence(self, res, res_dense, res_manual, *, check_storage=False):
         # Phase 2 dropped sort_val, so ``res.val.shape`` and ``manual.val.shape``
         # may carry equivalent data in different physical layouts (each dim's
         # ``axis`` / ``block_axis`` still points to its own physical slot). The
@@ -774,6 +812,80 @@ class TestSmokeScreen(unittest.TestCase):
         self.assertTrue(jnp.allclose(res.dense(), res_manual.dense(), **tol))
         if res.val is None or res_manual.val is None:
             self.assertTrue(res.val is None and res_manual.val is None)
+
+        # --- Opt-in storage-shape assertion (ticket dsnn-3qm.28.1) ---------
+        # ``check_storage`` is per-case, not a global switch: the owner reviews
+        # each manual_N reference's proposed physical shape (posted as a bd
+        # comment on dsnn-3qm.28.1, and see findings/62) before its case turns
+        # this on. Two invariants, both about ``.val``, never about ``.dense()``
+        # (the dense-value invariant above already covers correctness):
+        #
+        #  1. Same STORED element count, order-free. The physical axis order is
+        #     an engine choice (the "Phase 2 dropped sort_val" comment above),
+        #     not part of the contract — so compare the *sorted* val.shape, the
+        #     same order-free convention ``matmul_replication_test.py`` already
+        #     uses for its ``physical_shape`` argument.
+        #  2. Same axis-None pattern, POSITIONALLY by declared dim (``res.dims``
+        #     and ``res_manual.dims`` are each ``out_dims + primal_dims`` in the
+        #     test's own declared index-id order — see ``SparseTensor.dims`` —
+        #     so dim ``i`` of ``res`` and dim ``i`` of ``res_manual`` name the
+        #     same logical index even when their physical ``axis`` differs).
+        #     A dim the manual reference keeps implicit (``axis=None``) must
+        #     stay implicit in ``res`` too: if ``res`` has a concrete axis
+        #     there instead, the engine materialized an axis the reference
+        #     proves need not be stored.
+        if check_storage:
+            if res.val is None or res_manual.val is None:
+                self.assertTrue(
+                    res.val is None and res_manual.val is None,
+                    "storage check: one side is fully implicit (val is None) "
+                    "and the other is not",
+                )
+            else:
+                self.assertEqual(
+                    sorted(res.val.shape),
+                    sorted(res_manual.val.shape),
+                    "storage check: stored element counts differ (val.shape "
+                    f"{res.val.shape} vs manual {res_manual.val.shape})",
+                )
+            self.assertEqual(
+                len(res.dims),
+                len(res_manual.dims),
+                "storage check: dim count differs between res and manual",
+            )
+            res_none = [d.axis is None for d in res.dims]
+            manual_none = [d.axis is None for d in res_manual.dims]
+            self.assertEqual(
+                res_none,
+                manual_none,
+                "storage check: axis-None pattern differs per declared dim "
+                f"(res {res_none} vs manual {manual_none}) — the engine "
+                "materialized a dim the manual reference proves can stay "
+                "implicit, or vice versa",
+            )
+
+    def _assert_zero_growing_broadcasts(self, fn, *args, label=""):
+        """Trace-level census (ticket dsnn-3qm.28.1): trace ``fn(*args)`` with
+        ``jax.make_jaxpr`` and count ``broadcast_in_dim`` equations whose
+        output has strictly more elements than their operand — a "growing
+        broadcast". This is the same shape the ``t28b/broadcast_census.py``
+        and ``grow_where.py`` probes counted ad hoc against the tiled engine's
+        ``_as_shape(mode="broadcast")``. It is a TRACE-level count, taken
+        before XLA's fusion pass — a growing broadcast that feeds a reduce can
+        still be free in the compiled HLO (finding grill2/F2 section 1), so
+        this assertion is a proxy for "the frame never asks for the broadcast
+        in the first place", not a claim about the compiled cost. The proof of
+        compiled cost is the static-temp/HLO-broadcast table of dsnn-3qm.28.1
+        deliverable (c), never this count alone.
+        """
+        jaxpr = jax.make_jaxpr(fn)(*args)
+        count, grown_elems = _count_growing_broadcasts(jaxpr)
+        self.assertEqual(
+            count,
+            0,
+            f"{label}: {count} growing broadcast_in_dim op(s) in the jaxpr, "
+            f"{grown_elems} elements grown total (expected zero)",
+        )
 
     def _analyze(self, func, *args, **kwargs):
         name = func.__name__
@@ -1151,7 +1263,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1, s2, s2))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_07(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_07(a, b), check_storage=True)
 
     def test_08_matmul_sparse_sparse_3d(self):
         s1 = 2
@@ -1184,7 +1296,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1, s2, s2, s3))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_08(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_08(a, b), check_storage=True)
 
     def test_09_matmul_sparse_sparse_coverage(self):
         s1 = 4
@@ -1221,7 +1333,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1, s1, s4, s5))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_09(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_09(a, b), check_storage=True)
 
     def test_10_matmul_sparse_sparse_aligned(self):
         s1 = 6
@@ -1256,7 +1368,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1, s2, s3, s4))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_10(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_10(a, b), check_storage=True)
 
     def test_11_matmul_misaligned_blocks(self):
         s1 = 4
@@ -1289,7 +1401,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1 * s2, s1 * s2))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_11(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_11(a, b), check_storage=True)
 
     def test_12_matmul_batch_simple(self):
         s1 = 6
@@ -1322,7 +1434,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1, s2, s3, s1))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_12(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_12(a, b), check_storage=True)
 
     def test_13_matmul_batch_complex(self):
         s1 = 2
@@ -1366,7 +1478,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1, s2, s3, s3))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_13(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_13(a, b), check_storage=True)
 
     def test_14_matmul_unmaterialized(self):
         s1 = 5
@@ -1394,7 +1506,23 @@ class TestSmokeScreen(unittest.TestCase):
         self._deep_analysis(matmul, core_matmul, manual_14, a, b, expected_path="tiled")
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1, s2, s1, s3))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_14(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_14(a, b), check_storage=True)
+        # Trace-level census (ticket dsnn-3qm.28.1, deliverable a): NOT asserted
+        # at zero here, unlike the lazy-frame targets of output_layout_test.py.
+        # ``a`` is fully implicit (``val=None`` on every dim), and tracing
+        # ``sparse_matmul(a, b)`` shows exactly ONE growing ``broadcast_in_dim``
+        # (a scalar placeholder broadcast across a's fully-degenerate meta+dense
+        # frame slots) under GRAPHAX_TILED_LEGACY=1 *and* under both
+        # GRAPHAX_TILED_LAZY settings — lane B's rule that keeps a meta axis
+        # on the storing operand instead of broadcasting it (GRAPHAX_TILED_LAZY
+        # =full vs =nodemote) targets a meta axis stored by exactly ONE side;
+        # it does not touch this zero-sided (fully-None) case. The final
+        # ``val`` is bit-identical to
+        # ``b.val`` in every mode (the storage check above passes), so this
+        # broadcast produces a value nothing downstream keeps — a trace-level
+        # artifact the compiled HLO may still fold away, not a proven
+        # materialization cost. Left unresolved for ticket .28.2 (see
+        # findings/62-implicit-axis-small-case.md).
 
     def test_15_matmul(self):
         s1 = 6
@@ -1425,7 +1553,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1, s1))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_15(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_15(a, b), check_storage=True)
 
     def test_16_matmul_high_rank(self):
         s1 = 2
@@ -1469,7 +1597,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1, s2, s3, s3))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_16(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_16(a, b), check_storage=True)
 
     def test_17_matmul_aligned_blocks(self):
         s1 = 6
@@ -1504,7 +1632,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1 * s2, s1 * s4))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_17(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_17(a, b), check_storage=True)
 
     def test_18_matmul_sparse_primal_pairs(self):
         s1 = 4
@@ -1537,7 +1665,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1, s2, s2, s3))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_18(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_18(a, b), check_storage=True)
 
     def test_19_matmul_multi_batch(self):
         s1 = 2
@@ -1586,7 +1714,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1, s2, s3, s4, s3, s6))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_19(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_19(a, b), check_storage=True)
 
     def _get_chained_dims(self):
         s1 = 4
@@ -1756,7 +1884,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1 * s2, s4))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_21(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_21(a, b), check_storage=True)
 
     def test_22_pure_diagonal_x_dense(self):
         """Pure diagonal × dense matrix.
@@ -1797,7 +1925,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1, s2))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_22(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_22(a, b), check_storage=True)
 
     def test_23_deep_batched_matmul(self):
         """Deep-batched 2-D matmul (3 sib-pair batches + 1 dense contract).
@@ -1865,7 +1993,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1, s2, s3, s1, s2, s3, s5))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_23(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_23(a, b), check_storage=True)
 
     def test_24_block_diagonal_x_dense(self):
         """Block-diagonal × dense-matrix.
@@ -1907,7 +2035,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1 * s2, s3))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_24(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_24(a, b), check_storage=True)
 
     # --- Correctness gap tests (added as part of optimality assertions) ---
 
@@ -1960,7 +2088,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, a)
         self.assertEqual(res.shape, (s1 * s2, s1 * s2))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, a), manual_26(a, a))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, a), manual_26(a, a), check_storage=True)
 
     def test_27_chained_compressed_union_then_matmul(self):
         """``(a + b) @ c`` where ``a + b`` produces a ``compressed_val=
@@ -2037,7 +2165,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
         res = core_matmul(a, b)
         self.assertEqual(res.shape, (s1 * s2, s3))
-        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_28(a, b))
+        self._assert_equivalence(res, wrap_dense(matmul)(a, b), manual_28(a, b), check_storage=True)
 
     # --- Phase 1a additions: refinement spectrum + band scenarios ---
     # These exercise the cases the unified-kernel work in Phase 5/6 needs to
