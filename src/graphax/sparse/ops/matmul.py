@@ -820,6 +820,68 @@ def _dot_general_axes(N, pairs, demote=None):
     return ((contract_l, contract_r), (batch_l, batch_r))
 
 
+def _mul_reduce_enabled() -> bool:
+    """RACE-ONLY knob ``GRAPHAX_TILED_MULREDUCE`` (default OFF, ticket
+    dsnn-3qm.28.4).
+
+    The third emission for a single implicit sparse axis. Emission (1) keeps
+    the axis in the dot's batch list and broadcasts the side that does not
+    store it. Emission (2) keeps the axis on the storing operand and emits a
+    clean 2-D dot. Emission (3), this knob, never emits a dot at all: the frame
+    contraction becomes ``sum(lhs * rhs, axis=contracted)`` over the broadcast
+    shapes. That is the form XLA on GPU already rewrites emission (1) into
+    (grill2/F2-hlo-fusion.md section 1), and on CPU it compiles to one fused
+    loop with nothing materialized (section 3, form f). It gives up the vendor
+    GEMM. This knob exists so the price of that can be measured; it changes no
+    default and is deleted with the losing engine."""
+    return _os.environ.get("GRAPHAX_TILED_MULREDUCE", "0") != "0"
+
+
+def _gx_mul_reduce(a, b, dims):
+    """``dot_general(a, b, dims)`` written as a multiply and a reduce.
+
+    Same output axis order as ``lax.dot_general``: batch axes in the order of
+    the batch list, then the lhs free axes, then the rhs free axes. Both
+    operands are transposed to ``(batch, own free, contracted)``, given size-1
+    axes where the other operand's free axes go, multiplied, and summed over
+    the contracted axes. No buffer is written by this function: whether the
+    product is materialized is XLA's decision, which is the thing under
+    measurement."""
+    (cl, cr), (bl, br) = dims
+    cl, cr, bl, br = list(cl), list(cr), list(bl), list(br)
+    a_free = [i for i in range(a.ndim) if i not in cl and i not in bl]
+    b_free = [i for i in range(b.ndim) if i not in cr and i not in br]
+    at = jnp.transpose(a, bl + a_free + cl)
+    bt = jnp.transpose(b, br + b_free + cr)
+    nb, na_f, nb_f, nc = len(bl), len(a_free), len(b_free), len(cl)
+    at = jnp.reshape(
+        at, at.shape[: nb + na_f] + (1,) * nb_f + at.shape[nb + na_f :]
+    )
+    bt = jnp.reshape(bt, bt.shape[:nb] + (1,) * na_f + bt.shape[nb:])
+    # Match _gx_dot_general's accumulation dtype: a bf16 x bf16 contraction
+    # accumulates in float32 there (preferred_element_type), so it does here.
+    if (
+        _quant_narrow_gemm_enabled()
+        and _quant_pet_enabled()
+        and jnp.dtype(at.dtype) == jnp.dtype(jnp.bfloat16)
+        and jnp.dtype(bt.dtype) == jnp.dtype(jnp.bfloat16)
+    ):
+        at = at.astype(jnp.float32)
+        bt = bt.astype(jnp.float32)
+    prod = at * bt
+    if not nc:
+        return prod
+    axes = tuple(range(nb + na_f + nb_f, nb + na_f + nb_f + nc))
+    return jnp.sum(prod, axis=axes)
+
+
+def _frame_contract(a, b, dims):
+    """The one emission site of the tiled frame contraction."""
+    if _mul_reduce_enabled():
+        return _gx_mul_reduce(a, b, dims)
+    return _gx_dot_general(a, b, dims)
+
+
 def _final_grid(N, shared, lhs_bc, rhs_bc, lhs_block_lens, rhs_block_lens):
     grid = []
     for i in range(N):
@@ -1150,7 +1212,7 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
         is_lazy = True
     lhs_leftover = list(lhs_view.shape[3 * N :])
     rhs_leftover = list(rhs_view.shape[3 * N :])
-    res_raw = _gx_dot_general(
+    res_raw = _frame_contract(
         lhs_view, rhs_view, _dot_general_axes(N, pairs, demote)
     )
     dg_perm, drop = _lazy_raw_perm(
