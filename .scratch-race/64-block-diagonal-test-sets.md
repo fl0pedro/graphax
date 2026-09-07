@@ -424,3 +424,22 @@ zero because the census detects it only through a growing split-slot broadcast,
 which the landed default already removes; the isolated experiment covers it
 directly. Both numbers are lower bounds, and both cases are now covered by
 `implicit_axis_storage_test.py`.
+
+### The green run
+
+Job 63866, graphax 5637c7d. Whole graphax pytest: 1354 passed, 71 skipped,
+2 xfailed, 441 subtests passed, in 1755 seconds, exit 0.
+
+Against the baseline that is plus 11 passed, which is exactly the new module
+`implicit_axis_storage_test.py`. Skips and xfails are unchanged. Nothing went
+red. All eleven modules of the three sets pass one process each.
+
+The isolated experiment reproduces byte for byte between the two cluster runs.
+Against the local run it agrees in every cell but one static-temp figure, the
+planner on the LCM grid, 3008 bytes locally against 3376 on the node. That is
+XLA temp accounting, not structure.
+
+### A note for any lane that writes a finding into graphax
+
+`graphax/.gitignore` line 69 is `*.md`. A finding placed under
+`.scratch-race/` is silently ignored by `git add -A`. It needs `git add -f`.
