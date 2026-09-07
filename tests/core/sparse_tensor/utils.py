@@ -385,12 +385,57 @@ def matmul_reference(
     return _arr2st(res_dense, out_ndim=out_ndim)
 
 
+def stored_elements(st: SparseTensor) -> int:
+    """Physical element count of a SparseTensor. ``val is None`` stores nothing."""
+    return 0 if st.val is None else int(st.val.size)
+
+
+def support_size(dense_ref: jnp.ndarray, tol: float = 1e-12) -> int:
+    """Number of structurally non-zero entries of a dense reference.
+
+    With random operands a numerically zero product entry is a measure-zero
+    event, so this counts the STRUCTURAL support. It is the engine-independent
+    ceiling on honest storage: an emission may store fewer elements than the
+    support (a replicated axis kept implicit stores one copy of many equal
+    entries), but storing MORE means it materialised structure it did not need.
+    This is what ``physical_shape`` was supposed to catch and never did, because
+    every caller passed the result's own shape back in.
+    """
+    import numpy as _np
+
+    return int((_np.abs(_np.asarray(dense_ref)) > tol).sum())
+
+
+def assert_axis_pattern(st: SparseTensor, pattern: str, msg: str = ""):
+    """Pin which output dims stayed implicit, dim by dim.
+
+    One character per dim, in ``st.dims`` order:
+      ``D`` stored, physical axis        ``I`` implicit (``axis is None``)
+      ``S`` stored sparse (pair)         ``s`` implicit sparse (pair, no axis)
+    Physical axis ORDER is an engine choice and is not pinned; whether an axis
+    exists at all is the contract.
+    """
+    got = "".join(
+        ("S" if d.axis is not None else "s") if d.is_sparse
+        else ("D" if d.axis is not None else "I")
+        for d in st.dims
+    )
+    if got != pattern:
+        raise AssertionError(
+            f"{msg}Axis pattern {got} != expected {pattern}. "
+            f"An axis that should have stayed implicit was materialised "
+            f"(or the other way round)."
+        )
+
+
 def assert_matmul_result(
     st_result: SparseTensor,
     dense_ref: jnp.ndarray,
     out_logical_shape: tuple[int, ...],
     primal_logical_shape: tuple[int, ...],
     physical_shape: tuple[int, ...] | None = None,
+    max_stored: int | None = None,
+    axis_pattern: str | None = None,
 ):
     # ``physical_shape`` pins ``val.shape`` to catch unintended densification —
     # not a semantic invariant. The SparseTensor algebra allows any axis order
@@ -432,6 +477,18 @@ def assert_matmul_result(
                     f"The matmul operation may be losing sparsity."
                 )
 
+    if max_stored is not None:
+        got = stored_elements(st_result)
+        if got > max_stored:
+            raise AssertionError(
+                f"Densification: the result stores {got} elements, more than "
+                f"the {max_stored} the dense reference has structural support "
+                f"for. The contraction materialised structure it did not need."
+            )
+
+    if axis_pattern is not None:
+        assert_axis_pattern(st_result, axis_pattern)
+
 
 def get_keys(seed=42, n=10):
     return jrand.split(jrand.PRNGKey(seed), n)
@@ -446,6 +503,12 @@ def idfn(val):
 def run_matmul_blocks_test(test_case, tensor_a, tensor_b):
     reference_result = matmul_reference(tensor_a, tensor_b)
     reference_dense = reference_result.dense()
+    # The storage expectation. ``matmul_reference`` densifies both operands, so
+    # its own ``val.shape`` is the DENSE shape and carries no expectation; the
+    # old driver passed the RESULT's shape back in, which compared the result to
+    # itself and could never fail (ticket dsnn-3qm.28.5). The structural support
+    # of the dense reference is the engine-independent ceiling instead.
+    max_stored = support_size(reference_dense)
 
     with test_case.subTest(op="sparse @ sparse"):
         result = tensor_a @ tensor_b
@@ -454,7 +517,7 @@ def run_matmul_blocks_test(test_case, tensor_a, tensor_b):
             reference_dense,
             reference_result.out_shape,
             reference_result.primal_shape,
-            result.val.shape if result.val is not None else None,
+            max_stored=max_stored,
         )
 
     with test_case.subTest(op="sparse @ dense"):
@@ -464,7 +527,7 @@ def run_matmul_blocks_test(test_case, tensor_a, tensor_b):
             reference_dense,
             reference_result.out_shape,
             reference_result.primal_shape,
-            result_s_d.val.shape if result_s_d.val is not None else None,
+            max_stored=max_stored,
         )
 
     with test_case.subTest(op="dense @ sparse"):
@@ -474,7 +537,7 @@ def run_matmul_blocks_test(test_case, tensor_a, tensor_b):
             reference_dense,
             reference_result.out_shape,
             reference_result.primal_shape,
-            result_d_s.val.shape if result_d_s.val is not None else None,
+            max_stored=max_stored,
         )
 
 

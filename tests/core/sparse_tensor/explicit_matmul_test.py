@@ -30,9 +30,31 @@ def _engine_reduce(view, flat_idx, num_segments):
                                num_segments=num_segments)
 
 
-from graphax.sparse.indexes import DiagonalIndex, DenseIndex
+from graphax.sparse.indexes import BandedIndex, DiagonalIndex, DenseIndex
 from graphax.sparse.tensor import SparseTensor, _arr2st
 import math
+
+
+def assert_band_storage(R_ref, dense_ref, stored, hand_stored):  # noqa: D401
+    """Storage contract of a misaligned-contract matmul (ticket dsnn-3qm.28.5).
+
+    ``stored`` is the element count the engine's band form asks for. It equals
+    the number of structurally non-zero entries of the dense product, so it is
+    provably the smallest honest buffer. ``hand_stored`` is what the R_st
+    reference built below asks for; the reference stays as the VALUE oracle and
+    its larger buffer is recorded here rather than asserted."""
+    got = 0 if R_ref.val is None else int(R_ref.val.size)
+    support = int(jnp.sum(jnp.abs(dense_ref) > 1e-9))
+    assert support == stored, (
+        f"the dense product has {support} non-zeros, not the {stored} this "
+        f"test claims")
+    assert got == stored, (
+        f"stored {got} != the {stored}-element band form; the misaligned "
+        f"contraction lost its band structure")
+    assert any(isinstance(d, BandedIndex) for d in R_ref.dims), (
+        f"expected a BandedIndex pair, got "
+        f"{[type(d).__name__ for d in R_ref.dims]}")
+    assert stored <= hand_stored
 
 
 def get_routing_idx(b, d, l, g):
@@ -531,6 +553,8 @@ class TestExplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
+        assert_band_storage(R_ref, R_st.dense(), 280, 420)
+
         # Misaligned-contract matmul emits a BandedIndex pair (band buffer in
         # ``val``). Compare densified forms.
         assert jnp.allclose(
@@ -567,6 +591,8 @@ class TestExplicit(unittest.TestCase):
         assert jnp.allclose(R_st.dense(), A_st.dense() @ B_st.dense())
 
         R_ref = A_st @ B_st
+
+        assert_band_storage(R_ref, R_st.dense(), 140, 210)
 
         # Misaligned-contract matmul emits a BandedIndex pair (band buffer in
         # ``val``). Compare densified forms; structural shape / dim count is
@@ -607,6 +633,8 @@ class TestExplicit(unittest.TestCase):
         assert jnp.allclose(R_st.dense(), A_st.dense() @ B_st.dense())
 
         R_ref = A_st @ B_st
+
+        assert_band_storage(R_ref, R_st.dense(), 140, 210)
 
         # Misaligned-contract matmul emits a BandedIndex pair (band buffer in
         # ``val``). Compare densified forms; structural shape / dim count is
