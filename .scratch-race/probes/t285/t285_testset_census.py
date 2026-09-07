@@ -64,7 +64,9 @@ class CensusPlugin:
                 for f in frame:
                     sig.append(
                         (f["pairing_type"], f["T"], f["m_l"], f["m_r"],
-                         bool(f["aligned"]), bool(f["can"]))
+                         bool(f["aligned"]), bool(f["can"]),
+                         bool(f["meta_lazy"]), bool(f["lhs_lazy"]),
+                         bool(f["rhs_lazy"]), f["demote"] or "-")
                     )
             self.rows.append(
                 dict(
@@ -81,7 +83,19 @@ class CensusPlugin:
 def classify(row):
     """Which of the implicit-axis cases the test's contractions touch."""
     tags = set()
-    for pt, T, m_l, m_r, aligned, can in row["signatures"]:
+    for sg in row["signatures"]:
+        pt, T, m_l, m_r, aligned, can = sg[:6]
+        meta_lazy, lhs_lazy, rhs_lazy, dem = (sg[6:] if len(sg) > 6
+                                              else (False, False, False, "-"))
+        # The lazy rules name the case directly: an own-side extent nobody
+        # stores is a single implicit DENSE axis, block kind on a contract
+        # pairing and carried kind on any other.
+        if lhs_lazy or rhs_lazy:
+            tags.add("single_implicit_dense_block" if pt == "contract"
+                     else "single_implicit_dense_carried")
+        if meta_lazy:
+            tags.add("double_implicit_batch" if pt != "contract"
+                     else "double_implicit_contracted")
         if pt.startswith("spatial_sparse"):
             tags.add("spatial_sparse")
         if not aligned:

@@ -1,0 +1,2164 @@
+[
+ {
+  "nodeid": "tests/core/sparse_tensor/matmul_blocks_test.py::TestMatmulBlocks::test_dense_matmul",
+  "contractions": 39,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "matmul_blocks_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/matmul_blocks_test.py::TestMatmulBlocks::test_exhaustive_matmul_blocks",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "matmul_blocks_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/matmul_blocks_test.py::TestMatmulBlocks::test_matmul_dense_dense",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "matmul_blocks_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/matmul_blocks_test.py::TestMatmulBlocks::test_matmul_implicit_value",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "matmul_blocks_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/matmul_blocks_test.py::TestMatmulBlocks::test_scalar_matmul",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "matmul_blocks_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/matmul_diff_blocks_test.py::TestMatmulDiffBlocks::test_exhaustive_coprime_blocks",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "matmul_diff_blocks_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/matmul_diff_blocks_test.py::TestMatmulDiffBlocks::test_exhaustive_divisible_blocks",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "matmul_diff_blocks_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/matmul_diff_blocks_test.py::TestMatmulDiffBlocks::test_exhaustive_gcd_common_factor",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "matmul_diff_blocks_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/matmul_replication_test.py::TestReplicationMatmul::test_4d_replication",
+  "contractions": 1,
+  "growing_calls": 1,
+  "growing_elements": 30,
+  "growing_axes": [
+   {
+    "side": "lhs",
+    "slot": "meta",
+    "pair": 0,
+    "pairing_type": "contract",
+    "factor": 4
+   }
+  ],
+  "signatures": [
+   [
+    "contract",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "contract",
+    4,
+    4,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "matmul_replication_test.py",
+  "set": "aligned_and_matched",
+  "cases": [
+   "single_implicit_sparse"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/matmul_replication_test.py::TestReplicationMatmul::test_double_replication",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "matmul_replication_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/matmul_replication_test.py::TestReplicationMatmul::test_replication_2d",
+  "contractions": 1,
+  "growing_calls": 1,
+  "growing_elements": 16,
+  "growing_axes": [
+   {
+    "side": "lhs",
+    "slot": "meta",
+    "pair": 1,
+    "pairing_type": "contract",
+    "factor": 5
+   }
+  ],
+  "signatures": [
+   [
+    "contract",
+    4,
+    4,
+    4,
+    true,
+    true
+   ],
+   [
+    "contract",
+    5,
+    1,
+    5,
+    true,
+    true
+   ]
+  ],
+  "file": "matmul_replication_test.py",
+  "set": "aligned_and_matched",
+  "cases": [
+   "no_implicit_axis",
+   "single_implicit_sparse"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/matmul_replication_test.py::TestReplicationMatmul::test_replication_2d_2nd",
+  "contractions": 1,
+  "growing_calls": 1,
+  "growing_elements": 15,
+  "growing_axes": [
+   {
+    "side": "lhs",
+    "slot": "meta",
+    "pair": 0,
+    "pairing_type": "contract",
+    "factor": 4
+   }
+  ],
+  "signatures": [
+   [
+    "contract",
+    4,
+    4,
+    1,
+    true,
+    true
+   ],
+   [
+    "contract",
+    5,
+    5,
+    5,
+    true,
+    true
+   ]
+  ],
+  "file": "matmul_replication_test.py",
+  "set": "aligned_and_matched",
+  "cases": [
+   "no_implicit_axis",
+   "single_implicit_sparse"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/matmul_replication_test.py::TestReplicationMatmul::test_simple_replication",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "matmul_replication_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/diag_block_diagonal_test.py::test_diag_factor_one_is_noop",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "diag_block_diagonal_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/diag_block_diagonal_test.py::test_diag_factor_two_is_block_diagonal",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "diag_block_diagonal_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/diag_block_diagonal_test.py::test_diag_full_factor_is_pure_diagonal",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "diag_block_diagonal_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/diag_block_diagonal_test.py::test_diag_non_square_block_diagonal",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "diag_block_diagonal_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/coarsen_blockdiag_test.py::TestCoarsenExactness::test_indivisible_meta_raises",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "coarsen_blockdiag_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/coarsen_blockdiag_test.py::TestCoarsenExactness::test_meta16_to_1_dense_identical",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "coarsen_blockdiag_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/coarsen_blockdiag_test.py::TestCoarsenExactness::test_meta16_to_2_dense_identical",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "coarsen_blockdiag_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/coarsen_blockdiag_test.py::TestCoarsenExactness::test_noop_when_meta_equal",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "coarsen_blockdiag_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/coarsen_blockdiag_test.py::TestCoarsenExactness::test_val_none_uniform_ones",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "coarsen_blockdiag_test.py",
+  "set": "aligned_and_matched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/coarsen_blockdiag_test.py::TestMismatchedMetaContraction::test_reconciled_matches_dense_oracle",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "contract",
+    2,
+    2,
+    2,
+    true,
+    true
+   ],
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "coarsen_blockdiag_test.py",
+  "set": "aligned_and_matched",
+  "cases": [
+   "no_implicit_axis"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestElementwiseUnionMisalignedBlocks::test_asymmetric_blocks_coprime",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestElementwiseUnionMisalignedBlocks::test_coprime_2x3",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestElementwiseUnionMisalignedBlocks::test_coprime_3x5",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestElementwiseUnionMisalignedBlocks::test_divisor_2x4",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestElementwiseUnionMisalignedBlocks::test_divisor_3x9",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestElementwiseUnionMisalignedBlocks::test_shared_factor_4x6",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestElementwiseUnionMisalignedBlocks::test_shared_factor_6x9",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestElementwiseIntersectionMisalignedBlocks::test_intersection_coprime_2x3",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestElementwiseIntersectionMisalignedBlocks::test_intersection_coprime_3x5",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestElementwiseIntersectionMisalignedBlocks::test_intersection_divisor_2x4",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestElementwiseIntersectionMisalignedBlocks::test_intersection_shared_factor_4x6",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestMatmulMisalignedBlocks::test_2d_coprime_2x3_contract",
+  "contractions": 2,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    6,
+    6,
+    6,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": [
+   "no_implicit_axis"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestMatmulMisalignedBlocks::test_2d_coprime_3x5_contract",
+  "contractions": 2,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    30,
+    30,
+    30,
+    false,
+    true
+   ]
+  ],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": [
+   "lcm_grid"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestMatmulMisalignedBlocks::test_2d_divisor_2x4_contract",
+  "contractions": 2,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    8,
+    8,
+    8,
+    false,
+    true
+   ]
+  ],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": [
+   "lcm_grid"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestMatmulMisalignedBlocks::test_2d_shared_factor_4x6_contract",
+  "contractions": 2,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    12,
+    12,
+    12,
+    false,
+    true
+   ]
+  ],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": [
+   "lcm_grid"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestMatmulMisalignedBlocks::test_3d_one_misalignment",
+  "contractions": 2,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "batch_out",
+    3,
+    3,
+    3,
+    true,
+    true
+   ],
+   [
+    "contract",
+    12,
+    12,
+    12,
+    false,
+    true
+   ]
+  ],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": [
+   "lcm_grid",
+   "no_implicit_axis"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestMatmulMisalignedBlocks::test_4d_one_misalignment",
+  "contractions": 2,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "batch_out",
+    2,
+    2,
+    2,
+    true,
+    true
+   ],
+   [
+    "batch_out",
+    3,
+    3,
+    3,
+    true,
+    true
+   ],
+   [
+    "contract",
+    12,
+    12,
+    12,
+    false,
+    true
+   ]
+  ],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": [
+   "lcm_grid",
+   "no_implicit_axis"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/misaligned_blocks_test.py::TestMatmulMisalignedBlocks::test_4d_two_misalignments",
+  "contractions": 2,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    8,
+    8,
+    8,
+    false,
+    true
+   ],
+   [
+    "contract",
+    12,
+    12,
+    12,
+    false,
+    true
+   ]
+  ],
+  "file": "misaligned_blocks_test.py",
+  "set": "mismatched",
+  "cases": [
+   "lcm_grid"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_block_block_coprime_a_greater_b",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    6,
+    6,
+    6,
+    false,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "lcm_grid"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_block_block_coprime_a_less_b",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    6,
+    6,
+    6,
+    false,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "lcm_grid"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_block_block_equal",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    2,
+    2,
+    2,
+    true,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "no_implicit_axis"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_block_block_factor_a",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    4,
+    4,
+    4,
+    false,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "lcm_grid"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_block_block_factor_b",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    4,
+    4,
+    4,
+    false,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "lcm_grid"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_block_block_gcd",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    12,
+    12,
+    12,
+    false,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "lcm_grid"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_block_block_gcd_block_dense",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    3,
+    3,
+    3,
+    true,
+    true
+   ],
+   [
+    "contract",
+    12,
+    12,
+    12,
+    false,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "lcm_grid",
+   "no_implicit_axis"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_block_dense",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    2,
+    2,
+    2,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "no_implicit_axis"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_block_pure",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    8,
+    8,
+    8,
+    false,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "lcm_grid"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_dense_block",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    3,
+    3,
+    3,
+    true,
+    true
+   ],
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "no_implicit_axis"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_dense_dense",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_dense_pure",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    4,
+    4,
+    4,
+    true,
+    true
+   ],
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "no_implicit_axis"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_pure_block",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    6,
+    6,
+    6,
+    false,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "lcm_grid"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_pure_block_block_block_gcd",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    4,
+    4,
+    4,
+    false,
+    true
+   ],
+   [
+    "contract",
+    12,
+    12,
+    12,
+    false,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "lcm_grid"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_pure_block_block_block_gcd_block_dense",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    3,
+    3,
+    3,
+    true,
+    true
+   ],
+   [
+    "contract",
+    4,
+    4,
+    4,
+    false,
+    true
+   ],
+   [
+    "contract",
+    12,
+    12,
+    12,
+    false,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "lcm_grid",
+   "no_implicit_axis"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_pure_block_dense_pure",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    4,
+    4,
+    4,
+    false,
+    true
+   ],
+   [
+    "contract",
+    9,
+    9,
+    9,
+    true,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "lcm_grid",
+   "no_implicit_axis"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_pure_block_dense_pure_pure_pure",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    3,
+    3,
+    3,
+    true,
+    true
+   ],
+   [
+    "contract",
+    4,
+    4,
+    4,
+    false,
+    true
+   ],
+   [
+    "contract",
+    9,
+    9,
+    9,
+    true,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "lcm_grid",
+   "no_implicit_axis"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_pure_dense",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    3,
+    3,
+    3,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "no_implicit_axis"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_matmul_test.py::TestExplicit::test_pure_pure",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    4,
+    4,
+    4,
+    true,
+    true
+   ]
+  ],
+  "file": "explicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "no_implicit_axis"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_matmul_test.py::TestImplicit::test_a_b_c_implicit_c_d",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "batch_out",
+    2,
+    2,
+    2,
+    true,
+    true
+   ],
+   [
+    "contract",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "implicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "no_implicit_axis"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_matmul_test.py::TestImplicit::test_a_b_implicit_c",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "batch_out",
+    2,
+    2,
+    2,
+    true,
+    true
+   ],
+   [
+    "contract",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "implicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "no_implicit_axis"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_matmul_test.py::TestImplicit::test_a_implicit_b_c",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "batch_out",
+    2,
+    2,
+    2,
+    true,
+    true
+   ],
+   [
+    "contract",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "implicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "no_implicit_axis"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_matmul_test.py::TestImplicit::test_all_implicit_a_c_d",
+  "contractions": 1,
+  "growing_calls": 1,
+  "growing_elements": 1,
+  "growing_axes": [
+   {
+    "side": "lhs",
+    "slot": "meta",
+    "pair": 0,
+    "pairing_type": "batch_out",
+    "factor": 2
+   }
+  ],
+  "signatures": [
+   [
+    "batch_out",
+    2,
+    1,
+    2,
+    true,
+    true
+   ],
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "implicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "single_implicit_dense_carried"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_matmul_test.py::TestImplicit::test_all_implicit_all_implicit",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "batch_out",
+    2,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "implicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "double_implicit_batch"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_matmul_test.py::TestImplicit::test_implicit_a_b_c",
+  "contractions": 1,
+  "growing_calls": 1,
+  "growing_elements": 12,
+  "growing_axes": [
+   {
+    "side": "lhs",
+    "slot": "meta",
+    "pair": 1,
+    "pairing_type": "batch_out",
+    "factor": 2
+   }
+  ],
+  "signatures": [
+   [
+    "batch_out",
+    2,
+    1,
+    2,
+    true,
+    true
+   ],
+   [
+    "contract",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "implicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "single_implicit_dense_carried"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_matmul_test.py::TestImplicit::test_implicit_a_b_c_a_c_d",
+  "contractions": 1,
+  "growing_calls": 1,
+  "growing_elements": 4,
+  "growing_axes": [
+   {
+    "side": "lhs",
+    "slot": "meta",
+    "pair": 1,
+    "pairing_type": "batch_out",
+    "factor": 2
+   }
+  ],
+  "signatures": [
+   [
+    "batch_out",
+    2,
+    1,
+    2,
+    true,
+    true
+   ],
+   [
+    "contract",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "implicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": [
+   "single_implicit_dense_carried"
+  ]
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_matmul_test.py::TestImplicit::test_matmul_implicit_value",
+  "contractions": 1,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [
+   [
+    "contract",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_out_lhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ],
+   [
+    "spatial_primal_rhs",
+    1,
+    1,
+    1,
+    true,
+    true
+   ]
+  ],
+  "file": "implicit_matmul_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_densify_arr2st",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_densify_block_2d",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_densify_block_3d",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_densify_block_4d_1pair",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_densify_block_4d_2pairs",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_densify_mixed_4d_1pair",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_densify_mixed_4d_2pairs_v1",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_densify_mixed_4d_2pairs_v2",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_densify_pure_2d",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_densify_pure_3d",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_densify_pure_4d_1pair",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_densify_pure_4d_2pairs",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_partial_block_4d_axis0",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_partial_block_4d_axis1",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_partial_block_5d",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_partial_mixed_4d_axis0",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_partial_mixed_4d_axis1",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_partial_pure_4d_axis0",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_partial_pure_4d_axis1",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_partial_pure_5d_axis0",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_partial_pure_5d_axis1",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_partial_pure_6d_multiple_axes",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_partial_pure_6d_single_axis",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_shuffled_4d",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/explicit_dense_test.py::TestDenseDiags::test_shuffled_6d",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "explicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_dense_test.py::TestDenseNones::test_arr2st_densification",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "implicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_dense_test.py::TestDenseNones::test_block_diagonal_2d_densification_all_none",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "implicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_dense_test.py::TestDenseNones::test_block_diagonal_2d_densification_both_blocks_nones",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "implicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_dense_test.py::TestDenseNones::test_block_diagonal_2d_densification_first_block_none",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "implicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_dense_test.py::TestDenseNones::test_block_diagonal_2d_densification_second_block_none",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "implicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_dense_test.py::TestDenseNones::test_block_diagonal_2d_densification_sparse_none",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "implicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_dense_test.py::TestDenseNones::test_block_diagonal_3d_densification",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "implicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_dense_test.py::TestDenseNones::test_mixed_diagonal_4d_densification",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "implicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_dense_test.py::TestDenseNones::test_mixed_diagonal_5d_densification",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "implicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_dense_test.py::TestDenseNones::test_mixed_diagonal_6d_densification",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "implicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_dense_test.py::TestDenseNones::test_pure_diagonal_2d_densification",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "implicit_dense_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_dense_self_test.py::TestSelfDenseNones::test_dense_axis",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "implicit_dense_self_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_dense_self_test.py::TestSelfDenseNones::test_dense_axis_hard",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "implicit_dense_self_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_dense_self_test.py::TestSelfDenseNones::test_dense_once",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "implicit_dense_self_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_dense_self_test.py::TestSelfDenseNones::test_dense_once_hard",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "implicit_dense_self_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ },
+ {
+  "nodeid": "tests/core/sparse_tensor/implicit_dense_self_test.py::TestSelfDenseNones::test_dense_twice",
+  "contractions": 0,
+  "growing_calls": 0,
+  "growing_elements": 0,
+  "growing_axes": [],
+  "signatures": [],
+  "file": "implicit_dense_self_test.py",
+  "set": "explicit_vs_implicit",
+  "cases": []
+ }
+]
