@@ -6,10 +6,30 @@ import jax.random as jr
 from graphax.sparse.indexes import DiagonalIndex, DenseIndex
 from graphax.sparse.tensor import SparseTensor, _arr2st
 from graphax.sparse.ops.matmul import matmul
+from utils import assert_axis_pattern, stored_elements
 
 
 def dense_ref(A_full, B_full):
     return jax.lax.dot_general(A_full, B_full, (((2,), (1,)), ((0,), (0,))))
+
+
+def assert_storage(R_ref, R_st, stored, pattern):
+    """The storage contract of an implicit-dim contraction (dsnn-3qm.28.5).
+
+    ``stored`` and ``pattern`` are hand-written from the algebra and equal what
+    the owner's own ``R_st`` reference carries. They are NOT read off the
+    result. ``jnp.allclose(R, R_ref.val)`` alone cannot do this job: allclose
+    BROADCASTS, so a materialised axis whose length happens to be compatible
+    passes silently.
+    """
+    assert stored_elements(R_st) == stored, (
+        f"the hand reference itself stores {stored_elements(R_st)}, not {stored}")
+    got = stored_elements(R_ref)
+    assert got == stored, (
+        f"storage {got} != expected {stored}: an implicit axis was "
+        f"materialised, or a stored one was dropped")
+    assert_axis_pattern(R_ref, pattern)
+    assert_axis_pattern(R_st, pattern, msg="the hand reference disagrees: ")
 
 
 class TestImplicit(unittest.TestCase):
@@ -56,6 +76,8 @@ class TestImplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
+        assert_storage(R_ref, R_st, 30, "DDD")
+
         assert jnp.allclose(R_ref.dense(), R_st.dense())
         assert jnp.allclose(R_st.dense(), R_ref.dense())
         assert jnp.allclose(R * (x * y), R_ref.val * R_ref.scalar_mult)
@@ -98,6 +120,8 @@ class TestImplicit(unittest.TestCase):
         assert jnp.allclose(R_st.dense(), A_st.dense() @ B_st.dense())
 
         R_ref = A_st @ B_st
+
+        assert_storage(R_ref, R_st, 10, "DID")
 
         # TODO create these operations for calculating jnp.allclose: absolute(a - b) <= (atol + rtol * absolute(b))
         assert jnp.allclose(R_ref.dense(), R_st.dense())
@@ -144,6 +168,8 @@ class TestImplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
+        assert_storage(R_ref, R_st, 30, "DDD")
+
         assert jnp.allclose(R_ref.dense(), R_st.dense())
         # assert (R_st == R_ref).all()
         assert jnp.allclose(R_st.val, R_ref.val)
@@ -187,6 +213,8 @@ class TestImplicit(unittest.TestCase):
         assert jnp.allclose(R_st.dense(), A_st.dense() @ B_st.dense())
 
         R_ref = A_st @ B_st
+
+        assert_storage(R_ref, R_st, 30, "DDD")
 
         assert jnp.allclose(R_ref.dense(), R_st.dense())
         # assert (R_st == R_ref).all()
@@ -232,6 +260,8 @@ class TestImplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
+        assert_storage(R_ref, R_st, 10, "DID")
+
         assert jnp.allclose(R_ref.dense(), R_st.dense())
         assert jnp.allclose(R_st.dense(), R_ref.dense())
         assert jnp.allclose(R * (x * y), R_ref.val * R_ref.scalar_mult)
@@ -275,6 +305,8 @@ class TestImplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
+        assert_storage(R_ref, R_st, 2, "DII")
+
         assert jnp.allclose(R_ref.dense(), R_st.dense())
         assert (R_st == R_ref).all()
         assert jnp.allclose(R * (c * x * y), R_ref.val * R_ref.scalar_mult)
@@ -311,6 +343,8 @@ class TestImplicit(unittest.TestCase):
         assert jnp.allclose(R_st.dense(), A_st.dense() @ B_st.dense())
 
         R_ref = A_st @ B_st
+
+        assert_storage(R_ref, R_st, 0, "III")
 
         assert jnp.allclose(R_ref.dense(), R_st.dense())
         assert (R_st == R_ref).all()

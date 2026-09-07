@@ -7,7 +7,7 @@ import jax.random as jrand
 
 from graphax.sparse.indexes import DenseIndex, DiagonalIndex
 from graphax.sparse.tensor import SparseTensor
-from utils import assert_matmul_result
+from utils import assert_matmul_result, support_size
 
 
 class TestReplicationMatmul(unittest.TestCase):
@@ -25,7 +25,10 @@ class TestReplicationMatmul(unittest.TestCase):
         sty = SparseTensor([DenseIndex(0, 3, 0)], [DenseIndex(1, 2, 1)], y)
         stres = stx @ sty
 
-        assert_matmul_result(stres, res, (4,), (2,), (4, 2))
+        assert_matmul_result(
+            stres, res, (4,), (2,), (4, 2),
+            max_stored=support_size(res), axis_pattern="DD",
+        )
 
     def test_double_replication(self):
         key = jrand.PRNGKey(42)
@@ -43,7 +46,10 @@ class TestReplicationMatmul(unittest.TestCase):
         sty = SparseTensor([DenseIndex(0, 3, None)], [DenseIndex(1, 2, 0)], y)
         stres = stx @ sty
 
-        assert_matmul_result(stres, res, (4,), (2,), (4, 2))
+        assert_matmul_result(
+            stres, res, (4,), (2,), (4, 2),
+            max_stored=support_size(res), axis_pattern="DD",
+        )
 
     def test_replication_2d(self):
         key = jrand.PRNGKey(42)
@@ -71,7 +77,10 @@ class TestReplicationMatmul(unittest.TestCase):
         )
         stres = stx @ sty
 
-        assert_matmul_result(stres, res, (4,), (5,), (4, 5))
+        assert_matmul_result(
+            stres, res, (4,), (5,), (4, 5),
+            max_stored=support_size(res), axis_pattern="DD",
+        )
 
     def test_replication_2d_2nd(self):
         key = jrand.PRNGKey(42)
@@ -99,7 +108,10 @@ class TestReplicationMatmul(unittest.TestCase):
         )
         stres = stx @ sty
 
-        assert_matmul_result(stres, res, (4,), (5,), (4, 5))
+        assert_matmul_result(
+            stres, res, (4,), (5,), (4, 5),
+            max_stored=support_size(res), axis_pattern="DD",
+        )
 
     def test_4d_replication(self):
         key = jrand.PRNGKey(42)
@@ -125,7 +137,10 @@ class TestReplicationMatmul(unittest.TestCase):
         )
         stres = stx @ sty
 
-        assert_matmul_result(stres, res, (3, 4), (2,), (4, 3, 2))
+        assert_matmul_result(
+            stres, res, (3, 4), (2,), (4, 3, 2),
+            max_stored=support_size(res), axis_pattern="DDD",
+        )
 
 
 if __name__ == "__main__":

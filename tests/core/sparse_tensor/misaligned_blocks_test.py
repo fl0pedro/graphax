@@ -282,7 +282,13 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
     block(s) deliberately disagree. The contraction's logical size matches; the
     algorithm reconciles via per-axis LCM/GCD tiling."""
 
-    def _check(self, a, b, atol=1e-4):
+    def _check(self, a, b, atol=1e-4, stored=None, support=None, banded=None):
+        """``stored`` and ``support`` are HAND-WRITTEN, never read off the
+        result (ticket dsnn-3qm.28.5). ``support`` is the number of
+        structurally non-zero entries of the dense product, which is the
+        engine-independent ceiling on honest storage. ``banded`` says whether
+        the output should carry a BandedIndex pair, the form that stores the
+        support exactly."""
         for use_jit in (False, True):
             with self.subTest(jit=use_jit):
                 fn = jax.jit(matmul) if use_jit else matmul
@@ -293,6 +299,45 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
                     f"matmul mismatch (jit={use_jit}): max diff "
                     f"{float(jnp.max(jnp.abs(got.dense() - expected)))}",
                 )
+                self._assert_storage(got, expected, stored, support, banded)
+
+    def _assert_storage(self, got, expected, stored, support, banded):
+        if stored is None:
+            return
+        from graphax.sparse.indexes import BandedIndex
+
+        got_stored = 0 if got.val is None else int(got.val.size)
+        self.assertEqual(
+            got_stored, stored,
+            f"stored {got_stored} != expected {stored}: the misaligned "
+            f"contraction changed how much it materialises")
+        ref_support = int(jnp.sum(jnp.abs(expected) > 1e-9))
+        self.assertEqual(
+            ref_support, support,
+            f"the hand-written support {support} is wrong, the dense product "
+            f"has {ref_support} non-zeros")
+        # The docstring's structure expectation: the output must stay a
+        # compressed pair over the LCM meta grid, never the full dense buffer.
+        logical = 1
+        for d in got.dims:
+            logical *= int(d.logical_size)
+        if support < logical:
+            self.assertLess(
+                got_stored, logical,
+                "the output densified: it stores the whole logical grid "
+                "although the product is structurally sparse")
+        # The band form stores the support exactly; the plain LCM meta grid
+        # stores up to 1.5 times it. Anything worse is a regression.
+        self.assertLessEqual(
+            got_stored, (support * 3) // 2,
+            f"stored/support {got_stored}/{support} is worse than the known "
+            f"1.50 ceiling of the LCM meta grid")
+        if banded is not None:
+            is_banded = any(isinstance(d, BandedIndex) for d in got.dims)
+            self.assertEqual(
+                is_banded, banded,
+                f"expected banded={banded}, got dims "
+                f"{[type(d).__name__ for d in got.dims]}")
 
     # --- 2D matmul: sparse-pair LHS, dense RHS, coprime contracting blocks ---
     def test_2d_coprime_2x3_contract(self):
@@ -303,7 +348,7 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
             (DenseIndex(0, 12, 0),), (DenseIndex(1, 6, 1),),
             _n((12, 6), 2),
         )
-        self._check(a, b)
+        self._check(a, b, stored=72, support=72, banded=False)
 
     def test_2d_coprime_3x5_contract(self):
         # Bigger coprime: LCM(3,5)=15 along the contracting axis
@@ -318,20 +363,20 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
             _n((6, 5, 5), 2),
         )
         # logical: a is 30x30, b is 30x30 → result 30x30
-        self._check(a, b)
+        self._check(a, b, stored=270, support=210, banded=True)
 
     def test_2d_divisor_2x4_contract(self):
         # LCM(2,4)=4 — many small blocks
         a = _sparse_pair_2d(N=8, B_o=2, B_i=2, key_idx=1)
         b = _sparse_pair_2d(N=4, B_o=4, B_i=4, key_idx=2)
         # both 16x16 → 16x16 result
-        self._check(a, b)
+        self._check(a, b, stored=64, support=64, banded=False)
 
     def test_2d_shared_factor_4x6_contract(self):
         a = _sparse_pair_2d(N=6, B_o=4, B_i=4, key_idx=1)
         b = _sparse_pair_2d(N=4, B_o=6, B_i=6, key_idx=2)
         # both 24x24 → 24x24
-        self._check(a, b)
+        self._check(a, b, stored=192, support=192, banded=True)
 
     # --- 3D matmul (one batch axis + sparse-pair contraction) ----------
     def test_3d_one_misalignment(self):
@@ -355,7 +400,7 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
             _n((s1, 4, 3, 3), 2),
         )
         # logical a: (s1, 12, 12), b: (s1, 12, 12)
-        self._check(a, b)
+        self._check(a, b, stored=216, support=144, banded=False)
 
     # --- 4D matmul with one misalignment on the contraction axis -------
     def test_4d_one_misalignment(self):
@@ -380,7 +425,7 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
             _n((s1, s2, 4, 3, 3), 2),
         )
         # logical a: (s1, s2, 12, 12), b: (s1, s2, 12, 12)
-        self._check(a, b)
+        self._check(a, b, stored=432, support=288, banded=False)
 
     # --- 4D matmul with TWO misalignments ------------------------------
     def test_4d_two_misalignments(self):
@@ -424,6 +469,7 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
                     f"matmul mismatch (jit={use_jit}): max diff "
                     f"{float(jnp.max(jnp.abs(got.dense() - expected)))}",
                 )
+                self._assert_storage(got, expected, 4608, 3072, False)
 
 
 if __name__ == "__main__":

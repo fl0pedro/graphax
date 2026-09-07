@@ -22,6 +22,7 @@ from utils import (
     idfn,
     matmul_reference,
     run_matmul_blocks_test,
+    support_size,
     validate_sparse_tensor,
 )
 
@@ -107,14 +108,14 @@ class TestMatmulBlocks(unittest.TestCase):
                         expected_out = lhs_shape[:-n_contract]
                         expected_primal = rhs_shape[n_contract:]
 
+                        # The storage ceiling comes from the REFERENCE, never
+                        # from the result itself (ticket dsnn-3qm.28.5).
                         assert_matmul_result(
                             res_matmul,
                             reference.dense(),
                             expected_out,
                             expected_primal,
-                            res_matmul.val.shape
-                            if res_matmul.val is not None
-                            else None,
+                            max_stored=support_size(reference.dense()),
                         )
 
     def test_scalar_matmul(self):
@@ -132,7 +133,8 @@ class TestMatmulBlocks(unittest.TestCase):
             reference.dense(),
             (1,),
             (3,),
-            res_matmul.val.shape if res_matmul.val is not None else None,
+            physical_shape=(1, 3),
+            max_stored=support_size(reference.dense()),
         )
 
     @unittest.skipUnless(EXHAUSTIVE, "set EXHAUSTIVE=1 to run exhaustive sweeps")
