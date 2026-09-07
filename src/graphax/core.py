@@ -1322,6 +1322,17 @@ def _unpack_face_slots(slots, vertex):
     return lhs, rhs, res, None, None
 
 
+class FaceTransformIllegal(ValueError):
+    """A per-face transform the caller asked for cannot be applied to that
+    operand (ticket dsnn-3qm.70).
+
+    Raised instead of skipping, so a measured plan is always the plan that was
+    asked for. It subclasses ``ValueError`` so an existing ``except ValueError``
+    higher up still catches it, but the message names the vertex, the slot, the
+    action and the operand's structure.
+    """
+
+
 def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
                           out_edge=None, _xlog=None, log_slot=None):
     """Apply ONE per-face slot transform to ONE Jacobian operand.
@@ -1333,10 +1344,20 @@ def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
     :class:`TransformLog` when one is), any other callable is handed the tensor
     directly, and anything else raises ``TypeError``.
 
-    A ``ValueError`` is the documented best-effort miss — the transform does not
-    fit THIS operand's geometry — so the transform is skipped, the operand is
-    returned unchanged, and NOTHING is recorded, which keeps the record
-    truthful. ``TypeError`` is deliberately NOT caught (see the per-vertex loop).
+    An action that does not fit THIS operand's geometry RAISES
+    :class:`FaceTransformIllegal` (ticket dsnn-3qm.70, owner ruling D11). It used
+    to be swallowed and the operand returned unchanged, which made a measured
+    plan differ from the plan the caller asked for with no sign in the record:
+    on the CPU toy under the Markowitz order a literal ``Diag`` was dropped on
+    5 of 6 planned faces.
+
+    The caller decides what to do about an illegal action. A caller that cannot
+    know the operand's index structure until this moment — which is every
+    policy, because these operands are join intermediates — must pass a CHOOSER
+    callable instead of a literal action, and return ``None`` from it to skip.
+    That is the one legal way to decline, and it is recorded as a decline.
+    :func:`~graphax.sparse.micro_actions.action_is_legal` answers the same
+    question without applying anything.
 
     ``slot`` is the FaceSink's positional tag; ``log_slot`` (default: ``slot``)
     the transform log's finer one — see :func:`_record_micro`.
@@ -1376,8 +1397,17 @@ def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
                 "Compress, Quant, or a callable taking a SparseTensor and "
                 "returning either a SparseTensor or a chosen micro-action."
             )
-    except ValueError:
-        return val
+    except ValueError as exc:
+        raise FaceTransformIllegal(
+            f"Face transform {_t!r} cannot be applied to the operand in slot "
+            f"{slot!r} at vertex {vertex}: {exc}. The operand's dims are "
+            f"{tuple(type(d).__name__ for d in val.dims)} with logical sizes "
+            f"{tuple(int(d.logical_size) for d in val.dims)} and out/primal "
+            f"split {len(val.out_dims)}/{len(val.primal_dims)}. This used to be "
+            "skipped silently (ticket dsnn-3qm.70). Fix the caller: check with "
+            "action_is_legal, or pass a chooser callable that returns None to "
+            "decline."
+        ) from exc
     _assert_sparse_tensor_consistency(out)
     return out
 
@@ -1959,6 +1989,20 @@ def _eliminate_vertex(
                         edge_outval = _post_val * _pre_val
                         if count_ops:
                             muls += 1
+                    elif _is_scalar_st(_post_val) or _is_scalar_st(_pre_val):
+                        # ONE rank-0 edge. A scalar has no axes to contract, so
+                        # the chain rule here is a SCALE, not a matmul. This
+                        # used to fall through to ``@``, which rerouted it
+                        # silently inside matmul; matmul now raises
+                        # (ScalarMatmul, ticket dsnn-3qm.68) and the routing
+                        # belongs here, at the site that knows it is composing.
+                        from graphax.sparse.ops.matmul import scale_by_scalar
+                        _sc, _tn = ((_post_val, _pre_val)
+                                    if _is_scalar_st(_post_val)
+                                    else (_pre_val, _post_val))
+                        edge_outval = scale_by_scalar(_tn, _sc)
+                        if count_ops:
+                            muls += int(edge_outval.size)
                     elif count_ops:
                         edge_outval, (_a, _m, _f) = _with_demand_dense(
                             out_edge in _demand_head_vars,

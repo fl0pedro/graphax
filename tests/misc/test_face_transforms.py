@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from graphax.core import FaceTransformIllegal
 from graphax import faces_of
 from graphax.core import _stable_var_index
 from graphax.incremental import IncrementalJacobian
@@ -494,16 +495,33 @@ def test_unknown_face_key_is_ignored():
 # ---------------------------------------------------------------------------
 # error semantics (mirrors the per-vertex `transforms` contract)
 # ---------------------------------------------------------------------------
-def test_value_error_skips_the_slot_and_records_nothing():
-    """A ValueError means "this transform does not fit this operand" -- the
-    documented best-effort miss: skip the slot, keep the operand, record
-    nothing."""
+def test_value_error_now_raises_instead_of_skipping():
+    """A ValueError means "this transform does not fit this operand". It used
+    to be swallowed: the slot was skipped, the operand kept, nothing recorded.
+    That made a measured plan differ from the plan the caller asked for with no
+    sign in the record (ticket dsnn-3qm.70, owner ruling D11)."""
     def _boom(st):
         raise ValueError("does not fit")
 
     def _ft(ij, jaxpr):
         keys = faces_of(ij.graph, ij.tgraph, 1, jaxpr)
         return {keys[0]: (_boom, _boom, _boom)}
+
+    with pytest.raises(FaceTransformIllegal) as exc:
+        _run(_fanout, (_X3,), (0,), _ft, vertex=1)
+    assert "does not fit" in str(exc.value)
+    assert "slot" in str(exc.value)
+
+
+def test_a_chooser_returning_none_is_the_legal_way_to_decline():
+    """The replacement for the old silent skip: a callable handed the live
+    operand may return None. The run completes and nothing is recorded."""
+    def _decline(st):
+        return None
+
+    def _ft(ij, jaxpr):
+        keys = faces_of(ij.graph, ij.tgraph, 1, jaxpr)
+        return {keys[0]: (_decline, _decline, _decline)}
 
     ref = _jacobians(_fanout, (_X3,), (0,))
     _, ij, step = _run(_fanout, (_X3,), (0,), _ft, vertex=1)
@@ -513,20 +531,16 @@ def test_value_error_skips_the_slot_and_records_nothing():
     assert all(fr.approx == [] for fr in ij.step_faces(step))
 
 
-def test_diag_that_does_not_fit_is_skipped():
-    """The same best-effort skip for a typed micro-action whose geometry misses
-    (``Diag.i`` past the operand's logical rank)."""
+def test_a_diag_that_does_not_fit_now_raises():
+    """The same rule for a typed micro-action whose geometry misses
+    (``Diag.j`` past the operand's logical rank)."""
     def _ft(ij, jaxpr):
         keys = faces_of(ij.graph, ij.tgraph, 1, jaxpr)
         return {keys[0]: (Diag(0, 9, 2), None, None)}
 
-    ref = _jacobians(_fanout, (_X3,), (0,))
-    _, ij, step = _run(_fanout, (_X3,), (0,), _ft, vertex=1)
-
-    for out, r in zip(_eval(ij, (_X3,)), ref):
-        assert np.allclose(out, r, atol=1e-5)
-    assert ij.step_faces(step)[0].approx == [], (
-        "a skipped transform is not recorded")
+    with pytest.raises(FaceTransformIllegal) as exc:
+        _run(_fanout, (_X3,), (0,), _ft, vertex=1)
+    assert "out of range" in str(exc.value)
 
 
 def test_unknown_slot_type_raises_type_error():

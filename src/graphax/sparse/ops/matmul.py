@@ -3095,6 +3095,46 @@ def _reconcile_blockdiag_metas(lhs, rhs):
     return lhs, rhs
 
 
+
+class ScalarMatmul(ValueError):
+    """``matmul`` was called with a rank-0 operand (ticket dsnn-3qm.68).
+
+    A scalar has no axes, so there is nothing to contract. The operation the
+    caller means is an elementwise scale. Use :func:`scale_by_scalar`.
+
+    This RAISES rather than rerouting silently (owner ruling 2026-09-07):
+    accepting ``X @ scalar`` hides the call site that is wrong, and every
+    module with a real matmul rejects it for the same reason.
+    """
+
+
+def scale_by_scalar(tensor, scalar, count: bool = False):
+    """``scalar * tensor``, folded into ``scalar_mult``. No per-element work.
+
+    This is what a caller means when it reaches for ``X @ scalar``. The scalar
+    operand's effective value -- its 0-d ``val`` (``1`` when ``val is None``)
+    times its own ``scalar_mult`` -- is folded into the tensor operand's
+    ``scalar_mult``, leaving the tensor's ``val``, ``fill_value`` and dims
+    untouched. The scale is deferred, exactly like the both-implicit fold.
+
+    NOT ``scalar._stored_val()``: that returns a FLAT array sized
+    ``_structural_val_size`` (shape ``(N,)`` even for ``N == 1``), which
+    silently added a size-1 axis to ``scalar_mult`` on every fold and
+    compounded to ``(1, 1)`` on a second scale in the same chain. A rank-0
+    tensor's own ``val``, when present, is genuinely 0-d.
+    """
+    from graphax.sparse.dtype_compute import _scaled_mul
+
+    sval = (scalar.val if scalar.val is not None
+            else jnp.ones((), dtype=scalar.scalar_mult.dtype))
+    factor = _scaled_mul(sval, scalar.scalar_mult)
+    factor = jnp.asarray(factor, dtype=tensor.scalar_mult.dtype)
+    out = tensor.copy(scalar_mult=_scaled_mul(tensor.scalar_mult, factor))
+    if count:
+        return out, (0, out.size, 0)
+    return out
+
+
 def matmul(lhs, rhs, count: bool = False):
     """Sparse matmul dispatcher. Runs a cascade of paths, first-applicable
     wins, falling back to the general tiled algorithm; each path either
@@ -3173,69 +3213,30 @@ def matmul(lhs, rhs, count: bool = False):
     # mathematically-correct multiply rather than raise. Set
     # GRAPHAX_SEED_VERTICES_SCALAR_MM=0 to restore the legacy raise.
     if _lhs_scalar and _rhs_scalar:
-        if _SEED_SCALAR_MM:
-            out = lhs * rhs
-            _record_path("scalar_elementwise")
-            if count:
-                return out, (0, 1, 0)
-            return out
-        raise ValueError(
-            "matmul of two 0-rank SparseTensors is not supported; "
-            "use ``lhs * rhs`` (elementwise) instead"
+        raise ScalarMatmul(
+            "matmul of two 0-rank SparseTensors: a scalar has no axes to "
+            "contract. The operation meant here is a scale. Call "
+            "graphax.sparse.ops.matmul.scale_by_scalar(tensor, scalar) or "
+            "``lhs * rhs``. This used to be routed silently through ``*`` "
+            "under GRAPHAX_SEED_VERTICES_SCALAR_MM (ticket dsnn-3qm.68)."
         )
-    # Exactly ONE 0-rank (scalar) operand, the other of any real rank: ``X @
-    # scalar`` (or ``scalar @ X``) has no shared dimension to contract, so the
-    # contraction IS a scale -- ``scalar * X`` -- not a degenerate matmul.
-    # Owner ruling (dsnn-3qm.68, 2026-09-06): ``X @ scalar == scalar * X``,
-    # ALWAYS, on every engine; unlike the two-scalar case above this has no
-    # legacy-raise flag -- any caller that depended on the tiled engine's old
-    # behaviour (collapsing X's one-sided primal dim to a size-1 slice, see
-    # ``_build_pair_dims``'s ``spatial_primal_lhs`` branch, fixed separately)
-    # was wrong and is fixed, not accommodated. Routing here also makes that
-    # tiled branch (and the planner's rank-0 fallthrough guard below) dead for
-    # this family: neither engine ever contracts against a rank-0 operand.
+    # Exactly ONE 0-rank (scalar) operand: ``X @ scalar`` (or ``scalar @ X``)
+    # has no shared dimension to contract. It is a SCALE, and asking matmul for
+    # it is a caller error, so it RAISES (owner ruling 2026-09-07, ticket
+    # dsnn-3qm.68). The earlier fix rerouted it into ``scalar_mult`` silently,
+    # which produced the right number and hid the wrong call site.
+    # :func:`scale_by_scalar` is that fold, now public, for callers to use.
     if _lhs_scalar or _rhs_scalar:
-        _record_path("scalar_elementwise")
-        # ``elementwise``/``*`` requires equal SHAPES (its own
-        # ``_normalize_inputs`` raises "Shape mismatch" on ``() != tensor.shape``)
-        # -- it broadcasts a raw array up to its SparseTensor partner, but a
-        # rank-0 SparseTensor is already sparse, so that broadcast never
-        # triggers. Materializing a full-shape broadcast copy of the scalar
-        # just to go through ``elementwise`` would defeat the point (a real
-        # buffer for what is analytically a pure scale). Instead fold the
-        # scalar operand's own effective value -- its 0-d ``val`` (``1`` when
-        # ``val is None``) times its own ``scalar_mult`` -- into the TENSOR
-        # operand's ``scalar_mult`` via ``_scaled_mul``, the same "apply this
-        # operand's scale" primitive ``ops/utils._apply_scalar_mult`` uses
-        # everywhere else. This keeps the tensor operand's own ``val`` /
-        # ``fill_value`` / dims untouched (an elementwise SCALE, not a
-        # contraction) and does no per-element compute now: the scale is
-        # deferred into ``scalar_mult``, exactly like the both-implicit
-        # fold's ``factor`` above.
-        #
-        # NOT ``scalar._stored_val()``: that returns a FLAT array sized
-        # ``_structural_val_size`` (``jnp.ones(N)``, shape ``(N,)`` even for
-        # ``N == 1``) for reduction callers that don't care about rank -- it
-        # silently added a size-1 axis to ``scalar_mult`` on every fold, and a
-        # SECOND single-scalar contraction later in the same elimination
-        # chain compounded it to ``(1, 1)``, breaking an unrelated downstream
-        # broadcast (finding: Perceptron / multihead-attention / concat-same-
-        # primal all regressed this way on first cluster run). A rank-0
-        # tensor's own ``val``, when present, is genuinely 0-d.
-        tensor, scalar = (rhs, lhs) if _lhs_scalar else (lhs, rhs)
-        from graphax.sparse.dtype_compute import _scaled_mul
-
-        sval = (
-            scalar.val
-            if scalar.val is not None
-            else jnp.ones((), dtype=scalar.scalar_mult.dtype)
+        which = "lhs" if _lhs_scalar else "rhs"
+        other = rhs if _lhs_scalar else lhs
+        raise ScalarMatmul(
+            f"matmul got a rank-0 (scalar) {which} against an operand of shape "
+            f"{getattr(other, 'shape', None)}. A scalar has no axes, so there "
+            "is nothing to contract: this is a scale, not a matmul. Call "
+            "graphax.sparse.ops.matmul.scale_by_scalar(tensor, scalar). Fix "
+            "the caller (ticket dsnn-3qm.68); this used to be rerouted "
+            "silently."
         )
-        factor = _scaled_mul(sval, scalar.scalar_mult)
-        factor = jnp.asarray(factor, dtype=tensor.scalar_mult.dtype)
-        out = tensor.copy(scalar_mult=_scaled_mul(tensor.scalar_mult, factor))
-        if count:
-            return out, (0, out.size, 0)
-        return out
     # META RECONCILIATION (exact, engine-independent; GRAPHAX_RECONCILE_
     # BLOCKDIAG_METAS, default OFF). Two coupled block-diagonal factorings of
     # the SAME contracted logical axis with different meta counts -- a pure
