@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 
 @dataclass(frozen=True)
 class Index:
@@ -72,3 +74,30 @@ def DiagonalIndex(
     Historically named ``SparseIndex``; the new name better describes the
     underlying structure."""
     return Index(id, size, axis, other_id, block_size, block_axis)
+
+
+# --------------------------------------------------------------------------- #
+# Static routing
+# --------------------------------------------------------------------------- #
+def static_eye(n: int, dtype):
+    """The ``n`` x ``n`` identity as a COMPILE-TIME constant.
+
+    Every caller uses an identity to express *routing*: which sub-block of a
+    block-diagonal operand lands on which slot of a coarser or finer grid. The
+    grid is known when the jaxpr is built, so the identity is known too.
+
+    ``jnp.eye`` does not say that. It traces to ``iota``, ``iota`` and ``eq``,
+    which stay in the jaxpr as live equations, and the routing then reads as a
+    value XLA has to compute rather than a layout it can fold. The numpy form
+    is a literal, so the routing is static. This is the same choice
+    ``matmul._reduce_grid`` already makes for its one-hot fold.
+
+    ``n`` is a block-count ratio in every caller (a meta ratio or an expansion
+    factor), so the baked constant is small.
+    """
+    try:
+        return np.eye(n, dtype=dtype)
+    except TypeError:
+        # Extended dtypes (bfloat16 and friends) that numpy cannot construct
+        # directly still accept a cast from the default float form.
+        return np.eye(n).astype(dtype)

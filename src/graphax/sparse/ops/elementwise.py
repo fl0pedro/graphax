@@ -26,7 +26,7 @@ from .utils import (
 )
 from .layout import generate_block_permutation
 from graphax.sparse.dtype_compute import _unify_operand_dtypes, _compute_dtype
-from graphax.sparse.indexes import DiagonalIndex, DenseIndex
+from graphax.sparse.indexes import DiagonalIndex, DenseIndex, static_eye
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
@@ -374,7 +374,7 @@ def _promote_to_unified(value: Array, metrics, is_left: bool, fill: Array) -> Ar
             # loop over ``out.at[...].set(...)`` (one HLO op per slice).
             v = value.reshape(M, exp, 1, b1, b2, *rem)
             mask_shape = [1, exp, exp, 1, 1] + [1] * len(rem)
-            eye = jnp.eye(exp, dtype=jnp.bool_).reshape(mask_shape)
+            eye = static_eye(exp, bool).reshape(mask_shape)
             v = jnp.where(eye, v, fill)
             return v.transpose([0, 1, 3, 2, 4] + list(range(5, 5 + len(rem)))) \
                     .reshape(M, cb1, cb2, *rem)
@@ -395,8 +395,8 @@ def _promote_to_unified(value: Array, metrics, is_left: bool, fill: Array) -> Ar
                 # ``exp_h == exp_w``.
                 ms_h = [1] * len(exp_shape); ms_h[5 * i + 1] = exp_h; ms_h[5 * i + 2] = exp_h
                 ms_w = [1] * len(exp_shape); ms_w[5 * i + 1] = exp_w; ms_w[5 * i + 2] = exp_w
-                eye_h = jnp.eye(exp_h, dtype=jnp.bool_).reshape(ms_h)
-                eye_w = jnp.eye(exp_w, dtype=jnp.bool_).reshape(ms_w)
+                eye_h = static_eye(exp_h, bool).reshape(ms_h)
+                eye_w = static_eye(exp_w, bool).reshape(ms_w)
                 em = jnp.logical_and(eye_h, eye_w)
                 mask = em if mask is None else mask & em
         if mask is not None:

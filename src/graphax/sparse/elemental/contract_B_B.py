@@ -124,7 +124,7 @@ from graphax.sparse.elemental._common import (
     canonical_block_buffer,
     is_block_diagonal,
 )
-from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
+from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex, static_eye
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
@@ -162,7 +162,7 @@ def _scatter_block_diag(blocks: jnp.ndarray) -> jnp.ndarray:
     block ``i`` at rows ``[i*b_row]`` / cols ``[i*b_col]`` and zeros elsewhere —
     XLA fuses this into the surrounding einsum (no ``lax.scatter``)."""
     G, r, b_row, b_col = blocks.shape
-    eye = jnp.eye(r, dtype=blocks.dtype)  # (r, r): block-index i -> diag target j
+    eye = static_eye(r, blocks.dtype)  # (r, r): block-index i -> diag target j
     # The diagonal places block i at rows [i*b_row, (i+1)*b_row) and cols
     # [i*b_col, (i+1)*b_col): row index = i*b_row + p, col index = i*b_col + q.
     # placed[g, i, p, j, q] = blocks[g, i, p, q] * eye[i, j]

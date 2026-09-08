@@ -54,7 +54,7 @@ import jax.lax as lax
 import jax.numpy as jnp
 from jax import Array
 
-from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
+from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex, static_eye
 from graphax.sparse.dtype_compute import _scaled_mul
 
 if TYPE_CHECKING:
@@ -722,7 +722,7 @@ def _densify_diagonal_select(val: Array, fill_value: Array) -> Array:
     pairs into a single combined diagonal."""
     n_diag = val.shape[0]
     fv = jnp.asarray(fill_value, dtype=val.dtype)
-    eye_mask = jnp.eye(n_diag, dtype=jnp.bool_)
+    eye_mask = static_eye(n_diag, bool)
     eye_mask = eye_mask[(slice(None), slice(None)) + (None,) * (val.ndim - 1)]
     val_b = jnp.broadcast_to(val[:, None], (n_diag, n_diag) + val.shape[1:])
     return jnp.where(eye_mask, val_b, fv)

@@ -13,7 +13,7 @@ from jax import Array
 from jax.tree_util import register_pytree_node_class
 from jax.typing import DTypeLike
 
-from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
+from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex, static_eye
 from graphax.sparse.dtype_compute import _scaled_mul
 from graphax.sparse.ops.dense import dense  # noqa: F401  (re-exported: callers do `from graphax.sparse.tensor import dense`)
 from graphax.sparse.ops.elementwise import elementwise
@@ -971,7 +971,7 @@ def _subdivide_coupled_blockdiag(
         # Both block axes materialised: split each into (k, bn) and keep the
         # meta-diagonal (ki == kj == g) sub-block via the eye-einsum.
         v = v.reshape([N, k, b1n, k, b2n] + rest_shape)  # (N, ki, b1n, kj, b2n, *rest)
-        eye = jnp.eye(k, dtype=v.dtype)
+        eye = static_eye(k, v.dtype)
         # sub[N, g, r, c, *rest] = sum_{ki,kj} eye[g,ki] eye[g,kj] v[N,ki,r,kj,c,*rest]
         sub = jnp.einsum("gi,gj,nirjc...->ngrc...", eye, eye, v)  # (N, k, b1n, b2n, *rest)
         new_val = sub.reshape(out_lead + rest_shape)  # (factor, [b1n], [b2n], *rest)
@@ -1087,7 +1087,7 @@ def _coarsen_coupled_blockdiag(st, is_out1, rel_i, d1, is_out2, rel_j, d2,
         # blocks must become explicit, so the pattern materializes (all OTHER
         # dims stay implicit -- a ``val is None`` tensor has no physical axes).
         dt = getattr(st.scalar_mult, "dtype", None) or jnp.float32
-        eye = jnp.eye(k, dtype=dt)
+        eye = static_eye(k, dt)
         blk = jnp.einsum("ij,ab->iajb", eye, jnp.ones((b1, b2), dt))
         new_val = jnp.broadcast_to(blk.reshape(B1, B2)[None], (G, B1, B2))
         return _rebuild(new_d1, new_d2, new_val)
@@ -1119,7 +1119,7 @@ def _coarsen_coupled_blockdiag(st, is_out1, rel_i, d1, is_out2, rel_j, d2,
             v.reshape([N, 1, 1] + rest_shape), [N, b1, b2] + rest_shape)
 
     v = v.reshape([G, k, b1, b2] + rest_shape)
-    eye = jnp.eye(k, dtype=v.dtype)
+    eye = static_eye(k, v.dtype)
     # new[g, i, a, j, b, *rest] = eye[i, j] * v[g, i, a, b, *rest]
     nv = jnp.einsum("ij,giab...->giajb...", eye, v)
     new_val = nv.reshape([G, B1, B2] + rest_shape)
