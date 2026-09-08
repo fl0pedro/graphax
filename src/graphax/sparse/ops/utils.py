@@ -11,12 +11,11 @@ import copy
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Sequence
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-from graphax.sparse.indexes import Index, DenseIndex, DiagonalIndex
+from graphax.sparse.indexes import Index, DenseIndex
 from graphax.sparse.dtype_compute import _compute_dtype, _scaled_mul
 
 if TYPE_CHECKING:

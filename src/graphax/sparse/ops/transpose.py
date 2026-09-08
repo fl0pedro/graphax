@@ -15,7 +15,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Sequence
 from dataclasses import replace
 
-import jax.numpy as jnp
 
 from .dense import dense
 from .utils import _copy
