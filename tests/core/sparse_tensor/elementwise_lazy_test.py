@@ -19,6 +19,8 @@ right numbers by materializing has not done its job.
 """
 from __future__ import annotations
 
+import importlib
+
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -26,8 +28,12 @@ import numpy as np
 import pytest
 
 from graphax.sparse.indexes import DenseIndex, DiagonalIndex
-from graphax.sparse.ops import elementwise as ew
 from graphax.sparse.tensor import SparseTensor
+
+# ``graphax.sparse.ops.__init__`` re-exports the elementwise FUNCTION under the
+# module's own name, so a plain ``from ... import elementwise`` binds the
+# function. Take the module itself.
+ew = importlib.import_module("graphax.sparse.ops.elementwise")
 
 M, P, K, Q = 4, 3, 2, 5
 
