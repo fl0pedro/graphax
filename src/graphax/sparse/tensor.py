@@ -1011,6 +1011,72 @@ def _subdivide_coupled_blockdiag(
     return _rebuild(new_d1, new_d2, new_val, moved=moved, n_lead=n_lead)
 
 
+def squeeze_unit_axes(st):
+    """Drop every PHYSICAL ``val`` axis of extent 1 and mark its dim implicit.
+
+    The exact dual of :func:`materialize_uniform`. An axis of extent 1 stores
+    exactly one value along that role, which is precisely what an implicit axis
+    means, so the two forms hold the same data. Keeping it physical costs
+    nothing in bytes and everything in RANK.
+
+    Rank is not free. Every accumulation step unions the operands' dim ids, so
+    a Jacobian deep in a long elimination order carries a dim per id it has ever
+    touched, and nearly all of them are extent 1. MEASURED on TransformerLM at
+    the campaign shape (S=32, D=128, V=1024), minimum Markowitz order, before
+    this pass: reshape outputs reach rank 30 and carry 12 555 extent-1 axes for
+    38.9 GiB, transpose reaches rank 30 with 8 142 for 20.8 GiB, and 2 369
+    outputs are rank 6 or wider. A typical one is
+
+        (1,1,1,1,1,1,1,1,1,1,1, 32, 1, 128, 1,1,1,1,1,1,1,1,1,1,1,1,1, 128, 1, 128)
+
+    -- four real axes buried in twenty-six ones.
+
+    Making those dims implicit is not a heuristic: ``DenseIndex(id, N, None)``
+    is the engine's own encoding for "stored once", and the lazy elementwise
+    slot builder already keeps a role implicit when BOTH operands have it
+    implicit. So squeezing at the producer propagates: the next contraction
+    sees two compact operands and builds a compact result.
+    """
+    val = st.val
+    if val is None or getattr(val, "ndim", 0) == 0:
+        return st
+    shp = tuple(val.shape)
+    drop = set()
+    for d in st.dims:
+        if d.axis is not None and d.axis < len(shp) and shp[d.axis] == 1:
+            drop.add(d.axis)
+        if (d.is_sparse and d.block_axis is not None
+                and d.block_axis < len(shp) and shp[d.block_axis] == 1):
+            drop.add(d.block_axis)
+    if not drop:
+        return st
+
+    keep = [a for a in range(len(shp)) if a not in drop]
+    new_val = val.reshape(tuple(shp[a] for a in keep))
+    shift = {a: i for i, a in enumerate(keep)}
+
+    def _remap(d):
+        na = None if d.axis in drop else shift.get(d.axis, d.axis) \
+            if d.axis is not None else None
+        if d.is_sparse:
+            nb = None if d.block_axis in drop else (
+                shift.get(d.block_axis, d.block_axis)
+                if d.block_axis is not None else None)
+            return replace(d, axis=na, block_axis=nb)
+        return replace(d, axis=na)
+
+    return SparseTensor(
+        tuple(_remap(d) for d in st.out_dims),
+        tuple(_remap(d) for d in st.primal_dims),
+        new_val,
+        scalar_mult=st.scalar_mult,
+        fill_value=st.fill_value,
+        pre_transforms=st.pre_transforms,
+        post_transforms=st.post_transforms,
+        check_consistency=False,
+    )
+
+
 def materialize_uniform(st):
     """Give a UNIFORM (``val is None``) tensor an explicit buffer, WITHOUT
     densifying it.

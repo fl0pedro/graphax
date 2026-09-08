@@ -976,6 +976,13 @@ def _lazy_pair(lhs, rhs, op, l_by_id, r_by_id):
         res, scalar_mult=_identity_scalar_mult(res.dtype),
         fill_value=_combined_fill(lhs, rhs, op), check_consistency=False,
     )
+    # An accumulated Jacobian carries a dim per id it has ever touched, and
+    # nearly all of them end up extent 1. Left physical they cost rank, and rank
+    # is what the reshape and transpose traffic is made of. Squeezing here
+    # propagates: the next contraction sees compact operands and ``_slot``
+    # keeps a role implicit when both sides have it implicit.
+    from graphax.sparse.tensor import squeeze_unit_axes
+    out = squeeze_unit_axes(out)
     return _finish(out, rule)
 
 
