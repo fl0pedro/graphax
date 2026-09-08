@@ -42,6 +42,12 @@ def _expect_path(core_fn, *args, expected_path: str) -> None:
     to this assertion (no global state leaks). Tests use this to assert
     that a given input class actually hits the optimization rather than
     silently bailing to the slow path.
+   
+    ``"lazy"`` and ``"general"`` are the two branches of the elementwise
+    general path: ``"lazy"`` combines the operands in the structure they
+    already have, ``"general"`` promotes both to the least-common-multiple meta
+    grid first. Which one a signature takes is asserted exactly, so a case that
+    stops being lazy shows up here (ticket dsnn-3qm.72).
     """
     with track_paths() as paths:
         core_fn(*args)
@@ -1044,7 +1050,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
 
         self._deep_analysis(
-            plus, core_plus, manual_01, a, b, expected_path="general", mem_ratio_max=1.5
+            plus, core_plus, manual_01, a, b, expected_path="lazy", mem_ratio_max=1.5
         )
         res = core_plus(a, b)
         self.assertEqual(res.shape, (s1, s2, s3, s1))
@@ -1092,7 +1098,7 @@ class TestSmokeScreen(unittest.TestCase):
             manual_02,
             a,
             b,
-            expected_path="general",
+            expected_path="lazy",
             mem_ratio_max=1.5,
         )
         res = core_minus(a, b)
@@ -1159,7 +1165,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
 
         self._deep_analysis(
-            max, core_max, manual_04, a, b, expected_path="general", mem_ratio_max=1.5
+            max, core_max, manual_04, a, b, expected_path="lazy", mem_ratio_max=1.5
         )
         res = core_max(a, b)
         self.assertEqual(res.shape, (s1, s2, s2))
@@ -1184,7 +1190,7 @@ class TestSmokeScreen(unittest.TestCase):
         )
 
         self._deep_analysis(
-            mul, core_mul, manual_05, a, b, expected_path="general", mem_ratio_max=1.5
+            mul, core_mul, manual_05, a, b, expected_path="lazy", mem_ratio_max=1.5
         )
         res = core_mul(a, b)
         self.assertEqual(res.shape, (s1, s2, s1))
@@ -2188,7 +2194,7 @@ class TestSmokeScreen(unittest.TestCase):
             (DiagonalIndex(1, n, axis=0, other_id=0, block_size=b, block_axis=2),),
             self._n((n, b, b), 129),
         )
-        _expect_path(core_plus, a, rhs, expected_path="general")
+        _expect_path(core_plus, a, rhs, expected_path="lazy")
         expected = a.dense() + rhs.dense()
         res = core_plus(a, rhs)
         self.assertEqual(res.shape, expected.shape)
@@ -2270,7 +2276,7 @@ class TestSmokeScreen(unittest.TestCase):
             (DiagonalIndex(1, n, axis=0, other_id=0, block_size=b, block_axis=2),),
             self._n((n, b, b), 132),
         )
-        _expect_path(self._mul_intersection, a, rhs, expected_path="general")
+        _expect_path(self._mul_intersection, a, rhs, expected_path="lazy")
         expected = a.dense() * rhs.dense()
         res = self._mul_intersection(a, rhs)
         self.assertEqual(res.shape, expected.shape)

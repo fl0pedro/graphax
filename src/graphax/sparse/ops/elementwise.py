@@ -521,6 +521,8 @@ def _reconstruct_result(value, lhs, sp, dp, output_meta, op, rhs):
 #           implicit on BOTH sides stays implicit in the output.
 #   uu      both operands ``val is None``: the scalars combine and no buffer is
 #           built. Gated on statically-zero fills and a zero-preserving ``op``.
+#           OFF -- correct, but its ``val=None`` result breaks a consumer
+#           downstream. See ``_lazy_uu`` for the measurement.
 #   u_x     one operand ``val is None`` with matching structure: it contributes
 #           ONE scalar and the other's metadata rides through verbatim.
 #
@@ -541,6 +543,13 @@ def _reconstruct_result(value, lhs, sp, dp, output_meta, op, rhs):
 # compares this path against ``_materializing_general`` on the DENSE form over
 # every structured signature, for a union op and an intersection op, with zero
 # and non-zero fills. A rule that cannot pass that does not ship.
+#
+# That test alone was not enough. It passed on all four rules, and the full
+# suite then failed ``RoeFlux_3d``: ``uu`` is right in isolation but returns
+# ``val=None`` where the incumbent materializes, and a consumer downstream
+# collapses an extent on it. ``uu`` is OFF for that reason, measured, in
+# ``_lazy_uu``. The lesson is that a differential test on ONE op cannot clear a
+# structural change; the whole-graph suite is the check that matters.
 #
 # ``LAZY_STATS`` is the totality ledger: every rule hit and every named
 # fallthrough. Coverage is measured, never assumed.
@@ -659,7 +668,38 @@ def _all_implicit(t) -> bool:
 
 
 def _lazy_uu(lhs, rhs, op, l_by_id, r_by_id):
-    """U+U → U: two pure-structure operands combine entirely in scalar_mult."""
+    """U+U -> U: two pure-structure operands combine entirely in scalar_mult.
+
+    OFF. The rule is correct in isolation and it is the leanest of the four --
+    no buffer is built at all -- but its result is the one signature the rest
+    of the engine cannot yet read. It returns ``val=None`` where
+    ``_reconstruct_result`` materializes an array, and a consumer downstream
+    then collapses a logical extent.
+
+    MEASURED 2026-09-08 on ``RoeFlux_3d`` (order fwd), by disabling one rule at
+    a time:
+
+        lazy off entirely   PASS
+        all four rules      FAIL  edge shape (1, 1), expected (3, 1)
+        without uu          PASS  (eq 174, ibroad 46, u_x 66)
+        without u_x         FAIL
+        without eq+ibroad   FAIL
+        without ibroad      FAIL
+        without eq          FAIL
+
+    Every configuration that keeps ``uu`` fails and the one that drops it
+    passes, so the fault is ``uu``'s alone. Neither ``matmul`` nor
+    ``elementwise`` loses the extent -- both were instrumented and reported
+    zero -- so the consumer that mis-reads a ``val=None`` union result is a
+    third site and has not been found yet. Until it is, this signature takes
+    the materializing path, exactly as it did before, and the engine is
+    unchanged for it.
+
+    Do not re-enable this without finding that consumer.
+    ``elementwise_lazy_test.py::test_uu_declines_until_its_consumer_is_fixed``
+    pins the decline.
+    """
+    return _skip("uu_downstream_collapses_an_extent")
     reason = _match_structure(l_by_id, r_by_id)
     if reason:
         return _skip(reason)

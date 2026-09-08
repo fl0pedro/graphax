@@ -105,12 +105,14 @@ def _cases():
                 _st((a1,), (a2,), _n((M, P, P), 13)),
                 _st((d1,), (d2,), _n((M, P), 14)), "ibroad"))
 
-    # uu: both pure structure
+    # uu: both pure structure. The rule is OFF (see ``_lazy_uu``), so the
+    # lazy path must DECLINE this signature and the materializing path takes
+    # it, exactly as before.
     out.append(("uu_both_uniform",
                 _st((DenseIndex(0, M, None),), (DenseIndex(1, Q, None),), None,
                     scalar_mult=jnp.asarray(2.0)),
                 _st((DenseIndex(0, M, None),), (DenseIndex(1, Q, None),), None,
-                    scalar_mult=jnp.asarray(3.0)), "uu"))
+                    scalar_mult=jnp.asarray(3.0)), None))
 
     # u_x: one pure structure against a physical partner
     out.append(("u_x_uniform_lhs",
@@ -217,12 +219,36 @@ def test_the_zero_fill_marker_survives():
     assert out.fill_value is None
 
 
-def test_every_rule_is_exercised():
-    """Totality: the ledger must show all four rules across the battery, or
+def test_every_live_rule_is_exercised():
+    """Totality: the ledger must show every LIVE rule across the battery, or
     this file is not testing what it claims to."""
     ew.reset_lazy_stats()
     for _n_, lhs, rhs, _r in CASES:
         for op, is_inter in OPS.values():
             ew.elementwise(lhs, rhs, op, is_intersection=is_inter)
     fired = {k[len("rule:"):] for k in ew.LAZY_STATS if k.startswith("rule:")}
-    assert {"eq", "ibroad", "uu", "u_x"} <= fired, fired
+    assert {"eq", "ibroad", "u_x"} <= fired, fired
+    assert "uu" not in fired, "uu is off; see _lazy_uu"
+
+
+def test_uu_declines_until_its_consumer_is_fixed():
+    """``uu`` is correct in isolation and it is the leanest rule, but its
+    ``val=None`` result breaks a consumer downstream: with it on, RoeFlux_3d
+    fails with "edge shape (1, 1) does not match expected shape (3, 1)", and
+    with it off the suite is green. Disabling one rule at a time put the fault
+    on ``uu`` alone (see ``_lazy_uu`` for the table).
+
+    This pins the decline so the rule cannot come back without someone finding
+    that consumer first."""
+    lhs = _st((DenseIndex(0, M, None),), (DenseIndex(1, Q, None),), None,
+              scalar_mult=jnp.asarray(2.0))
+    rhs = _st((DenseIndex(0, M, None),), (DenseIndex(1, Q, None),), None,
+              scalar_mult=jnp.asarray(3.0))
+    ew.reset_lazy_stats()
+    out = ew.elementwise(lhs, rhs, jnp.add)
+    assert "rule:uu" not in ew.LAZY_STATS, dict(ew.LAZY_STATS)
+    assert ew.LAZY_STATS["skip:uu_downstream_collapses_an_extent"] == 1
+    # and the answer is still right, because the materializing path took it
+    np.testing.assert_allclose(
+        _dense(out), _dense(_oracle(lhs, rhs, jnp.add, False)),
+        rtol=1e-6, atol=1e-6)
