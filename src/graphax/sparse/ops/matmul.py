@@ -658,10 +658,14 @@ def _prepare_contraction_views(
 ):
     """``keep_l[i]`` False means the lhs stores nothing along pair ``i``'s meta
     axis, so that axis stays at length 1 on the lhs instead of being broadcast
-    to ``total[i]``. The caller then demotes it out of the dot's batch list
-    (ticket dsnn-3qm.67). ``keep_sl`` / ``keep_sr`` do the same for the
-    CONTRACTED axis, where the caller sums the storing side instead. With every
-    keep True this is the incumbent frame."""
+    to ``total[i]`` (ticket dsnn-3qm.67). ``keep_sl`` / ``keep_sr`` do the same
+    for the CONTRACTED axis. Either way the einsum then gives the size-1 axis a
+    private label and sums it away, which is free (see ``_frame_sublists``).
+    With every keep True this is the incumbent frame.
+
+    Any ``_as_shape(mode="broadcast")`` that still grows a buffer here is the
+    genuine least-common-multiple tiling of a misaligned grid, which no
+    labelling can avoid."""
     N = len(pairs)
     keep_l = [True] * N if keep_l is None else keep_l
     keep_r = [True] * N if keep_r is None else keep_r
@@ -1124,11 +1128,6 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
             split_true[i] if pairs[i].pairing_type == "contract" else split[i]
             for i in range(N)
         ]
-    # The contracted axis of a pair only one operand stores: summing the
-    # storing side is the same number and costs nothing, where broadcasting the
-    # other side up to it costs the whole buffer (the planner's "a contracted
-    # pair implicit on ONE side is a plain SUM over the physical side"). Stored
-    # by neither: an analytic scale.
     # A contracted axis only ONE operand stores is a plain sum over that
     # operand: the same number the broadcast dot produced, at none of its cost.
     # Keeping the non-storing side at extent 1 is all that is needed — the
