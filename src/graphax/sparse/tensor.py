@@ -9,6 +9,7 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jax.tree_util import register_pytree_node_class
 from jax.typing import DTypeLike
@@ -971,9 +972,15 @@ def _subdivide_coupled_blockdiag(
         # Both block axes materialised: split each into (k, bn) and keep the
         # meta-diagonal (ki == kj == g) sub-block via the eye-einsum.
         v = v.reshape([N, k, b1n, k, b2n] + rest_shape)  # (N, ki, b1n, kj, b2n, *rest)
-        eye = static_eye(k, v.dtype)
-        # sub[N, g, r, c, *rest] = sum_{ki,kj} eye[g,ki] eye[g,kj] v[N,ki,r,kj,c,*rest]
-        sub = jnp.einsum("gi,gj,nirjc...->ngrc...", eye, eye, v)  # (N, k, b1n, b2n, *rest)
+        # sub[N, g, r, c, *rest] = v[N, g, r, g, c, *rest]: SELECT the ki == kj
+        # sub-blocks. This used to contract two identity matrices against ``v``
+        # (``gi,gj,nirjc...->ngrc...``). An einsum lowers to a dot, and a dot on
+        # a GPU runs at the device's matmul precision -- MEASURED on an RTX 3090
+        # the selected values came back rounded to about 8 mantissa bits
+        # (-0.15441894 for -0.15443718), on a step that only moves numbers. A
+        # static index moves them exactly, and costs a gather instead of a dot.
+        _g = np.arange(k)
+        sub = jnp.moveaxis(v[:, _g, :, _g, :], 0, 1)  # (N, k, b1n, b2n, *rest)
         new_val = sub.reshape(out_lead + rest_shape)  # (factor, [b1n], [b2n], *rest)
     elif p1 or p2:
         # Exactly one block axis is materialised; its ``k`` split IS the new meta
@@ -1088,8 +1095,11 @@ def _coarsen_coupled_blockdiag(st, is_out1, rel_i, d1, is_out2, rel_j, d2,
         # dims stay implicit -- a ``val is None`` tensor has no physical axes).
         dt = getattr(st.scalar_mult, "dtype", None) or jnp.float32
         eye = static_eye(k, dt)
-        blk = jnp.einsum("ij,ab->iajb", eye, jnp.ones((b1, b2), dt))
-        new_val = jnp.broadcast_to(blk.reshape(B1, B2)[None], (G, B1, B2))
+        # Nothing here depends on traced data, so the whole block pattern is a
+        # compile-time constant.
+        blk = np.einsum("ij,ab->iajb", eye, np.ones((b1, b2), dt))
+        new_val = jnp.broadcast_to(
+            jnp.asarray(blk.reshape(B1, B2))[None], (G, B1, B2))
         return _rebuild(new_d1, new_d2, new_val)
 
     val = st.val
@@ -1120,8 +1130,16 @@ def _coarsen_coupled_blockdiag(st, is_out1, rel_i, d1, is_out2, rel_j, d2,
 
     v = v.reshape([G, k, b1, b2] + rest_shape)
     eye = static_eye(k, v.dtype)
-    # new[g, i, a, j, b, *rest] = eye[i, j] * v[g, i, a, b, *rest]
-    nv = jnp.einsum("ij,giab...->giajb...", eye, v)
+    # new[g, i, a, j, b, *rest] = eye[i, j] * v[g, i, a, b, *rest]: PLACE each
+    # finer block on the sub-diagonal of its coarse block. Written as a
+    # broadcast multiply, not an einsum, for the same reason as the select
+    # above: an einsum lowers to a dot and a dot rounds to the device's matmul
+    # precision, while a multiply by exactly 1.0 or 0.0 keeps every bit. It is
+    # also the cheaper of the two -- one product per output element rather than
+    # a contraction over ``k``. Same shape as ``elemental/contract_B_B``'s
+    # block placement, which XLA fuses into the surrounding einsum.
+    nv = jnp.expand_dims(v, 3) * eye.reshape(
+        (1, k, 1, k, 1) + (1,) * len(rest_shape))
     new_val = nv.reshape([G, B1, B2] + rest_shape)
     return _rebuild(new_d1, new_d2, new_val, moved=moved, n_lead=3)
 
