@@ -105,14 +105,13 @@ def _cases():
                 _st((a1,), (a2,), _n((M, P, P), 13)),
                 _st((d1,), (d2,), _n((M, P), 14)), "ibroad"))
 
-    # uu: both pure structure. The rule is OFF (see ``_lazy_uu``), so the
-    # lazy path must DECLINE this signature and the materializing path takes
-    # it, exactly as before.
+    # uu: both pure structure. Nothing is stored on either side and nothing is
+    # stored in the result; the whole op folds into ``scalar_mult``.
     out.append(("uu_both_uniform",
                 _st((DenseIndex(0, M, None),), (DenseIndex(1, Q, None),), None,
                     scalar_mult=jnp.asarray(2.0)),
                 _st((DenseIndex(0, M, None),), (DenseIndex(1, Q, None),), None,
-                    scalar_mult=jnp.asarray(3.0)), None))
+                    scalar_mult=jnp.asarray(3.0)), "uu"))
 
     # u_x: one pure structure against a physical partner
     out.append(("u_x_uniform_lhs",
@@ -125,14 +124,21 @@ def _cases():
                 _st((DenseIndex(0, M, None),), (DenseIndex(1, Q, None),), None,
                     scalar_mult=jnp.asarray(5.0)), "u_x"))
 
-    # --- signatures the lazy path MUST decline -----------------------------
-    # a MISALIGNED block grid: genuine least-common-multiple tiling. Both sides
-    # cover the same logical extent 12, one as 4 blocks of 3, one as 6 of 2.
+    # a MISALIGNED block grid. Both sides cover the logical extent 12, one as 4
+    # blocks of 3, one as 6 of 2. The two ops want DIFFERENT frames here, so the
+    # expectation is per-op. UNION lives at meta gcd(4, 6) = 2, and coarsening
+    # both sides into it makes them equal, so ``eq`` fires. INTERSECTION lives
+    # in the smaller-block frame, and neither meta divides the other, so there
+    # is no way to cut one side straight down to the other and the lazy path
+    # declines -- the general path's output frame is already the right one.
     e1, e2 = _pair(4, 0, 3, 1, 3, 2)
     f1, f2 = _pair(6, 0, 2, 1, 2, 2)
     out.append(("misaligned_grid",
                 _st((e1,), (e2,), _n((4, 3, 3), 17)),
-                _st((f1,), (f2,), _n((6, 2, 2), 18)), None))
+                _st((f1,), (f2,), _n((6, 2, 2), 18)),
+                {"union": "eq", "intersection": None}))
+
+    # --- signatures the lazy path MUST decline -----------------------------
 
     # a sparse role against a dense role at the same id
     out.append(("sparse_dense_mix",
@@ -146,6 +152,16 @@ def _cases():
 CASES = _cases()
 IDS = [c[0] for c in CASES]
 OPS = {"union": (jnp.add, False), "intersection": (jnp.multiply, True)}
+
+
+def _rule_for(rule, opname):
+    """The expected rule for one op. Most signatures take the same route for a
+    union and an intersection, so ``rule`` is a plain string (or ``None``). A
+    misaligned grid does not: the two ops have different containers, so its
+    entry is a ``{opname: rule}`` mapping."""
+    if isinstance(rule, dict):
+        return rule[opname]
+    return rule
 
 
 def _dense(t):
@@ -181,6 +197,7 @@ def test_the_expected_rule_fires(name, lhs, rhs, rule, opname):
     ew.reset_lazy_stats()
     ew.elementwise(lhs, rhs, op, is_intersection=is_inter)
     hits = [k[len("rule:"):] for k in ew.LAZY_STATS if k.startswith("rule:")]
+    rule = _rule_for(rule, opname)
     if rule is None:
         assert not hits, f"{name}/{opname}: expected a decline, got {hits}"
         assert any(k.startswith("skip:") for k in ew.LAZY_STATS), ew.LAZY_STATS
@@ -191,7 +208,7 @@ def test_the_expected_rule_fires(name, lhs, rhs, rule, opname):
 @pytest.mark.parametrize("name,lhs,rhs,rule", CASES, ids=IDS)
 def test_the_lazy_path_stores_no_more_than_the_materializing_one(name, lhs, rhs, rule):
     """The point of the path. Storage may only go DOWN."""
-    if rule is None:
+    if _rule_for(rule, "union") is None:
         pytest.skip("declines; storage is the materializing path's by definition")
     got = ew.elementwise(lhs, rhs, jnp.add)
     want = _oracle(lhs, rhs, jnp.add, False)
@@ -227,8 +244,7 @@ def test_every_live_rule_is_exercised():
         for op, is_inter in OPS.values():
             ew.elementwise(lhs, rhs, op, is_intersection=is_inter)
     fired = {k[len("rule:"):] for k in ew.LAZY_STATS if k.startswith("rule:")}
-    assert {"eq", "ibroad", "u_x"} <= fired, fired
-    assert "uu" not in fired, "uu is off; see _lazy_uu"
+    assert {"eq", "ibroad", "u_x", "uu"} <= fired, fired
 
 
 def test_uu_stores_nothing_at_all():
