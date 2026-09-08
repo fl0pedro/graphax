@@ -777,7 +777,21 @@ def _drain_or_unload_pre(post_val, pre_val, _post_val):
             _post_val = _t.apply_inverse(_post_val)
         _assert_sparse_tensor_consistency(_post_val)
         _pre_val = pre_val.copy()
-    elif len(_pre_transforms) > 0 and pre_val.val is not None:
+    elif len(_pre_transforms) > 0:
+        # ``pre_val.val is None`` (a UNIFORM operand) used to fall through to
+        # the pass-through below, which DROPS the transform. That is not a
+        # cheaper route, it is a wrong one: ``post_val``'s pre_transform carries
+        # the contracted dimension's relabelling, and the tensor it sits on is a
+        # rank-0 uniform stand-in with no dims of its own, so once the transform
+        # is gone nothing states the edge's shape. The store then writes a
+        # rank-0 tensor for an edge whose nominal shape is, for example, (1, 3),
+        # and core.py's nominal-shape assertion fires.
+        #
+        # It stayed hidden because a uniform ``pre_val`` was rare: the
+        # materializing elementwise path wrote a buffer for almost every edge,
+        # so ``val is not None`` held and the transform was resolved. Turning
+        # ``_lazy_uu`` on makes uniform operands common and the hole shows
+        # immediately. The fault is here, not in the lazy rule.
         _pre_val = unload_pre_transforms(post_val, pre_val)
     else:
         _pre_val = pre_val.copy()
