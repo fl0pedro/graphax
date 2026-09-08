@@ -1,18 +1,34 @@
-"""Tiled block-sparse matmul.
+"""Tiled block-sparse matmul: the one contraction engine.
 
 Pipeline (zero-fill fast path):
     1. Classify each dim pair as ``contract``/``batch_*``/``spatial_*``.
     2. ``_prepare_physical_arrays`` — bring both ``val`` buffers into the canonical
        (outer, block, shared_block, *leftover) layout via the shared transpose primitive.
-    3. ``_execute_block_sparse_contraction`` — split / broadcast / dot_general / reduce.
+    3. ``_execute_block_sparse_contraction`` — shrink every frame slot no operand
+       stores, then emit ONE einsum over integer sublists.
     4. ``_build_output_tensor`` — re-emit ``SparseTensor`` ``out_dims`` / ``primal_dims``.
+
+EMISSION (owner ruling D1, revised 2026-09-08). Every contraction leaves this
+module as ``jnp.einsum`` over INTEGER sublists, never ``lax.dot_general`` and
+never a hand-written multiply-then-reduce. The einsum states which axes meet
+and leaves the lowering to XLA, which picks a library GEMM, a fused multiply
+and reduce, or something else, per shape and per device. Integer labels also
+lift the letter form's 52-symbol cap. An axis one operand does not store is
+NEVER broadcast up to its partner: it is given a private label and summed
+away, which is free at extent 1. See ``_frame_sublists``.
 
 Late-densification escape hatch (non-zero fill_value):
     The tiled algorithm assumes implicit positions are zero. When ``_is_zero_fill``
     returns ``False`` for either operand, ``matmul`` reroutes through
     ``_matmul_via_densify`` — which materializes both sides via the fusion-friendly
-    ``dense_for_matmul`` and runs a plain ``jax.lax.dot_general``. Densification
-    stays as a JAX expression so XLA can fold it into the matmul kernel (SMEM, not HBM).
+    ``dense_for_matmul``. Densification stays as a JAX expression so XLA can fold
+    it into the contraction kernel (SMEM, not HBM).
+
+There is ONE engine and no environment switch. The structure-lowering planner
+(``sparse/lower/``), its compact-frame and spill entry points, the verbatim
+legacy tiled executor, and the race knobs that selected between them were
+deleted on 2026-09-08 (ticket dsnn-3qm.72); what they proved is recorded in
+the docstrings that carry it.
 """
 
 # pyright: reportImportCycles=false
@@ -785,7 +801,7 @@ def _reduce_grid(res_view, pairs, shared, total, lhs_block_lens, rhs_block_lens)
         _onehot[flat_arr, np.arange(_n_src)] = 1.0
         _rv = res_view.reshape(_n_src, math.prod(extra))
         _oh = jnp.asarray(_onehot, dtype=_rv.dtype)
-        res = jax.lax.dot_general(_oh, _rv, (((1,), (0,)), ((), ())))
+        res = jnp.einsum(_oh, [0, 1], _rv, [1, 2], [0, 2])
     else:
         res = jax.ops.segment_sum(
             res_view.reshape(math.prod(total), math.prod(extra)),
@@ -795,89 +811,82 @@ def _reduce_grid(res_view, pairs, shared, total, lhs_block_lens, rhs_block_lens)
     return res.reshape(*per_num, *extra)
 
 
-def _dot_general_axes(N, pairs, demote=None):
-    """Dimension numbers for the frame contraction.
+def _frame_sublists(N, pairs, lhs_shape, rhs_shape, n_ll, n_rl):
+    """Integer sublists for the frame contraction, plus the output order.
 
-    ``demote[i]`` drops pair ``i``'s meta axis from the BATCH lists. A batch
-    axis needs the same length on both operands, so a meta axis only one side
-    stores forces the other side to be broadcast up to it — the tiled path's
+    The prepared operands have a fixed slot layout, three slots per pair:
+
+      lhs  ``[meta_i] + [lhs block_i] + [split_i] + lhs leftover``
+      rhs  ``[meta_i] + [split_i] + [rhs shared block_i] + rhs leftover``
+
+    Every slot gets an integer label. A label on both operands means the two
+    axes meet: the meta axes ride through to the output, and a ``split`` axis
+    is contracted when its pair contracts and rides through otherwise.
+
+    An axis that its operand does not store sits at extent 1 against a partner
+    of extent N. That is the case the incumbent frame handled by broadcasting
+    the size-1 side up to N before a ``dot_general``, which is the tiled path's
     single largest materialization (finding 61: 56.9 MB against 378 KB on
-    TLM/CPU). Demoted, it rides as the storing side's FREE axis: the same
-    result, no broadcast. ``_execute_block_sparse_contraction`` puts the axis
-    back where the rest of the pipeline expects it."""
-    contract_l, contract_r = [], []
-    batch_l = [i for i in range(N) if not (demote and demote[i])]
-    batch_r = list(batch_l)
-    for i, p in enumerate(pairs):
-        if p.pairing_type == "contract":
-            contract_l.append(2 * N + i)
-            contract_r.append(N + i)
-        else:
-            batch_l.append(2 * N + i)
-            batch_r.append(N + i)
-    return ((contract_l, contract_r), (batch_l, batch_r))
+    TLM/CPU). Here the size-1 axis is given a PRIVATE label instead. It is then
+    absent from the output, so einsum sums it, and summing an extent-1 axis is
+    the identity. The partner's full axis carries the result:
 
+      * a meta axis only one side stores rides as that side's free axis,
+      * a contracted axis only one side stores becomes a plain sum over that
+        side, which is the same number the broadcast dot produced.
 
-def _mul_reduce_enabled() -> bool:
-    """RACE-ONLY knob ``GRAPHAX_TILED_MULREDUCE`` (default OFF, ticket
-    dsnn-3qm.28.4).
+    No buffer is written for either. Whether XLA re-introduces a broadcast is
+    XLA's decision, per shape and per device, which is the point of stating the
+    contraction rather than pinning one lowering.
 
-    The third emission for a single implicit sparse axis. Emission (1) keeps
-    the axis in the dot's batch list and broadcasts the side that does not
-    store it. Emission (2) keeps the axis on the storing operand and emits a
-    clean 2-D dot. Emission (3), this knob, never emits a dot at all: the frame
-    contraction becomes ``sum(lhs * rhs, axis=contracted)`` over the broadcast
-    shapes. That is the form XLA on GPU already rewrites emission (1) into
-    (grill2/F2-hlo-fusion.md section 1), and on CPU it compiles to one fused
-    loop with nothing materialized (section 3, form f). It gives up the vendor
-    GEMM. This knob exists so the price of that can be measured; it changes no
-    default and is deleted with the losing engine."""
-    return _os.environ.get("GRAPHAX_TILED_MULREDUCE", "0") != "0"
+    The output order is the canonical one the rest of the pipeline reads:
+    metas, the ridden-through splits, the lhs blocks, the rhs shared blocks,
+    then the two leftovers.
+    """
+    meta = list(range(N))                       # M_i
+    split = [N + i for i in range(N)]           # S_i
+    blk_l = [2 * N + i for i in range(N)]       # B_i, lhs only
+    blk_r = [3 * N + i for i in range(N)]       # F_i, rhs only
+    left_l = [4 * N + k for k in range(n_ll)]
+    left_r = [4 * N + n_ll + k for k in range(n_rl)]
+    nxt = 4 * N + n_ll + n_rl                   # private labels start here
 
-
-def _gx_mul_reduce(a, b, dims):
-    """``dot_general(a, b, dims)`` written as a multiply and a reduce.
-
-    Same output axis order as ``lax.dot_general``: batch axes in the order of
-    the batch list, then the lhs free axes, then the rhs free axes. Both
-    operands are transposed to ``(batch, own free, contracted)``, given size-1
-    axes where the other operand's free axes go, multiplied, and summed over
-    the contracted axes. No buffer is written by this function: whether the
-    product is materialized is XLA's decision, which is the thing under
-    measurement."""
-    (cl, cr), (bl, br) = dims
-    cl, cr, bl, br = list(cl), list(cr), list(bl), list(br)
-    a_free = [i for i in range(a.ndim) if i not in cl and i not in bl]
-    b_free = [i for i in range(b.ndim) if i not in cr and i not in br]
-    at = jnp.transpose(a, bl + a_free + cl)
-    bt = jnp.transpose(b, br + b_free + cr)
-    nb, na_f, nb_f, nc = len(bl), len(a_free), len(b_free), len(cl)
-    at = jnp.reshape(
-        at, at.shape[: nb + na_f] + (1,) * nb_f + at.shape[nb + na_f :]
+    lhs_sub = meta + blk_l + split + left_l
+    rhs_sub = meta + split + blk_r + left_r
+    for i in range(N):
+        # (lhs slot, rhs slot) of the two labels the two operands share.
+        for la, ra in ((i, i), (2 * N + i, N + i)):
+            el, er = int(lhs_shape[la]), int(rhs_shape[ra])
+            if el == er:
+                continue
+            if el == 1:
+                lhs_sub[la] = nxt
+            elif er == 1:
+                rhs_sub[ra] = nxt
+            else:
+                raise ValueError(
+                    f"frame contraction pair {i}: extents {el} and {er} meet "
+                    "on the same axis and neither is 1"
+                )
+            nxt += 1
+    ride = [i for i, p in enumerate(pairs) if p.pairing_type != "contract"]
+    out_sub = (
+        meta
+        + [split[i] for i in ride]
+        + blk_l
+        + blk_r
+        + left_l
+        + left_r
     )
-    bt = jnp.reshape(bt, bt.shape[:nb] + (1,) * na_f + bt.shape[nb:])
-    # Match _gx_dot_general's accumulation dtype: a bf16 x bf16 contraction
-    # accumulates in float32 there (preferred_element_type), so it does here.
-    if (
-        _quant_narrow_gemm_enabled()
-        and _quant_pet_enabled()
-        and jnp.dtype(at.dtype) == jnp.dtype(jnp.bfloat16)
-        and jnp.dtype(bt.dtype) == jnp.dtype(jnp.bfloat16)
-    ):
-        at = at.astype(jnp.float32)
-        bt = bt.astype(jnp.float32)
-    prod = at * bt
-    if not nc:
-        return prod
-    axes = tuple(range(nb + na_f + nb_f, nb + na_f + nb_f + nc))
-    return jnp.sum(prod, axis=axes)
+    return lhs_sub, rhs_sub, out_sub
 
 
-def _frame_contract(a, b, dims):
-    """The one emission site of the tiled frame contraction."""
-    if _mul_reduce_enabled():
-        return _gx_mul_reduce(a, b, dims)
-    return _gx_dot_general(a, b, dims)
+def _frame_contract(a, b, pairs, n_ll, n_rl):
+    """The one emission site of the tiled frame contraction: ONE einsum."""
+    lhs_sub, rhs_sub, out_sub = _frame_sublists(
+        len(pairs), pairs, a.shape, b.shape, n_ll, n_rl
+    )
+    return _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub)
 
 
 def _final_grid(N, shared, lhs_bc, rhs_bc, lhs_block_lens, rhs_block_lens):
@@ -994,26 +1003,6 @@ _LAZY_PAIRINGS = frozenset(
 )
 
 
-def _lazy_rules() -> str:
-    """RACE-ONLY diagnostic knob ``GRAPHAX_TILED_LAZY`` (ticket dsnn-3qm.67).
-
-    ``nodemote`` is the DEFAULT and the candidate: every lazy rule except the
-    demotion of a meta axis only one side stores, which keeps the incumbent's
-    broadcast there. Measured on TLM/GPU at the campaign shape (jobs 63802,
-    63803, 63805 against 63795): demoting costs 11 percent on the exact, Quant
-    and Diag classes, because XLA on GPU FUSES that broadcast into the batched
-    dot and loses the fusion once the axis leaves the batch list. XLA on CPU
-    allocates it instead, which is the 56.9 MB against 378 KB of finding 61, so
-    ``full`` (demotion on) is the leaner CPU frame. That makes the demotion a
-    device-dependent lowering choice, and the owner decides it.
-
-    ``full`` turns the demotion on, ``nosum`` keeps the incumbent's broadcast on
-    a contracted axis only one side stores (measured free on GPU), and ``off``
-    keeps the incumbent frame everywhere. Step 3 of the .28 design note deletes
-    the knob with the losing engine."""
-    return _os.environ.get("GRAPHAX_TILED_LAZY", "nodemote")
-
-
 def _slot_phys(val, i):
     return (
         int(val.shape[3 * i]),
@@ -1043,10 +1032,15 @@ def _lazy_frame(lhs_val, rhs_val, pairs):
     ``logical_element_count`` into ``scalar_mult`` — no dot over a broadcast.
 
     Anything this cannot prove (a genuine LCM grid, a spatial-sparse pair, a
-    partially stored extent) keeps the incumbent frame slot for slot."""
-    mode = _lazy_rules()
-    if mode == "off":
-        return list(pairs), [_NO_LAZY] * len(pairs), [None] * len(pairs)
+    partially stored extent) keeps the incumbent frame slot for slot.
+
+    The demotion used to be a per-device choice, because a ``dot_general``
+    forced one: XLA on GPU fused the broadcast into the batched dot and lost
+    the fusion once the axis left the batch list (11 percent on TLM/GPU),
+    while XLA on CPU allocated the broadcast instead (56.9 MB against 378 KB,
+    finding 61). The einsum emission does not force the choice. The axis is
+    stated, never broadcast, and XLA re-introduces the broadcast when it wants
+    it — so the demotion is now unconditional."""
     eff, lazy, demote = [], [], []
     for i, p in enumerate(pairs):
         lo_p, lb_p, ls_p = _slot_phys(lhs_val, i)
@@ -1066,9 +1060,9 @@ def _lazy_frame(lhs_val, rhs_val, pairs):
         if can and aligned and T > 1:
             if m_l == 1 and m_r == 1:
                 meta_lazy = True
-            elif mode != "nodemote" and m_l == T and m_r == 1:
+            elif m_l == T and m_r == 1:
                 dem = "r"       # the rhs stores nothing along this meta axis
-            elif mode != "nodemote" and m_r == T and m_l == 1:
+            elif m_r == T and m_l == 1:
                 dem = "l"
         nl, nr = l, r
         if meta_lazy:
@@ -1111,43 +1105,6 @@ def _lazy_frame(lhs_val, rhs_val, pairs):
     return eff, lazy, demote
 
 
-def _lazy_raw_perm(N, pairs, demote, n_ll, n_rl):
-    """Source axis of every canonical raw-output axis, plus the axes to drop.
-
-    The dot's output is ``(batch..., lhs free..., rhs free...)``. Demoting a
-    meta axis moves it out of the batch block into the lhs free block (and its
-    size-1 twin into the rhs free block). This rebuilds the layout the rest of
-    the pipeline expects: metas, the non-contract splits, the lhs blocks, the
-    rhs shared blocks, then the two leftovers. With no demotion it reproduces
-    the incumbent ``dg_perm`` exactly."""
-    nc = [i for i in range(N) if pairs[i].pairing_type != "contract"]
-    dem = [i for i in range(N) if demote[i]]
-    # ``demote[i] == "r"`` means the rhs stores nothing there, so the LHS free
-    # block carries the real meta axis and the rhs free block a size-1 twin.
-    lhs_dem = [("m", i) if demote[i] == "r" else ("d", i) for i in dem]
-    rhs_dem = [("d", i) if demote[i] == "r" else ("m", i) for i in dem]
-    src = (
-        [("m", i) for i in range(N) if not demote[i]]
-        + [("s", i) for i in nc]
-        + lhs_dem
-        + [("b", i) for i in range(N)]
-        + [("ll", k) for k in range(n_ll)]
-        + rhs_dem
-        + [("f", i) for i in range(N)]
-        + [("rl", k) for k in range(n_rl)]
-    )
-    pos = {lab: a for a, lab in enumerate(src)}
-    want = (
-        [("m", i) for i in range(N)]
-        + [("s", i) for i in nc]
-        + [("b", i) for i in range(N)]
-        + [("f", i) for i in range(N)]
-        + [("ll", k) for k in range(n_ll)]
-        + [("rl", k) for k in range(n_rl)]
-    )
-    return [pos[lab] for lab in want], tuple(pos[("d", i)] for i in dem)
-
-
 def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
     N = len(pairs)
     true_pairs = pairs
@@ -1172,20 +1129,24 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
     # other side up to it costs the whole buffer (the planner's "a contracted
     # pair implicit on ONE side is a plain SUM over the physical side"). Stored
     # by neither: an analytic scale.
+    # A contracted axis only ONE operand stores is a plain sum over that
+    # operand: the same number the broadcast dot produced, at none of its cost.
+    # Keeping the non-storing side at extent 1 is all that is needed — the
+    # einsum gives that axis a private label and sums the storing side for us
+    # (see ``_frame_sublists``). Stored by NEITHER side, the contraction is an
+    # analytic scale: nothing physical is left to sum, and the logical length
+    # only exists in the topology, so it is folded into ``scalar`` here.
     keep_sl, keep_sr = [True] * N, [True] * N
-    reduce_l, reduce_r, split_fold = [], [], 1
-    _sum_rules = _lazy_rules() not in ("off", "nosum")
+    split_fold = 1
     for i, p in enumerate(pairs):
-        if not _sum_rules or p.pairing_type != "contract" or split[i] <= 1:
+        if p.pairing_type != "contract" or split[i] <= 1:
             continue
         st_l = int(lhs_val.shape[3 * i + 2]) != 1
         st_r = int(rhs_val.shape[3 * i + 1]) != 1
         if st_l and not st_r:
             keep_sr[i] = False
-            reduce_l.append(2 * N + i)
         elif st_r and not st_l:
             keep_sl[i] = False
-            reduce_r.append(N + i)
         elif not st_l and not st_r:
             keep_sl[i] = keep_sr[i] = False
             split_fold *= split[i]
@@ -1201,26 +1162,16 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
         keep_sl=keep_sl,
         keep_sr=keep_sr,
     )
-    if reduce_l:
-        lhs_view = jnp.sum(lhs_view, axis=tuple(reduce_l), keepdims=True)
-    if reduce_r:
-        rhs_view = jnp.sum(rhs_view, axis=tuple(reduce_r), keepdims=True)
     if split_fold != 1:
         scalar *= float(split_fold)
         is_lazy = True
     lhs_leftover = list(lhs_view.shape[3 * N :])
     rhs_leftover = list(rhs_view.shape[3 * N :])
+    # ONE einsum, straight into the canonical output order. No broadcast to
+    # line the operands up, no squeeze of a demoted twin, no transpose back.
     res_raw = _frame_contract(
-        lhs_view, rhs_view, _dot_general_axes(N, pairs, demote)
+        lhs_view, rhs_view, pairs, len(lhs_leftover), len(rhs_leftover)
     )
-    dg_perm, drop = _lazy_raw_perm(
-        N, pairs, demote, len(lhs_leftover), len(rhs_leftover)
-    )
-    if drop:
-        res_raw = jnp.squeeze(res_raw, axis=drop)
-        dg_perm = [a - sum(1 for d in drop if d < a) for a in dg_perm]
-    if dg_perm != list(range(len(dg_perm))):
-        res_raw = jnp.transpose(res_raw, dg_perm)
     grid, final_lhs_lens, final_rhs_lens = _finalize_output(
         N,
         res_raw,
@@ -1614,79 +1565,21 @@ def _pad_axis_to(arr, axis: int, size: int, fill):
     return jnp.concatenate([arr, pad], axis=axis)
 
 
-# --- Both-implicit contracting-pair analytic fold (GRAPHAX_KEEP_BLOCKDIAG) -----
+# --- Both-implicit contracting-pair analytic fold --------------------------
 import os as _os
-_KEEP_BLOCKDIAG_MM = _os.environ.get("GRAPHAX_KEEP_BLOCKDIAG", "1") != "0"
-
-
-def _struct_lower_enabled() -> bool:
-    """Structure-lowering layer gate (GRAPHAX_STRUCT_LOWER, default OFF).
-    Read per call so tests / the differential harness can toggle it without
-    re-importing the module."""
-    return _os.environ.get("GRAPHAX_STRUCT_LOWER", "0") != "0"
-
-
-def _einsum_general_enabled() -> bool:
-    """New einsum general-path gate (GRAPHAX_EINSUM_GENERAL, default ON since
-    2026-08-02). Read per call so the differential harness can toggle it
-    without re-importing the module. When OFF, ``matmul`` is byte-identical
-    to the incumbent waterfall.
-
-    Default flipped after the nn256 single-face ablation (106 variants):
-    planner vs tiled = mean latency -15.3% vs -8.5%, memory reduced on 61/92
-    variants vs 4/92, cosines unchanged, and all Jacobian shapes verified
-    against the exact reference (the degenerate meta-1 pair canonicalization
-    closed the one wrong-shape family). Exact AD never enters (approx_active
-    firewall), so this changes APPROX-mode lowering only."""
-    return _os.environ.get("GRAPHAX_EINSUM_GENERAL", "1") != "0"
-# Two-scalar matmul -> elementwise multiply (seed-vertex aggregation). Default on.
-_SEED_SCALAR_MM = _os.environ.get("GRAPHAX_SEED_VERTICES_SCALAR_MM", "1") != "0"
-
-
-def _quant_narrow_gemm_enabled() -> bool:
-    """GRAPHAX_QUANT_NARROW_GEMM (default ON): when BOTH contraction
-    operands are bf16 (both edges were Quant'd -- a mixed {bf16, f32} pair
-    still upcasts, so quantizing one edge never approximates its exact
-    partner), run the dot on the bf16 inputs with float32 accumulation
-    (preferred_element_type) instead of a native bf16-out dot. Scope:
-    the tiled dot sites (_gx_dot_general) + the _scaled_mul
-    keep-narrow read (an already-bf16 edge is not re-promoted by its
-    scalar drain). Exact AD never carries narrow vals -- byte-identical
-    under either setting."""
-    return _os.environ.get("GRAPHAX_QUANT_NARROW_GEMM", "1") != "0"
-
-
-def _quant_pet_enabled() -> bool:
-    """GRAPHAX_QUANT_PET (default ON): gate for the ``preferred_element_type``
-    kwarg ALONE, split out of GRAPHAX_QUANT_NARROW_GEMM so that the kwarg and
-    the ``_scaled_mul`` keep-narrow read can be measured independently.
-    Default-on == the shipped behaviour, byte-identical."""
-    return _os.environ.get("GRAPHAX_QUANT_PET", "1") != "0"
-
-
-def _sublist_einsum_enabled() -> bool:
-    """Emit the contraction as an integer-sublist einsum (default ON).
-
-    Set ``GRAPHAX_SUBLIST_EINSUM=0`` to restore ``lax.dot_general``. The switch
-    exists only while the two forms are being proved equal on the whole suite;
-    it goes when the planner does.
-    """
-    return _os.environ.get("GRAPHAX_SUBLIST_EINSUM", "1") != "0"
 
 
 def _dims_to_sublists(lhs_ndim, rhs_ndim, dims):
     """``dot_general`` dimension numbers -> three INTEGER sublists for einsum.
 
-    ``dims`` is ``((lhs_contract, rhs_contract), (lhs_batch, rhs_batch))``, the
-    same tuple the dot takes, so the two forms cannot disagree about which axis
-    meets which. Labels are integers: ``Index.id`` is an integer and the
-    interleaved sublist form has no 52-symbol alphabet cap that the letter form
-    imposes.
+    ``dims`` is ``((lhs_contract, rhs_contract), (lhs_batch, rhs_batch))``, so a
+    caller that already holds dot dimension numbers cannot disagree with the
+    einsum about which axis meets which. Labels are integers: the interleaved
+    sublist form has no 52-symbol alphabet cap that the letter form imposes.
 
-    The output order is dot_general's own: batch axes, then the lhs's kept axes
-    in order, then the rhs's kept axes in order. Keeping that order means the
-    einsum is a drop-in for the dot and every downstream index calculation on
-    the result stays correct.
+    The output order is ``dot_general``'s own -- batch axes, then the lhs's kept
+    axes in order, then the rhs's kept axes in order -- so every index
+    calculation downstream of a converted call site stays correct.
     """
     (lc, rc), (lb, rb) = dims
     lhs_sub = [None] * lhs_ndim
@@ -1714,52 +1607,47 @@ def _dims_to_sublists(lhs_ndim, rhs_ndim, dims):
     return lhs_sub, rhs_sub, out_sub
 
 
-def _gx_einsum(a, b, dims):
+def _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub):
     """The contraction as ONE ``jnp.einsum`` over integer sublists.
 
-    The default emission (owner ruling D1, revised 2026-09-08). It states the
-    contraction and leaves the lowering to XLA, which may pick a library call,
-    a fused multiply and reduce, or something else, per shape and per device. A
-    ``dot_general`` pins one of those for every shape.
+    The sole emission of the contraction engine (owner ruling D1, revised
+    2026-09-08). It states which axes meet and leaves the lowering to XLA,
+    which may pick a library GEMM, a fused multiply and reduce, or something
+    else, per shape and per device. A ``dot_general`` pins one of those for
+    every shape, and a hand-written multiply-then-reduce pins another.
 
-    Same dtype rules as :func:`_gx_dot_general`: the accumulation type is read
-    from the same helper, so switching emission cannot change a value.
+    DTYPE. A bf16 x bf16 contraction accumulates in float32 through
+    ``preferred_element_type``. Only ``Quant`` produces a bf16 operand, and a
+    mixed ``{bf16, f32}`` pair is upcast by ``dtype_compute`` before it reaches
+    here, so this fires exactly when both edges were quantized.
+
+    Measured caveat, carried over from the deleted planner
+    (``lower.matmul._einsum_accum_dtype``, 2026-08): ``jnp.einsum`` honours
+    ``preferred_element_type`` as a genuine bf16-in / f32-out dot only for the
+    plain ``ij,jk->ik`` form. For a form carrying batch labels or size-1 axes
+    it instead converts BOTH operands to f32 up front, which deletes the bf16
+    dot and adds converts (measured on mlp2 / mlp4 / attn: every bf16 dot gone,
+    about 50 percent more converts). The error against the exact f32 Jacobian
+    was unchanged either way (relerr 4.207e-3 on mlp2, 4.103e-3 on mlp4),
+    because XLA already accumulates a bf16 dot in f32 internally and only
+    rounds the output. So the kwarg costs Quant some speed and buys no
+    accuracy on the batched forms. It stays because dropping it changes the
+    STORED width of the result, and every downstream edge dtype with it.
+    Changing that is a deliberate precision decision, not a tidy-up.
     """
-    lhs_sub, rhs_sub, out_sub = _dims_to_sublists(a.ndim, b.ndim, dims)
-    # The dtype rule is _gx_dot_general's, restated so switching the emission
-    # cannot change a value: a bf16 x bf16 contraction (only Quant makes them)
-    # accumulates in f32 when GRAPHAX_QUANT_PET is on, and keeps the narrow
-    # stored width when it is off. Every other dtype takes the plain call.
-    if (_quant_narrow_gemm_enabled()
-            and jnp.dtype(a.dtype) == jnp.dtype(jnp.bfloat16)
-            and jnp.dtype(b.dtype) == jnp.dtype(jnp.bfloat16)
-            and _quant_pet_enabled()):
+    if (jnp.dtype(a.dtype) == jnp.dtype(jnp.bfloat16)
+            and jnp.dtype(b.dtype) == jnp.dtype(jnp.bfloat16)):
         return jnp.einsum(a, lhs_sub, b, rhs_sub, out_sub,
                           preferred_element_type=jnp.float32)
     return jnp.einsum(a, lhs_sub, b, rhs_sub, out_sub)
 
 
-def _gx_dot_general(a, b, dims):
-    """``lax.dot_general`` with f32 accumulation whenever both operand
-    views are bf16 (only Quant produces them): tensor-core inputs, f32
-    product/accumulate, f32 result — downstream edges keep the dtype the
-    legacy upcast path produced. Any other dtype takes the plain call, so
-    the EXACT-AD path is byte-identical."""
-    if (
-        _quant_narrow_gemm_enabled()
-        and jnp.dtype(a.dtype) == jnp.dtype(jnp.bfloat16)
-        and jnp.dtype(b.dtype) == jnp.dtype(jnp.bfloat16)
-    ):
-        if _quant_pet_enabled():
-            return jax.lax.dot_general(
-                a, b, dims, preferred_element_type=jnp.float32
-            )
-        # PET dropped: a native bf16-out dot. XLA still accumulates the
-        # products in f32 internally; what changes is the STORED width of the
-        # result, which is what lets the narrow representation persist into
-        # the next contraction instead of being re-promoted here.
-        return jax.lax.dot_general(a, b, dims)
-    return jax.lax.dot_general(a, b, dims)
+def _gx_einsum(a, b, dims):
+    """The contraction stated by ``dot_general`` dimension numbers, as an
+    einsum. For call sites that hold dimension numbers rather than the tiled
+    frame's slot layout."""
+    lhs_sub, rhs_sub, out_sub = _dims_to_sublists(a.ndim, b.ndim, dims)
+    return _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub)
 
 
 def _both_implicit_contract_pairs(lhs, rhs):
@@ -1841,196 +1729,6 @@ def _fold_both_implicit(lhs, rhs, count):
     fac = jnp.asarray(factor, dtype=out.scalar_mult.dtype)
     out = out.copy(scalar_mult=out.scalar_mult * fac)
     return (out, cnt) if count else out
-
-
-# --- New einsum general path (GRAPHAX_EINSUM_GENERAL, default OFF) ----------
-def _carries_sparse_pair(st) -> bool:
-    """True iff any dim of ``st`` is a member of a DiagonalIndex pair
-    (``is_sparse`` == ``other_id is not None``) — a plain diagonal, a
-    block-diagonal, or a spatial-sparse pair. Admits plain-diagonal
-    contractions (``block_size`` None) to the einsum lowering, which keeps the
-    surviving diagonal a pair instead of densifying it."""
-    return any(
-        getattr(d, "is_sparse", False)
-        for d in (*st.out_dims, *st.primal_dims)
-    )
-
-
-def _einsum_matmul_general(lhs, rhs, count: bool = False):
-    """Sparsity-retaining general contraction path.
-
-    Emits ONE ``jnp.einsum`` over the operands' PHYSICAL axes only; every
-    implicit dim (``axis is None``, logical>1 = extent stored once) contributes
-    an einsum letter but is NEVER materialized into a physical buffer:
-
-      * an implicit-vs-physical contraction lowers to a ``jnp.sum`` reduction
-        over the physical operand's axis (XLA already fuses the broadcast),
-      * a both-implicit contraction folds analytically to a scale-by-N into
-        ``scalar_mult`` (no compute at all),
-      * a surviving free implicit dim stays ``axis=None`` in the output; a
-        surviving diagonal / block pair stays a ``DiagonalIndex`` pair;
-        ``val=None`` stays ``val=None``.
-
-    The pairing (what contracts / batches / rides through) is NOT re-derived:
-    it consumes the incumbent ``_align_tensor_ids`` / ``_build_matmul_topology``
-    ``Pair`` list, so it can never disagree with the tiled path about topology
-    — it only changes HOW the physical buffers combine. Output ids are the
-    canonical ``_build_output_tensor`` numbering so a downstream multi-edge
-    contraction aligns by id.
-
-    Returns the contracted ``SparseTensor`` (or ``(result, (adds, muls, fmas))``
-    with ``count=True``), or ``None`` on any case it cannot yet prove correct —
-    the caller then falls through to the existing path UNCHANGED. Returning
-    ``None`` (fall through) is always the safe choice.
-
-    The planner/executor is the shared einsum implementation in
-    ``graphax.sparse.lower.matmul`` (the working prototype); this entry point
-    applies the correctness firewall and routes it under the new flag. On
-    normalized inputs (``matmul`` always normalizes before this hook) the
-    differential harness proves the planner byte-exact vs the incumbent for
-    every structured contraction. A rank-0 (scalar) operand used to be the one
-    family the two paths disagreed on -- now moot: ``matmul`` routes any
-    single-0-rank-operand case to an elementwise scale BEFORE this function is
-    ever called (dsnn-3qm.68), so ``lhs``/``rhs`` here are never rank-0 and
-    the old rank-0 fallthrough guard was removed as dead code.
-    Gate: ``GRAPHAX_EINSUM_GENERAL`` (read by the caller) plus the guards below.
-    """
-    # EXACT-AD firewall: by default only an elimination carrying a
-    # Diag/Compress/Quant transform (approx_active) may be re-associated, so
-    # the exact path stays byte-identical to tiled whether the planner flag is
-    # on or off. GRAPHAX_PLANNER_EXACT=1 (L4) lifts the firewall: exact AD
-    # goes through the planner too, and the invariant becomes VALUE-identity
-    # to the dense oracle — reduction-order non-associativity vs tiled is
-    # expected and correct (two correct implementations).
-    from graphax.sparse.elemental.dispatch import approx_active
-
-    if not approx_active() and _os.environ.get(
-        "GRAPHAX_PLANNER_EXACT", "0"
-    ) in ("", "0", "false", "False"):
-        return None
-    from graphax.sparse.ops.utils import _is_approx, _is_zero_fill
-
-    # The einsum path assumes zero fill on the implicit positions (a broadcast
-    # of the stored extent). A non-zero fill is owned by the densify path.
-    if not (_is_zero_fill(lhs) and _is_zero_fill(rhs)):
-        return None
-    if lhs.dtype == jnp.bool_ or rhs.dtype == jnp.bool_:
-        return None
-    # Only take cases that actually carry lowerable structure — an implicit dim
-    # (Compress), a rectangular block (Diag), a PLAIN-DIAGONAL pair, or a
-    # pure-structure (``val=None``) operand. The plain-diagonal case is the big
-    # one: the incumbent general/elemental paths SKIP a diagonal-⊗-diagonal
-    # contraction ('no_lowerable_structure') and densify it O(N²), but a
-    # diagonal composed with a diagonal IS a diagonal — a repeated einsum index
-    # (elementwise, O(N)) with the surviving pair kept symbolic. ``is_sparse``
-    # (== ``other_id is not None``) detects any DiagonalIndex-pair member,
-    # including a plain diagonal (``block_size`` None). A plain-dense contraction
-    # carries no such structure and stays on the incumbent path.
-    if not (
-        _is_approx(lhs)
-        or _is_approx(rhs)
-        or lhs.val is None
-        or rhs.val is None
-        or _carries_sparse_pair(lhs)
-        or _carries_sparse_pair(rhs)
-    ):
-        return None
-    # Metadata-stated size-1↔size-N embeds are owned by the densify path.
-    if _has_implicit_block_contraction(lhs, rhs):
-        return None
-
-    # A rank-0 (scalar) operand used to reach here and disagree with the
-    # incumbent (the incumbent collapsed X's one-sided primal dim to a size-1
-    # slice -- a real bug, fixed in ``_build_pair_dims``; the einsum planner
-    # rode the dim through at its full extent, which was already the correct
-    # answer). ``matmul`` (dsnn-3qm.68) now routes EVERY single-0-rank-operand
-    # case to an elementwise scale before either engine ever sees it, so this
-    # function is never called with a rank-0 ``lhs``/``rhs`` any more -- the
-    # guard that used to fall through here was removed as dead code.
-    # (On GPU structured cases can differ from the tiled path by ~1e-3 in
-    # float32 — normal reduction-order non-associativity between two correct
-    # implementations, well inside the approximation regime this runs in and
-    # confirmed by the cosine-based anchors — so they are NOT gated.)
-
-    from graphax.sparse.lower.matmul import _NoRule, _bump, _lower
-
-    # LOWER_STATS is the totality ledger: every hit, every named fallthrough.
-    # (This entry point used to import _lower directly and bypass the lower
-    # module's own stats wrapper — the ledger read empty in production.)
-    try:
-        out, counts, _tags = _lower(lhs, rhs)
-    except _NoRule as _e:
-        # SPILL: a named gap. Materialize only THIS contraction's operands and
-        # replan — dense x dense always has a rule, so the planner is total by
-        # construction and every spill is counted, never hidden.
-        if _spill_enabled():
-            try:
-                out, counts, _tags = _lower(_spill_dense(lhs), _spill_dense(rhs))
-            except Exception as _e2:
-                _bump(
-                    "fallthrough:post_spill:"
-                    f"{getattr(_e2, 'reason', type(_e2).__name__)}"
-                )
-                return None
-            _bump(f"spill:{_e.reason}")
-            for _t in _tags:
-                _bump(_t)
-            if count:
-                return out, counts
-            return out
-        _bump(f"fallthrough:{_e.reason}")
-        return None
-    except Exception as _e:
-        _bump(f"fallthrough:unexpected:{type(_e).__name__}")
-        return None
-    _bump("hit")
-    for _t in _tags:
-        _bump(_t)
-    if count:
-        return out, counts
-    return out
-
-
-def _spill_enabled() -> bool:
-    import os
-
-    return os.environ.get("GRAPHAX_SPILL", "1") == "1"
-
-
-def _spill_dense(st):
-    """Materialize a structured operand into the fully-dense lattice element.
-
-    The SPILL rule's one job: when the planner has no rule for a structured
-    pairing, densifying JUST the two offending operands (never the whole
-    graph) always lands on the dense x dense contraction rule — totality by
-    construction, and the cost is local to the gap. Dim ids are preserved so
-    ``_align_tensor_ids`` / ``_build_output_tensor`` topology is unchanged;
-    ``dense()`` folds ``scalar_mult`` into the buffer, so the spilled tensor
-    carries the neutral multiplier; deferred-transform queues ride through
-    (they act on the ``.dense()`` form, which is exactly what this is).
-    """
-    from graphax.sparse.indexes import DenseIndex
-    from graphax.sparse.tensor import SparseTensor
-
-    sizes = [d.logical_size for d in (*st.out_dims, *st.primal_dims)]
-    arr = jnp.reshape(st.dense(), sizes)
-    n_out = len(st.out_dims)
-    out = tuple(
-        DenseIndex(d.id, d.logical_size, i) for i, d in enumerate(st.out_dims)
-    )
-    primal = tuple(
-        DenseIndex(d.id, d.logical_size, n_out + i)
-        for i, d in enumerate(st.primal_dims)
-    )
-    return SparseTensor(
-        out,
-        primal,
-        arr,
-        fill_value=st.fill_value,
-        pre_transforms=st.pre_transforms,
-        post_transforms=st.post_transforms,
-        check_consistency=False,
-    )
 
 
 # --- Late-densification escape hatch for non-zero fill_value --------------
@@ -2126,20 +1824,15 @@ def _matmul_via_densify(lhs, rhs):
                 rhs_dense, ra, ls,
                 rhs._eff_fill if _defer else _scaled_fill(rhs))
 
-    # EMISSION. The dimension numbers are the same either way; only the form
-    # handed to XLA differs. The einsum states the contraction and leaves the
-    # lowering open (owner ruling D1, revised 2026-09-08); the dot pins it.
-    # GRAPHAX_SUBLIST_EINSUM=0 restores the dot while the two are being proved
-    # equal on the whole suite.
+    # EMISSION. One einsum, stated by the dimension numbers (owner ruling D1,
+    # revised 2026-09-08).
     _dn = (
         (tuple(lhs_contract), tuple(rhs_contract)),
         (tuple(lhs_batch), tuple(rhs_batch)),
     )
-    result = (_gx_einsum(lhs_dense, rhs_dense, _dn)
-              if _sublist_einsum_enabled()
-              else _gx_dot_general(lhs_dense, rhs_dense, _dn))
+    result = _gx_einsum(lhs_dense, rhs_dense, _dn)
 
-    # `dot_general` lays out result axes as: batch, then lhs's kept (in order), then rhs's
+    # The result axes are laid out as: batch, then lhs's kept (in order), then rhs's
     # kept (in order). Build the output sizes/slot tags in that same order.
     lhs_kept = [
         i for i in range(n_lhs_dims) if i not in lhs_contract and i not in lhs_batch
@@ -2324,18 +2017,10 @@ def _normalize_inputs(lhs, rhs):
     # DELIBERATE (2026-08-04): a {bf16, f32} MIXED pair UPCASTS -- quantizing
     # one edge must never silently approximate its exact partner. The bf16
     # narrow GEMM engages only when BOTH operands were made bf16 (the policy
-    # quantizes both incident edges); see _gx_dot_general.
+    # quantizes both incident edges); see _emit_einsum.
     from graphax.sparse.dtype_compute import _unify_operand_dtypes
     lhs, rhs = _unify_operand_dtypes(lhs, rhs)
     return lhs, rhs
-
-
-def _compact_frame_enabled() -> bool:
-    """GRAPHAX_COMPACT_FRAME (default OFF): compute each contraction via the
-    compact einsum planner and re-canonicalize its layout to the incumbent
-    tiled output (byte-identical), skipping the size-1-padded physical frame.
-    Any case the planner declines / can't align falls back to the tiled path."""
-    return _os.environ.get("GRAPHAX_COMPACT_FRAME", "0") != "0"
 
 
 def _compact_block_lens(pairs, shared, total, split):
@@ -2411,126 +2096,10 @@ def _output_dims(ctx, rhs_dims, res):
     return final_out, final_primal
 
 
-def _execute_compact(ctx, rhs_dims, count=False):
-    """Compute the contraction via the compact einsum planner and re-canonicalize
-    its layout to the incumbent tiled output (byte-identical), skipping the
-    size-1-padded frame. Returns None to fall back to the tiled path on any case
-    the planner declines or a layout it cannot align."""
-    from graphax.sparse.tensor import SparseTensor
-    from graphax.sparse.dtype_compute import _scaled_mul as _sm
-    from graphax.sparse.lower.matmul import _lower, _NoRule
-    # Match try_lower_matmul's firewall: the einsum planner is unsafe for
-    # bool (einsum bool semantics != dot_general) or a non-zero fill (the tiled
-    # path assumes zero-fill).
-    if ctx.lhs.dtype == jnp.bool_ or ctx.rhs.dtype == jnp.bool_:
-        return None
-    if not (_is_zero_fill(ctx.lhs) and _is_zero_fill(ctx.rhs)):
-        return None
-    try:
-        low_t, _, _ = _lower(ctx.lhs, ctx.rhs)
-    except Exception:
-        return None
-    try:
-        shared, total, split, scalar = _contraction_factors(ctx.pairs)
-        fll, frl = _compact_block_lens(ctx.pairs, shared, total, split)
-        # _output_dims reads only the pair factors/lens from `res`; res.grid is
-        # never observed (only its .shape[5N:] leftover, which these contractions
-        # do not have), so a placeholder avoids re-tracing the whole tiled
-        # contraction just to size a grid that is then discarded.
-        res_meta = CRes(
-            grid=jax.ShapeDtypeStruct((), ctx.lhs.dtype),
-            shared_factors=shared,
-            lhs_block_lens=fll,
-            rhs_block_lens=frl,
-            scalar_mult=scalar,
-        )
-        final_out, final_primal = _output_dims(ctx, rhs_dims, res_meta)
-    except Exception:
-        return None
-    canon = {d.id: d for d in (final_out + final_primal)}
-    low = {d.id: d for d in low_t.dims}
-    if set(canon) != set(low):
-        return None
-    lv = low_t.val
-    ndim = lv.ndim if lv is not None else 0
-    perm = [None] * ndim
-    # Single pass: every matched id must agree on size + sparsity kind, and
-    # (when the planner produced a val) each physical axis maps canonical<-planner.
-    for did, cd in canon.items():
-        ld = low[did]
-        if int(cd.size) != int(ld.size) or bool(cd.is_sparse) != bool(ld.is_sparse):
-            return None
-        if lv is None:
-            continue
-        for ca, la in (
-            (cd.axis, ld.axis),
-            (getattr(cd, "block_axis", None), getattr(ld, "block_axis", None)),
-        ):
-            if ca is not None and la is not None:
-                if ca >= ndim or perm[ca] is not None:
-                    return None
-                perm[ca] = la
-            elif (ca is None) != (la is None):
-                return None
-    if lv is None:
-        # planner produced pure structure: every canonical dim must be implicit.
-        if any(d.axis is not None or getattr(d, "block_axis", None) is not None
-               for d in canon.values()):
-            return None
-        values = None
-    elif any(p is None for p in perm):
-        return None
-    else:
-        values = lv.transpose(perm) if perm != list(range(ndim)) else lv
-    # Trust the planner's own scalar_mult: its (val, scalar_mult) pair
-    # reproduces the tiled path's .dense() (validated byte-identical across
-    # the contraction census + q1 exact all-orders). Recomputing it would
-    # double-count the fold on a pure-structure (val=None) output.
-    final_mult = low_t.scalar_mult
-    has_val = any(
-        d.axis is not None
-        or (d.is_sparse and getattr(d, "block_axis", None) is not None)
-        for d in final_out + final_primal
-    )
-    if not has_val and values is not None and values.size == 1:
-        final_mult = _sm(final_mult, jnp.squeeze(values))
-        values = None
-    out_dtype = values.dtype if values is not None else jnp.asarray(final_mult).dtype
-    try:
-        out = SparseTensor(
-            final_out,
-            final_primal,
-            values,
-            scalar_mult=jnp.asarray(final_mult).astype(out_dtype),
-            fill_value=low_t.fill_value,
-        )
-    except Exception:
-        # A structural mismatch the guards missed -> fall back, never crash.
-        return None
-    if count:
-        return out, _compute_matmul_count(ctx.lhs, ctx.rhs, out)
-    return out
-
-
-
-def _tiled_legacy_enabled() -> bool:
-    """RACE-ONLY knob ``GRAPHAX_TILED_LEGACY`` (default OFF, ticket
-    dsnn-3qm.67): route every tiled contraction through the verbatim copy of
-    the incumbent executor in ``matmul_legacy_tiled``. The landing test of the
-    .28 race pairs the lazy candidate against the untouched engine of 1f3d404
-    inside ONE process, which needs both reachable at once. Read per call.
-    Step 3 of the .28 design note deletes this knob and that module."""
-    return _os.environ.get("GRAPHAX_TILED_LEGACY", "0") != "0"
-
-
 def _execute_tiled(ctx, rhs_dims):
     """Fallback: full tiled algorithm. Handles every case the fast paths
     bail on, including LCM-mismatched outer sizes, spatial sparse pairs,
     and broadcast / unmaterialized val axes."""
-    if _tiled_legacy_enabled():
-        from .matmul_legacy_tiled import _execute_tiled as _legacy_execute_tiled
-
-        return _legacy_execute_tiled(ctx, rhs_dims)
     lhs_val, rhs_val = _val_or_one(ctx.lhs), _val_or_one(ctx.rhs)
     lhs_val, rhs_val = _prepare_physical_arrays(lhs_val, rhs_val, ctx.pairs)
     grid, shared, lhs_lens, rhs_lens, scalar, lazy_info = (
@@ -2554,42 +2123,6 @@ def _execute_tiled(ctx, rhs_dims):
         )
     return _build_output_tensor(ctx, rhs_dims, res)
 
-
-
-
-_RECONCILE_BD_METAS = _os.environ.get(
-    "GRAPHAX_RECONCILE_BLOCKDIAG_METAS", "0"
-) not in ("", "0", "false", "False")
-
-def _reconcile_blockdiag_metas(lhs, rhs):
-    """Coarsen mismatched-meta coupled block-diagonal contracted pairs of
-    ``lhs @ rhs`` to their shared meta ``gcd`` (see ``matmul`` entry comment).
-    Best-effort: any resolution failure returns the operands unchanged."""
-    l_sparse = any(getattr(d, "is_sparse", False)
-                   for d in getattr(lhs, "dims", ()))
-    r_sparse = any(getattr(d, "is_sparse", False)
-                   for d in getattr(rhs, "dims", ()))
-    if not (l_sparse and r_sparse):
-        return lhs, rhs
-    try:
-        from graphax.sparse.elemental.dispatch import (
-            _contracted_pairs, _classify_pair, _coarsen_operand_pair)
-
-        pairs = _contracted_pairs(lhs, rhs)
-        for ld, rd in pairs:
-            if _classify_pair(ld, rd) != "B_B" or ld.size == rd.size:
-                continue
-            import math
-
-            g = math.gcd(int(ld.size), int(rd.size))
-            new_l = _coarsen_operand_pair(lhs, ld, g)
-            new_r = _coarsen_operand_pair(rhs, rd, g)
-            if new_l is None or new_r is None:
-                continue
-            lhs, rhs = new_l, new_r
-    except Exception:
-        return lhs, rhs
-    return lhs, rhs
 
 
 
@@ -2644,30 +2177,22 @@ def matmul(lhs, rhs, count: bool = False):
                                   SparseTensor (one or both), routed through
                                   ``*``: no shared dim to contract, so the
                                   contraction is a scale.
-      3. ``einsum_general``     -- opt-in (``GRAPHAX_EINSUM_GENERAL``): opt_einsum
-                                  lowering that retains sparsity.
-      4. ``struct_lower``       -- opt-in (``GRAPHAX_STRUCT_LOWER``): structure-
-                                  lowering contraction planner.
-      5. ``both_implicit_fold`` -- both contracted dims implicit: analytic
+      3. ``both_implicit_fold`` -- both contracted dims implicit: analytic
                                   scale-by-N folded into ``scalar_mult``.
-      6. ``elemental``          -- structured (diagonal/block) kernels,
+      4. ``elemental``          -- structured (diagonal/block) kernels,
                                   active only under ``approx_active()``.
-      7. ``densify``            -- non-zero ``fill_value`` OR an implicit-block
+      5. ``densify``            -- non-zero ``fill_value`` OR an implicit-block
                                   contraction, when ``_densify_is_safe``:
-                                  materialize via ``dense_for_matmul`` +
-                                  ``dot_general`` (tiled assumes implicit
-                                  positions are zero, wrong when fill != 0).
-                                  Runs LATE, after the structured paths above.
-      8. ``tiled``              -- general LCM/topology/finalize pipeline; the
-                                  sparsity-preserving fallback for everything else.
+                                  materialize via ``dense_for_matmul`` and
+                                  contract (tiled assumes implicit positions
+                                  are zero, wrong when fill != 0). Runs LATE,
+                                  after the structured paths above.
+      6. ``tiled``              -- general LCM/topology/finalize pipeline; the
+                                  sparsity-preserving engine for everything else.
 
-    Scalar @ scalar (both 0-rank SparseTensors) is, by default, routed through
-    ``lhs * rhs`` (elementwise); set ``GRAPHAX_SEED_VERTICES_SCALAR_MM=0`` to
-    restore the legacy raise. A single 0-rank operand against a real-rank
-    partner (``X @ scalar`` or ``scalar @ X``) is ALWAYS routed through ``*``
-    -- ``X @ scalar == scalar * X`` (owner ruling, dsnn-3qm.68) -- with no
-    flag to opt out. Vertex elimination routes scalar edges through ``*``
-    since core-v2.
+    A 0-rank (scalar) operand RAISES :class:`ScalarMatmul`, whether one side or
+    both. A scalar has no axes, so there is nothing to contract: the caller
+    means a scale (owner ruling, dsnn-3qm.68). Use :func:`scale_by_scalar`.
 
     With ``count=True`` returns ``(result, (adds, muls, fmas))``. Per output
     element the dot product decomposes into 1 plain multiply (no
@@ -2703,19 +2228,16 @@ def matmul(lhs, rhs, count: bool = False):
     )
     # Two 0-rank (scalar) SparseTensors: the contraction is a scalar product =
     # an ELEMENTWISE multiply (scalar . X == scale). This is what the AGGREGATION
-    # step needs when a Compress-reduced / seed-vertex scalar edge contracts
-    # another scalar edge (the --seed-vertices sentinel driver). The chain-rule
-    # site in core.py guards this too, but routes that leak through (the folded
-    # both-implicit reduction, a merge of two scalar edges) land here; do the
-    # mathematically-correct multiply rather than raise. Set
-    # GRAPHAX_SEED_VERTICES_SCALAR_MM=0 to restore the legacy raise.
+    # Two 0-rank (scalar) SparseTensors: the product of two scalars is a
+    # scale, not a contraction. The chain-rule site in core.py routes these to
+    # ``scale_by_scalar`` itself; anything that still arrives here is a caller
+    # that has not been fixed, so say so instead of quietly multiplying.
     if _lhs_scalar and _rhs_scalar:
         raise ScalarMatmul(
             "matmul of two 0-rank SparseTensors: a scalar has no axes to "
             "contract. The operation meant here is a scale. Call "
             "graphax.sparse.ops.matmul.scale_by_scalar(tensor, scalar) or "
-            "``lhs * rhs``. This used to be routed silently through ``*`` "
-            "under GRAPHAX_SEED_VERTICES_SCALAR_MM (ticket dsnn-3qm.68)."
+            "``lhs * rhs`` (ticket dsnn-3qm.68)."
         )
     # Exactly ONE 0-rank (scalar) operand: ``X @ scalar`` (or ``scalar @ X``)
     # has no shared dimension to contract. It is a SCALE, and asking matmul for
@@ -2734,57 +2256,6 @@ def matmul(lhs, rhs, count: bool = False):
             "the caller (ticket dsnn-3qm.68); this used to be rerouted "
             "silently."
         )
-    # META RECONCILIATION (exact, engine-independent; GRAPHAX_RECONCILE_
-    # BLOCKDIAG_METAS, default OFF). Two coupled block-diagonal factorings of
-    # the SAME contracted logical axis with different meta counts -- a pure
-    # diagonal (meta N, block 1) meeting a Diag(factor) edge (meta M, block
-    # L/M) -- are commensurable: both re-factor losslessly to the shared meta
-    # ``gcd(N, M)`` via ``_coarsen_coupled_blockdiag`` (off-sub-diagonal zeros
-    # become explicit; storage grows by N/G resp. M/G, never the dense outer
-    # product). Without this the pair is irreconcilable and every engine
-    # materializes the full logical extent for that contraction.
-    #
-    # DEFAULT OFF because keeping the edge sparse is NOT automatically
-    # cheaper: measured on nn256-xent (single-face ablation, 2026-08-02) the
-    # reconciled sparse chain was STRICTLY WORSE than the early densify
-    # (worst face +115.6 MB -> +179.8 MB, dLat +2.5% -> +94%) -- the Jacobian
-    # output extent must materialize dense anyway, so block + dense forms
-    # coexist, and XLA fuses the dense chain better than blocked einsums at
-    # these sizes. Flip ON for targets whose diagonalized edges stay interior
-    # (never forced dense downstream); numerics are exact either way
-    # (dense-oracle diff at float32 eps, exact-AD paths untouched).
-    if _RECONCILE_BD_METAS:
-        lhs, rhs = _reconcile_blockdiag_metas(lhs, rhs)
-    # New einsum general path (GRAPHAX_EINSUM_GENERAL, default OFF): the
-    # sparsity-retaining contraction. Tried FIRST after normalize/scalar, before
-    # the elemental cascade and the tiled path. Emits ONE einsum over physical
-    # axes, keeps implicit dims / block pairs / val=None symbolic, and folds a
-    # both-implicit contraction into scalar_mult. Returns None on any case it
-    # cannot yet prove correct, falling through to the EXISTING path UNCHANGED —
-    # so nothing regresses while this path is built out. Gated on
-    # ``approx_active()`` inside, so the EXACT-AD path never enters and stays
-    # byte-identical whether the flag is on or off.
-    if _einsum_general_enabled():
-        _ein = _einsum_matmul_general(lhs, rhs, count=count)
-        if _ein is not None:
-            _record_path("einsum_general")
-            return _ein
-    # Structure-lowering layer (GRAPHAX_STRUCT_LOWER, default OFF): compile
-    # the minimal physical computation for a structured contraction (ONE
-    # einsum over physical axes only) and build the output structure
-    # SYMBOLICALLY — a free implicit dim stays implicit, a surviving
-    # block-diagonal pair stays a pair, val=None stays val=None. Returns None
-    # on any case without a rule; every miss is counted in
-    # ``lower.matmul.LOWER_STATS`` (no silent behavior change). Gated on
-    # ``approx_active()`` inside, so the EXACT-AD path never enters here and
-    # stays byte-identical whether the env flag is on or off.
-    if _struct_lower_enabled():
-        from graphax.sparse.lower.matmul import try_lower_matmul
-
-        _low = try_lower_matmul(lhs, rhs, count=count)
-        if _low is not None:
-            _record_path("struct_lower")
-            return _low
     # Elemental fast path (Phase: bridge-cse): route a STRUCTURED contraction
     # (block-diagonal / implicit contracted dims) through the
     # composed elemental kernels. Returns None for a pure-dense contraction, so
@@ -2792,12 +2263,12 @@ def matmul(lhs, rhs, count: bool = False):
     # identical. Built with the canonical output-id convention so a downstream
     # multi-edge / all-vertices contraction aligns by id.
     # Both-implicit contracting pair -> analytic scale-by-N folded into
-    # scalar_mult (no dot_general over the broadcast axis, no materialization).
-    if _KEEP_BLOCKDIAG_MM:
-        _folded = _fold_both_implicit(lhs, rhs, count)
-        if _folded is not None:
-            _record_path("both_implicit_fold")
-            return _folded
+    # scalar_mult (nothing is contracted over the broadcast axis, nothing is
+    # materialized).
+    _folded = _fold_both_implicit(lhs, rhs, count)
+    if _folded is not None:
+        _record_path("both_implicit_fold")
+        return _folded
 
     from graphax.sparse.elemental.dispatch import try_elemental_matmul
 
@@ -2847,11 +2318,6 @@ def matmul(lhs, rhs, count: bool = False):
     rhs_dims = rhs_out_dims + rhs_primal_dims
     pairs = _build_matmul_topology(lhs, rhs_out_dims, rhs_primal_dims, rhs_id_offset)
     ctx = Ctx(lhs=lhs, rhs=rhs, pairs=pairs, rhs_id_offset=rhs_id_offset)
-    if _compact_frame_enabled():
-        _cf = _execute_compact(ctx, rhs_dims, count=count)
-        if _cf is not None:
-            _record_path("compact")
-            return _cf
     _record_path("tiled")
     out = _execute_tiled(ctx, rhs_dims)
     if count:

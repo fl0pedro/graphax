@@ -476,37 +476,6 @@ def _reconstruct_result(value, lhs, sp, dp, output_meta, op, rhs):
 
 
 
-# --- Sparsity-retaining general path (GRAPHAX_EINSUM_GENERAL) --------------
-# The NEW general elementwise trunk. Pairs operand dims BY ID (commit 6b1bfe9:
-# elementwise operands share ONE id space — never pair positionally) and emits
-# ONE physical ``op`` over reconciled layouts, building the output structure
-# SYMBOLICALLY: a matched implicit (axis=None) role stays implicit, a same-grid
-# block pair stays a pair, a uniform (val is None) operand stays uniform, and an
-# implicit-vs-physical role broadcasts ONLY that single size-1 axis under
-# ``op``'s numpy semantics — never the whole-tensor ``_align_value`` broadcast,
-# never the ``_promote_to_unified`` LCM densify.
-#
-# This is the ``lower_add`` prototype (graphax/sparse/lower/add.py) promoted to
-# the main op: its eq / ibroad / uu / u_x rules are already proven correct under
-# the ``GRAPHAX_STRUCT_LOWER`` differential harness, so ``_einsum_ew_general``
-# drives them directly rather than re-deriving the (correctness-critical) layout
-# algebra. Every signature the rules can't yet represent — a sparse↔dense
-# promotion pair, a MISALIGNED block grid (different block sizes ⇒ genuine LCM
-# tiling), leftover physical axes, a non-zero fill the rule can't compose —
-# returns ``None`` so ``elementwise`` falls through to the EXISTING path
-# UNCHANGED. ``None`` is always the safe answer (correct-but-partial by design).
-def _einsum_ew_general(lhs, rhs, op, is_intersection: bool = False,
-                       count: bool = False):
-    from graphax.sparse.lower.add import lower_add
-
-    out = lower_add(lhs, rhs, op, is_intersection=is_intersection)
-    if out is None:
-        return None
-    if count:
-        return out, _ew_op_count(lhs, rhs, is_intersection)
-    return out
-
-
 # --- Path tracing (test-only) ---------------------------------------------
 # Re-exports from ``_path_tracking``. See that module for the full design;
 # tests opt in via the ``track_paths()`` context manager or ``TRACK_PATHS=1``
@@ -554,41 +523,6 @@ def elementwise(
         )
     _record_path(None)
     lhs, rhs = _normalize_inputs(lhs, rhs)
-    # Sparsity-retaining general path (GRAPHAX_EINSUM_GENERAL, default OFF):
-    # tried FIRST — before the elemental cascade and the _map_topology general
-    # path. Pairs dims by id and retains implicit/block/uniform structure
-    # instead of broadcasting implicit dims to physical. Returns None on any
-    # signature it can't yet represent ⇒ falls through UNCHANGED. When OFF this
-    # block is a single env-dict lookup, so the op is byte-identical to today.
-    # OWN flag (GRAPHAX_EINSUM_EW, default OFF), deliberately DECOUPLED from
-    # the matmul planner's GRAPHAX_EINSUM_GENERAL: the EW einsum path is
-    # UNPROVEN — with the shared flag, enabling the (proven) matmul planner
-    # silently armed this block, and the float64 model diff caught it
-    # diverging up to 0.8 on ViT COMPRESS variants (matmul calls all
-    # oracle-exact). Prove it against the lattice property suite before ever
-    # flipping this default.
-    if os.environ.get("GRAPHAX_EINSUM_EW", "0") not in ("", "0", "false", "False"):
-        _eg = _einsum_ew_general(
-            lhs, rhs, op, is_intersection=is_intersection, count=count
-        )
-        if _eg is not None:
-            _record_path("einsum_general")
-            return _eg
-    # Structure-lowering layer (GRAPHAX_STRUCT_LOWER, default OFF): compile the
-    # minimal physical computation for structurally-matched operands and build
-    # the output structure symbolically (graphax/sparse/lower/add.py). A case
-    # without a rule returns None and falls through UNCHANGED (lower.add bumps
-    # its skip counters — no silent behavior change). Flag OFF ⇒ this block is
-    # a single env-dict lookup.
-    if os.environ.get("GRAPHAX_STRUCT_LOWER", "0") not in ("", "0", "false", "False"):
-        from graphax.sparse.lower.add import lower_add
-
-        _low = lower_add(lhs, rhs, op, is_intersection=is_intersection)
-        if _low is not None:
-            _record_path("lower_add")
-            if count:
-                return _low, _ew_op_count(lhs, rhs, is_intersection)
-            return _low
     # Elemental fast path (Phase: bridge-cse): route a STRUCTURED elementwise op
     # (block-diagonal / implicit dims) through the elemental kernels. Returns
     # None for a pure-dense op so the existing general path stays byte-identical

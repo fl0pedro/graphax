@@ -39,7 +39,7 @@ hand it. Two concrete gains over writing the multiply and the reduce by hand:
     answer for every shape.
 
 Integer sublists, not letters: `Index.id` is an integer and the sublist form has
-no 52-symbol alphabet cap. `sparse/lower/matmul.py` already emits this form.
+no 52-symbol alphabet cap.
 
 The one case einsum cannot state is an output index present in NEITHER operand
 (a double implicit axis riding to the output). That axis never enters the

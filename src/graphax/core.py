@@ -1677,43 +1677,6 @@ def _eliminate_vertex(
             for _slots in face_transforms.values()
         )
 
-    # Output vars of the whole jaxpr: edges stored onto these heads feed the
-    # output boundary's mandatory densify (demand-driven materialization).
-    # The per-vertex approx gate is VACUOUS for edges that reach the output
-    # head during a LATER (exact) elimination -- the dominant case: a pair
-    # made at the approximated vertex rides passthrough/add into the
-    # boundary. Under GRAPHAX_DEMAND_EMIT the store-time densify below
-    # therefore keys on the GLOBAL approx arming instead. Exact AD stays
-    # untouched: flag off (default), or no approx anywhere in the jacve call.
-    # PLANNER-ONLY (2026-08-04). On the TILED path this store-time densify
-    # was the 12-826x approx blow-up: ``dense()`` expands COUPLED pairs, and
-    # a vmapped graph's output-headed edges carry the BATCH DiagonalIndex
-    # pair (per-sample block-diagonal, val ``(B, 10, ...)``). Expanding it
-    # materialises the full cross-batch tensor (``(B, 10, B, 256)`` — 512x
-    # at batch 512, off-diagonal blocks exact zeros) and every consumer
-    # contraction then drags BOTH batch axes. The "boundary materialises it
-    # dense anyway" premise below is planner-specific: on tiled, later
-    # eliminations CONTRACT the pair away as a batched GEMM and the boundary
-    # never sees it. The +46 MB coexistence win this channel encodes was
-    # measured on the sparse planner only, so it keys on the planner gate;
-    # exact AD is untouched either way (requires the approx arming).
-    from .sparse.ops.matmul import _einsum_general_enabled as _egen
-    if os.environ.get("GRAPHAX_DEMAND_EMIT", "0") == "1":
-        from .sparse.elemental.dispatch import approx_active as _aa_demand
-        _demand_store = (_is_approx_cfg or _aa_demand()) and _egen()
-    else:
-        _demand_store = _is_approx_cfg and _egen()
-    _demand_dense_vars = (
-        set(jaxpr.outvars) if _demand_store else frozenset()
-    )
-    # L5 demand-emit channel: output-headed is a property of the EDGE, not of
-    # whether THIS vertex elimination carries the approx config -- a pair
-    # created at an approximated vertex is contracted onto the output head
-    # during a LATER (exact) elimination. Unconditional; the planner-side
-    # gate (GRAPHAX_DEMAND_EMIT + planner engagement + surviving pairs)
-    # makes it a no-op everywhere else.
-    _demand_head_vars = set(jaxpr.outvars)
-
     # Path tokenization sink (None on the exact-AD hot path -> zero overhead,
     # every contraction/accumulation runs inline exactly as before).
     # Face sink: records per-face edge identities + equation ranges into the
@@ -2004,18 +1967,14 @@ def _eliminate_vertex(
                         if count_ops:
                             muls += int(edge_outval.size)
                     elif count_ops:
-                        edge_outval, (_a, _m, _f) = _with_demand_dense(
-                            out_edge in _demand_head_vars,
-                            lambda: sparse_matmul(_post_val, _pre_val, count=True),
+                        edge_outval, (_a, _m, _f) = sparse_matmul(
+                            _post_val, _pre_val, count=True
                         )
                         adds += int(_a)
                         muls += int(_m)
                         fmas += int(_f)
                     else:
-                        edge_outval = _with_demand_dense(
-                            out_edge in _demand_head_vars,
-                            lambda: _post_val @ _pre_val,
-                        )
+                        edge_outval = _post_val @ _pre_val
                     if count_ops:
                         post_size = (
                             _post_val.val.size if _post_val.val is not None else 0
@@ -2320,34 +2279,6 @@ def _eliminate_vertex(
                 if os.environ.get("GX_NO_SQUEEZE", "0") != "1":
                     edge_outval = _squeeze_unreferenced_val_axes(edge_outval)
 
-                # DEMAND-DRIVEN MATERIALIZATION (approx mode, PLANNER path
-                # only — see ``_demand_store`` above; on tiled this decoupled
-                # the vmap batch pair: the 12-826x blow-up). An edge
-                # whose head is a GRAPH OUTPUT is materialized dense by the
-                # output boundary regardless -- its dense extent is a hard
-                # demand. Materializing HERE lets XLA fuse the expansion into
-                # the producing contraction's epilogue instead of carrying
-                # block form to the boundary and paying peak memory for BOTH
-                # forms (measured +46 MB avg DIAG coexistence on nn256 with
-                # the sparse planner). ``dense(hard=False)`` expands coupled
-                # pairs only (implicit broadcast dims stay implicit -- the
-                # boundary broadcast fuses fine); scalar_mult stays deferred.
-                # Exact AD is untouched: exact edges carry no coupled pairs
-                # here beyond what the boundary already handles, and the gate
-                # requires the approx config.
-                if (
-                    _demand_store
-                    and edge_outval.val is not None
-                    and out_edge in _demand_dense_vars
-                    and any(d.is_sparse for d in edge_outval.dims)
-                ):
-                    from .sparse.ops.dense import dense as _dense_st
-                    try:
-                        edge_outval = _dense_st(edge_outval)
-                        _assert_sparse_tensor_consistency(edge_outval)
-                    except Exception:
-                        pass  # keep the sparse form; boundary handles it
-
                 _record_edge_store(edge_outval)
                 _set_inner(graph, in_edge, out_edge, edge_outval)
                 _set_inner(transpose_graph, out_edge, in_edge, edge_outval)
@@ -2367,22 +2298,6 @@ def _eliminate_vertex(
             transpose_graph.pop(central_var, None)
 
     return adds, muls, fmas, mem
-
-
-def _with_demand_dense(active, thunk):
-    """L5 demand channel: contractions run via the ``@`` operator (no kwargs
-    can travel), so an output-headed edge's hard dense demand reaches the
-    einsum planner as a contextvar; ``_lower`` then emits the dense layout
-    directly from the single einsum (no block/dense buffer coexistence).
-    Gated inside the planner by GRAPHAX_DEMAND_EMIT (default off)."""
-    if not active:
-        return thunk()
-    from .sparse.lower import matmul as _lm
-    tok = _lm._DEMAND_DENSE.set(True)
-    try:
-        return thunk()
-    finally:
-        _lm._DEMAND_DENSE.reset(tok)
 
 
 def _is_persistent(obj) -> bool:
