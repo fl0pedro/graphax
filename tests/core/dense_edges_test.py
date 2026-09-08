@@ -29,6 +29,7 @@ from graphax.core import (
     _build_graph, _checkify_order, _prune_graph, _stable_var_index,
     prune_enabled,
 )
+from graphax.core import FaceTransformIllegal
 from graphax.dense_edges import DenseBudgetExceeded, unwrap, wrap
 from graphax.incremental import IncrementalJaxpr
 from graphax.sparse.micro_actions import (
@@ -370,37 +371,34 @@ def test_a_diag_plan_agrees_with_the_sparse_engine(order_name):
     assert _rel(dn, REF) > 1e-4, "the plan did not approximate anything"
 
 
-def test_a_literal_action_the_sparse_engine_silently_skips_is_caught(): 
-    """The census does not only catch a MASKED hook (ticket .69's finding).
+def test_a_literal_action_the_sparse_engine_cannot_apply_now_raises():
+    """The asymmetry this test was written for is GONE at the source.
 
-    ``core._apply_face_transform`` swallows a ``ValueError`` and leaves the
-    operand exact, so even a LITERAL Diag can be dropped on the sparse side and
-    applied on the dense one. Owner ruling D8 makes the dense mode raise; the
-    census is what turns the remaining asymmetry into a loud failure instead of
-    a value difference nobody can read.
+    ``core._apply_face_transform`` used to swallow a ``ValueError`` and leave
+    the operand exact, so a LITERAL Diag could be dropped on the sparse side
+    and applied on the dense one, and only the census made that visible. Ticket
+    dsnn-3qm.70 makes the sparse side RAISE instead, so the divergence can no
+    longer be produced: the run stops at the face the caller got wrong.
+
+    The census stays valuable for the asymmetries that remain (a MASKED hook,
+    ticket .69's original finding). What is pinned here is that the silent-skip
+    route is closed.
     """
     order = ORDERS["markowitz"]
     catalog = CATALOG["markowitz"]
-    divergent = None
     for i, entry in enumerate(catalog):
         rule = _diag_for(entry)
         if rule is None:
             continue
-        if not _both_engines_apply(order, catalog, i, {2: rule}):
-            divergent = (i, rule)
-            break
-    if divergent is None:
-        pytest.skip("no literal Diag site the two engines disagree about")
-    i, rule = divergent
-    ft = _plan(catalog, {2: rule}, faces={i})
-    cs, cd = ActionCensus(), ActionCensus()
-    _run(order, census_plan(ft, cs), dense=False)
-    _run(order, census_plan(ft, cd), dense=True)
-    assert cs.counts() != cd.counts(), (cs.counts(), cd.counts())
-    with pytest.raises(CensusMismatch, match="did not apply the same actions"):
-        compare_censuses(cs, cd)
-
-
+        if _both_engines_apply(order, catalog, i, {2: rule}):
+            continue
+        # A site the two engines used to disagree about. The sparse engine now
+        # raises rather than skipping.
+        ft = _plan(catalog, {2: rule}, faces={i})
+        with pytest.raises(FaceTransformIllegal):
+            _run(order, census_plan(ft, ActionCensus()), dense=False)
+        return
+    pytest.skip("no literal Diag site the sparse engine declines")
 def test_a_skipped_face_is_skipped_in_both_engines():
     """SKIP_FACE drops the face's contraction outright. Both engines must agree
     on the (different) gradient that leaves."""

@@ -12,12 +12,18 @@ pairing, so both the size and the stored values collapsed.
 
 These are value tests, not layout tests: the contraction is a scale, so the
 result must equal ``X.dense() * s.dense()`` element for element.
+
+They call ``scale_by_scalar`` rather than ``@``: a scalar has no axes, so
+``matmul`` RAISES on a rank-0 operand (ticket dsnn-3qm.68, owner ruling
+2026-09-07). The extents the tests pin are the same either way -- the point
+was never the operator, it was that the extents survive.
 """
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from graphax.sparse.indexes import DenseIndex
+from graphax.sparse.ops.matmul import scale_by_scalar
 from graphax.sparse.tensor import SparseTensor
 
 
@@ -32,7 +38,7 @@ def test_implicit_primal_dims_survive_a_scalar_contraction():
         (), (DenseIndex(0, 7, axis=None), DenseIndex(1, 5, axis=None)), None
     )
     rhs = SparseTensor((), (), None, scalar_mult=jnp.asarray(3.0))
-    out = lhs @ rhs
+    out = scale_by_scalar(lhs, rhs)
     assert [int(d.logical_size) for d in _dims(out)] == [7, 5]
     assert [d.axis for d in _dims(out)] == [None, None]
     assert out.val is None
@@ -46,7 +52,7 @@ def test_stored_primal_dim_survives_a_scalar_contraction():
     ride through, not collapse to the first element."""
     lhs = SparseTensor((), (DenseIndex(0, 5, axis=0),), jnp.arange(5.0))
     rhs = SparseTensor((), (), None, scalar_mult=jnp.asarray(3.0))
-    out = lhs @ rhs
+    out = scale_by_scalar(lhs, rhs)
     assert [int(d.logical_size) for d in _dims(out)] == [5]
     np.testing.assert_allclose(
         np.asarray(out.dense()), np.arange(5.0) * 3.0, rtol=0, atol=0
@@ -62,7 +68,7 @@ def test_mixed_stored_and_implicit_primal_dims():
         jnp.arange(4.0) + 1.0,
     )
     rhs = SparseTensor((), (), None, scalar_mult=jnp.asarray(2.0))
-    out = lhs @ rhs
+    out = scale_by_scalar(lhs, rhs)
     assert [int(d.logical_size) for d in _dims(out)] == [4, 6]
     np.testing.assert_allclose(
         np.asarray(out.dense()), np.asarray(lhs.dense()) * 2.0, rtol=0, atol=0
@@ -79,7 +85,7 @@ def test_out_side_mirror_is_unaffected(n_dims):
     )
     rhs = SparseTensor(dims, (), val)
     s = SparseTensor((), (), None, scalar_mult=jnp.asarray(5.0))
-    out = s @ rhs
+    out = scale_by_scalar(rhs, s)
     assert [int(d.logical_size) for d in _dims(out)] == [3 + i for i in range(n_dims)]
     np.testing.assert_allclose(
         np.asarray(out.dense()), np.asarray(rhs.dense()) * 5.0, rtol=0, atol=0
@@ -97,11 +103,26 @@ import os
 from graphax.sparse.indexes import DiagonalIndex
 
 
+def _contract(lhs, rhs):
+    """``lhs @ rhs``, except that a rank-0 operand is a SCALE. ``matmul`` raises
+    on a scalar (ticket dsnn-3qm.68), so the caller picks the operation; these
+    cases include scalar ones deliberately."""
+    l0 = lhs.out_dims == () and lhs.primal_dims == ()
+    r0 = rhs.out_dims == () and rhs.primal_dims == ()
+    if l0 and r0:
+        return scale_by_scalar(lhs, rhs)
+    if l0:
+        return scale_by_scalar(rhs, lhs)
+    if r0:
+        return scale_by_scalar(lhs, rhs)
+    return lhs @ rhs
+
+
 def _legacy_dense(lhs, rhs):
     saved = os.environ.get("GRAPHAX_TILED_LEGACY")
     os.environ["GRAPHAX_TILED_LEGACY"] = "1"
     try:
-        return np.asarray((lhs @ rhs).dense())
+        return np.asarray(_contract(lhs, rhs).dense())
     finally:
         if saved is None:
             os.environ.pop("GRAPHAX_TILED_LEGACY", None)
@@ -165,7 +186,7 @@ def _cases():
 
 @pytest.mark.parametrize("name,lhs,rhs", _cases(), ids=[c[0] for c in _cases()])
 def test_lazy_frame_matches_the_incumbent_dense_form(name, lhs, rhs):
-    got = np.asarray((lhs @ rhs).dense())
+    got = np.asarray(_contract(lhs, rhs).dense())
     want = _legacy_dense(lhs, rhs)
     assert got.shape == want.shape, f"{name}: {got.shape} vs {want.shape}"
     np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-6)

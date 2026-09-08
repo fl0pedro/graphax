@@ -71,12 +71,20 @@ def test_scalar_times_scalar_both_val_none_composes_correctly():
 
 
 def test_scalar_at_scalar_rejected():
-    """Scalar @ scalar routes through elementwise ``*`` by default
-    (``GRAPHAX_SEED_VERTICES_SCALAR_MM=1``). With the env var disabled,
-    it raises. Locks in both contracts."""
+    """Scalar @ scalar RAISES (ticket dsnn-3qm.68, owner ruling 2026-09-07).
+
+    It used to route through elementwise ``*`` by default under
+    ``GRAPHAX_SEED_VERTICES_SCALAR_MM``. Two rank-0 operands have no axes
+    between them, so there is nothing to contract, and accepting the call hides
+    the site that meant a scale. ``scale_by_scalar`` (or ``*``) is that scale.
+    """
+    from graphax.sparse.ops.matmul import ScalarMatmul, scale_by_scalar
+
     a = SparseTensor((), (), jnp.array(2.0))
     b = SparseTensor((), (), jnp.array(3.0))
-    # Default: routed through elementwise multiply, not rejected.
-    res = a @ b
-    effective = float(res.val) * float(res.scalar_mult) if res.val is not None else float(res.scalar_mult)
+    with pytest.raises(ScalarMatmul, match="no axes to contract"):
+        a @ b
+    res = scale_by_scalar(a, b)
+    effective = (float(res.val) * float(res.scalar_mult)
+                 if res.val is not None else float(res.scalar_mult))
     assert effective == pytest.approx(6.0)

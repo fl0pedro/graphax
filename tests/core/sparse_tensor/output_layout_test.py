@@ -323,7 +323,12 @@ def test_lazy_tiled_frame_default_rules_grow_fewer_than_the_incumbent(order_name
     lazy_calls, lazy_elems = _as_shape_growth_census(
         order, ft, tiled_legacy=False, lazy_rules="nodemote")
     legacy_calls, legacy_elems = _as_shape_growth_census(order, ft, tiled_legacy=True)
-    assert lazy_calls < legacy_calls, (
+    # ELEMENTS, not calls. Ticket dsnn-3qm.68 routed the single-rank-0
+    # composition to scale_by_scalar, which removed one growing broadcast from
+    # the INCUMBENT path too, so both now make 8 calls on this toy. The default
+    # still grows strictly fewer ELEMENTS, which is the quantity that costs
+    # memory. Calls are kept as a non-regression bound.
+    assert lazy_calls <= legacy_calls and lazy_elems < legacy_elems, (
         f"{order_name}/{plan}: GRAPHAX_TILED_LAZY=nodemote (default) has "
         f"{lazy_calls} growing "
         f"_as_shape(mode='broadcast') call(s) ({lazy_elems} elements grown); "
