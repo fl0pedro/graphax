@@ -2,18 +2,20 @@
 
 A 2-layer MLP with a scalar MSE loss, eliminated on the static minimum
 Markowitz degree order (the fixed order of the campaign) and on the reverse
-order, under BOTH contraction engines (tiled: GRAPHAX_EINSUM_GENERAL=0;
-planner: GRAPHAX_EINSUM_GENERAL=1 GRAPHAX_PLANNER_EXACT=1), with and without a
-face transform. Before the contract the tiled engine returned ``Wout`` with its
-val transposed (axes (1, 0)) and the planner did not, so the exact and the
-approximated gradient had different pytree structure (finding 60). Now:
+order, with and without a face transform. Before the contract the tiled engine
+returned ``Wout`` with its val transposed (axes (1, 0)) and the deleted planner
+did not, so the exact and the approximated gradient had different pytree
+structure (finding 60). Now:
 
   * every returned SparseTensor is in parameter layout (axis == position),
-  * the two engines return the SAME pytree structure for the same plan,
+  * the exact and the approximated plan return ONE pytree structure,
   * the exact gradient equals ``jax.grad`` (the one oracle),
   * an approximated gradient equals its own ``sparse_representation=False``
     run. That flag changes the RETURN form only (core.py:453, :3199), so
     this is an output-packing check, not an oracle (grill 2026-09-06).
+
+There is one engine since 2026-09-08 (ticket dsnn-3qm.72), so the tests that
+used to run each cell twice run it once.
 """
 from __future__ import annotations
 
@@ -46,12 +48,6 @@ ARGNUMS = (2, 3, 4)
 def loss_fn(x, y, w1, b1, wout):
     h = jnp.tanh(x @ w1 + b1)
     return jnp.mean((h @ wout - y) ** 2)
-
-
-ENGINES = {
-    "tiled": {"GRAPHAX_EINSUM_GENERAL": "0", "GRAPHAX_PLANNER_EXACT": "0"},
-    "planner": {"GRAPHAX_EINSUM_GENERAL": "1", "GRAPHAX_PLANNER_EXACT": "1"},
-}
 
 
 def _graph():
@@ -105,20 +101,11 @@ def _plans(order):
     }
 
 
-def _run(order, ft, engine, sparse):
-    saved = {k: os.environ.get(k) for k in ENGINES[engine]}
-    os.environ.update(ENGINES[engine])
-    try:
-        fn = jacve(loss_fn, list(order), argnums=ARGNUMS,
-                   sparse_representation=sparse,
-                   transforms=[], face_transforms=ft)
-        return jax.jit(fn)(*ARGS)
-    finally:
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+def _run(order, ft, sparse):
+    fn = jacve(loss_fn, list(order), argnums=ARGNUMS,
+               sparse_representation=sparse,
+               transforms=[], face_transforms=ft)
+    return jax.jit(fn)(*ARGS)
 
 
 def _dense(out):
@@ -131,16 +118,15 @@ def _structure(out):
 
 
 @pytest.mark.parametrize("order_name", sorted(ORDERS))
-@pytest.mark.parametrize("engine", sorted(ENGINES))
 @pytest.mark.parametrize("plan", ["exact", "quant_lhs", "compress_lhs"])
-def test_every_returned_gradient_is_in_parameter_layout(order_name, engine, plan):
+def test_every_returned_gradient_is_in_parameter_layout(order_name, plan):
     order = ORDERS[order_name]
     ft = _plans(order)[plan]
-    out = _run(order, ft, engine, True)
+    out = _run(order, ft, True)
     assert len(out) == len(ARGNUMS)
     for t in out:
         assert isinstance(t, SparseTensor)
-        assert is_parameter_layout(t), (order_name, engine, plan, t.dims, t.val.shape)
+        assert is_parameter_layout(t), (order_name, plan, t.dims, t.val.shape)
         dense_dims = [d for d in t.dims if d.axis is not None]
         for pos, d in enumerate(t.dims):
             if d.axis is not None and len(dense_dims) == len(t.dims):
@@ -149,48 +135,35 @@ def test_every_returned_gradient_is_in_parameter_layout(order_name, engine, plan
 
 @pytest.mark.parametrize("order_name", sorted(ORDERS))
 @pytest.mark.parametrize("plan", ["exact", "quant_lhs"])
-def test_both_engines_return_the_same_pytree_structure(order_name, plan):
-    order = ORDERS[order_name]
-    ft = _plans(order)[plan]
-    a = _run(order, ft, "tiled", True)
-    b = _run(order, ft, "planner", True)
-    assert _structure(a) == _structure(b)
-
-
-@pytest.mark.parametrize("order_name", sorted(ORDERS))
-@pytest.mark.parametrize("plan", ["exact", "quant_lhs"])
 def test_exact_and_approximated_share_one_structure(order_name, plan):
     """The reward path compares the plan's gradient with the same-order exact
     gradient by tree_map; that needs one structure (finding 60's failure)."""
     order = ORDERS[order_name]
-    for engine in ENGINES:
-        exact = _run(order, None, engine, True)
-        appr = _run(order, _plans(order)[plan], engine, True)
-        assert _structure(exact) == _structure(appr), (order_name, engine, plan)
-        jax.tree_util.tree_map(lambda e, a: None, exact, appr)
+    exact = _run(order, None, True)
+    appr = _run(order, _plans(order)[plan], True)
+    assert _structure(exact) == _structure(appr), (order_name, plan)
+    jax.tree_util.tree_map(lambda e, a: None, exact, appr)
 
 
 @pytest.mark.parametrize("order_name", sorted(ORDERS))
-@pytest.mark.parametrize("engine", sorted(ENGINES))
-def test_exact_gradient_equals_jax_grad(order_name, engine):
+def test_exact_gradient_equals_jax_grad(order_name):
     order = ORDERS[order_name]
     ref = [np.asarray(g, np.float64)
            for g in jax.grad(loss_fn, argnums=ARGNUMS)(*ARGS)]
     for sparse in (True, False):
-        got = _dense(_run(order, None, engine, sparse))
+        got = _dense(_run(order, None, sparse))
         for g, r in zip(got, ref):
             assert g.shape == r.shape
             np.testing.assert_allclose(g, r, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize("order_name", sorted(ORDERS))
-@pytest.mark.parametrize("engine", sorted(ENGINES))
 @pytest.mark.parametrize("plan", ["quant_lhs", "compress_lhs"])
-def test_approximated_sparse_equals_its_dense_return_form(order_name, engine, plan):
+def test_approximated_sparse_equals_its_dense_return_form(order_name, plan):
     order = ORDERS[order_name]
     ft = _plans(order)[plan]
-    sp = _dense(_run(order, ft, engine, True))
-    dn = _dense(_run(order, ft, engine, False))
+    sp = _dense(_run(order, ft, True))
+    dn = _dense(_run(order, ft, False))
     for a, b in zip(sp, dn):
         assert a.shape == b.shape
         np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-6)
@@ -203,21 +176,11 @@ def test_a_diagonal_pair_output_passes_the_contract():
     def f(x):
         return jnp.tanh(x) * 2.0
     x = jnp.arange(4.0) + 0.5
-    for engine in ENGINES:
-        saved = {k: os.environ.get(k) for k in ENGINES[engine]}
-        os.environ.update(ENGINES[engine])
-        try:
-            out = jax.jit(jacve(f, [1, 2], argnums=(0,), sparse_representation=True))(x)
-        finally:
-            for k, v in saved.items():
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
-        t = out[0]
-        assert isinstance(t, SparseTensor)
-        assert is_parameter_layout(t), (engine, t.dims, t.val.shape)
-        np.testing.assert_allclose(np.asarray(t.dense()), np.asarray(jax.jacfwd(f)(x)), rtol=1e-6)
+    out = jax.jit(jacve(f, [1, 2], argnums=(0,), sparse_representation=True))(x)
+    t = out[0]
+    assert isinstance(t, SparseTensor)
+    assert is_parameter_layout(t), (t.dims, t.val.shape)
+    np.testing.assert_allclose(np.asarray(t.dense()), np.asarray(jax.jacfwd(f)(x)), rtol=1e-6)
 
 
 # --- Growing-broadcast census (ticket dsnn-3qm.28.1, deliverable b) --------
@@ -234,17 +197,9 @@ def test_a_diagonal_pair_output_passes_the_contract():
 import importlib as _importlib
 
 _mm = _importlib.import_module("graphax.sparse.ops.matmul")
-_mm_legacy = _importlib.import_module("graphax.sparse.ops.matmul_legacy_tiled")
 
 
-def _as_shape_growth_census(order, ft, *, tiled_legacy, lazy_rules="nodemote"):
-    saved = {k: os.environ.get(k) for k in
-             ("GRAPHAX_TILED_LEGACY", "GRAPHAX_TILED_LAZY",
-              "GRAPHAX_EINSUM_GENERAL", "GRAPHAX_PLANNER_EXACT")}
-    os.environ["GRAPHAX_TILED_LEGACY"] = "1" if tiled_legacy else "0"
-    os.environ["GRAPHAX_TILED_LAZY"] = lazy_rules
-    os.environ["GRAPHAX_EINSUM_GENERAL"] = "0"
-    os.environ["GRAPHAX_PLANNER_EXACT"] = "0"
+def _as_shape_growth_census(order, ft):
     orig_as_shape = _mm._as_shape
     grew = {"calls": 0, "elems": 0}
 
@@ -259,14 +214,7 @@ def _as_shape_growth_census(order, ft, *, tiled_legacy, lazy_rules="nodemote"):
                 grew["elems"] += out_n - in_n
         return out
 
-    # ``matmul_legacy_tiled.py`` does ``from .matmul import (..., _as_shape,
-    # ...)`` — a name binding taken at import time. Patching
-    # ``matmul._as_shape`` alone does not touch that already-bound name in
-    # the legacy module, so the incumbent path (GRAPHAX_TILED_LEGACY=1)
-    # would silently read 0 calls. Patch both module-level names to the same
-    # wrapper so either engine's calls are counted.
     _mm._as_shape = _wrapped
-    _mm_legacy._as_shape = _wrapped
     try:
         fn = jacve(loss_fn, list(order), argnums=ARGNUMS,
                    sparse_representation=True,
@@ -274,64 +222,27 @@ def _as_shape_growth_census(order, ft, *, tiled_legacy, lazy_rules="nodemote"):
         jax.eval_shape(fn, *ARGS)
     finally:
         _mm._as_shape = orig_as_shape
-        _mm_legacy._as_shape = orig_as_shape
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
     return grew["calls"], grew["elems"]
 
 
 @pytest.mark.parametrize("order_name", sorted(ORDERS))
 @pytest.mark.parametrize("plan", ["exact", "quant_lhs", "compress_lhs"])
-def test_lazy_tiled_frame_full_rules_has_zero_growing_broadcasts(order_name, plan):
-    """``GRAPHAX_TILED_LAZY=full`` (ticket dsnn-3qm.67; keeps the meta axis on
-    the storing operand instead of broadcasting it inside the contraction)
-    reaches ZERO growing ``_as_shape(mode="broadcast")`` calls on this MLP
-    toy, on both orders and every plan (exact, Quant, Reduce) — the same
-    claim T28B-RESULT.md section 3 made for NeuralNetwork/TransformerLM. This
-    is the leaner-CPU setting; the LANDED DEFAULT is
-    ``GRAPHAX_TILED_LAZY=nodemote`` (broadcasts the meta axis inside the
-    contraction instead, chosen for GPU fusion — see the next test), which
-    does not reach zero here. Both are "the lazy frame"; only one env value
-    differs."""
+def test_the_frame_has_zero_growing_broadcasts(order_name, plan):
+    """The contraction frame never grows a buffer to line two operands up.
+
+    An axis one operand does not store is stated in the einsum and summed away
+    at extent 1, never broadcast to its partner's extent. Zero on both orders
+    and every plan (exact, Quant, Reduce), the same claim T28B-RESULT.md
+    section 3 made for NeuralNetwork and TransformerLM.
+
+    This used to hold only under ``GRAPHAX_TILED_LAZY=full``, because a
+    ``dot_general`` forced a choice between the broadcast and the GPU fusion.
+    The einsum emission does not force it, so the rule is unconditional
+    (ticket dsnn-3qm.72)."""
     order = ORDERS[order_name]
     ft = _plans(order)[plan]
-    calls, elems = _as_shape_growth_census(order, ft, tiled_legacy=False, lazy_rules="full")
+    calls, elems = _as_shape_growth_census(order, ft)
     assert calls == 0, (
-        f"{order_name}/{plan}: GRAPHAX_TILED_LAZY=full has {calls} growing "
-        f"_as_shape(mode='broadcast') call(s) ({elems} elements grown), expected zero"
-    )
-
-
-@pytest.mark.parametrize("order_name", sorted(ORDERS))
-@pytest.mark.parametrize("plan", ["exact", "quant_lhs", "compress_lhs"])
-def test_lazy_tiled_frame_default_rules_grow_fewer_than_the_incumbent(order_name, plan):
-    """The LANDED DEFAULT (``GRAPHAX_TILED_LAZY=nodemote`` — the
-    device-dependent tradeoff of T28B-RESULT.md section 4: broadcasting the
-    meta axis inside the contraction instead of keeping it on the storing
-    operand keeps the GPU fusion, at the cost of the CPU broadcast this test
-    measures) does NOT reach zero growing broadcasts on this toy, unlike
-    ``GRAPHAX_TILED_LAZY=full`` (previous test). It IS a strict improvement
-    over the incumbent on every (order, plan) cell. Do not read "zero" into
-    this test name — the zero claim belongs to ``full``, not to the landed
-    default. See findings/62-implicit-axis-small-case.md for the full count
-    table."""
-    order = ORDERS[order_name]
-    ft = _plans(order)[plan]
-    lazy_calls, lazy_elems = _as_shape_growth_census(
-        order, ft, tiled_legacy=False, lazy_rules="nodemote")
-    legacy_calls, legacy_elems = _as_shape_growth_census(order, ft, tiled_legacy=True)
-    # ELEMENTS, not calls. Ticket dsnn-3qm.68 routed the single-rank-0
-    # composition to scale_by_scalar, which removed one growing broadcast from
-    # the INCUMBENT path too, so both now make 8 calls on this toy. The default
-    # still grows strictly fewer ELEMENTS, which is the quantity that costs
-    # memory. Calls are kept as a non-regression bound.
-    assert lazy_calls <= legacy_calls and lazy_elems < legacy_elems, (
-        f"{order_name}/{plan}: GRAPHAX_TILED_LAZY=nodemote (default) has "
-        f"{lazy_calls} growing "
-        f"_as_shape(mode='broadcast') call(s) ({lazy_elems} elements grown); "
-        f"incumbent has {legacy_calls} ({legacy_elems} elements grown) — "
-        "expected the default lazy frame to grow strictly fewer, even though not zero"
+        f"{order_name}/{plan}: {calls} growing _as_shape(mode='broadcast') "
+        f"call(s) ({elems} elements grown), expected zero"
     )

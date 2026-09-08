@@ -4,13 +4,11 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 
-# Layout pins compare against HAND-BUILT tiled-layout references, so they
-# only hold on the incumbent engine. Under GRAPHAX_PLANNER_EXACT=1 the
-# planner emits a different, equally valid layout: assert VALUE identity
-# on the dense form instead (the engine-agnostic invariant).
-_PIN_LAYOUT = os.environ.get("GRAPHAX_PLANNER_EXACT", "0") in (
-    "", "0", "false", "False"
-)
+# Layout pins compare against HAND-BUILT tiled-layout references. There is one
+# engine now (the planner was deleted 2026-09-08, ticket dsnn-3qm.72), so the
+# pins always hold. The flag stays as a named constant because 18 asserts read
+# it and it documents which of them are layout pins rather than value checks.
+_PIN_LAYOUT = True
 
 def _engine_reduce(view, flat_idx, num_segments):
     """Mirror of the engine's _reduce_grid reduction (#51): constant one-hot
@@ -23,8 +21,8 @@ def _engine_reduce(view, flat_idx, num_segments):
         oh = _np.zeros((int(num_segments), n_src), dtype=_np.float32)
         oh[flat_idx, _np.arange(n_src)] = 1.0
         v2 = view.reshape(n_src, -1)
-        res = jax.lax.dot_general(
-            jnp.asarray(oh, dtype=v2.dtype), v2, (((1,), (0,)), ((), ())))
+        res = jnp.einsum(
+            jnp.asarray(oh, dtype=v2.dtype), [0, 1], v2, [1, 2], [0, 2])
         return res.reshape((int(num_segments),) + tuple(view.shape[1:]))
     return jax.ops.segment_sum(view, jnp.asarray(flat_idx),
                                num_segments=num_segments)

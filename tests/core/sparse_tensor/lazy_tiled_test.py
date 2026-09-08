@@ -93,13 +93,15 @@ def test_out_side_mirror_is_unaffected(n_dims):
 
 
 # --------------------------------------------------------------------------
-# Differential test: the lazy frame against the incumbent tiled executor of
-# graphax 1f3d404, reached in the same process under GRAPHAX_TILED_LEGACY=1
-# (ticket dsnn-3qm.67). Values must agree; the candidate may keep MORE
-# structure symbolic, so shapes are compared on the dense form.
+# Differential test: the lazy frame against a DENSE reference (ticket
+# dsnn-3qm.67). Both operands are materialized to their logical shapes and
+# contracted by a plain einsum, so the reference shares no code with the
+# engine under test. This used to compare against a verbatim copy of the
+# incumbent tiled executor of graphax 1f3d404, reached in the same process
+# under GRAPHAX_TILED_LEGACY=1. That copy and its knob were deleted with the
+# race they settled (ticket dsnn-3qm.72), and the dense form is the stronger
+# reference anyway: it is an oracle, not a second implementation.
 # --------------------------------------------------------------------------
-import os
-
 from graphax.sparse.indexes import DiagonalIndex
 
 
@@ -118,16 +120,28 @@ def _contract(lhs, rhs):
     return lhs @ rhs
 
 
-def _legacy_dense(lhs, rhs):
-    saved = os.environ.get("GRAPHAX_TILED_LEGACY")
-    os.environ["GRAPHAX_TILED_LEGACY"] = "1"
-    try:
-        return np.asarray(_contract(lhs, rhs).dense())
-    finally:
-        if saved is None:
-            os.environ.pop("GRAPHAX_TILED_LEGACY", None)
-        else:
-            os.environ["GRAPHAX_TILED_LEGACY"] = saved
+def _reference_dense(lhs, rhs):
+    """``lhs @ rhs`` computed on the fully materialized operands.
+
+    The dense form of a SparseTensor has the logical shape ``out_dims +
+    primal_dims``. The contraction pairs the lhs's primal dims with the rhs's
+    out dims, in order, so the reference is one einsum over those axes. A
+    rank-0 operand carries no axes and the operation is a scale.
+    """
+    l = np.asarray(lhs.dense(), np.float64).reshape(
+        [int(d.logical_size) for d in _dims(lhs)] or [])
+    r = np.asarray(rhs.dense(), np.float64).reshape(
+        [int(d.logical_size) for d in _dims(rhs)] or [])
+    n_c = len(rhs.out_dims)
+    if len(lhs.primal_dims) != n_c:
+        raise AssertionError("the case list must pair primal dims with out dims")
+    if n_c == 0:
+        return np.multiply.outer(l, r) if l.ndim and r.ndim else l * r
+    l_sub = list(range(l.ndim))
+    r_sub = list(range(l.ndim - n_c, l.ndim)) + list(
+        range(l.ndim, l.ndim + r.ndim - n_c))
+    out_sub = list(range(l.ndim - n_c)) + list(range(l.ndim, l.ndim + r.ndim - n_c))
+    return np.einsum(l, l_sub, r, r_sub, out_sub)
 
 
 def _cases():
@@ -185,8 +199,8 @@ def _cases():
 
 
 @pytest.mark.parametrize("name,lhs,rhs", _cases(), ids=[c[0] for c in _cases()])
-def test_lazy_frame_matches_the_incumbent_dense_form(name, lhs, rhs):
-    got = np.asarray(_contract(lhs, rhs).dense())
-    want = _legacy_dense(lhs, rhs)
+def test_lazy_frame_matches_the_dense_reference(name, lhs, rhs):
+    got = np.asarray(_contract(lhs, rhs).dense(), np.float64)
+    want = _reference_dense(lhs, rhs)
     assert got.shape == want.shape, f"{name}: {got.shape} vs {want.shape}"
     np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-6)

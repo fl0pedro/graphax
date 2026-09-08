@@ -4,6 +4,20 @@ dsnn-3qm.28.1, deliverable b). Turns lane B's ad hoc probe
 asserted test, on the second target the ticket names (the first is the MLP
 toy of ``output_layout_test.py``).
 
+The property under test: the contraction engine never grows a buffer to line
+two operands up. An axis one operand does not store is stated in the einsum
+and summed away at extent 1, never broadcast to its partner's extent. The
+census counts every ``_as_shape(mode="broadcast")`` call that makes the array
+bigger. It must be zero.
+
+That number used to depend on an environment variable, because a
+``dot_general`` forced a choice: keeping the axis in the batch list needed the
+broadcast, and taking it out lost the fusion on GPU. The einsum emission does
+not force the choice, so the rule is unconditional and the target is zero
+(ticket dsnn-3qm.72). Under the old ``full`` rules this target already
+reached zero, down from 15 calls and 50 258 grown elements on the incumbent
+frame (T28B-RESULT.md section 3).
+
 Needs alphagrad importable (``landscape_map.build_env`` builds the target the
 same way the campaign does) — skipped cleanly if it is not on the path, the
 same pattern ``analyze_and_smoke_test.py`` uses for ``jax_memory_monitor``.
@@ -22,7 +36,6 @@ alphagrad_lm = pytest.importorskip("alphagrad.approx.tools.landscape_map")
 from graphax import jacve  # noqa: E402  (after importorskip, deliberately)
 
 _mm = importlib.import_module("graphax.sparse.ops.matmul")
-_mm_legacy = importlib.import_module("graphax.sparse.ops.matmul_legacy_tiled")
 
 _CLI = ["--example", "NeuralNetwork", "--dataset", "mnist", "--seed", "250197",
         "--latency-inner-reps", "1", "--num-data-points", "1", "--reps-per-point", "1",
@@ -39,15 +52,9 @@ def _build():
     return env, order
 
 
-def _as_shape_growth_census(env, order, *, tiled_legacy, lazy_rules="nodemote"):
+def _as_shape_growth_census(env, order):
     saved = {k: os.environ.get(k) for k in
-             ("GRAPHAX_TILED_LEGACY", "GRAPHAX_TILED_LAZY",
-              "GRAPHAX_EINSUM_GENERAL", "GRAPHAX_PLANNER_EXACT",
-              "ALPHAGRAD_SKIP_COUNT_OPS", "ALPHAGRAD_SKIP_COST_ANALYSIS")}
-    os.environ["GRAPHAX_TILED_LEGACY"] = "1" if tiled_legacy else "0"
-    os.environ["GRAPHAX_TILED_LAZY"] = lazy_rules
-    os.environ["GRAPHAX_EINSUM_GENERAL"] = "0"
-    os.environ["GRAPHAX_PLANNER_EXACT"] = "0"
+             ("ALPHAGRAD_SKIP_COUNT_OPS", "ALPHAGRAD_SKIP_COST_ANALYSIS")}
     os.environ["ALPHAGRAD_SKIP_COUNT_OPS"] = "1"
     os.environ["ALPHAGRAD_SKIP_COST_ANALYSIS"] = "1"
     orig_as_shape = _mm._as_shape
@@ -64,10 +71,7 @@ def _as_shape_growth_census(env, order, *, tiled_legacy, lazy_rules="nodemote"):
                 grew["elems"] += out_n - in_n
         return out
 
-    # Same import-time-binding caveat as output_layout_test.py: patch both
-    # module-level names, since matmul_legacy_tiled imports _as_shape by name.
     _mm._as_shape = _wrapped
-    _mm_legacy._as_shape = _wrapped
     try:
         cfg = env.config
         fn = jacve(cfg.target_fun, list(order), argnums=cfg.argnums, has_aux=cfg.has_aux,
@@ -75,7 +79,6 @@ def _as_shape_growth_census(env, order, *, tiled_legacy, lazy_rules="nodemote"):
         jax.eval_shape(fn, *env.args)
     finally:
         _mm._as_shape = orig_as_shape
-        _mm_legacy._as_shape = orig_as_shape
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -84,37 +87,10 @@ def _as_shape_growth_census(env, order, *, tiled_legacy, lazy_rules="nodemote"):
     return grew["calls"], grew["elems"]
 
 
-def test_neuralnetwork_exact_plan_full_rules_has_zero_growing_broadcasts():
-    """``GRAPHAX_TILED_LAZY=full`` (keeps the meta axis on the storing
-    operand instead of broadcasting it inside the contraction) reaches ZERO
-    growing ``_as_shape(mode="broadcast")`` calls on the NeuralNetwork(mnist)
-    exact plan — matching T28B-RESULT.md section 3's "15 calls / 50258
-    elements to ZERO" claim exactly. That claim was measured under ``full``,
-    not under the landed default (see the next test)."""
+def test_neuralnetwork_exact_plan_has_zero_growing_broadcasts():
     env, order = _build()
-    calls, elems = _as_shape_growth_census(env, order, tiled_legacy=False, lazy_rules="full")
+    calls, elems = _as_shape_growth_census(env, order)
     assert calls == 0, (
-        f"NeuralNetwork exact, GRAPHAX_TILED_LAZY=full: {calls} growing "
-        f"_as_shape(mode='broadcast') call(s) ({elems} elements grown), expected zero"
-    )
-
-
-def test_neuralnetwork_exact_plan_default_rules_grow_fewer_than_the_incumbent():
-    """The LANDED DEFAULT (``GRAPHAX_TILED_LAZY=nodemote`` — the
-    GPU-favoring choice of T28B-RESULT.md section 4) does NOT reach zero on
-    this target either: 10 calls / 49 353 elements remain (all from the
-    one-sided meta axis that broadcasting inside the contraction, instead of
-    keeping it on the storing operand, would otherwise take out of the
-    dot_general batch list), down from 15 calls / 49 398 elements on the
-    incumbent. Still a strict improvement, never a regression; not zero."""
-    env, order = _build()
-    lazy_calls, lazy_elems = _as_shape_growth_census(
-        env, order, tiled_legacy=False, lazy_rules="nodemote")
-    legacy_calls, legacy_elems = _as_shape_growth_census(env, order, tiled_legacy=True)
-    assert lazy_calls < legacy_calls, (
-        f"NeuralNetwork exact, GRAPHAX_TILED_LAZY=nodemote (default): "
-        f"{lazy_calls} growing "
-        f"_as_shape(mode='broadcast') call(s) ({lazy_elems} elements grown); "
-        f"incumbent has {legacy_calls} ({legacy_elems} elements grown) — "
-        "expected the default lazy frame to grow strictly fewer, even though not zero"
+        f"NeuralNetwork exact: {calls} growing _as_shape(mode='broadcast') "
+        f"call(s) ({elems} elements grown), expected zero"
     )

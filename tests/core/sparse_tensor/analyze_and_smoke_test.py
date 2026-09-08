@@ -46,14 +46,6 @@ def _expect_path(core_fn, *args, expected_path: str) -> None:
     with track_paths() as paths:
         core_fn(*args)
     actual = paths[-1] if paths else None
-    # GRAPHAX_EINSUM_GENERAL routes the general path through its einsum incarnation,
-    # labelled 'einsum_general'. It IS the structured general path, so accept it wherever a
-    # test expects 'general' (the assertions verify "hit the optimized path, don't bail to
-    # slow dense" -- einsum_general satisfies that).
-    import os as _os
-    if (_os.environ.get("GRAPHAX_EINSUM_GENERAL", "0") not in ("", "0", "false", "False")
-            and expected_path == "general" and actual == "einsum_general"):
-        actual = "general"
     if actual != expected_path:
         raise AssertionError(
             f"Expected {core_fn.__name__} to use path {expected_path!r}, "
@@ -1512,9 +1504,8 @@ class TestSmokeScreen(unittest.TestCase):
         # ``a`` is fully implicit (``val=None`` on every dim), and tracing
         # ``sparse_matmul(a, b)`` shows exactly ONE growing ``broadcast_in_dim``
         # (a scalar placeholder broadcast across a's fully-degenerate meta+dense
-        # frame slots) under GRAPHAX_TILED_LEGACY=1 *and* under both
-        # GRAPHAX_TILED_LAZY settings — lane B's rule that keeps a meta axis
-        # on the storing operand instead of broadcasting it (GRAPHAX_TILED_LAZY
+        # frame slots) under every frame rule — the rule that keeps a meta
+        # axis on the storing operand instead of broadcasting it (the
         # =full vs =nodemote) targets a meta axis stored by exactly ONE side;
         # it does not touch this zero-sided (fully-None) case. The final
         # ``val`` is bit-identical to
