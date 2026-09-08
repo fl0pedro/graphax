@@ -476,6 +476,29 @@ def _reconstruct_result(value, lhs, sp, dp, output_meta, op, rhs):
 
 
 
+# --- WHAT THIS OP MATERIALIZES (measured 2026-09-08) ----------------------
+# The contraction engine stopped broadcasting on the same day (ticket
+# dsnn-3qm.72). This op did NOT. The census below counts every
+# ``broadcast_in_dim`` in the jaxpr whose output holds more elements than its
+# input, plus the compiled temp, on a 32-meta diagonal pair of 32x32 blocks:
+#
+#   aligned diagonal + diagonal            0 growing            temp 0 B
+#   diagonal + meta-implicit diagonal      1 growing, 1024 -> 32768 (32x)
+#   misaligned diagonal + diagonal         8 growing, 7 281 elements, 33 eqns
+#     (meta 4 blocks of 12 against meta 6 blocks of 8, for 1 152 stored out)
+#   uniform (val is None) + dense          1 growing, 1 -> 4096
+#
+# Row 2 is the elementwise MIRROR of the case D1 fixed in the contraction: a
+# role implicit on one side and physical on the other, at the same id-matched
+# extent. ``_align_value`` broadcasts the implicit side to the full extent
+# instead of letting the op broadcast one size-1 axis. Row 3 is
+# ``_promote_to_unified``: both operands go to the least-common-multiple meta
+# grid, with iota / eq / select machinery to build the mask. Row 4 is a union
+# op against a scalar and is unavoidable.
+#
+# Rows 2 and 3 are what ``lower_add`` existed to remove.
+
+
 # --- NOT MERGED: the sparsity-retaining elementwise rules -----------------
 # ``sparse/lower/add.py`` held a second elementwise engine, ``lower_add``. It
 # was deleted on 2026-09-08 with the rest of the planner (ticket dsnn-3qm.72).

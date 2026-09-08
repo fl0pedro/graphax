@@ -9,13 +9,20 @@ Pipeline (zero-fill fast path):
     4. ``_build_output_tensor`` — re-emit ``SparseTensor`` ``out_dims`` / ``primal_dims``.
 
 EMISSION (owner ruling D1, revised 2026-09-08). Every contraction leaves this
-module as ``jnp.einsum`` over INTEGER sublists, never ``lax.dot_general`` and
-never a hand-written multiply-then-reduce. The einsum states which axes meet
-and leaves the lowering to XLA, which picks a library GEMM, a fused multiply
-and reduce, or something else, per shape and per device. Integer labels also
-lift the letter form's 52-symbol cap. An axis one operand does not store is
-NEVER broadcast up to its partner: it is given a private label and summed
-away, which is free at extent 1. See ``_frame_sublists``.
+module as ``jnp.einsum`` over INTEGER sublists, never a ``lax.dot_general``
+this module wrote itself and never a hand-written multiply-then-reduce.
+
+Be precise about what that buys. ``jnp.einsum`` still lowers to ``dot_general``
+in the jaxpr; it is a jnp-level API, not a different XLA primitive. What
+changes is WHO picks the dimension numbers and what has to happen to the
+operands first. Stating the contraction lets einsum choose, and it chooses
+better than the frame did: an axis one operand does not store is given a
+PRIVATE label, so einsum emits a ``reduce_sum`` over the storing side instead
+of a ``broadcast_in_dim`` growing the other side up to it. MEASURED on a
+meta-32 diagonal pair whose rhs stores no meta axis: the broadcast
+(96 -> 3072 elements) is gone and the compiled temp goes 12 288 B -> 0 B, with
+identical flops. Integer labels also lift the letter form's 52-symbol cap.
+See ``_frame_sublists``.
 
 Late-densification escape hatch (non-zero fill_value):
     The tiled algorithm assumes implicit positions are zero. When ``_is_zero_fill``
@@ -23,6 +30,19 @@ Late-densification escape hatch (non-zero fill_value):
     ``_matmul_via_densify`` — which materializes both sides via the fusion-friendly
     ``dense_for_matmul``. Densification stays as a JAX expression so XLA can fold
     it into the contraction kernel (SMEM, not HBM).
+
+MISALIGNED (least-common-multiple) GRIDS materialize NEITHER operand. The lcm
+refinement is carved out of each operand's own block axis by a reshape, so a
+meta-a and a meta-b factoring of one contracted axis meet at meta lcm(a, b) for
+free. The cost sits after the contraction: ``_reduce_grid`` folds the refined
+metas into the output's ``(gcd, a/gcd, b/gcd)`` band grid through a constant
+one-hot contraction, and that grid holds cells that are structurally zero.
+MEASURED on meta 16 against meta 24: 3 072 stored in, 49 152 stored out
+against a structural support of 32 768 (1.50x), temp 196 608 B, two
+contractions and 10 HLO fusions, against 0 B, one contraction and 4 fusions
+for the aligned control. The class that held that support exactly was
+``BandedIndex``, deleted by the two-class ruling of 2026-09-07, so 1.50x is
+the floor for the classes that remain.
 
 There is ONE engine and no environment switch. The structure-lowering planner
 (``sparse/lower/``), its compact-frame and spill entry points, the verbatim
