@@ -804,36 +804,31 @@ def _all_implicit(t) -> bool:
 def _lazy_uu(lhs, rhs, op, l_by_id, r_by_id):
     """U+U -> U: two pure-structure operands combine entirely in scalar_mult.
 
-    OFF. The rule is correct in isolation and it is the leanest of the four --
-    no buffer is built at all -- but its result is the one signature the rest
-    of the engine cannot yet read. It returns ``val=None`` where
-    ``_reconstruct_result`` materializes an array, and a consumer downstream
-    then collapses a logical extent.
+    The leanest of the four rules: neither operand stores anything, the result
+    stores nothing, and the whole combination is one scalar op folded into
+    ``scalar_mult``. Without it a uniform union writes its entire output -- at
+    256 x 256 that is 65 536 elements, 262 144 bytes, 13 equations and two
+    growing broadcasts, for a tensor whose every cell holds the same number.
 
-    MEASURED 2026-09-08 on ``RoeFlux_3d`` (order fwd), by disabling one rule at
-    a time:
+    It was OFF, because enabling it made ``RoeFlux_3d`` fail core.py's
+    nominal-shape assertion with "edge shape (1, 1), expected (3, 1)". The fault
+    was NOT this rule's. ``_drain_or_unload_pre`` in core.py resolved a
+    ``post_val`` pre_transform only when ``pre_val.val is not None``, and a
+    uniform ``pre_val`` fell through to a branch that DROPPED the transform. The
+    transform carried the contracted dimension's relabelling and the tensor it
+    sat on was a rank-0 uniform stand-in with no dims, so once it was gone
+    nothing stated the edge's shape.
 
-        lazy off entirely   PASS
-        all four rules      FAIL  edge shape (1, 1), expected (3, 1)
-        without uu          PASS  (eq 174, ibroad 46, u_x 66)
-        without u_x         FAIL
-        without eq+ibroad   FAIL
-        without ibroad      FAIL
-        without eq          FAIL
+    That hole was invisible while the materializing path wrote a buffer for
+    nearly every edge. This rule makes uniform operands common, which is why it
+    looked responsible. Two instruments cleared it: wrapping ``matmul`` and
+    ``elementwise`` to flag any output whose rank fell below what the op must
+    produce reported ZERO across the whole run, and the first rank-deficient
+    edge store of 12 was the elemental partial itself, not an op's output.
 
-    Every configuration that keeps ``uu`` fails and the one that drops it
-    passes, so the fault is ``uu``'s alone. Neither ``matmul`` nor
-    ``elementwise`` loses the extent -- both were instrumented and reported
-    zero -- so the consumer that mis-reads a ``val=None`` union result is a
-    third site and has not been found yet. Until it is, this signature takes
-    the materializing path, exactly as it did before, and the engine is
-    unchanged for it.
-
-    Do not re-enable this without finding that consumer.
-    ``elementwise_lazy_test.py::test_uu_declines_until_its_consumer_is_fixed``
-    pins the decline.
+    With core.py resolving the transform for a uniform operand, ``RoeFlux_3d``
+    runs clean.
     """
-    return _skip("uu_downstream_collapses_an_extent")
     reason = _match_structure(l_by_id, r_by_id)
     if reason:
         return _skip(reason)

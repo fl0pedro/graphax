@@ -231,24 +231,29 @@ def test_every_live_rule_is_exercised():
     assert "uu" not in fired, "uu is off; see _lazy_uu"
 
 
-def test_uu_declines_until_its_consumer_is_fixed():
-    """``uu`` is correct in isolation and it is the leanest rule, but its
-    ``val=None`` result breaks a consumer downstream: with it on, RoeFlux_3d
-    fails with "edge shape (1, 1) does not match expected shape (3, 1)", and
-    with it off the suite is green. Disabling one rule at a time put the fault
-    on ``uu`` alone (see ``_lazy_uu`` for the table).
+def test_uu_stores_nothing_at_all():
+    """``uu`` is the leanest rule: two operands that store nothing combine into
+    one that stores nothing, with the whole op folded into ``scalar_mult``.
 
-    This pins the decline so the rule cannot come back without someone finding
-    that consumer first."""
+    It used to decline. Enabling it made RoeFlux_3d fail core.py's nominal-shape
+    assertion with "edge shape (1, 1), expected (3, 1)", and the fault was read
+    as this rule's. It was not. ``_drain_or_unload_pre`` resolved a pre_transform
+    only for a materialized operand and DROPPED it for a uniform one, and that
+    transform was the only thing stating the edge's shape. This rule just made
+    uniform operands common enough to hit it.
+
+    Pins both halves of the contract: the rule fires, and it allocates
+    nothing."""
     lhs = _st((DenseIndex(0, M, None),), (DenseIndex(1, Q, None),), None,
               scalar_mult=jnp.asarray(2.0))
     rhs = _st((DenseIndex(0, M, None),), (DenseIndex(1, Q, None),), None,
               scalar_mult=jnp.asarray(3.0))
     ew.reset_lazy_stats()
     out = ew.elementwise(lhs, rhs, jnp.add)
-    assert "rule:uu" not in ew.LAZY_STATS, dict(ew.LAZY_STATS)
-    assert ew.LAZY_STATS["skip:uu_downstream_collapses_an_extent"] == 1
-    # and the answer is still right, because the materializing path took it
+    assert ew.LAZY_STATS["rule:uu"] == 1, dict(ew.LAZY_STATS)
+    assert out.val is None, "uu must not allocate a buffer"
+    # the dims survive at full extent, so the consumer can still read the shape
+    assert tuple(int(d.logical_size) for d in out.dims) == (M, Q)
     np.testing.assert_allclose(
         _dense(out), _dense(_oracle(lhs, rhs, jnp.add, False)),
         rtol=1e-6, atol=1e-6)
