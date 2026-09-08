@@ -1011,6 +1011,59 @@ def _subdivide_coupled_blockdiag(
     return _rebuild(new_d1, new_d2, new_val, moved=moved, n_lead=n_lead)
 
 
+def materialize_uniform(st):
+    """Give a UNIFORM (``val is None``) tensor an explicit buffer, WITHOUT
+    densifying it.
+
+    A ``val is None`` tensor means "every logical cell equals ``scalar_mult``",
+    and it stores nothing: every dim is implicit. That is the leanest form, but
+    it is not a form every consumer can read. A face transform, in particular,
+    reshapes or slices ``val``, and there is no ``val`` to reshape.
+
+    This gives each dim a physical axis of its own extent -- the two members of
+    a coupled pair sharing one meta axis, as the layout requires -- and fills
+    the buffer with ones, leaving the value in ``scalar_mult``. The structural
+    class does not change and neither does the logical content, so this is the
+    block-diagonal storage, not the dense one: exactly the
+    ``_structural_val_size`` this tensor would occupy if materialized.
+    """
+    if st.val is not None:
+        return st
+    shape: list[int] = []
+    meta_of_pair: dict[int, int] = {}
+    new_by_id: dict[int, Index] = {}
+    for d in st.dims:
+        if d.is_sparse:
+            ax = meta_of_pair.get(d.id)
+            if ax is None:
+                ax = len(shape)
+                shape.append(int(d.size))
+                # Both members of the pair read the SAME meta axis.
+                meta_of_pair[d.id] = ax
+                meta_of_pair[d.other_id] = ax
+            b_ax = None
+            if d.block_size is not None and int(d.block_size) > 1:
+                b_ax = len(shape)
+                shape.append(int(d.block_size))
+            new_by_id[d.id] = replace(d, axis=ax, block_axis=b_ax)
+        else:
+            ax = len(shape)
+            shape.append(int(d.size))
+            new_by_id[d.id] = replace(d, axis=ax)
+    dt = getattr(st.scalar_mult, "dtype", None) or jnp.float32
+    val = jnp.ones(tuple(shape), dtype=dt)
+    return SparseTensor(
+        tuple(new_by_id[d.id] for d in st.out_dims),
+        tuple(new_by_id[d.id] for d in st.primal_dims),
+        val,
+        scalar_mult=st.scalar_mult,
+        fill_value=st.fill_value,
+        pre_transforms=st.pre_transforms,
+        post_transforms=st.post_transforms,
+        check_consistency=False,
+    )
+
+
 def _coarsen_coupled_blockdiag(st, is_out1, rel_i, d1, is_out2, rel_j, d2,
                                new_meta):
     """EXACT dual of :func:`_subdivide_coupled_blockdiag`: re-factor an ALREADY

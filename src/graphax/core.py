@@ -792,6 +792,12 @@ def _drain_or_unload_pre(post_val, pre_val, _post_val):
         # so ``val is not None`` held and the transform was resolved. Turning
         # ``_lazy_uu`` on makes uniform operands common and the hole shows
         # immediately. The fault is here, not in the lazy rule.
+        # The transform reshapes and slices ``val``, so a uniform operand needs
+        # a buffer first. ``materialize_uniform`` gives it the block-diagonal
+        # storage it would occupy, not the dense one.
+        if pre_val.val is None:
+            from .sparse.tensor import materialize_uniform
+            pre_val = materialize_uniform(pre_val)
         _pre_val = unload_pre_transforms(post_val, pre_val)
     else:
         _pre_val = pre_val.copy()
