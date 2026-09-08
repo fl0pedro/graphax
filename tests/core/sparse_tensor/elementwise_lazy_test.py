@@ -46,10 +46,13 @@ def _st(out_dims, primal_dims, val, **kw):
     return SparseTensor(out_dims, primal_dims, val, check_consistency=False, **kw)
 
 
-def _pair(size, axis, block, block_axis, i=0, j=1, **kw):
-    """A DiagonalIndex pair with ids ``i`` and ``j``."""
-    return (DiagonalIndex(i, size, axis, j, block, block_axis),
-            DiagonalIndex(j, size, axis, i, block, block_axis))
+def _pair(size, axis, blk_a, ax_a, blk_b, ax_b, i=0, j=1):
+    """A DiagonalIndex pair: the two members SHARE the meta ``axis`` and each
+    carries its own within-block axis. Signature is
+    ``DiagonalIndex(id, size, axis, other_id, block_size, block_axis)``.
+    """
+    return (DiagonalIndex(i, size, axis, j, blk_a, ax_a),
+            DiagonalIndex(j, size, axis, i, blk_b, ax_b))
 
 
 # --- the signatures ---------------------------------------------------------
@@ -57,9 +60,9 @@ def _pair(size, axis, block, block_axis, i=0, j=1, **kw):
 def _cases():
     out = []
 
-    # eq: same block grid, both physical
-    a1, a2 = _pair(M, 0, P, 1)
-    b1, b2 = _pair(M, 0, P, 1)
+    # eq: the same block grid, both physical. val is (meta, block, block).
+    a1, a2 = _pair(M, 0, P, 1, P, 2)
+    b1, b2 = _pair(M, 0, P, 1, P, 2)
     out.append(("eq_block_pair",
                 _st((a1,), (a2,), _n((M, P, P), 1)),
                 _st((b1,), (b2,), _n((M, P, P), 2)), "eq"))
@@ -88,15 +91,16 @@ def _cases():
                 _st((DenseIndex(0, M, None),), (DenseIndex(1, Q, 0),), _n((Q,), 10)),
                 "ibroad"))
 
-    # ibroad: the META diagonal of a pair implicit on one side
-    c1, c2 = _pair(M, None, P, 0)
+    # ibroad: the shared META axis of a pair is implicit on the rhs, so the rhs
+    # stores one block and the block axes shift down by one.
+    c1, c2 = _pair(M, None, P, 0, P, 1)
     out.append(("ibroad_meta_diagonal",
                 _st((a1,), (a2,), _n((M, P, P), 11)),
                 _st((c1,), (c2,), _n((P, P), 12)), "ibroad"))
 
-    # ibroad: a within-block axis implicit on one side
-    d1 = DiagonalIndex(0, M, 0, 1, P, None)
-    d2 = DiagonalIndex(1, M, 0, 0, P, 1)
+    # ibroad: the SECOND member's within-block axis is implicit on the rhs.
+    d1 = DiagonalIndex(0, M, 0, 1, P, 1)
+    d2 = DiagonalIndex(1, M, 0, 0, P, None)
     out.append(("ibroad_within_block",
                 _st((a1,), (a2,), _n((M, P, P), 13)),
                 _st((d1,), (d2,), _n((M, P), 14)), "ibroad"))
@@ -120,9 +124,10 @@ def _cases():
                     scalar_mult=jnp.asarray(5.0)), "u_x"))
 
     # --- signatures the lazy path MUST decline -----------------------------
-    # a MISALIGNED block grid: genuine least-common-multiple tiling
-    e1, e2 = _pair(4, 0, 3, 1)
-    f1, f2 = _pair(6, 0, 2, 1)
+    # a MISALIGNED block grid: genuine least-common-multiple tiling. Both sides
+    # cover the same logical extent 12, one as 4 blocks of 3, one as 6 of 2.
+    e1, e2 = _pair(4, 0, 3, 1, 3, 2)
+    f1, f2 = _pair(6, 0, 2, 1, 2, 2)
     out.append(("misaligned_grid",
                 _st((e1,), (e2,), _n((4, 3, 3), 17)),
                 _st((f1,), (f2,), _n((6, 2, 2), 18)), None))
