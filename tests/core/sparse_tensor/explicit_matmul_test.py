@@ -30,31 +30,33 @@ def _engine_reduce(view, flat_idx, num_segments):
                                num_segments=num_segments)
 
 
-from graphax.sparse.indexes import BandedIndex, DiagonalIndex, DenseIndex
+from graphax.sparse.indexes import DiagonalIndex, DenseIndex
 from graphax.sparse.tensor import SparseTensor, _arr2st
 import math
 
 
-def assert_band_storage(R_ref, dense_ref, stored, hand_stored):  # noqa: D401
+def assert_meta_grid_storage(R_ref, dense_ref, support, stored):  # noqa: D401
     """Storage contract of a misaligned-contract matmul (ticket dsnn-3qm.28.5).
 
-    ``stored`` is the element count the engine's band form asks for. It equals
-    the number of structurally non-zero entries of the dense product, so it is
-    provably the smallest honest buffer. ``hand_stored`` is what the R_st
-    reference built below asks for; the reference stays as the VALUE oracle and
-    its larger buffer is recorded here rather than asserted."""
+    ``support`` is the number of structurally non-zero entries of the dense
+    product. ``stored`` is the element count the engine asks for: the meta grid
+    at the least common multiple of the two operands' block sizes, coarsened to
+    ``gcd`` many meta blocks.
+
+    The BandedIndex form used to store exactly ``support``, the smallest honest
+    buffer. That class is gone (ruling 2026-09-07: SparseTensor has exactly two
+    index classes, DenseIndex and DiagonalIndex), so the meta grid is the
+    fallback and it stores more. Both numbers are hand-written; neither is read
+    off the result."""
     got = 0 if R_ref.val is None else int(R_ref.val.size)
-    support = int(jnp.sum(jnp.abs(dense_ref) > 1e-9))
-    assert support == stored, (
-        f"the dense product has {support} non-zeros, not the {stored} this "
-        f"test claims")
+    ref_support = int(jnp.sum(jnp.abs(dense_ref) > 1e-9))
+    assert ref_support == support, (
+        f"the dense product has {ref_support} non-zeros, not the {support} "
+        f"this test claims")
     assert got == stored, (
-        f"stored {got} != the {stored}-element band form; the misaligned "
-        f"contraction lost its band structure")
-    assert any(isinstance(d, BandedIndex) for d in R_ref.dims), (
-        f"expected a BandedIndex pair, got "
-        f"{[type(d).__name__ for d in R_ref.dims]}")
-    assert stored <= hand_stored
+        f"stored {got} != the {stored}-element meta grid; the misaligned "
+        f"contraction changed how much it materialises")
+    assert stored >= support
 
 
 def get_routing_idx(b, d, l, g):
@@ -553,10 +555,12 @@ class TestExplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
-        assert_band_storage(R_ref, R_st.dense(), 280, 420)
+        # gcd(4, 6) = 2 meta blocks of (4/2)*5 = 10 rows by (6/2)*7 = 21
+        # cols, so 2 * 10 * 21 = 420. The band form stored the 280-element
+        # support exactly; that class is gone, so the grid stores 1.50x it.
+        assert_meta_grid_storage(R_ref, R_st.dense(), 280, 420)
 
-        # Misaligned-contract matmul emits a BandedIndex pair (band buffer in
-        # ``val``). Compare densified forms.
+        # Compare densified forms.
         assert jnp.allclose(
             R_ref.dense(), R_st.dense(), rtol=1e-4, atol=1e-6
         )
@@ -592,11 +596,13 @@ class TestExplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
-        assert_band_storage(R_ref, R_st.dense(), 140, 210)
+        # gcd(2, 3) = 1, so the grid is a single 10 x 21 = 210 meta block.
+        # The band form stored the 140-element support exactly; that class
+        # is gone, so the grid stores 1.50x it.
+        assert_meta_grid_storage(R_ref, R_st.dense(), 140, 210)
 
-        # Misaligned-contract matmul emits a BandedIndex pair (band buffer in
-        # ``val``). Compare densified forms; structural shape / dim count is
-        # still preserved.
+        # Compare densified forms; structural shape / dim count is still
+        # preserved.
         assert jnp.allclose(
             R_st.dense(), R_ref.dense(), rtol=1e-4, atol=1e-6
         )
@@ -634,11 +640,13 @@ class TestExplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
-        assert_band_storage(R_ref, R_st.dense(), 140, 210)
+        # gcd(2, 3) = 1, so the grid is a single 10 x 21 = 210 meta block.
+        # The band form stored the 140-element support exactly; that class
+        # is gone, so the grid stores 1.50x it.
+        assert_meta_grid_storage(R_ref, R_st.dense(), 140, 210)
 
-        # Misaligned-contract matmul emits a BandedIndex pair (band buffer in
-        # ``val``). Compare densified forms; structural shape / dim count is
-        # still preserved.
+        # Compare densified forms; structural shape / dim count is still
+        # preserved.
         assert jnp.allclose(
             R_st.dense(), R_ref.dense(), rtol=1e-4, atol=1e-6
         )

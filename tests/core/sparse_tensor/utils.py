@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import jax.random as jrand
 from chex import Array
 
-from graphax.sparse.indexes import BandedIndex, DenseIndex, DiagonalIndex
+from graphax.sparse.indexes import DenseIndex, DiagonalIndex
 from graphax.sparse.ops.utils import _arr2st
 from graphax.sparse.tensor import SparseTensor
 
@@ -431,8 +431,8 @@ def assert_axis_pattern(st: SparseTensor, pattern: str, msg: str = ""):
 # --------------------------------------------------------------------------
 # Class cover (ruling 2026-09-07, CONTEXT.md "Structural class")
 #
-# A SparseTensor cannot store an arbitrary set of entries. It stores one of four
-# structural classes: dense, block diagonal, block banded, set index. So the
+# A SparseTensor cannot store an arbitrary set of entries. It stores one of two
+# structural classes: dense or block diagonal. So the
 # support is NOT the floor on honest storage. The floor is the CLASS COVER: the
 # smallest number of elements that holds the support inside the class the result
 # declares. The cover is at or above the support and differs from it whenever
@@ -528,12 +528,13 @@ def _pair_covers(occ, ia, ib, n_a, n_b, b_a, b_b):
 
 
 def declared_pair_class(st: SparseTensor, ia: int, ib: int) -> str:
-    """The class family the result DECLARES for one sparse pair."""
-    d = st.dims[ia]
-    if isinstance(d, BandedIndex):
-        return "row_band" if getattr(d, "primary", True) else "col_band"
-    if type(d).__name__ == "SetIndex":
-        return "set"
+    """The class family the result DECLARES for one sparse pair.
+
+    A sparse pair is always a meta-block diagonal now. The band and set classes
+    are gone with BandedIndex and SetIndex (ruling 2026-09-07), so nothing
+    declares them any more; ``_pair_covers`` still measures them because they
+    remain useful as a lower bound on what some other class COULD hold.
+    """
     return "diagonal"
 
 
@@ -644,10 +645,10 @@ def assert_honest_storage(st: SparseTensor, dense_ref, msg: str = "",
     return cov
 
 
-EMITTABLE_CLASSES = ("diagonal", "row_band", "col_band", "dense")
-"""The classes ``matmul`` actually emits. ``set`` is a legal SparseTensor
-class and no contraction path builds one, so a cover that needs it is
-headroom for a future emission, not a defect of the one running."""
+EMITTABLE_CLASSES = ("diagonal", "dense")
+"""The classes ``matmul`` actually emits. The band and set covers that
+``_pair_covers`` still computes are headroom no index class can express any
+more, not a defect of the emission running."""
 
 
 def partition_covers(dense_ref, block_sizes, tol: float = 1e-12,

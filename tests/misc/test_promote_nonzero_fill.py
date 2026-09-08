@@ -9,7 +9,7 @@ operand has no explicit block, i.e. its implicit fill. Writing a literal 0
 there was correct only for zero-fill operands; for a non-zero fill it dropped
 the fill contribution, so ``(a + b).dense()`` disagreed with
 ``a.dense() + b.dense()``. The non-zero-fill misaligned case routes through
-the general promote path (the SetIndex / divisor-remainder emitters bail when
+the general promote path (the misaligned emitters bail when
 either fill is non-zero), so this path is reachable.
 """
 import jax.numpy as jnp

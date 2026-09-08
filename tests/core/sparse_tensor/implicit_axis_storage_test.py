@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 
-from graphax.sparse.indexes import BandedIndex, DenseIndex, DiagonalIndex
+from graphax.sparse.indexes import DenseIndex, DiagonalIndex
 from graphax.sparse.tensor import SparseTensor
 
 from utils import assert_axis_pattern, stored_elements, support_size
@@ -67,7 +67,7 @@ def growing_broadcasts(lhs, rhs):
 
 class TestImplicitAxisStorage(unittest.TestCase):
     def _check(self, lhs, rhs, oracle, *, stored, pattern, growing,
-               support=None, banded=None):
+               support=None, over_support=False):
         res = lhs @ rhs
         self.assertTrue(
             jnp.allclose(res.dense(), oracle, atol=1e-5),
@@ -85,12 +85,16 @@ class TestImplicitAxisStorage(unittest.TestCase):
         if support is not None:
             self.assertEqual(support_size(oracle), support,
                              "the hand-written support is wrong")
-            self.assertLessEqual(
-                stored, support,
-                "the emission stores more than the structural support")
-        if banded is not None:
-            self.assertEqual(
-                any(isinstance(d, BandedIndex) for d in res.dims), banded)
+            if over_support:
+                # The emission has no index class that holds this support
+                # exactly, so it covers it with the meta grid. Say by how much.
+                self.assertGreater(
+                    stored, support,
+                    "this case now reaches the support; drop over_support")
+            else:
+                self.assertLessEqual(
+                    stored, support,
+                    "the emission stores more than the structural support")
 
     # --- single implicit sparse axis: the meta axis of a diagonal pair ----
     # Optimum: M*P*Q = 60 stored, M*P*K*Q = 120 products. The default engine
@@ -231,9 +235,17 @@ class TestImplicitAxisStorage(unittest.TestCase):
                     stored=10, pattern="DID", growing=(1, 1))
 
     # --- genuine LCM grid --------------------------------------------------
-    # meta 4 against meta 6, gcd 2, lcm 12. The band form stores 280, which is
-    # exactly the structural support of the dense product, so it is provably
-    # the smallest honest buffer. The planner stores 840.
+    # meta 4 against meta 6, gcd 2, lcm 12. The result coarsens to gcd = 2 meta
+    # blocks of (4/2)*5 = 10 rows by (6/2)*7 = 21 cols, so 2 * 10 * 21 = 420.
+    # The BandedIndex form stored 280, exactly the structural support of the
+    # dense product, and was the smallest honest buffer. That class is gone
+    # (ruling 2026-09-07: SparseTensor has exactly two index classes), so the
+    # meta grid is the fallback and it stores 1.50x the support. The planner
+    # stores 840.
+    #
+    # The growing-broadcast count drops from (3, 2087) to (0, 0): those three
+    # broadcasts were the band packer building its (M_p, M_s, W) selection
+    # grid, and the packer is gone with the class.
     def test_lcm_grid(self):
         a, b, c, d, e, f = 4, 6, 2, 5, 3, 7
         lhs = SparseTensor(
@@ -247,8 +259,8 @@ class TestImplicitAxisStorage(unittest.TestCase):
             _n((b, c, f), 2),
         )
         self._check(lhs, rhs, lhs.dense() @ rhs.dense(),
-                    stored=280, pattern="SS", growing=(3, 2087),
-                    support=280, banded=True)
+                    stored=420, pattern="SS", growing=(0, 0),
+                    support=280, over_support=True)
 
     # --- spatial_sparse pairing -------------------------------------------
     # An lhs-only diagonal pair riding through an uncontracted primal dim.

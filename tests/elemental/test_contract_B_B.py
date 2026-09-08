@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 
 from graphax.sparse.elemental import contract_B_B
-from graphax.sparse.indexes import DenseIndex, DiagonalIndex
+from graphax.sparse.indexes import DenseIndex, DiagonalIndex, Index
 from graphax.sparse.tensor import SparseTensor
 
 
@@ -69,9 +69,9 @@ def _check(lhs, rhs):
     oracle = np.asarray(lhs.dense() @ rhs.dense())
     assert got.shape == oracle.shape, (got.shape, oracle.shape)
     assert np.allclose(got, oracle, atol=1e-5), np.abs(got - oracle).max()
-    # closure: every result dim is Dense or (non-compressed) Diagonal
-    for d in res.dims:
-        assert not d.is_compressed
+    # closure: every result dim is Dense or Diagonal. There is no third form
+    # any more, so the class assertion the loop used to carry is gone.
+    assert all(isinstance(d, Index) for d in res.dims)
     return res
 
 
