@@ -777,7 +777,7 @@ def _drain_or_unload_pre(post_val, pre_val, _post_val):
             _post_val = _t.apply_inverse(_post_val)
         _assert_sparse_tensor_consistency(_post_val)
         _pre_val = pre_val.copy()
-    elif len(_pre_transforms) > 0:
+    elif len(_pre_transforms) > 0 and (pre_val.val is not None or pre_val.dims):
         # ``pre_val.val is None`` (a UNIFORM operand) used to fall through to
         # the pass-through below, which DROPS the transform. That is not a
         # cheaper route, it is a wrong one: ``post_val``'s pre_transform carries
@@ -795,6 +795,13 @@ def _drain_or_unload_pre(post_val, pre_val, _post_val):
         # The transform reshapes and slices ``val``, so a uniform operand needs
         # a buffer first. ``materialize_uniform`` gives it the block-diagonal
         # storage it would occupy, not the dense one.
+        #
+        # A DIMS-LESS uniform operand is excluded above and keeps the
+        # pass-through. It has no contracted axis for the transform to relabel,
+        # so there is nothing to unload onto: materializing it yields a rank-0
+        # buffer and the slice/concat transforms raise on it (IndexError on
+        # roll / gather / multi-head attention). The case this branch exists
+        # for is the one with dims and no buffer.
         if pre_val.val is None:
             from .sparse.tensor import materialize_uniform
             pre_val = materialize_uniform(pre_val)
