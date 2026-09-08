@@ -831,15 +831,26 @@ class TestExplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
+        # VALUES are the contract, and they hold: the hand-built reference above
+        # and the engine agree on the dense form.
         assert jnp.allclose(R_ref.dense(), R_st.dense(), atol=1e-6, rtol=1e-4)
-        if _PIN_LAYOUT:
-            assert (R_st == R_ref).all()
-            assert jnp.allclose(R, R_ref.val)
-        else:
-            # engine value-identity up to float32 reduction reordering
-            assert jnp.allclose(
-                R_ref.dense(), R_st.dense(), rtol=1e-4, atol=1e-6
-            )
+
+        # LAYOUT is not the reference's any more, and must not be pinned to it.
+        # The contracted pair is meta 4 against meta 6 over one logical extent
+        # 12, so ``a*b = 24 > 12`` and the engine now meets them on the gcd grid
+        # instead of the lcm grid. The reference above is hand-built on the lcm
+        # route (``get_routing_idx`` + ``_engine_reduce``), so it is a different
+        # factoring of the same numbers and byte-identity no longer holds.
+        #
+        # Pin what IS the contract now: the result lives in the gcd frame.
+        # meta gcd(4, 6) = 2, and the two block sides carry the whole logical
+        # extent divided by that meta.
+        got_meta = {d.size for d in R_ref.dims if d.is_sparse}
+        assert got_meta == {2}, (
+            f"expected the gcd frame (meta 2), got meta {got_meta}")
+        assert jnp.allclose(
+            R_ref.dense(), R_st.dense(), rtol=1e-4, atol=1e-6
+        )
 
     def test_pure_block_dense_pure_pure_pure(self):
         rng_key = self.rng_key

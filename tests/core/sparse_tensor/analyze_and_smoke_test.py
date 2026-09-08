@@ -1218,7 +1218,13 @@ class TestSmokeScreen(unittest.TestCase):
             jnp.abs(self._n((s3, s4, s4), 2)),
         )
 
-        self._deep_analysis(power, core_power, manual_06, a, b, expected_path="general")
+        # ``power`` is a UNION op for the engine, so a misaligned pair meets on
+        # the gcd grid: metas 4 and 6 give gcd 2, the two sides coarsen into it
+        # and the ``eq`` rule fires. The off-block positions the coarsening
+        # makes explicit hold ``0 ** 0 == 1``, which is exactly the fill the
+        # general path would have carried implicitly, so the values are the
+        # same and only the storage form differs.
+        self._deep_analysis(power, core_power, manual_06, a, b, expected_path="lazy")
 
         res = core_power(a, b)
         self.assertEqual(res.shape, (s1 * s2, s3 * s4))
