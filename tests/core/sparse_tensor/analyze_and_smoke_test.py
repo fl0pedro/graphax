@@ -1139,7 +1139,7 @@ class TestSmokeScreen(unittest.TestCase):
             manual_03,
             a,
             b,
-            expected_path="general",
+            expected_path="lazy",
             mem_ratio_max=2.0,
         )
         res = core_lor(a, b)
@@ -2222,7 +2222,7 @@ class TestSmokeScreen(unittest.TestCase):
             (DiagonalIndex(1, n_rhs, axis=0, other_id=0, block_size=b_rhs, block_axis=2),),
             self._n((n_rhs, b_rhs, b_rhs), 130),
         )
-        _expect_path(core_plus, a, rhs, expected_path="general")
+        _expect_path(core_plus, a, rhs, expected_path="lazy")
         expected = a.dense() + rhs.dense()
         res = core_plus(a, rhs)
         self.assertEqual(res.shape, expected.shape)

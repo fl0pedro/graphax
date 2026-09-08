@@ -741,7 +741,17 @@ def _reframe_misaligned(lhs, rhs, is_intersection: bool):
             continue
         misaligned = True
         if not is_intersection:
-            l_target[i1] = r_target[i1] = math.gcd(a, b)
+            g = math.gcd(a, b)
+            if g <= 1:
+                # The union container at meta 1 IS the dense form, and a
+                # "block-diagonal pair" of meta 1 is a degenerate way to write
+                # it -- it carries a size-1 meta axis that the canonical dense
+                # form does not have. Coarsening must leave some block
+                # structure behind, which is the same guard the matmul
+                # re-framing uses. The general path already lands in the right
+                # container here, five equations more.
+                return _skip("reframe_gcd_1_is_dense")
+            l_target[i1] = r_target[i1] = g
         else:
             lo, hi = (a, b) if a < b else (b, a)
             if hi % lo:
