@@ -2333,6 +2333,12 @@ def matmul(lhs, rhs, count: bool = False):
     # densifying fast-path fallbacks were removed (Phase bridge-cse): they only
     # fired when tiled raised, and no live trajectory (ViT / ConvNet / MoE,
     # exact + approx) reaches that fallback any more.
+    # Misaligned meta grids: meet at the gcd, which IS the result's own frame,
+    # instead of at the lcm, which the tiled path has to fold back afterwards.
+    _rf = _reframe_misaligned_contraction(lhs, rhs)
+    if _rf is not None:
+        _record_path("reframe_gcd")
+        lhs, rhs = _rf
     rhs_out_dims, rhs_primal_dims, rhs_id_offset = _align_tensor_ids(lhs, rhs)
     rhs_dims = rhs_out_dims + rhs_primal_dims
     pairs = _build_matmul_topology(lhs, rhs_out_dims, rhs_primal_dims, rhs_id_offset)
@@ -2342,6 +2348,82 @@ def matmul(lhs, rhs, count: bool = False):
     if count:
         return out, _compute_matmul_count(lhs, rhs, out)
     return out
+
+
+def _mm_locate(t, dim_id):
+    """``(is_out, rel_index, dim)`` for ``dim_id`` in ``t``, or ``None``."""
+    for rel, d in enumerate(t.out_dims):
+        if d.id == dim_id:
+            return True, rel, d
+    for rel, d in enumerate(t.primal_dims):
+        if d.id == dim_id:
+            return False, rel, d
+    return None
+
+
+def _coarsen_pair_to(t, dim_id, other_id, meta):
+    from graphax.sparse.tensor import _coarsen_coupled_blockdiag
+    l1, l2 = _mm_locate(t, dim_id), _mm_locate(t, other_id)
+    if l1 is None or l2 is None:
+        return None
+    if l1[2].size == meta:
+        return t
+    return _coarsen_coupled_blockdiag(
+        t, l1[0], l1[1], l1[2], l2[0], l2[1], l2[2], meta)
+
+
+def _reframe_misaligned_contraction(lhs, rhs):
+    """``(lhs, rhs)`` re-cut onto ONE meta grid before the tiled path, or
+    ``None`` to leave the operands alone.
+
+    The contracted axis has one logical extent ``L`` and the two operands can
+    disagree about how it is cut: the lhs block-diagonal at meta ``a`` with
+    blocks ``K1``, the rhs at meta ``b`` with blocks ``K2``, ``a*K1 == b*K2 ==
+    L``. The tiled path meets them on the least-common-multiple grid, which
+    costs nothing going in -- the refinement is carved out of each operand's
+    own block axis by reshape -- but costs afterwards, in ``_reduce_grid``,
+    which folds the refined grid back with a one-hot whose size is quadratic in
+    the lcm.
+
+    Where the answer lives says the grid should be the gcd instead. Result
+    position ``(i, k)`` is live when some ``j`` has both operands live, that is
+    when the ``K1``-block of ``i`` and the ``K2``-block of ``k`` overlap. The
+    finest block-diagonal holding all of those is meta ``gcd(a, b)``, with
+    blocks ``L / gcd(a, b) == lcm(K1, K2)``. So coarsening BOTH operands to meta
+    ``gcd(a, b)`` lands directly in the result's own frame: the contraction is
+    then one batched einsum over the meta axis and ``_reduce_grid`` has nothing
+    to fold.
+
+    Declined when ``gcd(a, b) == 1``, where the "block-diagonal" container is
+    the dense form and coarsening is just an early densify of both operands.
+    Declined on non-zero fill, because coarsening is defined for structural
+    zeros only.
+    """
+    if not _is_zero_fill(lhs) or not _is_zero_fill(rhs):
+        return None
+    if len(lhs.primal_dims) != len(rhs.out_dims):
+        return None
+    plan = []
+    for ld, rd in zip(lhs.primal_dims, rhs.out_dims):
+        if not (ld.is_sparse and rd.is_sparse):
+            continue
+        if ld.size == rd.size:
+            continue
+        if ld.logical_size != rd.logical_size:
+            return None
+        g = math.gcd(int(ld.size), int(rd.size))
+        if g <= 1:
+            return None
+        plan.append((ld, rd, g))
+    if not plan:
+        return None
+    new_l, new_r = lhs, rhs
+    for ld, rd, g in plan:
+        new_l = _coarsen_pair_to(new_l, ld.id, ld.other_id, g)
+        new_r = _coarsen_pair_to(new_r, rd.id, rd.other_id, g)
+        if new_l is None or new_r is None:
+            return None
+    return new_l, new_r
 
 
 def _densify_is_safe(lhs, rhs) -> bool:
