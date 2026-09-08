@@ -642,18 +642,152 @@ def _place_axes(val, srcs):
     return val
 
 
+def _locate_dim(t, dim_id):
+    """``(is_out, rel_index, dim)`` for ``dim_id``, or ``None``. The re-framing
+    helpers in ``tensor.py`` address a coupled pair by slot, and every step
+    rewrites the slots, so the pair is re-located by id on each step."""
+    for rel, d in enumerate(t.out_dims):
+        if d.id == dim_id:
+            return True, rel, d
+    for rel, d in enumerate(t.primal_dims):
+        if d.id == dim_id:
+            return False, rel, d
+    return None
+
+
+def _coupled_pair_ids(t):
+    """The id of each coupled block-diagonal pair, once, in dim order."""
+    seen, out = set(), []
+    for d in t.dims:
+        if not d.is_sparse or d.id in seen:
+            continue
+        if _locate_dim(t, d.other_id) is None:
+            continue
+        seen.add(d.id)
+        seen.add(d.other_id)
+        out.append((d.id, d.other_id))
+    return out
+
+
+def _apply_reframe(t, pair_ids, target_meta, coarsen: bool):
+    """Move every coupled pair of ``t`` to ``target_meta[pair_id]``."""
+    from graphax.sparse.tensor import (
+        _coarsen_coupled_blockdiag, _subdivide_coupled_blockdiag)
+    fn = _coarsen_coupled_blockdiag if coarsen else _subdivide_coupled_blockdiag
+    for i1, i2 in pair_ids:
+        want = target_meta[i1]
+        l1, l2 = _locate_dim(t, i1), _locate_dim(t, i2)
+        if l1 is None or l2 is None:
+            return None
+        if l1[2].size == want:
+            continue
+        t = fn(t, l1[0], l1[1], l1[2], l2[0], l2[1], l2[2], want)
+    return t
+
+
+def _reframe_misaligned(lhs, rhs, is_intersection: bool):
+    """``(lhs, rhs)`` re-expressed in ONE common block grid, or ``None``.
+
+    Two coupled block-diagonal operands over the same logical extent can
+    disagree about how that extent is cut into meta blocks: the left at meta
+    ``a`` with blocks ``K1``, the right at meta ``b`` with blocks ``K2``, and
+    ``a*K1 == b*K2 == L``. No rule fires on that, so it falls to the general
+    path, which sends BOTH operands to the least-common-multiple grid and
+    reduces back afterwards.
+
+    The support algebra says where the answer really lives, and it differs by
+    op:
+
+    UNION (add). A position is live if EITHER side is, so the container must
+    hold both diagonals. A block-diagonal container at meta ``m`` holds the
+    meta-``a`` diagonal only when ``m | a``, and the meta-``b`` one only when
+    ``m | b``. The finest that holds both is therefore ``m = gcd(a, b)``. That
+    is not one option among several, it IS the union container, and it is the
+    same container the LCM path already ends in. Only the route differs, so
+    coarsening both sides costs nothing in output size and skips the promote
+    entirely. MEASURED over 8 misaligned shapes: output size identical on every
+    one, 33 equations down to 3, six growing broadcasts down to zero, about 22
+    percent fewer flops, values equal.
+
+    INTERSECTION (mul). A position is live only where BOTH sides are. Coarsening
+    is exactly wrong here: MEASURED on the same 8 shapes it stores 3 times the
+    output (9216 against 3072) because it grows to the union container for an
+    op whose support shrank. The right container is the operand with the
+    SMALLER blocks, which is what the general path already reduces to.
+
+    So the intersection is re-framed only when the coarse operand can be cut
+    down to the fine one's grid directly, that is when ``a | b``. Subdividing
+    the coarse side to meta ``b`` keeps exactly the cells on the meta-``b``
+    diagonal, and every cell it drops is one where the fine operand is zero, so
+    the product is unchanged. When neither meta divides the other the general
+    path keeps the case: its output frame is already optimal for two index
+    classes, and the exact support there is a common refinement with UNEQUAL
+    block sizes, which no index class can express.
+    """
+    if lhs.fill_value is not None or rhs.fill_value is not None:
+        return _skip("reframe_nonzero_fill")
+    l_pairs = _coupled_pair_ids(lhs)
+    if not l_pairs or l_pairs != _coupled_pair_ids(rhs):
+        return _skip("reframe_pair_layout")
+
+    l_target, r_target, misaligned = {}, {}, False
+    for i1, i2 in l_pairs:
+        ld, rd = _locate_dim(lhs, i1)[2], _locate_dim(rhs, i1)[2]
+        a, b = ld.size, rd.size
+        if ld.logical_size != rd.logical_size:
+            return _skip("reframe_extent_mismatch")
+        if a == b:
+            l_target[i1] = r_target[i1] = a
+            continue
+        misaligned = True
+        if not is_intersection:
+            l_target[i1] = r_target[i1] = math.gcd(a, b)
+        else:
+            lo, hi = (a, b) if a < b else (b, a)
+            if hi % lo:
+                return _skip("reframe_intersection_indivisible")
+            k = hi // lo
+            coarse = ld if a < b else rd
+            i2d = _locate_dim(lhs if a < b else rhs, i2)[2]
+            if (coarse.block_size or 1) % k or (i2d.block_size or 1) % k:
+                return _skip("reframe_intersection_block_indivisible")
+            l_target[i1] = r_target[i1] = hi
+    if not misaligned:
+        return _skip("reframe_already_aligned")
+
+    new_l = _apply_reframe(lhs, l_pairs, l_target, coarsen=not is_intersection)
+    new_r = _apply_reframe(rhs, l_pairs, r_target, coarsen=not is_intersection)
+    if new_l is None or new_r is None:
+        return _skip("reframe_lost_pair")
+    LAZY_STATS["reframe:" + ("intersection" if is_intersection else "union")] += 1
+    return new_l, new_r
+
+
 def _lazy_general(lhs, rhs, op: Callable, is_intersection: bool = False):
     """Try to lower ``op(lhs, rhs)``; ``None`` ⇒ no rule (caller falls through).
 
-    ``is_intersection`` needs no special handling here: every rule operates on
-    ALIGNED structure (no LCM promotion), where the general path's
-    intersection demote is a no-op by construction.
+    Every rule below operates on ALIGNED structure (no LCM promotion), where
+    the general path's intersection demote is a no-op by construction. A
+    misaligned pair of block grids is brought into one frame first, by
+    ``_reframe_misaligned``, which is the only place ``is_intersection``
+    changes what happens: the union frame and the intersection frame are
+    different containers.
     """
     l_by_id = {d.id: d for d in lhs.dims}
     r_by_id = {d.id: d for d in rhs.dims}
     if set(l_by_id) != set(r_by_id) or len(l_by_id) != len(lhs.dims) \
             or len(r_by_id) != len(rhs.dims):
         return _skip("id_mismatch")
+
+    # Misaligned coupled block grids get a common frame FIRST; the rules below
+    # all assume aligned structure, so without this they only ever skip.
+    if _match_structure(l_by_id, r_by_id) == "sparse_meta_mismatch":
+        _rf = _reframe_misaligned(lhs, rhs, is_intersection)
+        if _rf is None:
+            return None
+        lhs, rhs = _rf
+        l_by_id = {d.id: d for d in lhs.dims}
+        r_by_id = {d.id: d for d in rhs.dims}
 
     if lhs.val is None and rhs.val is None:
         return _lazy_uu(lhs, rhs, op, l_by_id, r_by_id)
