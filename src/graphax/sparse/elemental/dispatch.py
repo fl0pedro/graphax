@@ -422,13 +422,12 @@ def _dispatch_matmul(lhs, rhs, pairs, kinds):
     # Before densifying BOTH operands: fold any BOTH-IMPLICIT contracting pair
     # analytically (scale-by-N into scalar_mult) so we never materialize a
     # broadcast contraction axis. Returns None when there is no such pair.
-    from graphax.sparse.ops.matmul import matmul as _matmul, _fold_both_implicit, _KEEP_BLOCKDIAG_MM
+    from graphax.sparse.ops.matmul import matmul as _matmul, _fold_both_implicit
 
-    if _KEEP_BLOCKDIAG_MM:
-        _folded = _fold_both_implicit(lhs, rhs, False)
-        if _folded is not None:
-            _bump("matmul_composed_dense")
-            return _folded
+    _folded = _fold_both_implicit(lhs, rhs, False)
+    if _folded is not None:
+        _bump("matmul_composed_dense")
+        return _folded
 
     _bump("matmul_composed_dense")
     lhs_d = _to_dense_st(lhs)

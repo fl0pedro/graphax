@@ -218,10 +218,8 @@ def _unify_operand_dtypes(lhs, rhs):
     # quantizing one edge must never silently approximate its exact partner
     # (user decision; an earlier draft downcast the pair). The bf16 fast
     # path exists only when BOTH edges were made bf16: same-dtype pairs
-    # return above unchanged, and the tiled dot sites then run the bf16
-    # GEMM with f32 accumulation (matmul._gx_dot_general). The companion
-    # keep-narrow read in _scaled_mul stops a lone scalar drain from
-    # re-promoting an already-bf16 edge before that both-bf16 meeting.
+    # return above unchanged, and the contraction then asks for f32
+    # accumulation (matmul._emit_einsum).
     cdt = _compute_dtype(ldt, rdt)
     return _cast_operand(lhs, cdt), _cast_operand(rhs, cdt)
 

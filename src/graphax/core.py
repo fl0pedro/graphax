@@ -3144,9 +3144,9 @@ def vertex_elimination_jaxpr(
     # PER-FACE transforms approximate exactly as much as per-vertex ones, so
     # they arm the dispatch flag by the SAME rule (Diag/Compress instance, the
     # documented callable escape hatch, or a SKIP_FACE sentinel). Without this
-    # no approx-mode machinery (elemental kernels, einsum_general planner,
-    # struct_lower) can ever see a face-hook elimination — the flag lied about
-    # what the elimination carries. Handles both the nested
+    # no approx-mode machinery (the elemental kernels) can ever see a face-hook
+    # elimination — the flag lied about what the elimination carries. Handles
+    # both the nested
     # {vertex: {face_key: slots}} and the per-vertex flat layout.
     if not _approx_on and face_transforms:
         def _face_slot_iter(ft):
