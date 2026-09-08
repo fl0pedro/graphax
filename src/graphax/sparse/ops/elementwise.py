@@ -9,6 +9,7 @@ Pipeline:
     5. Rebuild ``SparseTensor`` ``out_dims`` / ``primal_dims`` from the grid axes.
 """
 from __future__ import annotations
+import collections
 import math
 import os
 from dataclasses import replace
@@ -499,53 +500,304 @@ def _reconstruct_result(value, lhs, sp, dp, output_meta, op, rhs):
 # Rows 2 and 3 are what ``lower_add`` existed to remove.
 
 
-# --- NOT MERGED: the sparsity-retaining elementwise rules -----------------
-# ``sparse/lower/add.py`` held a second elementwise engine, ``lower_add``. It
-# was deleted on 2026-09-08 with the rest of the planner (ticket dsnn-3qm.72).
-# It is recorded here rather than merged, and this section says why, so the
-# next person starts from the evidence instead of from scratch.
+# --- The lazy general path -------------------------------------------------
+# Combine two operands in the structure they ALREADY have. Dims are paired BY
+# ID -- elementwise operands share ONE id space, so they are never paired
+# positionally -- and ONE physical ``op`` runs over reconciled layouts while
+# the output structure is built symbolically. No ``_align_value`` broadcast of
+# a whole tensor, no ``_promote_to_unified`` densify.
 #
-# WHAT IT DID. It paired the two operands' dims BY ID (elementwise operands
-# share ONE id space, so never pair positionally) and emitted ONE physical
-# ``op`` over reconciled layouts, building the output structure symbolically.
-# Four rules:
+# Four rules, from the deleted ``sparse/lower/add.py`` prototype (ticket
+# dsnn-3qm.72, owner instruction 2026-09-08 to replace the general case):
 #
-#   * ``eq``     every id-matched dim pair is structurally equal (same sparse
-#                pairing, block grid and implicitness; layouts reconciled by
-#                transpose). ``out.val = op(lhs.val * sm, rhs.val_permuted *
-#                sm)``, ``sm = 1``, metadata verbatim. No broadcast and no LCM
-#                grid. Covers I+I -> I and same-grid B+B -> B.
-#   * ``ibroad`` as ``eq``, but some axis role is implicit on one side and
-#                physical on the other at the SAME id-matched extent. Only
-#                that role's size-1 axis broadcasts under ``op``. A role
-#                implicit on BOTH sides stays implicit in the output.
-#   * ``uu``     both operands ``val is None``. The scalars combine and no
-#                buffer is ever built. Gated on statically-zero fills and a
-#                zero-preserving ``op``.
-#   * ``u_x``    one operand ``val is None`` with matching structure: that
-#                side contributes ONE scalar, the other's metadata rides
-#                through verbatim.
+#   eq      every id-matched dim pair is structurally equal (same sparse
+#           pairing, same block grid, same implicitness; physical layouts
+#           reconciled by transpose). ``out.val = op(lhs.val * sm,
+#           rhs.val_permuted * sm)``, ``scalar_mult = 1``, metadata verbatim.
+#           Covers implicit+implicit -> implicit and same-grid block+block.
+#   ibroad  as ``eq``, but some axis ROLE is implicit on one side and physical
+#           on the other at the SAME id-matched extent. Only that role's size-1
+#           axis broadcasts, under ``op``'s own numpy semantics. A role
+#           implicit on BOTH sides stays implicit in the output.
+#   uu      both operands ``val is None``: the scalars combine and no buffer is
+#           built. Gated on statically-zero fills and a zero-preserving ``op``.
+#   u_x     one operand ``val is None`` with matching structure: it contributes
+#           ONE scalar and the other's metadata rides through verbatim.
 #
-# Everything else (a sparse-to-dense promotion pair, a misaligned block grid,
-# leftover physical axes) returned None and fell through. The output-fill
-# algebra was identical to ``_reconstruct_result``.
+# Anything else -- a sparse-to-dense promotion pair, a MISALIGNED block grid
+# (genuine least-common-multiple tiling), leftover physical axes, a fill the
+# rule cannot compose -- returns None, and ``_materializing_general`` runs
+# unchanged. None is always the safe answer.
 #
-# WHY IT IS NOT THE PATH BELOW. The general path materializes: ``_align_value``
-# broadcasts and ``_promote_to_unified`` densifies to the LCM meta grid. The
-# rules above do neither, so they ARE the direction this op should go. They
-# were never turned on because they are UNPROVEN. Armed behind
-# ``GRAPHAX_EINSUM_EW``, a float64 model diff caught the result diverging by
-# up to 0.8 on ViT COMPRESS variants, while every matmul in the same run
-# stayed oracle-exact. The divergence was never localized to a rule. The
-# likeliest suspects, in order: ``ibroad`` combining an implicit role with a
-# physical one under a UNION op, and the claim that ``is_intersection`` needs
-# no handling because the general path's intersection demote is a no-op on
-# aligned structure.
+# The output-fill algebra is IDENTICAL to ``_reconstruct_result``: ``None``
+# (statically zero) when both inputs are statically zero AND ``op`` is
+# zero-preserving, else the concrete post-scaled combined fill.
 #
-# WHAT IT WOULD TAKE. Re-derive the rules one at a time against the lattice
-# property suite, cheapest first: ``uu``, then ``u_x``, then ``eq``, and only
-# then ``ibroad``. Each one is a value-preserving claim that a differential
-# test against the general path can settle on its own. Do not arm the set.
+# HISTORY, because this path once shipped wrong. Armed behind the deleted
+# ``GRAPHAX_EINSUM_EW`` flag, a float64 model diff caught it diverging by up to
+# 0.8 on ViT COMPRESS variants while every matmul in the same run stayed
+# oracle-exact, and the divergence was never localized to a rule. It is armed
+# now because ``elementwise_lazy_test.py`` settles that question directly: it
+# compares this path against ``_materializing_general`` on the DENSE form over
+# every structured signature, for a union op and an intersection op, with zero
+# and non-zero fills. A rule that cannot pass that does not ship.
+#
+# ``LAZY_STATS`` is the totality ledger: every rule hit and every named
+# fallthrough. Coverage is measured, never assumed.
+LAZY_STATS: collections.Counter = collections.Counter()
+
+
+def reset_lazy_stats() -> None:
+    LAZY_STATS.clear()
+
+
+def _skip(reason: str):
+    LAZY_STATS[f"skip:{reason}"] += 1
+    return None
+
+
+def _finish(out, rule: str):
+    LAZY_STATS[f"rule:{rule}"] += 1
+    return out
+
+
+def _combined_fill(lhs, rhs, op):
+    """Same algebra as ``_reconstruct_result``: keep the static-zero ``None``
+    marker when sound, else the concrete post-scaled combined fill."""
+    if lhs.fill_value is None and rhs.fill_value is None and op in _ZERO_PRESERVING_OPS:
+        return None
+    return op(_scaled_fill(lhs), _scaled_fill(rhs))
+
+
+def _match_structure(l_by_id, r_by_id):
+    """``None`` when every id-matched dim pair is structurally compatible
+    (equal logical extent; sparse pairs share partner id / meta size / block
+    grid), else the skip reason. Physical-layout (implicit vs physical) mixes
+    are NOT checked here — they are legal for every axis role and handled
+    per-slot by the ``ibroad`` machinery in ``_lazy_pair``."""
+    for i, ld in l_by_id.items():
+        rd = r_by_id[i]
+        if ld.is_sparse != rd.is_sparse:
+            return "sparse_dense_mix"
+        if ld.logical_size != rd.logical_size:
+            return "extent_mismatch"
+        if ld.is_sparse:
+            if (ld.other_id != rd.other_id or ld.size != rd.size
+                    or (ld.block_size or 1) != (rd.block_size or 1)):
+                return "sparse_meta_mismatch"
+    return None
+
+
+def _side_axes_cover(t) -> bool:
+    """True iff ``t.val``'s physical axes are exactly the axes described by
+    ``t.dims`` (sparse pair meta axis counted once and REQUIRED equal on both
+    members). Leftover / duplicated / dangling axes ⇒ no rule."""
+    by_id = {d.id: d for d in t.dims}
+    seen: set[int] = set()
+    axes: list[int] = []
+    for d in t.dims:
+        if d.is_sparse:
+            if d.id in seen:
+                continue
+            partner = by_id.get(d.other_id)
+            if partner is None:
+                return False
+            seen.update((d.id, d.other_id))
+            if (d.axis is None) != (partner.axis is None) or (
+                    d.axis is not None and d.axis != partner.axis):
+                return False
+            if d.axis is not None:
+                axes.append(d.axis)
+            for m in (d, partner):
+                if getattr(m, "block_axis", None) is not None:
+                    axes.append(m.block_axis)
+        elif d.axis is not None:
+            axes.append(d.axis)
+    return sorted(axes) == list(range(t.val.ndim))
+
+
+def _place_axes(val, srcs):
+    """Transpose/reshape ``val`` so that source axis ``srcs[k]`` lands at
+    target position ``k`` (``None`` ⇒ a fresh size-1 axis there). Requires the
+    non-None entries to be a permutation of ``range(val.ndim)`` — guaranteed by
+    ``_side_axes_cover`` + slot construction. Pure layout: no broadcast, no
+    copy beyond the transpose."""
+    order = [a for a in srcs if a is not None]
+    if order != list(range(val.ndim)):
+        val = val.transpose(order)
+    if len(srcs) != val.ndim:
+        shape, it = [], iter(val.shape)
+        for a in srcs:
+            shape.append(1 if a is None else next(it))
+        val = val.reshape(shape)
+    return val
+
+
+def _lazy_general(lhs, rhs, op: Callable, is_intersection: bool = False):
+    """Try to lower ``op(lhs, rhs)``; ``None`` ⇒ no rule (caller falls through).
+
+    ``is_intersection`` needs no special handling here: every rule operates on
+    ALIGNED structure (no LCM promotion), where the general path's
+    intersection demote is a no-op by construction.
+    """
+    l_by_id = {d.id: d for d in lhs.dims}
+    r_by_id = {d.id: d for d in rhs.dims}
+    if set(l_by_id) != set(r_by_id) or len(l_by_id) != len(lhs.dims) \
+            or len(r_by_id) != len(rhs.dims):
+        return _skip("id_mismatch")
+
+    if lhs.val is None and rhs.val is None:
+        return _lazy_uu(lhs, rhs, op, l_by_id, r_by_id)
+    if lhs.val is None or rhs.val is None:
+        return _lazy_u_x(lhs, rhs, op, l_by_id, r_by_id)
+    return _lazy_pair(lhs, rhs, op, l_by_id, r_by_id)
+
+
+def _all_implicit(t) -> bool:
+    return all(d.axis is None and getattr(d, "block_axis", None) is None
+               for d in t.dims)
+
+
+def _lazy_uu(lhs, rhs, op, l_by_id, r_by_id):
+    """U+U → U: two pure-structure operands combine entirely in scalar_mult."""
+    reason = _match_structure(l_by_id, r_by_id)
+    if reason:
+        return _skip(reason)
+    if not (_all_implicit(lhs) and _all_implicit(rhs)):
+        return _skip("u_axes")
+    if not (lhs.fill_value is None and rhs.fill_value is None
+            and op in _ZERO_PRESERVING_OPS):
+        return _skip("uu_fill")
+    from graphax.sparse.tensor import SparseTensor
+
+    s = op(_apply_scalar_mult(jnp.ones((), lhs.dtype), lhs),
+           _apply_scalar_mult(jnp.ones((), rhs.dtype), rhs))
+    out = SparseTensor(lhs.out_dims, lhs.primal_dims, None, scalar_mult=s,
+                       fill_value=None, check_consistency=False)
+    return _finish(out, "uu")
+
+
+def _lazy_u_x(lhs, rhs, op, l_by_id, r_by_id):
+    """U+x with matching structure: the U side is one scalar; x's metadata
+    (and val layout) are preserved verbatim."""
+    reason = _match_structure(l_by_id, r_by_id)
+    if reason:
+        return _skip(reason)
+    u, x = (lhs, rhs) if lhs.val is None else (rhs, lhs)
+    if not _all_implicit(u):
+        return _skip("u_axes")
+    # Support equality: x may not be "wider" than u along a dense dim — a dim
+    # that is implicit on u must be implicit-or-physical on x with the SAME
+    # logical extent (checked above), which makes the supports identical.
+    from graphax.sparse.tensor import SparseTensor
+
+    x_by_id = {d.id: d for d in x.dims}
+    s = _apply_scalar_mult(jnp.ones((), u.dtype), u)
+    xv = _apply_scalar_mult(x.val, x)
+    if s.dtype != xv.dtype:
+        cdt = _compute_dtype(s.dtype, xv.dtype)
+        s, xv = s.astype(cdt), xv.astype(cdt)
+    val = op(s, xv) if u is lhs else op(xv, s)
+    out = SparseTensor(
+        tuple(x_by_id[d.id] for d in lhs.out_dims),
+        tuple(x_by_id[d.id] for d in lhs.primal_dims),
+        val, scalar_mult=_identity_scalar_mult(val.dtype),
+        fill_value=_combined_fill(lhs, rhs, op), check_consistency=False,
+    )
+    return _finish(out, "u_x")
+
+
+def _lazy_pair(lhs, rhs, op, l_by_id, r_by_id):
+    """Both sides carry a val: the eq / ibroad fast path."""
+    reason = _match_structure(l_by_id, r_by_id)
+    if reason:
+        return _skip(reason)
+    if not (_side_axes_cover(lhs) and _side_axes_cover(rhs)):
+        return _skip("leftover_axes")
+
+    # --- Pair up dims in lhs encounter order (mirrors _map_topology). ---
+    sp, dp, processed = [], [], set()
+    for d in lhs.dims:
+        if d.id in processed:
+            continue
+        rd = r_by_id[d.id]
+        if d.is_sparse:
+            processed.update((d.id, d.other_id))
+            sp.append((d, l_by_id[d.other_id], rd, r_by_id[d.other_id]))
+        else:
+            processed.add(d.id)
+            dp.append((d, rd))
+
+    # --- Canonical output layout: one target axis per axis role that is
+    # PHYSICAL on at least one side; a role implicit on BOTH sides stays
+    # implicit (retention by construction: I+I → I, implicit meta diagonals,
+    # implicit-within-block). A role physical on ONE side broadcasts that
+    # single size-1 axis under ``op`` (the ``ibroad`` rule) — extents are
+    # id-matched equal, so this is never a genuine logical-1 stretch.
+    # slots[k] = (lhs_src_axis|None, rhs_src_axis|None, target_extent).
+    slots: list[tuple[int | None, int | None, int]] = []
+    rec: dict[int, object] = {}
+    rule = "eq"
+
+    def _slot(l_ax, r_ax, extent):
+        nonlocal rule
+        if l_ax is None and r_ax is None:
+            return None  # implicit on both sides — stays implicit
+        if l_ax is None or r_ax is None:
+            rule = "ibroad"
+        slots.append((l_ax, r_ax, extent))
+        return len(slots) - 1
+
+    def _bs(d, nb):
+        # A dim that gained a (size-1) physical block axis from the partner
+        # side must carry an explicit block_size — block_axis without
+        # block_size is inconsistent metadata.
+        return 1 if (nb is not None and d.block_size is None) else d.block_size
+
+    for ld1, ld2, rd1, rd2 in sp:
+        new_axis = _slot(ld1.axis, rd1.axis, ld1.size)
+        nb1 = _slot(ld1.block_axis, rd1.block_axis, ld1.block_size or 1)
+        nb2 = _slot(ld2.block_axis, rd2.block_axis, ld2.block_size or 1)
+        rec[ld1.id] = replace(ld1, axis=new_axis, block_axis=nb1, block_size=_bs(ld1, nb1))
+        rec[ld2.id] = replace(ld2, axis=new_axis, block_axis=nb2, block_size=_bs(ld2, nb2))
+    for ld, rd in dp:
+        new_axis = _slot(ld.axis, rd.axis, ld.logical_size)
+        rec[ld.id] = ld if new_axis is None else replace(ld, axis=new_axis)
+
+    # Physical extents may legally be the full logical extent OR 1 (a
+    # stored-once axis, which _align_value stretches with broadcast_to on the
+    # general path). Anything else is malformed for these rules — fall through.
+    for l_ax, r_ax, ext in slots:
+        if l_ax is not None and lhs.val.shape[l_ax] not in (ext, 1):
+            return _skip("phys_extent")
+        if r_ax is not None and rhs.val.shape[r_ax] not in (ext, 1):
+            return _skip("phys_extent")
+
+    # --- One physical op over the reconciled layouts. ---
+    la = _place_axes(_apply_scalar_mult(lhs.val, lhs), [s[0] for s in slots])
+    ra = _place_axes(_apply_scalar_mult(rhs.val, rhs), [s[1] for s in slots])
+    if la.dtype != ra.dtype:
+        cdt = _compute_dtype(la.dtype, ra.dtype)
+        la, ra = la.astype(cdt), ra.astype(cdt)
+    res = op(la, ra)
+    target = tuple(s[2] for s in slots)
+    if res.shape != target:
+        # An axis stored once (physical extent 1, logical extent N) on BOTH
+        # sides: the output metadata is full-extent, so materialize it exactly
+        # as the general path's broadcast_to would. Counted — this is the one
+        # spot where the lowering still expands storage.
+        LAZY_STATS["note:bcast_materialize"] += 1
+        res = jnp.broadcast_to(res, target)
+
+    from graphax.sparse.tensor import SparseTensor
+
+    out = SparseTensor(
+        tuple(rec[d.id] for d in lhs.out_dims),
+        tuple(rec[d.id] for d in lhs.primal_dims),
+        res, scalar_mult=_identity_scalar_mult(res.dtype),
+        fill_value=_combined_fill(lhs, rhs, op), check_consistency=False,
+    )
+    return _finish(out, rule)
 
 
 # --- Path tracing (test-only) ---------------------------------------------
@@ -610,7 +862,31 @@ def elementwise(
     if count:
         n = _ew_op_count(lhs, rhs, is_intersection)
 
+    # LAZY GENERAL PATH: combine the two operands in the structure they already
+    # have. Returns None when no rule covers the signature, and the
+    # materializing path below then runs UNCHANGED. See ``_lazy_general``.
+    _lz = _lazy_general(lhs, rhs, op, is_intersection)
+    if _lz is not None:
+        _record_path("lazy")
+        if count:
+            return _lz, n
+        return _lz
+
     _record_path("general")
+    return _materializing_general(lhs, rhs, op, is_intersection, n if count else None)
+
+
+def _materializing_general(lhs, rhs, op, is_intersection, n):
+    """The incumbent general path: align, promote to the least-common-multiple
+    meta grid, apply ``op``, demote, rebuild. It materializes -- an implicit
+    role is broadcast to its partner's full extent by ``_align_value`` and a
+    misaligned block grid goes to the LCM grid in ``_promote_to_unified``.
+
+    ``n`` is the op count, or ``None`` for no count. Kept as its own function
+    so the differential test can call it directly as the oracle, with no flag
+    to set and nothing to monkeypatch.
+    """
+    count = n is not None
     try:
         sp, dp = _map_topology(lhs, rhs)
     except ValueError as e:
