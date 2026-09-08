@@ -476,6 +476,55 @@ def _reconstruct_result(value, lhs, sp, dp, output_meta, op, rhs):
 
 
 
+# --- NOT MERGED: the sparsity-retaining elementwise rules -----------------
+# ``sparse/lower/add.py`` held a second elementwise engine, ``lower_add``. It
+# was deleted on 2026-09-08 with the rest of the planner (ticket dsnn-3qm.72).
+# It is recorded here rather than merged, and this section says why, so the
+# next person starts from the evidence instead of from scratch.
+#
+# WHAT IT DID. It paired the two operands' dims BY ID (elementwise operands
+# share ONE id space, so never pair positionally) and emitted ONE physical
+# ``op`` over reconciled layouts, building the output structure symbolically.
+# Four rules:
+#
+#   * ``eq``     every id-matched dim pair is structurally equal (same sparse
+#                pairing, block grid and implicitness; layouts reconciled by
+#                transpose). ``out.val = op(lhs.val * sm, rhs.val_permuted *
+#                sm)``, ``sm = 1``, metadata verbatim. No broadcast and no LCM
+#                grid. Covers I+I -> I and same-grid B+B -> B.
+#   * ``ibroad`` as ``eq``, but some axis role is implicit on one side and
+#                physical on the other at the SAME id-matched extent. Only
+#                that role's size-1 axis broadcasts under ``op``. A role
+#                implicit on BOTH sides stays implicit in the output.
+#   * ``uu``     both operands ``val is None``. The scalars combine and no
+#                buffer is ever built. Gated on statically-zero fills and a
+#                zero-preserving ``op``.
+#   * ``u_x``    one operand ``val is None`` with matching structure: that
+#                side contributes ONE scalar, the other's metadata rides
+#                through verbatim.
+#
+# Everything else (a sparse-to-dense promotion pair, a misaligned block grid,
+# leftover physical axes) returned None and fell through. The output-fill
+# algebra was identical to ``_reconstruct_result``.
+#
+# WHY IT IS NOT THE PATH BELOW. The general path materializes: ``_align_value``
+# broadcasts and ``_promote_to_unified`` densifies to the LCM meta grid. The
+# rules above do neither, so they ARE the direction this op should go. They
+# were never turned on because they are UNPROVEN. Armed behind
+# ``GRAPHAX_EINSUM_EW``, a float64 model diff caught the result diverging by
+# up to 0.8 on ViT COMPRESS variants, while every matmul in the same run
+# stayed oracle-exact. The divergence was never localized to a rule. The
+# likeliest suspects, in order: ``ibroad`` combining an implicit role with a
+# physical one under a UNION op, and the claim that ``is_intersection`` needs
+# no handling because the general path's intersection demote is a no-op on
+# aligned structure.
+#
+# WHAT IT WOULD TAKE. Re-derive the rules one at a time against the lattice
+# property suite, cheapest first: ``uu``, then ``u_x``, then ``eq``, and only
+# then ``ibroad``. Each one is a value-preserving claim that a differential
+# test against the general path can settle on its own. Do not arm the set.
+
+
 # --- Path tracing (test-only) ---------------------------------------------
 # Re-exports from ``_path_tracking``. See that module for the full design;
 # tests opt in via the ``track_paths()`` context manager or ``TRACK_PATHS=1``

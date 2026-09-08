@@ -39,7 +39,7 @@ _mm = importlib.import_module("graphax.sparse.ops.matmul")
 
 _CLI = ["--example", "NeuralNetwork", "--dataset", "mnist", "--seed", "250197",
         "--latency-inner-reps", "1", "--num-data-points", "1", "--reps-per-point", "1",
-        "--quality-metric", "grad_cosine", "--approx-old", "same",
+        "--quality-metric", "grad_cosine",
         "--out-dir", "/tmp/t28b-repro", "--dry-run",
         "--quant-slots", "0,1,2", "--diag-slots", "2", "--compress-slots", "2"]
 
