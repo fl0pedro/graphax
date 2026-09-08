@@ -16,13 +16,35 @@ axis, "neither" a double implicit axis (CONTEXT.md).
 The decision that follows the frame is one rule (owner ruling D1, 2026-09-07):
 
     no dot axis                     -> ANALYTIC, a scale or an elementwise product
-    multiply grid fits the budget   -> MULTIPLY_REDUCE, the default
+    multiply grid fits the budget   -> EINSUM, the default
     otherwise                       -> DOT_GENERAL, the fallback
 
 Broadcasting an implicit axis into the physical grid is NOT an option. It is
-the only emission that materialises, and on GPU it is the program XLA rewrites
-into MULTIPLY_REDUCE anyway. The budget is a materialisation guard, not a
-performance knob, and there is no device branch.
+the only emission that materialises. The budget is a materialisation guard, not
+a performance knob, and there is no device branch.
+
+WHY EINSUM AND NOT A HAND-WRITTEN MULTIPLY-THEN-REDUCE (owner ruling
+2026-09-08). An einsum with the interleaved INTEGER SUBLIST form states the
+contraction and leaves the lowering to XLA, which is the most freedom we can
+hand it. Two concrete gains over writing the multiply and the reduce by hand:
+
+  * An implicit axis needs no special case. It is simply ABSENT from that
+    operand's index list. An index in one operand and in the output is a free
+    axis of that operand; an index in one operand and not in the output is
+    summed. Neither needs a broadcast, and neither needs us to choose between a
+    multiply-reduce and a dot.
+  * XLA keeps the choice. It can lower one einsum to a library GEMM, to a fused
+    multiply and reduce, or to something else, per shape and per device. A
+    hand-written multiply-then-reduce takes that choice away and pins one
+    answer for every shape.
+
+Integer sublists, not letters: `Index.id` is an integer and the sublist form has
+no 52-symbol alphabet cap. `sparse/lower/matmul.py` already emits this form.
+
+The one case einsum cannot state is an output index present in NEITHER operand
+(a double implicit axis riding to the output). That axis never enters the
+contraction at all: it is carried on the frame and the output dim keeps
+`axis=None`, so no value work is needed for it.
 """
 from __future__ import annotations
 
@@ -51,9 +73,12 @@ NO_DOT = frozenset({AxisCase.SUM_STORER, AxisCase.FOLD_SCALE,
 
 
 class EmissionKind(Enum):
-    ANALYTIC = "analytic"
-    MULTIPLY_REDUCE = "multiply_reduce"
-    DOT_GENERAL = "dot_general"
+    """The three forms a contraction is emitted in. Broadcasting an implicit
+    axis into the physical grid is NOT among them (owner ruling D1)."""
+
+    ANALYTIC = "analytic"          # no dot axis survives: a scale or a product
+    EINSUM = "einsum"              # the default
+    DOT_GENERAL = "dot_general"    # the fallback when the grid will not fit
 
 
 @dataclass(frozen=True)
@@ -98,7 +123,8 @@ class Frame:
 
     @property
     def multiply_grid(self) -> int:
-        """Elements of the intermediate MULTIPLY_REDUCE would form.
+        """Elements of the intermediate the einsum would form if XLA fuses it
+        as a multiply and a reduce rather than a library call.
 
         NOT the product of the logical extents. A meta-block-diagonal pair
         threads ONE meta extent through several axes: on a block-diagonal
@@ -152,7 +178,7 @@ def _classify(present_lhs: bool, present_rhs: bool, stored_lhs: bool,
     return AxisCase.FOLD_SCALE if contracted else AxisCase.IMPLICIT_OUT
 
 
-#: Byte budget on the MULTIPLY_REDUCE intermediate. Above it the emission falls
+#: Byte budget on the einsum's intermediate grid. Above it the emission falls
 #: back to DOT_GENERAL, because a grid XLA will not fuse is a materialisation.
 #: The VALUE is a device property (the fusion window is hardware); the RULE is
 #: not, so there is no device branch. Measured and pinned per device class.
@@ -175,7 +201,7 @@ def decide_emission(frame: Frame, itemsize: int = 4,
         return EmissionKind.ANALYTIC
     budget = multiply_budget_bytes() if budget_bytes is None else budget_bytes
     if frame.multiply_grid * itemsize <= budget:
-        return EmissionKind.MULTIPLY_REDUCE
+        return EmissionKind.EINSUM
     return EmissionKind.DOT_GENERAL
 
 

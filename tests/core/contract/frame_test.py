@@ -106,7 +106,10 @@ def test_a_contracted_axis_stored_by_one_sums_the_storer():
 
 
 def test_the_budget_is_what_switches_the_emission():
-    """The rule reads the grid and nothing else. No device branch exists."""
+    """The rule reads the grid and nothing else. No device branch exists.
+
+    Above the budget the einsum's intermediate would not fit, so the emission
+    falls back to an explicit dot rather than materialising a grid."""
     lhs = SparseTensor((DenseIndex(0, 64, 0),), (DenseIndex(1, 64, 1),),
                        jnp.ones((64, 64)))
     rhs = SparseTensor((DenseIndex(0, 64, 0),), (DenseIndex(1, 64, 1),),
@@ -115,7 +118,7 @@ def test_the_budget_is_what_switches_the_emission():
     assert f.multiply_grid == 64 ** 3
     big = decide_emission(f, itemsize=4, budget_bytes=64 ** 3 * 4)
     small = decide_emission(f, itemsize=4, budget_bytes=64 ** 3 * 4 - 1)
-    assert big is EmissionKind.MULTIPLY_REDUCE
+    assert big is EmissionKind.EINSUM
     assert small is EmissionKind.DOT_GENERAL
 
 
@@ -127,7 +130,7 @@ def test_a_narrower_dtype_fits_a_larger_grid():
                        jnp.ones((64, 64)))
     f = build_frame(lhs, rhs)
     budget = 64 ** 3 * 2
-    assert decide_emission(f, itemsize=2, budget_bytes=budget) is EmissionKind.MULTIPLY_REDUCE
+    assert decide_emission(f, itemsize=2, budget_bytes=budget) is EmissionKind.EINSUM
     assert decide_emission(f, itemsize=4, budget_bytes=budget) is EmissionKind.DOT_GENERAL
 
 
@@ -135,7 +138,7 @@ def test_broadcasting_is_not_an_emission():
     """Owner ruling D1: an implicit axis is never broadcast into the physical
     grid. Only three emissions exist, and none of them is that."""
     assert {e.value for e in EmissionKind} == {
-        "analytic", "multiply_reduce", "dot_general"}
+        "analytic", "einsum", "dot_general"}
 
 
 def test_a_mismatched_contracted_extent_raises():
