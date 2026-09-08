@@ -10,12 +10,19 @@ test pins three things that no other test in this directory pins:
   zero where the algebra says the contraction needs no broadcast at all.
 
 The growing-broadcast count is asserted EXACTLY, including where it is not
-zero today. A change that removes one of those broadcasts (ticket dsnn-3qm.28.2
-does exactly that for the single implicit sparse axis and for the
-spatial-sparse pairing) must therefore edit this file on purpose, not silently.
+zero today. A change that removes one of those broadcasts must therefore edit
+this file on purpose, not silently.
 
-Everything here runs under the DEFAULT engine. The per-mode sweep lives in
-``.scratch-race/probes/t285/`` and is a probe, not a test.
+Ticket dsnn-3qm.72 (2026-09-08) removed four of them. The engine now emits one
+einsum instead of a ``dot_general``, so an axis one operand does not store is
+given a private label and summed away at extent 1 rather than broadcast up to
+its partner. Four cells went from one growing broadcast to none: the single
+implicit sparse axis on either side (30 and 18 elements), the carried dense
+axis (12), and the uniform operand (1). One cell still grows: the
+spatial-sparse pairing, whose pairing type no lazy rule covers.
+
+There is one engine. The per-mode sweep lives in ``.scratch-race/probes/t285/``
+and is a probe, not a test.
 """
 import math
 import unittest
@@ -97,9 +104,11 @@ class TestImplicitAxisStorage(unittest.TestCase):
                     "the emission stores more than the structural support")
 
     # --- single implicit sparse axis: the meta axis of a diagonal pair ----
-    # Optimum: M*P*Q = 60 stored, M*P*K*Q = 120 products. The default engine
-    # reaches both and pays a 30-element operand broadcast for the fusion it
-    # buys on GPU (finding 63 deliverable c).
+    # Optimum: M*P*Q = 60 stored, M*P*K*Q = 120 products. The engine reaches
+    # both and writes no broadcast at all: the rhs stores nothing along the
+    # meta axis, so that axis rides as the lhs's free axis in the einsum. It
+    # used to cost a 30-element operand broadcast (finding 63 deliverable c),
+    # which a ``dot_general`` needed to put the axis in its batch list.
     def test_single_implicit_sparse_lhs_stores_meta(self):
         lhs = SparseTensor(
             (DiagonalIndex(0, M_META, 0, 1, P_BLK, 1),),
@@ -112,7 +121,7 @@ class TestImplicitAxisStorage(unittest.TestCase):
             _n((K_CON, Q_OUT), 2),
         )
         self._check(lhs, rhs, lhs.dense() @ rhs.dense(),
-                    stored=60, pattern="SS", growing=(1, 30), support=60)
+                    stored=60, pattern="SS", growing=(0, 0), support=60)
 
     def test_single_implicit_sparse_rhs_stores_meta(self):
         lhs = SparseTensor(
@@ -126,7 +135,7 @@ class TestImplicitAxisStorage(unittest.TestCase):
             _n((M_META, K_CON, Q_OUT), 2),
         )
         self._check(lhs, rhs, lhs.dense() @ rhs.dense(),
-                    stored=60, pattern="SS", growing=(1, 18), support=60)
+                    stored=60, pattern="SS", growing=(0, 0), support=60)
 
     # --- single implicit dense axis, block kind ---------------------------
     # Optimum: M*Q = 20 stored, M*K*Q = 40 products, because the out-side
@@ -182,7 +191,7 @@ class TestImplicitAxisStorage(unittest.TestCase):
             _n((A_, C_, D_), 2),
         )
         self._check(lhs, rhs, jnp.einsum("abc,acd->abd", lhs.dense(), rhs.dense()),
-                    stored=30, pattern="DDD", growing=(1, 12))
+                    stored=30, pattern="DDD", growing=(0, 0))
 
     # --- double implicit contracted axis ----------------------------------
     # c folds into scalar_mult. 30 stored, 30 products, no dot.
@@ -217,9 +226,9 @@ class TestImplicitAxisStorage(unittest.TestCase):
                     stored=15, pattern="IDD", growing=(0, 0))
 
     # --- uniform operand: val is None on every dim ------------------------
-    # 10 stored, 40 adds. The one residual growing element is the carried
-    # batch axis above, not the uniform operand (finding 63 corrects
-    # finding 62 on this point).
+    # 10 stored, 40 adds. The one residual growing element used to come from
+    # the carried batch axis above, not from the uniform operand (finding 63
+    # corrects finding 62 on this point). It is gone with that broadcast.
     def test_uniform_operand(self):
         lhs = SparseTensor(
             (DenseIndex(0, A_, None), DenseIndex(1, B_, None)),
@@ -232,7 +241,7 @@ class TestImplicitAxisStorage(unittest.TestCase):
             _n((A_, C_, D_), 2),
         )
         self._check(lhs, rhs, jnp.einsum("abc,acd->abd", lhs.dense(), rhs.dense()),
-                    stored=10, pattern="DID", growing=(1, 1))
+                    stored=10, pattern="DID", growing=(0, 0))
 
     # --- genuine LCM grid --------------------------------------------------
     # meta 4 against meta 6, gcd 2, lcm 12. The result coarsens to gcd = 2 meta
@@ -269,6 +278,7 @@ class TestImplicitAxisStorage(unittest.TestCase):
     # operand, because "spatial_sparse_lhs" is not in _LAZY_PAIRINGS so no
     # lazy rule fires. Its frame numbers are m_l/m_r = 3/1 with T = 3, which
     # is the shape the demote rule already handles for a contract pairing.
+    # This is the ONE growing broadcast left in this file after dsnn-3qm.72.
     def test_spatial_sparse_pairing(self):
         s_, b, c = 3, 4, 5
         lhs = SparseTensor(
