@@ -1664,6 +1664,81 @@ def _quant_pet_enabled() -> bool:
     return _os.environ.get("GRAPHAX_QUANT_PET", "1") != "0"
 
 
+def _sublist_einsum_enabled() -> bool:
+    """Emit the contraction as an integer-sublist einsum (default ON).
+
+    Set ``GRAPHAX_SUBLIST_EINSUM=0`` to restore ``lax.dot_general``. The switch
+    exists only while the two forms are being proved equal on the whole suite;
+    it goes when the planner does.
+    """
+    return _os.environ.get("GRAPHAX_SUBLIST_EINSUM", "1") != "0"
+
+
+def _dims_to_sublists(lhs_ndim, rhs_ndim, dims):
+    """``dot_general`` dimension numbers -> three INTEGER sublists for einsum.
+
+    ``dims`` is ``((lhs_contract, rhs_contract), (lhs_batch, rhs_batch))``, the
+    same tuple the dot takes, so the two forms cannot disagree about which axis
+    meets which. Labels are integers: ``Index.id`` is an integer and the
+    interleaved sublist form has no 52-symbol alphabet cap that the letter form
+    imposes.
+
+    The output order is dot_general's own: batch axes, then the lhs's kept axes
+    in order, then the rhs's kept axes in order. Keeping that order means the
+    einsum is a drop-in for the dot and every downstream index calculation on
+    the result stays correct.
+    """
+    (lc, rc), (lb, rb) = dims
+    lhs_sub = [None] * lhs_ndim
+    rhs_sub = [None] * rhs_ndim
+    nxt = 0
+    for a, b in zip(lb, rb):          # batch axes share a label
+        lhs_sub[a] = rhs_sub[b] = nxt
+        nxt += 1
+    n_batch = nxt
+    for a, b in zip(lc, rc):          # contracted axes share a label, absent
+        lhs_sub[a] = rhs_sub[b] = nxt  # from the output, so einsum sums them
+        nxt += 1
+    lhs_kept, rhs_kept = [], []
+    for a in range(lhs_ndim):
+        if lhs_sub[a] is None:
+            lhs_sub[a] = nxt
+            lhs_kept.append(nxt)
+            nxt += 1
+    for b in range(rhs_ndim):
+        if rhs_sub[b] is None:
+            rhs_sub[b] = nxt
+            rhs_kept.append(nxt)
+            nxt += 1
+    out_sub = list(range(n_batch)) + lhs_kept + rhs_kept
+    return lhs_sub, rhs_sub, out_sub
+
+
+def _gx_einsum(a, b, dims):
+    """The contraction as ONE ``jnp.einsum`` over integer sublists.
+
+    The default emission (owner ruling D1, revised 2026-09-08). It states the
+    contraction and leaves the lowering to XLA, which may pick a library call,
+    a fused multiply and reduce, or something else, per shape and per device. A
+    ``dot_general`` pins one of those for every shape.
+
+    Same dtype rules as :func:`_gx_dot_general`: the accumulation type is read
+    from the same helper, so switching emission cannot change a value.
+    """
+    lhs_sub, rhs_sub, out_sub = _dims_to_sublists(a.ndim, b.ndim, dims)
+    # The dtype rule is _gx_dot_general's, restated so switching the emission
+    # cannot change a value: a bf16 x bf16 contraction (only Quant makes them)
+    # accumulates in f32 when GRAPHAX_QUANT_PET is on, and keeps the narrow
+    # stored width when it is off. Every other dtype takes the plain call.
+    if (_quant_narrow_gemm_enabled()
+            and jnp.dtype(a.dtype) == jnp.dtype(jnp.bfloat16)
+            and jnp.dtype(b.dtype) == jnp.dtype(jnp.bfloat16)
+            and _quant_pet_enabled()):
+        return jnp.einsum(a, lhs_sub, b, rhs_sub, out_sub,
+                          preferred_element_type=jnp.float32)
+    return jnp.einsum(a, lhs_sub, b, rhs_sub, out_sub)
+
+
 def _gx_dot_general(a, b, dims):
     """``lax.dot_general`` with f32 accumulation whenever both operand
     views are bf16 (only Quant produces them): tensor-core inputs, f32
@@ -2051,14 +2126,18 @@ def _matmul_via_densify(lhs, rhs):
                 rhs_dense, ra, ls,
                 rhs._eff_fill if _defer else _scaled_fill(rhs))
 
-    result = _gx_dot_general(
-        lhs_dense,
-        rhs_dense,
-        (
-            (tuple(lhs_contract), tuple(rhs_contract)),
-            (tuple(lhs_batch), tuple(rhs_batch)),
-        ),
+    # EMISSION. The dimension numbers are the same either way; only the form
+    # handed to XLA differs. The einsum states the contraction and leaves the
+    # lowering open (owner ruling D1, revised 2026-09-08); the dot pins it.
+    # GRAPHAX_SUBLIST_EINSUM=0 restores the dot while the two are being proved
+    # equal on the whole suite.
+    _dn = (
+        (tuple(lhs_contract), tuple(rhs_contract)),
+        (tuple(lhs_batch), tuple(rhs_batch)),
     )
+    result = (_gx_einsum(lhs_dense, rhs_dense, _dn)
+              if _sublist_einsum_enabled()
+              else _gx_dot_general(lhs_dense, rhs_dense, _dn))
 
     # `dot_general` lays out result axes as: batch, then lhs's kept (in order), then rhs's
     # kept (in order). Build the output sizes/slot tags in that same order.
