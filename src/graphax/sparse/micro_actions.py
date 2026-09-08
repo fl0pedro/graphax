@@ -41,7 +41,7 @@ from typing import Callable, Sequence, Union
 
 import jax.numpy as jnp
 
-from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex, CompressedIndex
+from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
 from graphax.sparse.tensor import SparseTensor, _apply_block_diagonal, _subdivide_coupled_blockdiag
 from graphax.sparse.dtype_compute import _scaled_mul
 
@@ -842,9 +842,8 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
     # (16 vs 4 / 16 vs 10) on high-rank edges (ViT attention, MoE experts).
     # Raise ValueError so the elimination loop's best-effort handler skips this
     # COMPRESS on this edge (leaving it exact) instead of corrupting it.
-    # DenseIndex axes (NN/ConvNet) are unaffected: not sparse, no block_axis,
-    # not a CompressedIndex.
-    # REMOVED 2026-07-15: over-conservative structural-block-axis / CompressedIndex guard.
+    # DenseIndex axes (NN/ConvNet) are unaffected: not sparse, no block_axis.
+    # REMOVED 2026-07-15: over-conservative structural-block-axis guard.
     # It raised ValueError *so the elimination loop would silently SKIP the COMPRESS*, which
     # desyncs the two edges of a shared var -> the documented root cause of the very
     # "Contraction size mismatch" family it claimed to prevent. Block-axis compress is

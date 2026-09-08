@@ -127,12 +127,11 @@ def _is_implicit(d: Index) -> bool:
     its ``logical_size`` is the (broadcast) size ``N``.
 
     A ``DiagonalIndex`` may also carry ``axis=None`` (the meta axis lives on its
-    partner), so we explicitly require a NON-sparse, non-compressed dim: only a
+    partner), so we explicitly require a NON-sparse dim: only a
     compressed-away Dense dim is "implicit" in the (broadcast-constant) sense
     this kernel handles."""
     return (
         not d.is_sparse
-        and not d.is_compressed
         and d.axis is None
     )
 

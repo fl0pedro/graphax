@@ -42,17 +42,13 @@ Transform = Callable[["SparseTensor", "SparseTensor", Array], "SparseTensor"]
 
 
 def _on_materialized(method):
-    """Decorator for value-semantic methods (reductions + non-linear unary ops)
-    that must NOT read a raw compressed ``val``: when the tensor has compressed
-    (``BandedIndex`` / ``SetIndex``) dims, run ``method`` on the materialized
-    ``{Diagonal, Dense}`` equivalent instead. No-op for non-compressed tensors.
-    A band buffer carries out-of-band padding and a set buffer the
-    pre-combination per-side blocks, so reducing either directly is wrong."""
+    """Historically re-ran value-semantic methods (reductions + non-linear unary
+    ops) on a materialized copy when the tensor carried a compressed dim. Those
+    index classes are gone (ruling 2026-09-07), so every ``val`` now holds
+    exactly the non-fill values and the method runs directly. Kept as an
+    identity decorator to mark the methods that read ``val`` by value."""
     @wraps(method)
     def wrapper(self, *args, **kwargs):
-        t = self._materialize_compressed()
-        if t is not self:
-            return getattr(t, method.__name__)(*args, **kwargs)
         return method(self, *args, **kwargs)
     return wrapper
 
@@ -466,16 +462,12 @@ class SparseTensor(SparseMathMixin):
         # ``dense_for_matmul`` is the single Array-producing densifier (fusion
         # fast paths, with a ``dense(hard=True)`` fallback for shapes they don't
         # cover) — see the densification map in ``ops/dense.py``. It consumes
-        # only Dense/Diagonal, so first strip any compressed (BandedIndex /
-        # SetIndex) dims (no-op when there are none).
         from graphax.sparse.ops.dense import dense_for_matmul
-        from graphax.sparse.ops.utils import _compressed_dims, _densify_compressed_dims
         # ``keep_quantization=False`` (default): promote to the full
         # mul-capable dtype and return full precision -- lossless.
         # ``True``: broadcast scalar_mult down and multiply in val's narrow
         # dtype, so the Quant survives (raises on concrete overflow).
-        t = _densify_compressed_dims(self) if _compressed_dims(self) else self
-        return dense_for_matmul(t, keep_quantization=keep_quantization)
+        return dense_for_matmul(self, keep_quantization=keep_quantization)
 
     @property
     def T(self) -> SparseTensor:
@@ -512,20 +504,6 @@ class SparseTensor(SparseMathMixin):
         fill_value=_KEEP,
     ):
         return _copy(self, val, scalar_mult, fill_value)
-
-    def _materialize_compressed(self) -> SparseTensor:
-        """Return an equivalent tensor with no compressed (``BandedIndex`` /
-        ``SetIndex``) dims — they are densified to their compact
-        ``DiagonalIndex`` / ``DenseIndex`` form so ``val`` again holds *exactly*
-        the non-fill values with ``size - val.size`` implicit fill cells. Any
-        value-semantic reduction / non-linear unary op below must route through
-        this first: a raw band / set buffer carries out-of-band padding slots
-        (banded) or pre-combination per-side blocks (set) whose element multiset
-        does NOT match the dense form, so reducing it directly is wrong. No-op
-        (returns ``self``) when the tensor has no compressed dims."""
-        from graphax.sparse.ops.utils import _compressed_dims, _materialize_for_op
-
-        return _materialize_for_op(self) if _compressed_dims(self) else self
 
     # Low priority TODO: axis, and other args
     @property

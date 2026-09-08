@@ -30,7 +30,6 @@ from jax import Array
 
 from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
 
-from .block_storage import _band_axis_select
 from .dense import dense_for_matmul
 from .layout import generate_block_permutation, generate_grouped_permutation
 from .utils import (
@@ -96,7 +95,6 @@ class CRes(NamedTuple):
     lhs_block_lens: list[int]
     rhs_block_lens: list[int]
     scalar_mult: float
-    banded_geom: "BandedLayout | MultiAxisBandedLayout | None" = None
     # --- lazy frame (ticket dsnn-3qm.67) ---------------------------------
     # ``grid`` is built on the EFFECTIVE frame: every extent that neither
     # operand stores is 1 there instead of broadcast to its logical length.
@@ -1235,33 +1233,8 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
         lhs_leftover,
         rhs_leftover,
     )
-    banded_geom = None
-    if not frame_changed:
-        banded_geom = _should_emit_block_banded(
-            ctx,
-            pairs,
-            shared,
-            total,
-            final_lhs_lens,
-            final_rhs_lens,
-            lhs_leftover,
-            rhs_leftover,
-        )
-        if banded_geom is None:
-            # Fall through to the K>1 multi-axis probe when the K=1 single-pair
-            # probe didn't fire (typically because ``len(pairs) != 1``).
-            banded_geom = _should_emit_multi_axis_banded(
-                ctx,
-                pairs,
-                shared,
-                total,
-                final_lhs_lens,
-                final_rhs_lens,
-                lhs_leftover,
-                rhs_leftover,
-            )
     if not is_lazy:
-        return grid, shared, final_lhs_lens, final_rhs_lens, scalar, banded_geom, None
+        return grid, shared, final_lhs_lens, final_rhs_lens, scalar, None
     true_shared, true_total, true_split, _ = _contraction_factors(true_pairs)
     true_fll, true_frl = _compact_block_lens(
         true_pairs, true_shared, true_total, true_split
@@ -1287,7 +1260,6 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
         final_lhs_lens,
         final_rhs_lens,
         scalar,
-        banded_geom,
         (pairs, checked, true_shared, true_fll, true_frl),
     )
 
@@ -1579,87 +1551,6 @@ def _build_output_tensor(ctx, rhs_dims, res):
     if not has_val and values is not None and values.size == 1:
         final_mult = _sm_promote(final_mult, jnp.squeeze(values))
         values = None
-    # Banded emission: when ``_should_emit_block_banded`` (run upstream in
-    # ``_execute_block_sparse_contraction``) finds a band-storage form
-    # strictly tighter than the natural dense output, pack ``values`` into
-    # the extended ``BlockBanded`` pytree via broadcast+where+sum (gather-
-    # free; XLA fuses with the producing dot_general). The probe gates on
-    # 2-D single-contract-pair geometry with no leftover, so ``values`` is
-    # always 2-D dense at this point.
-    if res.banded_geom is not None and values is not None:
-        from graphax.sparse.indexes import BandedIndex
-
-        layout = res.banded_geom
-        out_id = final_out[0].id if final_out else 0
-        primal_id = final_primal[0].id if final_primal else (out_id + 1)
-
-        # Multi-axis (K≥2) banded output: pack into the interleaved band
-        # buffer and emit K BandedIndex pairs describing each axis-pair's band.
-        if isinstance(layout, MultiAxisBandedLayout):
-            band_data = _pack_dense_to_multi_axis_banded(values, layout)
-            K = len(layout.per_axis)
-            out_dims_new = []
-            primal_dims_new = []
-            for i, ax in enumerate(layout.per_axis):
-                is_row_primary = ax.primary_axis == 0
-                M_row = ax.m_primary if is_row_primary else ax.n_secondary
-                M_col = ax.n_secondary if is_row_primary else ax.m_primary
-                # ``size`` is the META count (logical_size = size*block_size),
-                # matching DiagonalIndex convention.
-                out_dims_new.append(BandedIndex(
-                    id=out_id + i, size=ax.n_meta * M_row,
-                    axis=i, other_id=primal_id + i,
-                    block_size=ax.block_row, block_axis=K + i,
-                    band_width=ax.band_width, offset=ax.offset,
-                    primary=is_row_primary, n_secondary=ax.n_secondary,
-                    n_meta=ax.n_meta,
-                ))
-                primal_dims_new.append(BandedIndex(
-                    id=primal_id + i, size=ax.n_meta * M_col,
-                    axis=K + i, other_id=out_id + i,
-                    block_size=ax.block_col, block_axis=3 * K + i,
-                    band_width=ax.band_width, offset=ax.offset,
-                    primary=is_row_primary, n_secondary=ax.n_secondary,
-                    n_meta=ax.n_meta,
-                ))
-            return SparseTensor(
-                tuple(out_dims_new), tuple(primal_dims_new), band_data,
-                scalar_mult=jnp.asarray(final_mult).astype(values.dtype),
-                fill_value=None,  # tiled path assumes zero fill → statically zero
-                check_consistency=False,
-            )
-
-        # K=1 banded output: band buffer in val + a single BandedIndex pair.
-        band_data = _pack_dense_to_banded(values, layout)
-        is_row_primary = layout.primary_axis == 0
-        M_row = layout.m_primary if is_row_primary else layout.n_secondary
-        M_col = layout.n_secondary if is_row_primary else layout.m_primary
-        # ``size`` is the META count (logical_size = size*block_size).
-        # ``axis`` / ``block_axis`` are NOMINAL for a BandedIndex — densify
-        # reconstructs the layout from ``val.shape`` + the band params, never
-        # from these fields — but we keep them distinct per side and matching
-        # the K>=2 convention (out: axis=i, block_axis=K+i; primal: axis=K+i,
-        # block_axis=3K+i, here K=1) so no consumer conflates the two sides.
-        out_ix = BandedIndex(
-            id=out_id, size=layout.n_meta * M_row,
-            axis=0, other_id=primal_id, block_size=layout.block_row, block_axis=1,
-            band_width=layout.band_width, offset=layout.offset,
-            primary=is_row_primary, n_secondary=layout.n_secondary,
-            n_meta=layout.n_meta,
-        )
-        primal_ix = BandedIndex(
-            id=primal_id, size=layout.n_meta * M_col,
-            axis=1, other_id=out_id, block_size=layout.block_col, block_axis=3,
-            band_width=layout.band_width, offset=layout.offset,
-            primary=is_row_primary, n_secondary=layout.n_secondary,
-            n_meta=layout.n_meta,
-        )
-        return SparseTensor(
-            (out_ix,), (primal_ix,), band_data,
-            scalar_mult=jnp.asarray(final_mult).astype(values.dtype),
-            fill_value=None,  # tiled path assumes zero fill → statically zero
-            check_consistency=False,
-        )
     out_dtype = values.dtype if values is not None else jnp.asarray(final_mult).dtype
     # transforms intentionally not propagated through matmul; callers in
     # core.py unload pre/post transforms before the matmul and reattach
@@ -1671,455 +1562,6 @@ def _build_output_tensor(ctx, rhs_dims, res):
         scalar_mult=jnp.asarray(final_mult).astype(out_dtype),
         fill_value=None,  # tiled path assumes zero fill → statically zero
     )
-
-
-class MultiAxisBandedLayout(NamedTuple):
-    """Multi-axis (K>1) banded layout returned by the multi-contract probe.
-
-    Each axis-pair carries its own :class:`BandedLayout`-equivalent
-    metadata (orientation, band width, sub-block dims, offset). Currently
-    populated for K=2; the structure naturally extends to K>2 once the
-    emission kernel supports it.
-    """
-
-    per_axis: tuple["BandedLayout", ...]
-
-
-class BandedLayout(NamedTuple):
-    """Static layout for emitting a ``BlockBanded`` matmul output.
-
-    Computed by :func:`_should_emit_block_banded` from input metadata alone
-    (no traced array shapes). The new fields mirror the extended
-    :class:`~graphax.sparse.ops.block_storage.BlockBanded` pytree:
-
-      * ``primary_axis``: ``0`` = row-primary (band traverses cols), ``1`` =
-        col-primary (band traverses rows). The probe picks whichever
-        orientation packs tighter for the geometry at hand.
-      * ``m_primary``: meta-blocks along the primary axis (``M_row`` for
-        row-primary, ``M_col`` for col-primary). Equals ``data.shape[0]``.
-      * ``n_secondary``: meta-blocks along the non-primary axis.
-      * ``band_width``: ``W`` = max in-band sub-blocks per primary slot.
-        Equals ``data.shape[1]``.
-      * ``block_row`` / ``block_col``: sub-block dims. Equal
-        ``lhs.out_dims[0].block_size`` / ``rhs.primal_dims[0].block_size``.
-      * ``offset``: per-primary integer offsets along the secondary axis.
-
-    Replaces the legacy ``BandedGeom`` (which mirrored a dead emission gate
-    and never fired in practice). The new probe fires for misaligned-
-    contract cases (``B_a_w`` and ``B_b_h`` non-divisible), which the
-    pre-Phase-5d matmul stored as a fully-dense output.
-    """
-
-    primary_axis: int
-    m_primary: int
-    n_secondary: int
-    band_width: int
-    block_row: int
-    block_col: int
-    offset: tuple[int, ...]
-    n_meta: int = 1
-
-
-def _row_band_spans(
-    M_a: int, B_a_w: int, B_b_h: int, M_b: int
-) -> list[tuple[int, int]]:
-    """For each output meta-row ``a in [0, M_a)``, return
-    ``(b_lo, b_hi)`` — the inclusive-exclusive range of overlapping
-    rhs meta-cols. ``b_lo`` is the smallest ``b`` with overlap, ``b_hi``
-    one past the largest.
-
-    The overlap condition (mathematician's derivation): row ``a`` covers
-    contracting range ``[a*B_a_w, (a+1)*B_a_w)``; col ``b`` covers
-    ``[b*B_b_h, (b+1)*B_b_h)``. Overlap iff
-    ``a*B_a_w < (b+1)*B_b_h ∧ b*B_b_h < (a+1)*B_a_w``.
-    """
-    spans: list[tuple[int, int]] = []
-    for a in range(M_a):
-        a_lo, a_hi = a * B_a_w, (a + 1) * B_a_w
-        # b_lo: smallest b such that (b+1)*B_b_h > a_lo, i.e., b >= a_lo // B_b_h.
-        b_lo = a_lo // B_b_h
-        # b_hi: smallest b such that b*B_b_h >= a_hi, i.e., b >= ceil(a_hi/B_b_h).
-        b_hi = -(-a_hi // B_b_h)
-        b_lo = builtins.max(0, b_lo)
-        spans.append((b_lo, b_hi))
-    return spans
-
-
-def _should_emit_block_banded(
-    ctx: "Ctx",
-    pairs: list["Pair"],
-    shared: list[int],
-    total: list[int],
-    final_lhs_lens: list[int],
-    final_rhs_lens: list[int],
-    lhs_leftover: list[int],
-    rhs_leftover: list[int],
-) -> BandedLayout | None:
-    """Static probe: detect whether the matmul output has a band-sparse
-    structure tighter than the fully-dense form, and choose the
-    row-primary vs col-primary orientation that packs tighter.
-
-    Returns a :class:`BandedLayout` when emission is justified
-    (band-storage strictly less than the dense alternative), else ``None``
-    (matmul falls through to the legacy ``val=values`` path).
-
-    Gates (static, all decidable from operand metadata):
-
-      * 2-D single-contract-pair matmul on block-sparse inputs.
-      * Equal logical contracting size: ``M_a * B_a_w == M_b * B_b_h``.
-      * Band width > 1 OR row/col counts differ — i.e., something is
-        actually being compressed (pure-aligned cases stay on the existing
-        ``val=(M, B_h, B_w)`` storage, no BlockBanded wrap).
-    """
-    # DELETED CLASS (ruling 2026-09-07): `SparseTensor` has exactly two index
-    # classes, DenseIndex and DiagonalIndex, each axis explicit or implicit.
-    # Measured over 88 runs on 17 targets, both engines, both orders, exact and
-    # approximated, no target ever constructed one of these (finding 67). The
-    # probe is kept as a stub returning None so the caller's fall-through is
-    # the single path; the body goes with the class in step C.
-    return None
-    lhs, rhs = ctx.lhs, ctx.rhs
-    if len(lhs.dims) != 2 or len(rhs.dims) != 2:
-        return None
-    if not all(d.is_sparse for d in (*lhs.dims, *rhs.dims)):
-        return None
-    if len(pairs) != 1 or pairs[0].pairing_type != "contract":
-        return None
-    if lhs_leftover or rhs_leftover:
-        return None
-    if len(total) != 1 or len(final_lhs_lens) != 1 or len(final_rhs_lens) != 1:
-        return None
-
-    M_a = lhs.out_dims[0].size
-    B_a_h = lhs.out_dims[0].block_size or 1
-    B_a_w = lhs.primal_dims[0].block_size or 1
-    M_b = rhs.primal_dims[0].size
-    B_b_h = rhs.out_dims[0].block_size or 1
-    B_b_w = rhs.primal_dims[0].block_size or 1
-    if M_a * B_a_w != M_b * B_b_h:
-        return None  # logical contract sizes don't align — outside scope
-
-    # Divisibility gate: when one contract block divides the other, the natural
-    # matmul output preserves meta-block structure (stored as ``val=(M, B_h, B_w)``
-    # — tight already). BlockBanded only helps when neither divides the other
-    # — that's when the LCM-grid expansion forces the natural output to be
-    # 2-D dense, losing the meta-block dim.
-    if B_a_w % B_b_h == 0 or B_b_h % B_a_w == 0:
-        return None
-
-    # When ``gcd(M_a, M_b) > 1`` the matmul output splits into ``N = gcd``
-    # independent banded meta-blocks stacked along the meta-diagonal (Case A
-    # of the mathematician's taxonomy). The per-batch geometry is the same
-    # as a smaller ``(M_per_a, B_a) × (M_per_b, B_b)`` matmul; ``BlockBanded``'s
-    # ``n_meta`` field carries the outer batch count.
-    N = math.gcd(M_a, M_b)
-    M_per_a = M_a // N
-    M_per_b = M_b // N
-
-    B_row, B_col = B_a_h, B_b_w
-
-    # Compute both orientations' band spans at *per-batch* granularity.
-    row_spans = _row_band_spans(M_per_a, B_a_w, B_b_h, M_per_b)
-    col_spans = _row_band_spans(M_per_b, B_b_h, B_a_w, M_per_a)
-
-    # If any row has empty span (shouldn't happen given the logical-contract
-    # check above, but bail defensively) - no band, fall through.
-    if any(lo >= hi for lo, hi in row_spans):
-        return None
-
-    W_rp = builtins.max(hi - lo for lo, hi in row_spans)
-    W_cp = builtins.max(hi - lo for lo, hi in col_spans)
-    offset_rp = tuple(lo for lo, _ in row_spans)
-    offset_cp = tuple(lo for lo, _ in col_spans)
-
-    # Storage footprint per orientation. ``N`` factors out — pick whichever
-    # per-batch slot count is smaller. Compare against the natural per-batch
-    # dense (which is what the eager path materializes when N>1).
-    rp_cost = N * M_per_a * W_rp * B_row * B_col
-    cp_cost = N * M_per_b * W_cp * B_row * B_col
-    dense_cost = N * (M_per_a * B_row) * (M_per_b * B_col)
-
-    # Fall through when no compression possible — keeps existing val=values path
-    # for aligned (divisor) cases that the natural meta-block storage already
-    # handles tightly.
-    if rp_cost >= dense_cost and cp_cost >= dense_cost:
-        return None
-
-    # Pick the tighter orientation.
-    if cp_cost < rp_cost:
-        return BandedLayout(
-            primary_axis=1,
-            m_primary=M_per_b,
-            n_secondary=M_per_a,
-            band_width=W_cp,
-            block_row=B_row,
-            block_col=B_col,
-            offset=offset_cp,
-            n_meta=N,
-        )
-    return BandedLayout(
-        primary_axis=0,
-        m_primary=M_per_a,
-        n_secondary=M_per_b,
-        band_width=W_rp,
-        block_row=B_row,
-        block_col=B_col,
-        offset=offset_rp,
-        n_meta=N,
-    )
-
-
-def _should_emit_multi_axis_banded(
-    ctx: "Ctx",
-    pairs: list["Pair"],
-    shared: list[int],
-    total: list[int],
-    final_lhs_lens: list[int],
-    final_rhs_lens: list[int],
-    lhs_leftover: list[int],
-    rhs_leftover: list[int],
-) -> MultiAxisBandedLayout | None:
-    """K=2 multi-contract probe: detect when both contract pairs are
-    misaligned and emission as a multi-axis block-banded output strictly
-    beats the dense 4-D output.
-
-    K=2 only for now; K>2 would mirror the same per-pair logic and emit
-    a higher-rank multi-axis block-banded output once the K-axis
-    ``to_dense`` kernel extends to K>2.
-    """
-    # DELETED CLASS (ruling 2026-09-07): `SparseTensor` has exactly two index
-    # classes, DenseIndex and DiagonalIndex, each axis explicit or implicit.
-    # Measured over 88 runs on 17 targets, both engines, both orders, exact and
-    # approximated, no target ever constructed one of these (finding 67). The
-    # probe is kept as a stub returning None so the caller's fall-through is
-    # the single path; the body goes with the class in step C.
-    return None
-    K = len(pairs)
-    if K < 2:
-        return None  # K=1 handled by single-axis probe upstream.
-    if any(p.pairing_type != "contract" for p in pairs):
-        return None
-    if lhs_leftover or rhs_leftover:
-        return None
-
-    lhs, rhs = ctx.lhs, ctx.rhs
-    if len(lhs.out_dims) != K or len(lhs.primal_dims) != K:
-        return None
-    if len(rhs.out_dims) != K or len(rhs.primal_dims) != K:
-        return None
-    if not all(d.is_sparse for d in (*lhs.dims, *rhs.dims)):
-        return None
-
-    per_axis: list[BandedLayout] = []
-    for pair_i in range(K):
-        M_a = lhs.out_dims[pair_i].size
-        B_a_h = lhs.out_dims[pair_i].block_size or 1
-        B_a_w = lhs.primal_dims[pair_i].block_size or 1
-        M_b = rhs.primal_dims[pair_i].size
-        B_b_h = rhs.out_dims[pair_i].block_size or 1
-        B_b_w = rhs.primal_dims[pair_i].block_size or 1
-        if M_a * B_a_w != M_b * B_b_h:
-            return None
-        # Per-axis divisibility gate (same as K=1 single-axis probe).
-        if B_a_w % B_b_h == 0 or B_b_h % B_a_w == 0:
-            return None
-        # K=2 multi-axis with per-axis n_meta>1 is a follow-up (would
-        # require multi-axis block-banded ``to_dense`` per-batch handling).
-        if math.gcd(M_a, M_b) > 1:
-            return None
-
-        row_spans = _row_band_spans(M_a, B_a_w, B_b_h, M_b)
-        if any(lo >= hi for lo, hi in row_spans):
-            return None
-        W_rp = builtins.max(hi - lo for lo, hi in row_spans)
-        offset_rp = tuple(lo for lo, _ in row_spans)
-        # K=2 multi-axis: row-primary only for now (col-primary follows the
-        # same swap+transpose pattern but the kernel doesn't yet implement it).
-        per_axis.append(
-            BandedLayout(
-                primary_axis=0,
-                m_primary=M_a,
-                n_secondary=M_b,
-                band_width=W_rp,
-                block_row=B_a_h,
-                block_col=B_b_w,
-                offset=offset_rp,
-                n_meta=1,
-            )
-        )
-
-    # Storage check: combined K=2 compressed < combined dense.
-    # Compressed = prod over axes of (M_p * W * B_row * B_col).
-    # Dense     = prod over axes of (M_p * n_sec * B_row * B_col).
-    # Ratio = prod(W_i / n_sec_i). Compression iff prod(W_i) < prod(n_sec_i).
-    compressed_factor = 1
-    dense_factor = 1
-    for ax in per_axis:
-        compressed_factor *= ax.band_width
-        dense_factor *= ax.n_secondary
-    if compressed_factor >= dense_factor:
-        return None
-
-    return MultiAxisBandedLayout(per_axis=tuple(per_axis))
-
-
-def _pack_dense_to_banded(values: Array, layout: BandedLayout) -> Array:
-    """Pack a dense ``(M_row*B_row, M_col*B_col)`` matmul output into
-    ``BlockBanded`` data shape ``(m_primary, W, B_row, B_col)`` via
-    broadcast+where+sum — no gather, XLA-fusable with the producing
-    dot_general so the dense intermediate stays in SMEM, not HBM.
-
-    Layout:
-      * ``values``: dense output of the matmul.
-      * ``layout``: computed by ``_should_emit_block_banded``; determines
-        primary-axis orientation, band width, sub-block sizes, offsets.
-
-    Algorithm (uniform for row- and col-primary):
-
-      1. Reshape dense ``(M_row * B_row, M_col * B_col)`` to
-         ``(M_row, B_row, M_col, B_col)``.
-      2. Transpose so the primary-axis becomes axis-0:
-         ``(M_primary, M_secondary, B_row, B_col)``.
-      3. Insert a W-axis via broadcast: ``(M_p, W, M_s, B_row, B_col)``.
-      4. Build a one-hot mask ``m == offset[p] + w`` of shape ``(M_p, W, M_s)``
-         and ``jnp.where(mask, ., 0).sum(axis=2)`` to collapse the secondary
-         axis. Exactly one ``m`` matches per ``(p, w)``, so the sum acts as a
-         per-cell select — XLA fuses into a single ``kLoop`` pass.
-    """
-    M_p = layout.m_primary
-    N_s = layout.n_secondary
-    W = layout.band_width
-    B_row = layout.block_row
-    B_col = layout.block_col
-    N = layout.n_meta
-
-    if layout.primary_axis == 0:
-        M_row, M_col = M_p, N_s
-    else:
-        M_row, M_col = N_s, M_p
-
-    # Step 1: reshape to ``(N, M_row, B_row, M_col, B_col)``. For ``N=1`` values
-    # arrives as 2-D dense ``(M_row*B_row, M_col*B_col)``; for ``N>1`` it arrives
-    # 3-D ``(N, M_row*B_row, M_col*B_col)`` (the matmul writes the per-batch
-    # diagonals into a leading axis already).
-    if N == 1:
-        grid_5d = values.reshape(1, M_row, B_row, M_col, B_col)
-    else:
-        grid_5d = values.reshape(N, M_row, B_row, M_col, B_col)
-
-    # Step 2: permute so axis-1 is the primary, axis-2 is the secondary.
-    # (Axis-0 stays as the batch axis.)
-    if layout.primary_axis == 0:
-        # Row-primary: M_row at axis-1, M_col at axis-3 → bring M_col to axis-2.
-        grid_t = grid_5d.transpose(0, 1, 3, 2, 4)  # (N, M_p, N_s, B_row, B_col)
-    else:
-        # Col-primary: M_col at axis-3 (= M_p), M_row at axis-1 (= N_s).
-        grid_t = grid_5d.transpose(0, 3, 1, 2, 4)  # (N, M_p, N_s, B_row, B_col)
-
-    # Step 3: insert W axis via broadcast (pure broadcast, zero-copy).
-    grid_b = jnp.broadcast_to(
-        grid_t[:, :, None, ...],  # (N, M_p, 1, N_s, B_row, B_col)
-        (N, M_p, W, N_s, B_row, B_col),
-    )
-
-    # Step 4: one-hot band mask + sum collapse. Shares ``_band_axis_select`` with
-    # the inverse densify kernel (provably inverse). The selector yields
-    # ``(M_p, N_s, W)``; transpose to this pack's ``(M_p, W, N_s)`` axis order.
-    mask = _band_axis_select(N_s, W, tuple(layout.offset)).transpose(0, 2, 1)
-    mask = mask[None, ..., None, None]  # (1, M_p, W, N_s, 1, 1)
-    out = jnp.where(mask, grid_b, 0).sum(axis=3)  # (N, M_p, W, B_row, B_col)
-    # Flatten the leading ``(N, M_p)`` into ``(N * M_p)`` — the layout
-    # BlockBanded expects on its ``data`` axis-0 (``n_meta * M_per_primary``).
-    return out.reshape(N * M_p, W, B_row, B_col)
-
-
-def _pack_dense_to_multi_axis_banded(
-    values: Array, layout: MultiAxisBandedLayout
-) -> Array:
-    """Pack a dense ``(M_row_0*B_row_0, ..., M_row_{K-1}*B_row_{K-1},
-    M_col_0*B_col_0, ..., M_col_{K-1}*B_col_{K-1}, *L)`` K-axis matmul
-    output into multi-axis block-banded data shape
-    ``(M_p_0, W_0, ..., M_p_{K-1}, W_{K-1}, B_row_0, ..., B_row_{K-1},
-       B_col_0, ..., B_col_{K-1}, *L)`` via per-axis broadcast+where+sum.
-
-    Generalizes the K=1 packing kernel by adding one ``(M_p, M_s, W)``
-    prefix triple per axis, combined via AND of per-axis one-hot masks.
-    Both per-axis ``M_s`` reductions happen in one fused pass.
-    """
-    K = len(layout.per_axis)
-    M_p = [ax.m_primary for ax in layout.per_axis]
-    M_s = [ax.n_secondary for ax in layout.per_axis]
-    W = [ax.band_width for ax in layout.per_axis]
-    B_row = [ax.block_row for ax in layout.per_axis]
-    B_col = [ax.block_col for ax in layout.per_axis]
-    offsets = [ax.offset for ax in layout.per_axis]
-    L = values.shape[2 * K :]
-
-    # Step 1: reshape dense to ``(M_p_0, B_row_0, ..., M_p_{K-1}, B_row_{K-1},
-    # M_s_0, B_col_0, ..., M_s_{K-1}, B_col_{K-1}, *L)`` — split each
-    # output axis into (meta, sub-block).
-    split_shape = []
-    for i in range(K):
-        split_shape += [M_p[i], B_row[i]]
-    for i in range(K):
-        split_shape += [M_s[i], B_col[i]]
-    split_shape += list(L)
-    grid = values.reshape(*split_shape)
-
-    # Step 2: permute to group per-axis (M_p_i, M_s_i, B_row_i, B_col_i):
-    # Target order: M_p_0, M_s_0, M_p_1, M_s_1, ..., M_p_{K-1}, M_s_{K-1},
-    # B_row_0, B_row_1, ..., B_row_{K-1}, B_col_0, ..., B_col_{K-1}, *L.
-    perm: list[int] = []
-    for i in range(K):
-        perm.append(2 * i)              # M_p_i (rows split)
-        perm.append(2 * K + 2 * i)      # M_s_i (cols split)
-    for i in range(K):
-        perm.append(2 * i + 1)          # B_row_i
-    for i in range(K):
-        perm.append(2 * K + 2 * i + 1)  # B_col_i
-    perm += list(range(4 * K, 4 * K + len(L)))
-    grid = grid.transpose(perm)
-    # Shape now: (M_p_0, M_s_0, M_p_1, M_s_1, ..., M_p_{K-1}, M_s_{K-1},
-    #             B_row_0, ..., B_row_{K-1}, B_col_0, ..., B_col_{K-1}, *L)
-
-    # Step 3: insert W axes via singleton broadcast. Each (M_p_i, M_s_i)
-    # gets a W_i axis right after the pair.
-    indexer = []
-    for i in range(K):
-        indexer.append(slice(None))  # M_p_i
-        indexer.append(slice(None))  # M_s_i
-        indexer.append(None)          # W_i (inserted)
-    indexer += [slice(None)] * (2 * K + len(L))  # B_row, B_col, L
-    grid_b = grid[tuple(indexer)]
-    # Broadcast W axes to their actual sizes.
-    expanded = []
-    for i in range(K):
-        expanded += [M_p[i], M_s[i], W[i]]
-    expanded += B_row
-    expanded += B_col
-    expanded += list(L)
-    grid_b = jnp.broadcast_to(grid_b, tuple(expanded))
-
-    # Step 4: build per-axis selection masks ``w_idx == b - offset[a]``
-    # and AND them. Shares ``_band_axis_select`` with the inverse densify kernel
-    # so pack / densify stay provably in-band-consistent.
-    combined_mask = None
-    for i in range(K):
-        sel = _band_axis_select(M_s[i], W[i], offsets[i])  # (M_p_i, M_s_i, W_i)
-        sel_shape = [1] * len(expanded)
-        sel_shape[3 * i] = M_p[i]
-        sel_shape[3 * i + 1] = M_s[i]
-        sel_shape[3 * i + 2] = W[i]
-        sel_r = sel.reshape(*sel_shape)
-        combined_mask = sel_r if combined_mask is None else (combined_mask & sel_r)
-
-    # Step 5: where + sum over all M_s_i axes (positions 1, 4, 7, ...) in
-    # one fused reduction.
-    Ms_axes = tuple(3 * i + 1 for i in range(K))
-    out = jnp.where(combined_mask, grid_b, 0).sum(axis=Ms_axes)
-    # Shape: (M_p_0, W_0, M_p_1, W_1, ..., B_row_0, ..., B_col_{K-1}, *L)
-    # — matches the multi-axis block-banded data layout.
-    return out
 
 
 # --- Metadata-stated single-block contraction -----------------------------
@@ -2396,10 +1838,6 @@ def _einsum_matmul_general(lhs, rhs, count: bool = False):
     # The einsum path assumes zero fill on the implicit positions (a broadcast
     # of the stored extent). A non-zero fill is owned by the densify path.
     if not (_is_zero_fill(lhs) and _is_zero_fill(rhs)):
-        return None
-    # Compressed dims are materialized by ``_normalize_inputs`` before this hook;
-    # this is a defensive guard for any direct caller.
-    if any(getattr(d, "is_compressed", False) for d in (*lhs.dims, *rhs.dims)):
         return None
     if lhs.dtype == jnp.bool_ or rhs.dtype == jnp.bool_:
         return None
@@ -2788,20 +2226,12 @@ def _reconcile_permuted_val(tensor):
 
 
 def _normalize_inputs(lhs, rhs):
-    """Convert array operands to ``SparseTensor`` and pre-densify any
-    compressed Index dims. Pure shape / structure prep — no actual matmul
-    work happens here. Materializing compressed storage is fused into the
-    consuming kernel by XLA (SMEM, not HBM)."""
+    """Convert array operands to ``SparseTensor``. Pure shape / structure prep —
+    no actual matmul work happens here."""
     if not _is_sparse(lhs):
         lhs = _arr2st(lhs, out_ndim=lhs.ndim - len(rhs.out_dims))
     if not _is_sparse(rhs):
         rhs = _arr2st(rhs, out_ndim=len(lhs.primal_dims))
-    # Phase 8: pre-densify any compressed Index dims (BandedIndex / SetIndex)
-    # to DiagonalIndex / DenseIndex — the tiled matmul consumes only those.
-    # No-op when the operand has no compressed dims.
-    from .utils import _materialize_for_op
-    lhs = _materialize_for_op(lhs)
-    rhs = _materialize_for_op(rhs)
     # Class 3b: an approx transform can leave a dim whose physical ``val`` axis
     # order disagrees with its ``size`` metadata (the ViT seq/embed swap). Both
     # the tiled kernel and the elemental densify lay ``val`` out by ``dim.axis``
@@ -2911,13 +2341,11 @@ def _execute_compact(ctx, rhs_dims, count=False):
     from graphax.sparse.dtype_compute import _scaled_mul as _sm
     from graphax.sparse.lower.matmul import _lower, _NoRule
     # Match try_lower_matmul's firewall: the einsum planner is unsafe for
-    # bool (einsum bool semantics != dot_general), non-zero fill (the tiled
-    # path assumes zero-fill), or a not-yet-materialized compressed dim.
+    # bool (einsum bool semantics != dot_general) or a non-zero fill (the tiled
+    # path assumes zero-fill).
     if ctx.lhs.dtype == jnp.bool_ or ctx.rhs.dtype == jnp.bool_:
         return None
     if not (_is_zero_fill(ctx.lhs) and _is_zero_fill(ctx.rhs)):
-        return None
-    if any(getattr(d, "is_compressed", False) for d in (*ctx.lhs.dims, *ctx.rhs.dims)):
         return None
     try:
         low_t, _, _ = _lower(ctx.lhs, ctx.rhs)
@@ -2926,28 +2354,6 @@ def _execute_compact(ctx, rhs_dims, count=False):
     try:
         shared, total, split, scalar = _contraction_factors(ctx.pairs)
         fll, frl = _compact_block_lens(ctx.pairs, shared, total, split)
-        # Banded output geometry is owned by the tiled path (band-packed val,
-        # different layout) — fall back rather than emit a dense result.
-        _lu = set()
-        _ru = set()
-        for _pm in ctx.pairs:
-            _lu.update((_pm.lhs.outer_axis, _pm.lhs.block_axis, _pm.lhs.shared_block_axis))
-            _ru.update((_pm.rhs.outer_axis, _pm.rhs.block_axis, _pm.rhs.shared_block_axis))
-        _lu.discard(None)
-        _ru.discard(None)
-        _lval = _val_or_one(ctx.lhs)
-        _rval = _val_or_one(ctx.rhs)
-        _llo = [_lval.shape[a] for a in range(_lval.ndim) if a not in _lu]
-        _rlo = [_rval.shape[a] for a in range(_rval.ndim) if a not in _ru]
-        if (
-            _should_emit_block_banded(ctx, ctx.pairs, shared, total, fll, frl, _llo, _rlo)
-            is not None
-            or _should_emit_multi_axis_banded(
-                ctx, ctx.pairs, shared, total, fll, frl, _llo, _rlo
-            )
-            is not None
-        ):
-            return None
         # _output_dims reads only the pair factors/lens from `res`; res.grid is
         # never observed (only its .shape[5N:] leftover, which these contractions
         # do not have), so a placeholder avoids re-tracing the whole tiled
@@ -2958,7 +2364,6 @@ def _execute_compact(ctx, rhs_dims, count=False):
             lhs_block_lens=fll,
             rhs_block_lens=frl,
             scalar_mult=scalar,
-            banded_geom=None,
         )
         final_out, final_primal = _output_dims(ctx, rhs_dims, res_meta)
     except Exception:
@@ -3049,7 +2454,7 @@ def _execute_tiled(ctx, rhs_dims):
         return _legacy_execute_tiled(ctx, rhs_dims)
     lhs_val, rhs_val = _val_or_one(ctx.lhs), _val_or_one(ctx.rhs)
     lhs_val, rhs_val = _prepare_physical_arrays(lhs_val, rhs_val, ctx.pairs)
-    grid, shared, lhs_lens, rhs_lens, scalar, banded_geom, lazy_info = (
+    grid, shared, lhs_lens, rhs_lens, scalar, lazy_info = (
         _execute_block_sparse_contraction(lhs_val, rhs_val, ctx.pairs, ctx)
     )
     res = CRes(
@@ -3058,7 +2463,6 @@ def _execute_tiled(ctx, rhs_dims):
         lhs_block_lens=lhs_lens,
         rhs_block_lens=rhs_lens,
         scalar_mult=scalar,
-        banded_geom=banded_geom,
     )
     if lazy_info is not None:
         eff_pairs, lazy, t_shared, t_fll, t_frl = lazy_info
@@ -3167,7 +2571,7 @@ def matmul(lhs, rhs, count: bool = False):
                                   lowering contraction planner.
       5. ``both_implicit_fold`` -- both contracted dims implicit: analytic
                                   scale-by-N folded into ``scalar_mult``.
-      6. ``elemental``          -- structured (diagonal/block/banded) kernels,
+      6. ``elemental``          -- structured (diagonal/block) kernels,
                                   active only under ``approx_active()``.
       7. ``densify``            -- non-zero ``fill_value`` OR an implicit-block
                                   contraction, when ``_densify_is_safe``:
@@ -3303,7 +2707,7 @@ def matmul(lhs, rhs, count: bool = False):
             _record_path("struct_lower")
             return _low
     # Elemental fast path (Phase: bridge-cse): route a STRUCTURED contraction
-    # (block-diagonal / implicit / compressed contracted dims) through the
+    # (block-diagonal / implicit contracted dims) through the
     # composed elemental kernels. Returns None for a pure-dense contraction, so
     # the EXACT-AD (transforms=()) edge never enters here and stays byte-
     # identical. Built with the canonical output-id convention so a downstream

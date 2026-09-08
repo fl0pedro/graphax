@@ -12,7 +12,6 @@ elemental operation between a specific pair of structured dims:
   * ``contract_implicit``              — an implicit (Compress-away) contracted dim
   * ``elementwise_dense_block_diagonal``— ``D (+|*) B`` / ``B op B``
   * ``elementwise_implicit``           — an implicit dim under an elementwise op
-  * ``materialize_compressed``         — expand a CompressedIndex → ``{D, B}``
 
 Each kernel handles EXACTLY ONE structured contracted pair plus ride-through free
 dims.  A real jacve contraction, however, may contract SEVERAL dims at once of
@@ -179,7 +178,6 @@ def _is_implicit(d) -> bool:
     (``axis is None``) while its logical size is the broadcast size > 1."""
     return (
         not d.is_sparse
-        and not d.is_compressed
         and d.axis is None
         and int(d.logical_size) > 1
     )
@@ -189,10 +187,6 @@ def _has_structured_dim(st: "SparseTensor") -> bool:
     """Whether ANY dim of ``st`` is block-diagonal or implicit — i.e. the
     operand is structured and a dense path would be wasteful / wrong-shaped."""
     return any(_is_block_diagonal(d) or _is_implicit(d) for d in st.dims)
-
-
-def _has_compressed_dim(st: "SparseTensor") -> bool:
-    return any(d.is_compressed for d in st.dims)
 
 
 # --------------------------------------------------------------------------- #
@@ -308,40 +302,33 @@ def try_elemental_matmul(lhs: "SparseTensor", rhs: "SparseTensor", count: bool =
     from graphax.sparse.dtype_compute import _unify_operand_dtypes
     lhs, rhs = _unify_operand_dtypes(lhs, rhs)
 
-    # Expand any compressed operand into {D, B} so the kernels can consume it.
-    lhs_m, rhs_m = _materialize_both(lhs, rhs)
-
     # Find the contracted pairs and classify them. If NONE is structured the
     # contraction is pure-dense — bail so the existing path stays byte-identical.
     try:
-        pairs = _contracted_pairs(lhs_m, rhs_m)
+        pairs = _contracted_pairs(lhs, rhs)
     except Exception:
         return None
     kinds = [_classify_pair(ld, rd) for ld, rd in pairs]
     structured = [k for k in kinds if k != "dense"]
 
-    if not structured and not _has_structured_dim(lhs_m) and not _has_structured_dim(rhs_m):
+    if not structured and not _has_structured_dim(lhs) and not _has_structured_dim(rhs):
         _bump("matmul_pure_dense_skip")
         return None
 
     # Only intercept contractions the existing path can't do byte-identically:
     # plain-diagonal / pure-dense contractions stay on the existing path (no
     # float reassociation), preserving EXACT-AD.
-    if not _needs_elemental(pairs, kinds, lhs_m, rhs_m):
+    if not _needs_elemental(pairs, kinds, lhs, rhs):
         _bump("matmul_pure_dense_skip")
         return None
 
-    result = _dispatch_matmul(lhs_m, rhs_m, pairs, kinds)
+    result = _dispatch_matmul(lhs, rhs, pairs, kinds)
     if result is None:
         return None
     if count:
         from graphax.sparse.ops.matmul import _compute_matmul_count
 
-        # Count from the operands ACTUALLY contracted (post-materialization):
-        # for a compressed operand, lhs/rhs have a different shape/topology than
-        # the expanded lhs_m/rhs_m the kernel ran on, so the un-materialized
-        # operands give a wrong op count.
-        return result, _compute_matmul_count(lhs_m, rhs_m, result)
+        return result, _compute_matmul_count(lhs, rhs, result)
     return result
 
 
@@ -557,17 +544,16 @@ def try_elemental_elementwise(
         _bump("elementwise_nonzero_fill_skip")
         return None
 
-    lhs_m, rhs_m = _materialize_both(lhs, rhs)
-    if lhs_m.shape != rhs_m.shape:
+    if lhs.shape != rhs.shape:
         return None
 
-    l_struct = _has_structured_dim(lhs_m)
-    r_struct = _has_structured_dim(rhs_m)
+    l_struct = _has_structured_dim(lhs)
+    r_struct = _has_structured_dim(rhs)
     if not l_struct and not r_struct:
         _bump("elementwise_pure_dense_skip")
         return None
 
-    out = _dispatch_elementwise(lhs_m, rhs_m, op, is_intersection)
+    out = _dispatch_elementwise(lhs, rhs, op, is_intersection)
     if out is None:
         return None
     if count:
@@ -613,17 +599,6 @@ def _dispatch_elementwise(lhs, rhs, op, is_intersection):
 # --------------------------------------------------------------------------- #
 # Shared helpers
 # --------------------------------------------------------------------------- #
-def _materialize_both(lhs, rhs):
-    """Expand compressed operands to ``{D, B}`` (no-op when none are compressed)."""
-    from graphax.sparse.elemental.materialize_C import materialize_compressed
-
-    if _has_compressed_dim(lhs):
-        lhs = materialize_compressed(lhs)
-    if _has_compressed_dim(rhs):
-        rhs = materialize_compressed(rhs)
-    return lhs, rhs
-
-
 def _to_dense_st(st: "SparseTensor") -> "SparseTensor":
     """Expand a structured operand to a plain ``DenseIndex``-only SparseTensor,
     PRESERVING each dim's id and logical order so the downstream id-based
@@ -633,7 +608,7 @@ def _to_dense_st(st: "SparseTensor") -> "SparseTensor":
     order (each block-diagonal / implicit dim expanded to its full logical
     size), so a fresh ``DenseIndex`` per logical dim — same ids, same sizes,
     physical axis = logical position — describes that array exactly. The result
-    has no block-diagonal / implicit / compressed dims, so a recursive matmul on
+    has no block-diagonal / implicit dims, so a recursive matmul on
     it cannot re-enter the structured fast path (no infinite recursion).
     """
     from graphax.sparse.indexes import DenseIndex

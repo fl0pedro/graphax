@@ -29,7 +29,7 @@ from .sparse.ops import add_w_counts
 from .sparse.dtype_compute import _scaled_mul as _scaled_mul_promote
 from .sparse.ops.matmul import matmul as sparse_matmul
 from .sparse.ops.utils import (
-    _compressed_dims, _materialize_for_op, _is_approx,
+    _is_approx,
     _squeeze_unreferenced_val_axes,
 )
 from .sparse.tensor import _assert_sparse_tensor_consistency
@@ -1061,7 +1061,7 @@ def _micro_applied(before, after) -> bool:
 
     ``apply_quant`` returns its input UNCHANGED (the same object) for a
     structural ``val is None`` edge or an already-matching dtype, and
-    ``_materialize_compressed`` / ``apply_*`` may likewise short-circuit — so a
+    ``apply_*`` may likewise short-circuit — so a
     dispatched micro-action is not evidence that an approximation happened. The
     identity check is the reliable signal (every real micro-action builds a new
     :class:`SparseTensor`); the field-wise fallback additionally catches a fresh
@@ -2064,15 +2064,6 @@ def _eliminate_vertex(
                     edge_outval.pre_transforms = (
                         tuple(_pre_reattach) + tuple(edge_outval.pre_transforms)
                     )
-
-                # A misaligned-contract matmul can emit a compressed output
-                # (BandedIndex / SetIndex). The consistency check and the
-                # Diag / Compress micro-actions below consume only plain
-                # {Dense, Diagonal} dims, so densify the compressed pair to
-                # its compact equivalent here (keeps the M× meta-block-diagonal
-                # form where the structure reduces to a diagonal).
-                if _compressed_dims(edge_outval):
-                    edge_outval = _materialize_for_op(edge_outval)
 
                 # Per-path contraction-RESULT hook (``new``). The face engine
                 # applies its ``new`` to the product; here we apply it to the
@@ -3307,7 +3298,6 @@ def vertex_elimination_jaxpr(
         # holds; asserted, never silently skipped.
         from .sparse.ops.output_layout import (
             canonical_output_layout, is_parameter_layout)
-        from .sparse.indexes import CompressedIndex
         from .sparse.tensor import SparseTensor
 
         jac_vals = []
@@ -3318,13 +3308,12 @@ def vertex_elimination_jaxpr(
                 tensor = _force(edge) if edge is not None else None
                 if isinstance(tensor, SparseTensor):
                     tensor = canonical_output_layout(tensor)
-                    if not any(isinstance(d, CompressedIndex) for d in tensor.dims):
-                        assert is_parameter_layout(tensor), (
-                            "OUTPUT LAYOUT CONTRACT VIOLATED: the gradient "
-                            f"d{outvar}/d{invar} is not stored in parameter "
-                            f"layout after canonicalization: dims={tensor.dims} "
-                            f"val.shape={None if tensor.val is None else tensor.val.shape}"
-                        )
+                    assert is_parameter_layout(tensor), (
+                        "OUTPUT LAYOUT CONTRACT VIOLATED: the gradient "
+                        f"d{outvar}/d{invar} is not stored in parameter "
+                        f"layout after canonicalization: dims={tensor.dims} "
+                        f"val.shape={None if tensor.val is None else tensor.val.shape}"
+                    )
                 jac_vals.append(tensor)
     else:
         jac_vals = []

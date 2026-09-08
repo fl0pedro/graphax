@@ -30,18 +30,13 @@ from .matmul import (
     AXES_PER_PAIR,
     GRID_AXES_PER_PAIR,
     CRes,
-    MultiAxisBandedLayout,
     _as_shape,
     _build_sparse,
     _contraction_factors,
     _contraction_perms,
     _final_grid,
     _gx_dot_general,
-    _pack_dense_to_banded,
-    _pack_dense_to_multi_axis_banded,
     _reduce_grid,
-    _should_emit_block_banded,
-    _should_emit_multi_axis_banded,
 )
 from .layout import generate_grouped_permutation
 
@@ -262,30 +257,7 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
         lhs_leftover,
         rhs_leftover,
     )
-    banded_geom = _should_emit_block_banded(
-        ctx,
-        pairs,
-        shared,
-        total,
-        final_lhs_lens,
-        final_rhs_lens,
-        lhs_leftover,
-        rhs_leftover,
-    )
-    if banded_geom is None:
-        # Fall through to the K>1 multi-axis probe when the K=1 single-pair
-        # probe didn't fire (typically because ``len(pairs) != 1``).
-        banded_geom = _should_emit_multi_axis_banded(
-            ctx,
-            pairs,
-            shared,
-            total,
-            final_lhs_lens,
-            final_rhs_lens,
-            lhs_leftover,
-            rhs_leftover,
-        )
-    return grid, shared, final_lhs_lens, final_rhs_lens, scalar, banded_geom
+    return grid, shared, final_lhs_lens, final_rhs_lens, scalar
 
 
 def _resolve_output_shape(ctx, res):
@@ -535,87 +507,6 @@ def _build_output_tensor(ctx, rhs_dims, res):
     if not has_val and values is not None and values.size == 1:
         final_mult = _sm_promote(final_mult, jnp.squeeze(values))
         values = None
-    # Banded emission: when ``_should_emit_block_banded`` (run upstream in
-    # ``_execute_block_sparse_contraction``) finds a band-storage form
-    # strictly tighter than the natural dense output, pack ``values`` into
-    # the extended ``BlockBanded`` pytree via broadcast+where+sum (gather-
-    # free; XLA fuses with the producing dot_general). The probe gates on
-    # 2-D single-contract-pair geometry with no leftover, so ``values`` is
-    # always 2-D dense at this point.
-    if res.banded_geom is not None and values is not None:
-        from graphax.sparse.indexes import BandedIndex
-
-        layout = res.banded_geom
-        out_id = final_out[0].id if final_out else 0
-        primal_id = final_primal[0].id if final_primal else (out_id + 1)
-
-        # Multi-axis (K≥2) banded output: pack into the interleaved band
-        # buffer and emit K BandedIndex pairs describing each axis-pair's band.
-        if isinstance(layout, MultiAxisBandedLayout):
-            band_data = _pack_dense_to_multi_axis_banded(values, layout)
-            K = len(layout.per_axis)
-            out_dims_new = []
-            primal_dims_new = []
-            for i, ax in enumerate(layout.per_axis):
-                is_row_primary = ax.primary_axis == 0
-                M_row = ax.m_primary if is_row_primary else ax.n_secondary
-                M_col = ax.n_secondary if is_row_primary else ax.m_primary
-                # ``size`` is the META count (logical_size = size*block_size),
-                # matching DiagonalIndex convention.
-                out_dims_new.append(BandedIndex(
-                    id=out_id + i, size=ax.n_meta * M_row,
-                    axis=i, other_id=primal_id + i,
-                    block_size=ax.block_row, block_axis=K + i,
-                    band_width=ax.band_width, offset=ax.offset,
-                    primary=is_row_primary, n_secondary=ax.n_secondary,
-                    n_meta=ax.n_meta,
-                ))
-                primal_dims_new.append(BandedIndex(
-                    id=primal_id + i, size=ax.n_meta * M_col,
-                    axis=K + i, other_id=out_id + i,
-                    block_size=ax.block_col, block_axis=3 * K + i,
-                    band_width=ax.band_width, offset=ax.offset,
-                    primary=is_row_primary, n_secondary=ax.n_secondary,
-                    n_meta=ax.n_meta,
-                ))
-            return SparseTensor(
-                tuple(out_dims_new), tuple(primal_dims_new), band_data,
-                scalar_mult=jnp.asarray(final_mult).astype(values.dtype),
-                fill_value=None,  # tiled path assumes zero fill → statically zero
-                check_consistency=False,
-            )
-
-        # K=1 banded output: band buffer in val + a single BandedIndex pair.
-        band_data = _pack_dense_to_banded(values, layout)
-        is_row_primary = layout.primary_axis == 0
-        M_row = layout.m_primary if is_row_primary else layout.n_secondary
-        M_col = layout.n_secondary if is_row_primary else layout.m_primary
-        # ``size`` is the META count (logical_size = size*block_size).
-        # ``axis`` / ``block_axis`` are NOMINAL for a BandedIndex — densify
-        # reconstructs the layout from ``val.shape`` + the band params, never
-        # from these fields — but we keep them distinct per side and matching
-        # the K>=2 convention (out: axis=i, block_axis=K+i; primal: axis=K+i,
-        # block_axis=3K+i, here K=1) so no consumer conflates the two sides.
-        out_ix = BandedIndex(
-            id=out_id, size=layout.n_meta * M_row,
-            axis=0, other_id=primal_id, block_size=layout.block_row, block_axis=1,
-            band_width=layout.band_width, offset=layout.offset,
-            primary=is_row_primary, n_secondary=layout.n_secondary,
-            n_meta=layout.n_meta,
-        )
-        primal_ix = BandedIndex(
-            id=primal_id, size=layout.n_meta * M_col,
-            axis=1, other_id=out_id, block_size=layout.block_col, block_axis=3,
-            band_width=layout.band_width, offset=layout.offset,
-            primary=is_row_primary, n_secondary=layout.n_secondary,
-            n_meta=layout.n_meta,
-        )
-        return SparseTensor(
-            (out_ix,), (primal_ix,), band_data,
-            scalar_mult=jnp.asarray(final_mult).astype(values.dtype),
-            fill_value=None,  # tiled path assumes zero fill → statically zero
-            check_consistency=False,
-        )
     out_dtype = values.dtype if values is not None else jnp.asarray(final_mult).dtype
     # transforms intentionally not propagated through matmul; callers in
     # core.py unload pre/post transforms before the matmul and reattach
@@ -636,7 +527,7 @@ def _execute_tiled(ctx, rhs_dims):
     and broadcast / unmaterialized val axes."""
     lhs_val, rhs_val = _val_or_one(ctx.lhs), _val_or_one(ctx.rhs)
     lhs_val, rhs_val = _prepare_physical_arrays(lhs_val, rhs_val, ctx.pairs)
-    grid, shared, lhs_lens, rhs_lens, scalar, banded_geom = (
+    grid, shared, lhs_lens, rhs_lens, scalar = (
         _execute_block_sparse_contraction(lhs_val, rhs_val, ctx.pairs, ctx)
     )
     res = CRes(
@@ -645,7 +536,6 @@ def _execute_tiled(ctx, rhs_dims):
         lhs_block_lens=lhs_lens,
         rhs_block_lens=rhs_lens,
         scalar_mult=scalar,
-        banded_geom=banded_geom,
     )
     return _build_output_tensor(ctx, rhs_dims, res)
 

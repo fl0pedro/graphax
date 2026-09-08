@@ -25,8 +25,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from graphax.sparse.indexes import CompressedIndex
-
 
 def _materialized_axes(st) -> list[int]:
     """The DISTINCT val axes the dims point to, in the order of first
@@ -54,16 +52,11 @@ def is_parameter_layout(st) -> bool:
 def canonical_output_layout(st):
     """Return ``st`` with ``val`` in parameter layout (see the module doc).
 
-    Compressed dims (``BandedIndex`` / ``SetIndex``) index their buffer by
-    band structure, not by ``axis``, so a tensor that carries one is returned
-    unchanged; ``is_parameter_layout`` is not asserted for it by the caller.
     A tensor whose pointers do not cover ``val`` exactly (an orphan val axis)
     is returned unchanged as well: that is a different invariant's business.
     """
     val = getattr(st, "val", None)
     if val is None:
-        return st
-    if any(isinstance(d, CompressedIndex) for d in st.dims):
         return st
     old_axes = _materialized_axes(st)
     if sorted(old_axes) != list(range(val.ndim)):

@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-from graphax.sparse.indexes import Index, DenseIndex, DiagonalIndex, _split_fill
+from graphax.sparse.indexes import Index, DenseIndex, DiagonalIndex
 from graphax.sparse.dtype_compute import _compute_dtype, _scaled_mul
 
 if TYPE_CHECKING:
@@ -48,7 +48,7 @@ def _is_sparse(obj) -> bool:
 
 
 # Shared "keep the source's value" sentinel for the optional ``fill_value``
-# override on ``_copy`` / ``_rewrap`` / ``_dense_pair_result``: passed verbatim
+# override on ``_copy``: passed verbatim
 # ⇒ reuse the source's fill; any other value — INCLUDING ``None`` (the
 # statically-zero marker) — is used as the explicit override. (A plain ``None``
 # default would be ambiguous now that ``None`` is a meaningful fill.)
@@ -80,254 +80,6 @@ def _scaled_fill(tensor) -> Array:
 
 
 
-def _compressed_dims(tensor) -> list:
-    """The ``out_dims`` + ``primal_dims`` that are compressed Index types
-    (``BandedIndex`` / ``SetIndex``). Empty when the tensor carries no
-    compressed structure — the common case, for which the densify helpers
-    below are no-ops."""
-    return [d for d in (*tensor.out_dims, *tensor.primal_dims)
-            if getattr(d, "is_compressed", False)]
-
-
-def _rewrap(tensor, out_dims, primal_dims, val, fill_value=_KEEP):
-    """Re-emit ``tensor`` with new dims/val, carrying scalar_mult / fill_value /
-    zero_fill (the shared tail of every densify branch).
-
-    ``fill_value`` defaults to the source's, but SetIndex densify branches
-    override it with the COMBINED ``op(fill_lhs, fill_rhs)``: the source carries
-    a per-side fill (scalar or tuple), whereas the densified result's implicit
-    cells hold the op-combined fill that ``densify_axis`` / ``to_meta_blocks``
-    already stitch into the data (L3)."""
-    from graphax.sparse.tensor import SparseTensor
-
-    fv = tensor.fill_value if fill_value is _KEEP else fill_value
-    return SparseTensor(
-        out_dims, primal_dims, val,
-        scalar_mult=tensor.scalar_mult, fill_value=fv,
-        check_consistency=False,
-    )
-
-
-def _dense_pair_result(tensor, dense, K, fill_value=_KEEP):
-    """Wrap a fully-materialized ``dense`` array as a K-pair ``DenseIndex``
-    tensor (out axes 0..K-1, primal axes K..2K-1), reusing the source dim ids."""
-    from graphax.sparse.indexes import DenseIndex
-
-    out = tuple(DenseIndex(tensor.out_dims[i].id, dense.shape[i], i) for i in range(K))
-    primal = tuple(
-        DenseIndex(tensor.primal_dims[i].id, dense.shape[K + i], K + i)
-        for i in range(K)
-    )
-    return _rewrap(tensor, out, primal, dense, fill_value=fill_value)
-
-
-def _densify_toeplitz(tensor):
-    """Densify a tensor whose compressed dims are ``ToeplitzIndex`` pairs (conv
-    Jacobians), which may COEXIST with plain Dense/Diagonal dims — unlike the
-    pure-pair banded/set path below.
-
-    Each Toeplitz pair contracts its stored ``val`` axis (the kernel taps for
-    ``d out/d lhs``, the input positions for ``d out/d rhs``) against the
-    scatter-free windowed indicator ``M[p, q, k]`` and produces the pair's two
-    roles as fresh dense axes. Dense dims ride through the same einsum; Diagonal
-    (``axis is None``) dims are untouched (not stored in ``val``). One einsum
-    per tensor — XLA fuses the iota-built ``M`` into it. The result is a plain
-    Dense/Diagonal tensor, exactly what matmul / elementwise consume."""
-    from graphax.sparse.indexes import ToeplitzIndex, DenseIndex
-
-    val = tensor.val
-    out_dims, primal_dims = list(tensor.out_dims), list(tensor.primal_dims)
-    by_id = {d.id: d for d in (*out_dims, *primal_dims)}
-
-    pool = iter("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-    val_letter = {a: next(pool) for a in range(val.ndim)}
-    out_letter: dict[int, str] = {}      # dim id -> its produced einsum letter
-    m_subs, m_arrays = [], []
-
-    # Toeplitz pairs: the primary owns the contracted val axis.
-    handled: set[int] = set()
-    for d in (*out_dims, *primal_dims):
-        if not (isinstance(d, ToeplitzIndex) and d.primary):
-            continue
-        partner = by_id[d.other_id]
-        contracted = val_letter[d.axis]                  # the val-role axis
-        roles = [None, None, None]
-        val_role = ({0, 1, 2} - {d.role, partner.role}).pop()
-        roles[val_role] = contracted
-        roles[d.role] = lo = next(pool)
-        roles[partner.role] = lp = next(pool)
-        m_subs.append("".join(roles))
-        m_arrays.append(d.indicator())
-        out_letter[d.id], out_letter[partner.id] = lo, lp
-        handled.add(d.id); handled.add(partner.id)
-
-    # Dense (non-Toeplitz, val-backed) dims carry their letter straight through.
-    for d in (*out_dims, *primal_dims):
-        if d.id not in handled and d.axis is not None:
-            out_letter[d.id] = val_letter[d.axis]
-
-    out_block = [d for d in out_dims if d.id in out_letter]
-    primal_block = [d for d in primal_dims if d.id in out_letter]
-    eq = (",".join(["".join(val_letter[a] for a in range(val.ndim))] + m_subs)
-          + "->" + "".join(out_letter[d.id] for d in out_block + primal_block))
-    dense = jnp.einsum(eq, val, *m_arrays)
-
-    no = len(out_block)
-    new_out, oi = [], 0
-    for d in out_dims:
-        if d.id in out_letter:
-            new_out.append(DenseIndex(d.id, d.size, oi)); oi += 1
-        else:
-            new_out.append(d)                            # diagonal pass-through
-    new_primal, pi = [], no
-    for d in primal_dims:
-        if d.id in out_letter:
-            new_primal.append(DenseIndex(d.id, d.size, pi)); pi += 1
-        else:
-            new_primal.append(d)
-    return _rewrap(tensor, tuple(new_out), tuple(new_primal), dense)
-
-
-def _densify_compressed_dims(tensor, compact: bool = False):
-    """Replace a tensor's compressed Index dims (``BandedIndex`` / ``SetIndex``)
-    with their densified ``DenseIndex`` / ``DiagonalIndex`` equivalents, writing
-    the expanded data into ``val``.
-
-    * ``compact=False`` (for ``dense()``): full materialization — each
-      compressed pair becomes a ``DenseIndex`` pair over the dense
-      ``(rows, cols)`` block.
-    * ``compact=True`` (for ``_materialize_for_op``): the meta-block-diagonal
-      form when the pair ``reduces_to_diagonal`` (``SetIndex`` always;
-      ``BandedIndex`` when W=1 identity), yielding a ``DiagonalIndex`` pair at
-      ``M×`` lower storage; full dense otherwise.
-
-    No-op (returns ``tensor`` unchanged) when there are no compressed dims.
-
-    Currently handles the single-compressed-pair (K=1) banded case whose
-    ``val`` is the canonical ``(n_meta*M_p, W, B_row, B_col, *L)`` Array.
-    Multi-axis (K≥2) and the ``SetIndex`` dual-buffer ``val`` are wired with
-    their producers (Phase 8.E / 8.F).
-    """
-    comp = _compressed_dims(tensor)
-    if not comp:
-        return tensor
-
-    from graphax.sparse.indexes import (
-        BandedIndex, SetIndex, DiagonalIndex, ToeplitzIndex,
-    )
-
-    # ToeplitzIndex (conv) pairs may coexist with Dense/Diagonal dims, so they
-    # have their own mixed-tensor densify rather than the pure-pair paths below.
-    if any(isinstance(d, ToeplitzIndex) for d in comp):
-        return _densify_toeplitz(tensor)
-
-    banded = [d for d in comp if isinstance(d, BandedIndex)]
-    # Kernels consume the fill as a concrete array (``_eff_fill`` → 0 when the
-    # fill is the statically-zero ``None`` marker); the RESULT tensor's fill,
-    # however, preserves ``None`` so the materialized tensor stays fast-path
-    # eligible. ``raw_fill`` carries that marker through.
-    raw_fill = tensor.fill_value
-    fill = tensor._eff_fill
-
-    # Only a *pure* compressed pair (the whole tensor is one out + one primal
-    # compressed dim) is handled — the branches below index ``dims[0]`` directly.
-    # A compressed pair coexisting with extra Dense/Diagonal dims would mislabel
-    # those, so it falls through to the explicit ``NotImplementedError``.
-    pure_pair = len(tensor.out_dims) == 1 and len(tensor.primal_dims) == 1
-
-    # --- K=1 SetIndex pair (combined 1-D Array val) ---
-    set_dims = [d for d in comp if isinstance(d, SetIndex)]
-    if pure_pair and len(set_dims) == 2 and isinstance(tensor.val, jax.Array):
-        sx = tensor.out_dims[0]
-        o, p = tensor.out_dims[0], tensor.primal_dims[0]
-        # The densified data's implicit cells hold op(fill_lhs, fill_rhs); the
-        # result tensor's fill must match that combined value, not the raw
-        # per-side fill (L3). combined_fill keeps a None (statically-zero) None.
-        set_fill = sx.combined_fill(raw_fill)
-        if compact:  # SetIndex always reduces to a meta-block-diagonal
-            meta = sx.to_meta_blocks(tensor.val, fill)  # (M, LCM_h, LCM_w, *L)
-            M, H, W = meta.shape[0], meta.shape[1], meta.shape[2]
-            return _rewrap(tensor, (DiagonalIndex(o.id, M, 0, p.id, H, 1),),
-                           (DiagonalIndex(p.id, M, 0, o.id, W, 2),), meta,
-                           fill_value=set_fill)
-        dense = sx.densify_axis(tensor.val, fill)  # (M*LCM_h, M*LCM_w, *L)
-        return _dense_pair_result(tensor, dense, 1, fill_value=set_fill)
-
-    # --- K=1 banded pair (Array val) ---
-    if pure_pair and len(banded) == 2 and isinstance(tensor.val, jax.Array):
-        primary = next((d for d in banded if d.primary), banded[0])
-        o, p = tensor.out_dims[0], tensor.primal_dims[0]
-        if compact and primary.reduces_to_diagonal():
-            meta = primary.to_meta_blocks(tensor.val)  # (n_meta*M, B_row, B_col, *L)
-            M, B_row, B_col = meta.shape[0], meta.shape[1], meta.shape[2]
-            return _rewrap(tensor, (DiagonalIndex(o.id, M, 0, p.id, B_row, 1),),
-                           (DiagonalIndex(p.id, M, 0, o.id, B_col, 2),), meta)
-        dense = primary.densify_axis(tensor.val, fill)  # (rows, cols, *L)
-        return _dense_pair_result(tensor, dense, 1)
-
-    # --- K≥2 SetIndex (multi-axis dual block-diagonal buffers) ---
-    K = len(tensor.out_dims)
-    if (set_dims and len(set_dims) == 2 * K and K >= 2
-            and isinstance(tensor.val, jax.Array)
-            and all(isinstance(d, SetIndex) for d in tensor.out_dims)
-            and all(isinstance(d, SetIndex) for d in tensor.primal_dims)):
-        from graphax.sparse.ops.block_storage import (
-            _densify_multi_banded, BandAxisSpec,
-        )
-
-        sx = tensor.out_dims[0]
-        lhs_blocks, rhs_blocks = sx._split(tensor.val)  # W=1 multi-banded buffers
-        # Each per-side block-diagonal is a W=1 multi-banded buffer; densify it
-        # via the shared band kernel, then combine the two sides with the op.
-        def _specs(shape):
-            return tuple(
-                BandAxisSpec(band_width=1, block_row=shape[2 * K + i],
-                             block_col=shape[3 * K + i], n_secondary=shape[2 * i])
-                for i in range(K)
-            )
-        fill_lhs, fill_rhs = _split_fill(fill)
-        lhs_dense = _densify_multi_banded(lhs_blocks, _specs(sx.lhs_shape), fill_lhs)
-        if rhs_blocks is not None:
-            rhs_dense = _densify_multi_banded(rhs_blocks, _specs(sx.rhs_shape), fill_rhs)
-            dense = sx._op()(lhs_dense, rhs_dense)
-        else:
-            dense = sx._op()(lhs_dense, fill_rhs)
-        # Result fill is the op-combined per-side fill (L3), matching the data;
-        # combined_fill keeps a None (statically-zero) fill None.
-        return _dense_pair_result(tensor, dense, K, fill_value=sx.combined_fill(raw_fill))
-
-    # --- K≥2 banded (multi-axis interleaved Array val) ---
-    if (banded and len(banded) == 2 * K and isinstance(tensor.val, jax.Array)
-            and all(isinstance(d, BandedIndex) for d in tensor.out_dims)
-            and all(isinstance(d, BandedIndex) for d in tensor.primal_dims)):
-        from graphax.sparse.ops.block_storage import (
-            _densify_multi_banded, BandAxisSpec,
-        )
-
-        specs = tuple(
-            BandAxisSpec(
-                primary_axis=0 if o.primary else 1,
-                n_secondary=o.n_secondary, offset=o.offset, n_meta=o.n_meta,
-                band_width=o.band_width, block_row=o.block_size,
-                block_col=p.block_size,
-            )
-            for o, p in zip(tensor.out_dims, tensor.primal_dims)
-        )
-        dense = _densify_multi_banded(
-            tensor.val, specs, fill,
-        )  # (rows_0..rows_{K-1}, cols_0..cols_{K-1}, *L)
-        return _dense_pair_result(tensor, dense, K)
-
-    raise NotImplementedError(
-        f"densify of compressed dims: unhandled shape — {len(comp)} compressed "
-        f"dims across {len(tensor.out_dims)} out / {len(tensor.primal_dims)} "
-        f"primal dims, val type {type(tensor.val).__name__}. Handled: a pure "
-        "K=1 SetIndex / banded pair, or an all-BandedIndex K≥2 tensor. A "
-        "compressed pair coexisting with Dense/Diagonal dims is not yet "
-        "supported (no producer emits it today)."
-    )
-
-
 def _is_approx(st) -> bool:
     """True iff ``st`` carries an approximation structure that the downstream
     sparse contraction / drain cannot consume directly — a ``Diag`` block (a
@@ -344,17 +96,6 @@ def _is_approx(st) -> bool:
         if (not d.is_sparse) and d.axis is None and int(d.logical_size) > 1:
             return True
     return False
-
-
-def _materialize_for_op(tensor):
-    """Pre-densify a tensor's compressed Index dims to ``DiagonalIndex`` /
-    ``DenseIndex`` so matmul / elementwise — which consume only those — never
-    see a ``BandedIndex`` / ``SetIndex``. No-op when the tensor has no
-    compressed dims (the case for every operand today, until the Phase 8.E/8.F
-    producers land)."""
-    if not _compressed_dims(tensor):
-        return tensor
-    return _densify_compressed_dims(tensor, compact=True)
 
 
 def _val_or_one(tensor: SparseTensor) -> Array:
@@ -442,11 +183,7 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
     dim_map = {d.id: d for d in st.dims}
     block_axiss = set()
     for d in st.dims:
-        # Compressed pairs (BandedIndex / ToeplitzIndex) legitimately link axes
-        # of DIFFERENT sizes (e.g. a conv's out-pos P vs kernel-tap K) and carry
-        # their own densify-time validation, so they are exempt from the
-        # size-equality sparse-pair invariant below.
-        if d.is_sparse and not d.is_compressed:
+        if d.is_sparse:
             if not _check_sparse_dim_pair(d, dim_map):
                 raise ValueError(
                     f"Topology Error: Invalid sparse dimension pair configuration for dimension {d.id}"
@@ -454,16 +191,14 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
             if getattr(d, "block_axis", None) is not None:
                 _check_block_axis(d, dim_map, block_axiss)
 
-    # Physical-buffer agreement. Every non-compressed dim's ``axis`` /
+    # Physical-buffer agreement. Every dim's ``axis`` /
     # ``block_axis`` must point at a val axis whose extent equals the dim's
     # declared ``size`` / ``block_size`` (a size-1 physical axis is allowed as a
     # broadcast/implicit stand-in). This catches metadata that disagrees with the
     # buffer -- e.g. a dense dim whose ``axis`` was renumbered onto a
     # DiagonalIndex block axis (the MoE-9 squeeze construction bug) -- LOUDLY at
     # construction, instead of as an opaque "transpose permutation isn't a
-    # permutation" far downstream in a contraction. Compressed dims carry band /
-    # set buffers whose axes are not plain (size / block_size) extents, so they
-    # are skipped (their own densify path validates them).
+    # permutation" far downstream in a contraction.
     val = getattr(st, "val", None)
     if val is not None:
         try:
@@ -473,8 +208,6 @@ def _assert_sparse_tensor_consistency(st: SparseTensor):
         if vshape is not None:
             ndim = len(vshape)
             for d in st.dims:
-                if d.is_compressed:
-                    continue
                 ax = d.axis
                 if ax is not None:
                     if ax < 0 or ax >= ndim:

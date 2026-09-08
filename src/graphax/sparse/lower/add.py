@@ -32,7 +32,7 @@ Rules (dims are matched BY ID — elementwise operands share ONE dim-id space):
 
 Anything else (sparse↔dense promotion, misaligned block grids, leftover
 physical axes) falls through, loudly counted, to the existing path —
-including the Phase-6b/9 SetIndex emissions which already compress the
+including the misaligned emissions which already compress the
 misaligned zero-fill cases.
 
 Output-fill algebra is IDENTICAL to ``_reconstruct_result``: ``None`` (static
@@ -165,10 +165,6 @@ def lower_add(lhs, rhs, op: Callable, is_intersection: bool = False):
     ALIGNED structure (no LCM promotion), where the general path's
     intersection demote is a no-op by construction.
     """
-    for d in (*lhs.dims, *rhs.dims):
-        if getattr(d, "is_compressed", False):
-            return _skip("compressed")
-
     l_by_id = {d.id: d for d in lhs.dims}
     r_by_id = {d.id: d for d in rhs.dims}
     if set(l_by_id) != set(r_by_id) or len(l_by_id) != len(lhs.dims) \

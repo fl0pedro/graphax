@@ -514,10 +514,10 @@ def _slice_elementals(primals, val_out, **params):
 
     def slice_transform(pre):
         # Structure-preserving fast path: every sliced output dim is a plain
-        # DenseIndex (not sparse / not compressed).
+        # DenseIndex (not sparse).
         preservable = True
         for ax, d in enumerate(pre.out_dims):
-            if _is_sliced(ax, d.logical_size) and (d.is_sparse or d.is_compressed):
+            if _is_sliced(ax, d.logical_size) and d.is_sparse:
                 preservable = False
                 break
 
@@ -605,7 +605,7 @@ def _slice_elementals(primals, val_out, **params):
         )
         if preservable:
             for d in post.primal_dims:
-                if d.is_sparse or d.is_compressed or d.axis is None:
+                if d.is_sparse or d.axis is None:
                     preservable = False
                     break
 

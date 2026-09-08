@@ -175,11 +175,6 @@ def try_lower_matmul(lhs: "SparseTensor", rhs: "SparseTensor", count: bool = Fal
     if not (_is_zero_fill(lhs) and _is_zero_fill(rhs)):
         _bump("fallthrough:nonzero_fill")
         return None
-    if any(d.is_compressed for d in (*lhs.dims, *rhs.dims)):
-        # _normalize_inputs materializes compressed dims before the hook; this
-        # is a defensive guard for direct callers.
-        _bump("fallthrough:compressed")
-        return None
     if lhs.dtype == jnp.bool_ or rhs.dtype == jnp.bool_:
         _bump("fallthrough:bool_dtype")
         return None
