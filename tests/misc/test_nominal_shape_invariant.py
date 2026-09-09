@@ -32,9 +32,30 @@ of the gated assert recorded at the assert's own site):
     in 1506 recorded armed checks across both targets, and 110 armed samples
     run with the gate FORCED OPEN raised nothing.
   * an approximation CAN change how many edges are stored -- ``SKIP_FACE``
-    drops contractions, and ``GRAPHAX_FACTORED_OUTPUTS`` defers an output
-    edge in exact AD that is not deferred once the approx config is armed.
-    So the pin below is "no NEW non-nominal pattern", not "the same counts".
+    drops contractions -- so the pin below is "no NEW non-nominal pattern",
+    not "the same counts".
+
+WHAT THE (b) PATTERN ACTUALLY IS (dsnn-3qm.71, measured 2026-09-09): every
+non-nominal stored edge is an edge with an UNRESOLVED ``JacobianTransform``
+still queued on it. ``lax.transpose_p``'s elemental rule
+(``primitives/transforms.py::_transpose_elementals``) returns a dim-less seed
+``SparseTensor([], [], None, pre_transforms=[transpose_transform])`` -- the
+permutation is a LAZY relabel. When that seed is the identity operand of a
+face, ``_identity_passthrough`` + ``append_pre_transforms`` carry the relabel
+onto the contraction result, which is then STORED with it still queued, so
+``SparseTensor.shape`` reports the PRE-relabel dim order. Census with an extra
+column for ``core._drain_transforms``:
+
+  nn256 6/6 (b) edges, TLM 1/1, this model 1/1, and 13/13 class-(c) edges on
+  ``RoeFlux_3d`` (which carries ``slice_transform``s) -- 20 of 20 non-nominal
+  stores out of 3 200 censused across ten targets and both orders -- carry a
+  queued transform, and EVERY one of them drains to EXACTLY nominal.
+
+So ``SparseTensor.shape == out_edge.aval.shape + in_edge.aval.shape`` is not an
+invariant of a stored edge; it is an invariant of its DRAINED form. Draining is
+not free: ``transpose_transform`` ends in ``_swap_back_axes``, which physically
+transposes ``val``, so making the stored shape nominal costs equations, temp and
+flops -- it is not a metadata-only change.
 
 So the three approximation classes leave the LOGICAL shape alone, exactly as
 the API documents: ``Compress`` sets ``axis=None`` and keeps ``size``,
@@ -269,15 +290,33 @@ def _store_census(monkeypatch, face_transforms=None, order="rev"):
     by the mirrored write into the transpose graph with the SAME object and
     the keys swapped; only the first of each pair is counted, so ``k1`` is
     always the in_edge and ``k2`` the out_edge.
+
+    The pair is identified by those KEYS, never by ``id(v)``. An ``id``
+    comparison against the previous call, keeping only the integer, ALIASES:
+    the tensor of an eliminated vertex's edge is deleted from the graph and
+    freed, CPython hands its address to the next stored tensor, and the test
+    then drops that genuine store as if it were a mirror -- losing one edge
+    from the census. MEASURED (dsnn-3qm.71, 2026-09-09): the exact and the
+    armed run of this model make the SAME 34 ``_set_inner`` calls with the same
+    keys and the same stored shapes, yet the ``id``-keyed census reported 17
+    edges for the exact run and 16 for the armed run of ONE face -- and WHICH
+    face depends on the allocator, i.e. on everything that ran earlier in the
+    process. A control that merely holds a reference to every stored tensor
+    (so no address can be recycled) moved at NO face, for all three
+    approximation classes, both standalone and after ``tests/examples``. That
+    artefact, not any engine behaviour and not a leaked env var, is why the
+    earlier raw-count-equality form of the sweep below "passed standalone and
+    failed in the suite". ``k1``/``k2`` are ``core.Var``s alive in the graph,
+    so this comparison cannot alias.
     """
     orig = _ORIG_SET_INNER
     recs = []
-    last = [None]
+    prev = [None, None, None]
 
     def _wrapped(outer, k1, k2, v):
-        same = (id(v) == last[0])
-        last[0] = id(v)
-        if not same:
+        mirror = (prev[0] is v and prev[1] is k2 and prev[2] is k1)
+        prev[0], prev[1], prev[2] = v, k1, k2
+        if not mirror:
             nominal = (tuple(int(n) for n in k2.aval.shape)
                        + tuple(int(n) for n in k1.aval.shape))
             stored = tuple(int(d.logical_size) for d in v.dims)
@@ -367,15 +406,25 @@ def _bad_patterns(recs):
     return {(nominal, stored) for cls, nominal, stored in recs if cls != "a"}
 
 
-# ``GRAPHAX_FACTORED_OUTPUTS`` changes WHICH edges get stored -- with it on,
-# the final contraction onto a pure output head is deferred as a factor pair
-# (``DeferredOutputProduct``) and stored through a different site, and that
-# deferral is disabled once an approximation is armed. So the two settings do
-# not store the same NUMBER of edges, and an equality of raw counts between
-# the exact and the armed run is only true with it off (the suite leaks it on
-# from tests/core/factored_outputs_test.py, which is how this was found).
-# Both settings are pinned here, against the claim that survives either:
-# an approximation introduces no NEW non-nominal pattern.
+# ``GRAPHAX_FACTORED_OUTPUTS`` changes WHICH edges get stored in general -- with
+# it on, the final contraction onto a pure output head can be deferred as a
+# factor pair (``DeferredOutputProduct``) and stored through a different site --
+# so both settings are parametrized here and the claim pinned is the one that
+# survives either: an approximation introduces no NEW non-nominal pattern.
+#
+# CORRECTION (dsnn-3qm.71, measured 2026-09-09). The earlier raw-count-equality
+# form of this sweep was believed to fail in the suite because
+# tests/core/factored_outputs_test.py leaks the env var. It does not: that test
+# saves and restores it in setUp/tearDown, the only other toucher uses
+# ``monkeypatch.setenv``, and the flag was measured OFF both standalone and at
+# this test's own site in a full-suite run. The real cause was the ``id(v)``
+# pair dedupe in ``_store_census`` (see its docstring) -- an allocator-dependent
+# miscount in the instrumentation. With the dedupe keyed on the Var pair the
+# exact and armed censuses of this model agree edge for edge at EVERY face, for
+# all three approximation classes, in both process contexts. The pin below is
+# still the weaker, always-true statement; it is no longer the only one
+# available, but restoring the equality form is an owner call (``SKIP_FACE``
+# really does drop contractions, and this sweep does not exercise it).
 @pytest.mark.parametrize("factored", ["0", "1"], ids=["plain", "factored"])
 @pytest.mark.parametrize(
     "action",
