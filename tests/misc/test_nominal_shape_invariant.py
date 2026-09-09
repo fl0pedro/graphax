@@ -31,6 +31,10 @@ of the gated assert recorded at the assert's own site):
   * at the assert's OWN site (the merge branch) both operands were class (a)
     in 1506 recorded armed checks across both targets, and 110 armed samples
     run with the gate FORCED OPEN raised nothing.
+  * an approximation CAN change how many edges are stored -- ``SKIP_FACE``
+    drops contractions, and ``GRAPHAX_FACTORED_OUTPUTS`` defers an output
+    edge in exact AD that is not deferred once the approx config is armed.
+    So the pin below is "no NEW non-nominal pattern", not "the same counts".
 
 So the three approximation classes leave the LOGICAL shape alone, exactly as
 the API documents: ``Compress`` sets ``axis=None`` and keeps ``size``,
@@ -358,48 +362,74 @@ def _best_effort(action, log):
     return _hook
 
 
+def _bad_patterns(recs):
+    """The DISTINCT non-nominal (nominal, stored) pairs of a census."""
+    return {(nominal, stored) for cls, nominal, stored in recs if cls != "a"}
+
+
+# ``GRAPHAX_FACTORED_OUTPUTS`` changes WHICH edges get stored -- with it on,
+# the final contraction onto a pure output head is deferred as a factor pair
+# (``DeferredOutputProduct``) and stored through a different site, and that
+# deferral is disabled once an approximation is armed. So the two settings do
+# not store the same NUMBER of edges, and an equality of raw counts between
+# the exact and the armed run is only true with it off (the suite leaks it on
+# from tests/core/factored_outputs_test.py, which is how this was found).
+# Both settings are pinned here, against the claim that survives either:
+# an approximation introduces no NEW non-nominal pattern.
+@pytest.mark.parametrize("factored", ["0", "1"], ids=["plain", "factored"])
 @pytest.mark.parametrize(
     "action",
     [Quant(dtype="bfloat16"), Compress(axes=(0,), kind="mean"), "diag"],
     ids=["quant", "compress", "diag"],
 )
-def test_approximation_does_not_change_the_stored_shape_census(
-        monkeypatch, action):
+def test_approximation_introduces_no_new_non_nominal_edge(
+        monkeypatch, action, factored):
     """THE measurement, as a regression pin.
 
-    Arming an approximation on a face must not change WHICH shape any edge is
-    stored with -- ``Compress`` keeps the logical size behind an implicit dim,
-    ``Diag`` re-factors meta against block, ``Quant`` moves only the dtype. So
-    the exact-AD census and the armed census of the SAME elimination order
-    must agree class for class.
+    ``Compress`` keeps the logical size behind an implicit dim, ``Diag``
+    re-factors meta against block, ``Quant`` moves only the dtype -- so no
+    approximation may put an edge into the graph at a shape exact AD would
+    not also have stored it at. Class (c) may never appear at all.
 
     Swept over EVERY face of the model, all three slots (``lhs``/``rhs``/
     ``res``) hooked, and checked at every face where the approximation
     actually landed -- a face that declines it proves nothing.
     """
-    exact = _counts(_store_census(monkeypatch))
+    monkeypatch.setenv("GRAPHAX_FACTORED_OUTPUTS", factored)
+    exact_recs = _store_census(monkeypatch)
+    exact_bad = _bad_patterns(exact_recs)
+    assert _counts(exact_recs)["c"] == 0
 
     landed = 0
     for v, key in _all_faces():
         log = []
         hook = _best_effort(action, log)
         ft = {v: {key: (hook, hook, hook)}}
-        armed = _counts(_store_census(monkeypatch, face_transforms=ft))
+        armed_recs = _store_census(monkeypatch, face_transforms=ft)
         if not any(e[0] == "applied" for e in log):
             continue
         landed += 1
-        assert armed == exact, (
-            f"{action!r} on face {key} of vertex {v} moved the stored-edge "
-            f"census: exact {exact} -> armed {armed}  (hook log {log})")
+        counts = _counts(armed_recs)
+        assert counts["c"] == 0, (
+            f"{action!r} on face {key} of vertex {v} stored a class-(c) edge "
+            f"-- an extent or a rank was LOST: "
+            f"{[r for r in armed_recs if r[0] == 'c']}")
+        new = _bad_patterns(armed_recs) - exact_bad
+        assert not new, (
+            f"{action!r} on face {key} of vertex {v} introduced a "
+            f"non-nominal stored shape exact AD never produces: {new} "
+            f"(exact patterns {exact_bad}, hook log {log})")
 
     assert landed, (
         f"{action!r} never landed on ANY of the {len(_all_faces())} faces -- "
         f"the sweep approximated nothing, so it would be vacuous")
 
 
-def test_no_stored_edge_ever_loses_an_extent(monkeypatch):
+@pytest.mark.parametrize("factored", ["0", "1"], ids=["plain", "factored"])
+def test_no_stored_edge_ever_loses_an_extent(monkeypatch, factored):
     """Class (c) is the serious bug -- an approximation dropping metadata.
     It was never observed on either campaign target, exact or armed."""
+    monkeypatch.setenv("GRAPHAX_FACTORED_OUTPUTS", factored)
     fts = [None]
     for v, key in _all_faces():
         for act in (Quant(dtype="bfloat16"), Compress(axes=(0,), kind="mean"),
@@ -421,6 +451,10 @@ def test_no_stored_edge_ever_loses_an_extent(monkeypatch):
            "invariant as written is what should hold at the store.",
 )
 def test_every_stored_edge_matches_nominal_in_exact_ad(monkeypatch):
+    # Pinned OFF: with factored outputs on, the drifted edge is stored through
+    # the deferred-output site instead, and a leaked setting would make this
+    # strict xfail non-deterministic.
+    monkeypatch.setenv("GRAPHAX_FACTORED_OUTPUTS", "0")
     recs = _store_census(monkeypatch)
     bad = [r for r in recs if r[0] != "a"]
     assert not bad, f"{len(bad)} of {len(recs)} stored edges are not nominal: {bad}"
