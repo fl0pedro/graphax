@@ -15,12 +15,13 @@ with the comment "an approximation can leave an edge sparse/permuted".
 MEASURED (2026-09-09, probe ``t93_nominal.py``; nn256 =
 ``VmappedNeuralNetwork``/mnist and TLM = ``TransformerLM``/wikitext at the
 campaign shapes, minimum-Markowitz order, THREE random ``Diag`` + THREE
-``Compress`` + THREE ``Quant`` per sample on distinct vertices and faces;
-70 nn256 samples and 26 TLM samples, every stored edge censused by wrapping
-``core._set_inner``):
+``Compress`` + THREE ``Quant`` per sample on distinct vertices and faces, plus
+a variant that adds three ``SKIP_FACE``; 100 nn256 and 46 TLM armed samples,
+every stored edge censused by wrapping ``core._set_inner`` and every operand
+of the gated assert recorded at the assert's own site):
 
   * class (c) -- genuinely different extents, or a different rank -- NEVER
-    occurred. Not once, on either target.
+    occurred. Not once, on either target, in any plan.
   * class (b) -- a PERMUTATION of nominal -- does occur, but it occurs in
     EXACT AD too, at the SAME vertices with the SAME shapes, and the whole
     census is bit-identical between the exact and the armed run of the same
@@ -28,8 +29,8 @@ campaign shapes, minimum-Markowitz order, THREE random ``Diag`` + THREE
     run, both ways). It is dim-ORDER drift -- ticket .62, the same defect as
     the transposed parameter gradients -- not something an approximation does.
   * at the assert's OWN site (the merge branch) both operands were class (a)
-    in every armed sample of both targets, and a run with the gate forced
-    open raised nothing.
+    in 1506 recorded armed checks across both targets, and 110 armed samples
+    run with the gate FORCED OPEN raised nothing.
 
 So the three approximation classes leave the LOGICAL shape alone, exactly as
 the API documents: ``Compress`` sets ``axis=None`` and keeps ``size``,
