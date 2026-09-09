@@ -905,11 +905,42 @@ def _frame_sublists(N, pairs, lhs_shape, rhs_shape, n_ll, n_rl):
     return lhs_sub, rhs_sub, out_sub
 
 
+def _drop_unit_slots(v, sub, out_labels):
+    """Squeeze every extent-1 axis of ``v`` whose label the OUTPUT does not
+    carry, and drop that label from ``sub``.
+
+    The frame gives each contraction pair THREE slots per operand, so an
+    operand's rank is ``3N + leftovers`` whether or not the pair stores
+    anything along those roles. On a long elimination order most of them are
+    extent 1: MEASURED on TransformerLM at the campaign shape, the frame views
+    reach rank 20 with four real axes.
+
+    Dropping such an axis does not change the number. An extent-1 axis whose
+    label is absent from the output is summed by the einsum, and a sum over one
+    element is the identity; if the partner carries the same label at extent N,
+    the einsum sums the partner instead, which is the same product. A label the
+    output does carry stays, because einsum has to produce it from somewhere.
+
+    This is what the deleted GRAPHAX_COMPACT_FRAME switch bought by routing
+    through the planner -- "skipping the size-1-padded physical frame". The
+    planner is gone, so the frame skips them itself.
+    """
+    out_set = set(out_labels)
+    keep = [ax for ax, lab in enumerate(sub)
+            if not (int(v.shape[ax]) == 1 and lab not in out_set)]
+    if len(keep) == len(sub):
+        return v, sub
+    return (v.reshape(tuple(int(v.shape[ax]) for ax in keep)),
+            [sub[ax] for ax in keep])
+
+
 def _frame_contract(a, b, pairs, n_ll, n_rl):
     """The one emission site of the tiled frame contraction: ONE einsum."""
     lhs_sub, rhs_sub, out_sub = _frame_sublists(
         len(pairs), pairs, a.shape, b.shape, n_ll, n_rl
     )
+    a, lhs_sub = _drop_unit_slots(a, lhs_sub, out_sub)
+    b, rhs_sub = _drop_unit_slots(b, rhs_sub, out_sub)
     return _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub)
 
 
