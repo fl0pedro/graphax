@@ -32,10 +32,10 @@ from graphax.sparse.tensor import SparseTensor
 
 @pytest.fixture(autouse=True)
 def _approx_active():
-    """The dispatch is a hard no-op unless an approximation is active (so plain
-    exact AD stays byte-identical — see dispatch.set_approx_active). These tests
-    exercise the routing itself, i.e. the approximation-active condition, so we
-    flag it on for the duration of each test and reset afterwards."""
+    """The dispatch no longer reads ``approx_active`` (GRAPHAX_ELEMENTAL is its
+    only gate now), but ``core`` still keys its approx handling off the flag, so
+    these routing tests set it for the duration of each test — as a real approx
+    elimination would — and reset afterwards."""
     DSP.set_approx_active(True)
     try:
         yield

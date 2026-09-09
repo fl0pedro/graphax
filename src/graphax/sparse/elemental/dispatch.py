@@ -66,18 +66,22 @@ if TYPE_CHECKING:
 
 
 # --------------------------------------------------------------------------- #
-# Approximation-active gate.
+# Approximation-armed signal.
 #
-# DESIGN INVARIANT: with NO approximation (``Diag``/``Compress``) active, reverse
-# (and forward) vertex elimination must be EXACT and byte-identical to the
-# pre-elemental path — the existing matmul/elementwise already exploit block-
-# diagonal / zero-fill structure correctly there. The elemental kernels exist
-# only to make the APPROXIMATION edges (rectangular Diag blocks, Compress implicit
-# dims) contract legally; firing them on the intrinsic-diagonal edges that arise
-# in plain exact AD restructures those edges and breaks a downstream contraction
-# (e.g. a broadcast-bias Jacobian -> ``size mismatch 1 vs N``). So the dispatch is
-# a hard no-op unless ``core`` has flagged that this elimination carries a
-# Diag/Compress transform. Thread-local so concurrent traces don't race.
+# ``core.vertex_elimination_jaxpr`` sets this for the duration of an elimination
+# that carries a Diag/Compress (or callable / SKIP_FACE) transform, and restores
+# the prior value on the way out — it RECURSES for jit/cond macro-vertices, so a
+# nested exact elimination must not clear an outer approx one's flag.
+#
+# It NO LONGER GATES THIS MODULE (dsnn-3qm.28.2). Its remaining readers are
+#   * ``core._eliminate_vertex``, which relaxes the nominal-shape asserts when an
+#     approximation is armed anywhere in the elimination — a permuted edge from an
+#     approximated vertex legally reaches a non-approx vertex's merge, so the
+#     per-vertex ``_is_approx_cfg`` alone is stale there (ViT layer_norm case);
+#   * alphagrad's legality oracle and face probes
+#     (``approx/common/masks.py``, ``approx/common/var_probe.py``,
+#     ``approx/live_faces.py``), which drive it around their own replays.
+# Thread-local so concurrent traces don't race.
 # --------------------------------------------------------------------------- #
 _approx_state = threading.local()
 
@@ -86,17 +90,28 @@ def set_approx_active(active: bool) -> None:
     _approx_state.active = bool(active)
 
 
+def approx_active() -> bool:
+    return getattr(_approx_state, "active", False)
+
+
+# --------------------------------------------------------------------------- #
+# The kernel-layer gate — the ONLY gate on this module.
+#
 # Default OFF (2026-08-02): with the face-transform gate armed, this layer
 # fired in production for the first time and was measured pathological on the
 # nn256 single-face ablation (runs killed on time/memory; COMPRESS +256 ms
 # mean), while the general planner + tiled path handle every case it owned.
 # GRAPHAX_ELEMENTAL=1 restores it for comparison.
+#
+# It used to be ANDed with ``approx_active()`` above, which kept the kernels off
+# exact AD even with the env var on. That second condition is gone: with
+# GRAPHAX_ELEMENTAL=1 the kernels now run for exact AD too. Nothing sets the var
+# in production (the campaign's SHARED_ENV does not), so this module is dead code
+# there either way, but a debugging run with the var on is no longer restricted
+# to approximation edges.
+# --------------------------------------------------------------------------- #
 _ELEMENTAL_ENABLED = os.environ.get("GRAPHAX_ELEMENTAL", "0") not in (
     "", "0", "false", "False")
-
-
-def approx_active() -> bool:
-    return getattr(_approx_state, "active", False)
 
 
 # --------------------------------------------------------------------------- #
@@ -271,14 +286,10 @@ def try_elemental_matmul(lhs: "SparseTensor", rhs: "SparseTensor", count: bool =
     ``count=True``, ``(result, (adds, muls, fmas))``) built with the canonical
     output-id convention so downstream contractions align.
     """
-    # EXACT-AD GUARD: no approximation active -> defer entirely to the existing
-    # (block-diagonal/zero-fill-efficient) path so reverse/forward stay exact and
-    # byte-identical. The elemental kernels only handle approximation edges.
-    # GRAPHAX_ELEMENTAL=0 disables the whole kernel layer (the general planner
-    # or the tiled path then own every structured contraction) — the separable
-    # control that lets measurements attribute costs to THIS layer vs the
-    # approx_active signal itself.
-    if not approx_active() or not _ELEMENTAL_ENABLED:
+    # KERNEL-LAYER GATE: GRAPHAX_ELEMENTAL=0 (the default, and what production
+    # runs) disables the whole kernel layer — the tiled path then owns every
+    # structured contraction and reverse/forward stay exact and byte-identical.
+    if not _ELEMENTAL_ENABLED:
         _bump("matmul_pure_dense_skip")
         return None
 
@@ -535,8 +546,8 @@ def try_elemental_elementwise(
     shape is outside the pairwise kernels' 2-D core (the general tiled path then
     owns it).
     """
-    # EXACT-AD GUARD (see try_elemental_matmul): no-op unless approximation active.
-    if not approx_active() or not _ELEMENTAL_ENABLED:
+    # KERNEL-LAYER GATE (see try_elemental_matmul): no-op unless GRAPHAX_ELEMENTAL=1.
+    if not _ELEMENTAL_ENABLED:
         _bump("elementwise_pure_dense_skip")
         return None
     if not (_is_zero_fill(lhs) and _is_zero_fill(rhs)):

@@ -2352,7 +2352,8 @@ def matmul(lhs, rhs, count: bool = False):
       3. ``both_implicit_fold`` -- both contracted dims implicit: analytic
                                   scale-by-N folded into ``scalar_mult``.
       4. ``elemental``          -- structured (diagonal/block) kernels,
-                                  active only under ``approx_active()``.
+                                  active only under ``GRAPHAX_ELEMENTAL=1``
+                                  (default off, so this path never fires).
       5. ``densify``            -- non-zero ``fill_value`` OR an implicit-block
                                   contraction, when ``_densify_is_safe``:
                                   materialize via ``dense_for_matmul`` and
