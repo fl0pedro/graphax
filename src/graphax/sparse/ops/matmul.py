@@ -3,7 +3,9 @@
 Pipeline (zero-fill fast path):
     1. Classify each dim pair as ``contract``/``batch_*``/``spatial_*``.
     2. ``_prepare_physical_arrays`` — bring both ``val`` buffers into the canonical
-       (outer, block, shared_block, *leftover) layout via the shared transpose primitive.
+       (outer, block, shared_block, *leftover) layout via the shared transpose
+       primitive, building ONLY the slots a val axis backs and returning a
+       ``_Slots`` map that says where each nominal slot went.
     3. ``_execute_block_sparse_contraction`` — shrink every frame slot no operand
        stores, then emit ONE einsum over integer sublists.
     4. ``_build_output_tensor`` — re-emit ``SparseTensor`` ``out_dims`` / ``primal_dims``.
@@ -588,16 +590,62 @@ def _build_matmul_topology(lhs, rhs_out_dims, rhs_primal_dims, rhs_id_offset):
 
 
 # --- Physical array preparation -------------------------------------------
+class _Slots(NamedTuple):
+    """Where each NOMINAL frame slot landed on a prepared operand.
+
+    The frame names three slots per contraction pair — ``3 * i + k`` for pair
+    ``i``, role ``k`` (0 outer/meta, 1 block, 2 shared block). Only the slots a
+    ``val`` axis actually backs are BUILT; ``pos[3 * i + k]`` is the physical
+    axis of a built slot and ``None`` for one that was not built. So the
+    prepared rank is the number of backed slots, not ``3 * N``, and the
+    leftovers start at ``rank``.
+
+    Nothing is lost by not building a slot: an unbacked slot could only ever be
+    extent 1, and it is extent 1 because no axis of the buffer is behind it.
+    Read a not-built slot's extent with ``_slot_len``.
+    """
+
+    pos: tuple
+    rank: int
+
+
+def _slot_len(val, slots, k):
+    """Physical extent of nominal frame slot ``k`` — 1 when it was not built."""
+    p = slots.pos[k]
+    return 1 if p is None else int(val.shape[p])
+
+
 def _prepare_physical_arrays(lhs_val, rhs_val, pairs):
-    def flat_axes(sides):
-        return [
+    """Canonical per-pair slot order, building ONLY the slots a val axis backs.
+
+    The frame used to pad the prepared buffer out to the full ``3 * N`` nominal
+    slots, which costs a ``reshape`` to append the missing size-1 axes and turns
+    the canonicalizing ``transpose`` into a non-identity permutation even when
+    the source axes were already in order. Both are pure bookkeeping: an
+    unbacked slot is extent 1 and carries nothing. Building the compact layout
+    instead hands ``_prepare_physical_array`` a permutation of real axes only,
+    which is a no-op whenever they are already ascending.
+    """
+
+    def prep(val, sides):
+        flat = [
             a for s in sides for a in (s.outer_axis, s.block_axis, s.shared_block_axis)
         ]
+        # A slot is BACKED when its source axis exists on this buffer. A nominal
+        # axis at or beyond ``val.ndim`` belongs to an implicit dim and backs
+        # nothing — the same test ``_prepare_physical_array`` applies internally.
+        built = [k for k, a in enumerate(flat) if a is not None and a < val.ndim]
+        pos = [None] * len(flat)
+        for new, k in enumerate(built):
+            pos[k] = new
+        return (
+            _prepare_physical_array(val, [flat[k] for k in built]),
+            _Slots(tuple(pos), len(built)),
+        )
 
-    return (
-        _prepare_physical_array(lhs_val, flat_axes([p.lhs for p in pairs])),
-        _prepare_physical_array(rhs_val, flat_axes([p.rhs for p in pairs])),
-    )
+    lhs_out, lhs_slots = prep(lhs_val, [p.lhs for p in pairs])
+    rhs_out, rhs_slots = prep(rhs_val, [p.rhs for p in pairs])
+    return lhs_out, rhs_out, lhs_slots, rhs_slots
 
 
 # --- Tiled contraction core -----------------------------------------------
@@ -664,6 +712,59 @@ def _as_shape(view, target_shape, *, mode):
     )
 
 
+class _FrameOperands(NamedTuple):
+    """The two operands of the frame einsum, plus the slot bookkeeping.
+
+    ``lhs`` / ``rhs`` are COMPACT: a nominal merged slot that carries nothing
+    was never built. ``lhs_shape`` / ``rhs_shape`` are the NOMINAL
+    ``3 * N + leftovers`` shapes and ``keep_l`` / ``keep_r`` say which of those
+    slots survived, so ``_frame_sublists`` can label the nominal layout — the
+    only layout the labels are defined on — and the emission site then drops the
+    same slots from the label lists.
+    """
+
+    lhs: Any
+    rhs: Any
+    lhs_shape: list
+    rhs_shape: list
+    keep_l: list
+    keep_r: list
+    lhs_leftover: list
+    rhs_leftover: list
+
+
+def _merged_keep(N, pairs, lhs_shape, rhs_shape):
+    """Which NOMINAL merged slots the frame has to build.
+
+    A slot carries nothing when its extent is 1 AND the output does not carry
+    its label. The einsum sums a label absent from the output, and a sum over
+    one element is the identity; where the partner carries the same label at
+    extent N the einsum sums the PARTNER instead, which is the same product. So
+    the number is the same whether or not the axis exists.
+
+    A label the output does carry stays even at extent 1, because einsum has to
+    produce it from somewhere: that is both block groups, both leftovers, the
+    meta of every pair, and the split of every pair that rides through.
+    """
+    keep_l = [True] * len(lhs_shape)
+    keep_r = [True] * len(rhs_shape)
+    for i, p in enumerate(pairs):
+        # The meta rides through, so only the side that stores nothing along it
+        # is droppable, and only against a partner that stores something.
+        el, er = int(lhs_shape[i]), int(rhs_shape[i])
+        if el == 1 and er != 1:
+            keep_l[i] = False
+        elif er == 1 and el != 1:
+            keep_r[i] = False
+        if p.pairing_type != "contract":
+            continue        # a riding-through split is in the output
+        if int(lhs_shape[2 * N + i]) == 1:
+            keep_l[2 * N + i] = False
+        if int(rhs_shape[N + i]) == 1:
+            keep_r[N + i] = False
+    return keep_l, keep_r
+
+
 def _prepare_contraction_views(
     lhs_val,
     rhs_val,
@@ -671,6 +772,8 @@ def _prepare_contraction_views(
     shared,
     total,
     split,
+    slots_l,
+    slots_r,
     keep_l=None,
     keep_r=None,
     keep_sl=None,
@@ -694,14 +797,18 @@ def _prepare_contraction_views(
     split_l = [split[i] if keep_sl[i] else 1 for i in range(N)]
     split_r = [split[i] if keep_sr[i] else 1 for i in range(N)]
     lhs_leftover, rhs_leftover = (
-        list(lhs_val.shape[3 * N :]),
-        list(rhs_val.shape[3 * N :]),
+        list(lhs_val.shape[slots_l.rank :]),
+        list(rhs_val.shape[slots_r.rank :]),
     )
 
-    def split_shape(val, pairs_side, lens, is_lhs):
+    def split_shape(val, slots, pairs_side, lens, is_lhs):
         out = []
         for i, p in enumerate(pairs):
-            ax0, ax1, ax2 = val.shape[3 * i], val.shape[3 * i + 1], val.shape[3 * i + 2]
+            ax0, ax1, ax2 = (
+                _slot_len(val, slots, 3 * i),
+                _slot_len(val, slots, 3 * i + 1),
+                _slot_len(val, slots, 3 * i + 2),
+            )
             ps = pairs_side[i]
             if is_lhs:
                 tail = (1, 1) if ax2 == 1 else (total[i] // ps.outer_len, split[i])
@@ -711,8 +818,12 @@ def _prepare_contraction_views(
                 out.extend([ax0, *tail, ax2])
         return out + lens
 
-    lhs_split = split_shape(lhs_val, [p.lhs for p in pairs], lhs_leftover, True)
-    rhs_split = split_shape(rhs_val, [p.rhs for p in pairs], rhs_leftover, False)
+    lhs_split = split_shape(
+        lhs_val, slots_l, [p.lhs for p in pairs], lhs_leftover, True
+    )
+    rhs_split = split_shape(
+        rhs_val, slots_r, [p.rhs for p in pairs], rhs_leftover, False
+    )
     perm_l, perm_r = _contraction_perms(N)
     perm_l.extend(range(4 * N, len(lhs_split)))
     perm_r.extend(range(4 * N, len(rhs_split)))
@@ -757,8 +868,16 @@ def _prepare_contraction_views(
     rhs_merged = (
         rhs_meta + split_r + [p.rhs.shared_block_len for p in pairs] + rhs_leftover
     )
-    lhs_view = _as_shape(lhs_view, lhs_merged, mode="reshape")
-    rhs_view = _as_shape(rhs_view, rhs_merged, mode="reshape")
+    # The merge from the 4N split layout down to the 3N slot layout is a reshape
+    # that always happens, so the compact slot layout costs nothing extra: give
+    # the reshape the compact target and the unit slots are never built.
+    keep_ml, keep_mr = _merged_keep(N, pairs, lhs_merged, rhs_merged)
+    lhs_view = _as_shape(
+        lhs_view, [d for d, k in zip(lhs_merged, keep_ml) if k], mode="reshape"
+    )
+    rhs_view = _as_shape(
+        rhs_view, [d for d, k in zip(rhs_merged, keep_mr) if k], mode="reshape"
+    )
     lhs_bc, rhs_bc = [], []
     for i, p in enumerate(pairs):
         lhs_bc.extend(
@@ -771,7 +890,17 @@ def _prepare_contraction_views(
                 p.rhs.shared_block_len,
             ]
         )
-    return lhs_view, rhs_view, lhs_bc, rhs_bc
+    frame = _FrameOperands(
+        lhs_view,
+        rhs_view,
+        lhs_merged,
+        rhs_merged,
+        keep_ml,
+        keep_mr,
+        lhs_leftover,
+        rhs_leftover,
+    )
+    return frame, lhs_bc, rhs_bc
 
 
 def _tiled_index(p, gcd_len, lcm_len):
@@ -838,7 +967,13 @@ def _reduce_grid(res_view, pairs, shared, total, lhs_block_lens, rhs_block_lens)
 def _frame_sublists(N, pairs, lhs_shape, rhs_shape, n_ll, n_rl):
     """Integer sublists for the frame contraction, plus the output order.
 
-    The prepared operands have a fixed slot layout, three slots per pair:
+    Called on the NOMINAL slot layout — three slots per pair — which is the only
+    layout the labels are defined on. The operands themselves build only the
+    slots that carry data (``_merged_keep``), and ``_frame_contract`` drops the
+    rest from the two lists it gets back. ``out_sub`` is unaffected: every label
+    it carries is built by at least one operand.
+
+    The nominal layout is:
 
       lhs  ``[meta_i] + [lhs block_i] + [split_i] + lhs leftover``
       rhs  ``[meta_i] + [split_i] + [rhs shared block_i] + rhs leftover``
@@ -905,12 +1040,24 @@ def _frame_sublists(N, pairs, lhs_shape, rhs_shape, n_ll, n_rl):
     return lhs_sub, rhs_sub, out_sub
 
 
-def _frame_contract(a, b, pairs, n_ll, n_rl):
-    """The one emission site of the tiled frame contraction: ONE einsum."""
+def _frame_contract(frame: "_FrameOperands", pairs):
+    """The one emission site of the tiled frame contraction: ONE einsum.
+
+    The labels are assigned on the NOMINAL slot layout, the only layout they are
+    defined on, and then the slots the operands do not build (see
+    ``_merged_keep``) are dropped from the two label lists. ``out_sub`` is
+    untouched: every label it carries is built by at least one operand."""
     lhs_sub, rhs_sub, out_sub = _frame_sublists(
-        len(pairs), pairs, a.shape, b.shape, n_ll, n_rl
+        len(pairs),
+        pairs,
+        frame.lhs_shape,
+        frame.rhs_shape,
+        len(frame.lhs_leftover),
+        len(frame.rhs_leftover),
     )
-    return _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub)
+    lhs_sub = [s for s, k in zip(lhs_sub, frame.keep_l) if k]
+    rhs_sub = [s for s, k in zip(rhs_sub, frame.keep_r) if k]
+    return _emit_einsum(frame.lhs, lhs_sub, frame.rhs, rhs_sub, out_sub)
 
 
 def _final_grid(N, shared, lhs_bc, rhs_bc, lhs_block_lens, rhs_block_lens):
@@ -1027,15 +1174,15 @@ _LAZY_PAIRINGS = frozenset(
 )
 
 
-def _slot_phys(val, i):
+def _slot_phys(val, slots, i):
     return (
-        int(val.shape[3 * i]),
-        int(val.shape[3 * i + 1]),
-        int(val.shape[3 * i + 2]),
+        _slot_len(val, slots, 3 * i),
+        _slot_len(val, slots, 3 * i + 1),
+        _slot_len(val, slots, 3 * i + 2),
     )
 
 
-def _lazy_frame(lhs_val, rhs_val, pairs):
+def _lazy_frame(lhs_val, rhs_val, pairs, slots_l, slots_r):
     """Shrink every frame slot that neither operand stores.
 
     Returns ``(pairs_eff, lazy, demote)``.
@@ -1067,8 +1214,8 @@ def _lazy_frame(lhs_val, rhs_val, pairs):
     it — so the demotion is now unconditional."""
     eff, lazy, demote = [], [], []
     for i, p in enumerate(pairs):
-        lo_p, lb_p, ls_p = _slot_phys(lhs_val, i)
-        ro_p, rb_p, rs_p = _slot_phys(rhs_val, i)
+        lo_p, lb_p, ls_p = _slot_phys(lhs_val, slots_l, i)
+        ro_p, rb_p, rs_p = _slot_phys(rhs_val, slots_r, i)
         l, r = p.lhs, p.rhs
         ol, orr = int(l.outer_len), int(r.outer_len)
         T, G = math.lcm(ol, orr), math.gcd(ol, orr)
@@ -1129,10 +1276,12 @@ def _lazy_frame(lhs_val, rhs_val, pairs):
     return eff, lazy, demote
 
 
-def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
+def _execute_block_sparse_contraction(
+    lhs_val, rhs_val, pairs, ctx: "Ctx", slots_l, slots_r
+):
     N = len(pairs)
     true_pairs = pairs
-    pairs, lazy, demote = _lazy_frame(lhs_val, rhs_val, pairs)
+    pairs, lazy, demote = _lazy_frame(lhs_val, rhs_val, pairs, slots_l, slots_r)
     # ``frame_changed`` means the OUTPUT geometry moved, so the band probes
     # (which read that geometry) sit this one out. A demotion or a summed
     # contracted axis leaves the geometry alone and only changes the buffers.
@@ -1160,8 +1309,8 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
     for i, p in enumerate(pairs):
         if p.pairing_type != "contract" or split[i] <= 1:
             continue
-        st_l = int(lhs_val.shape[3 * i + 2]) != 1
-        st_r = int(rhs_val.shape[3 * i + 1]) != 1
+        st_l = _slot_len(lhs_val, slots_l, 3 * i + 2) != 1
+        st_r = _slot_len(rhs_val, slots_r, 3 * i + 1) != 1
         if st_l and not st_r:
             keep_sr[i] = False
         elif st_r and not st_l:
@@ -1169,13 +1318,15 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
         elif not st_l and not st_r:
             keep_sl[i] = keep_sr[i] = False
             split_fold *= split[i]
-    lhs_view, rhs_view, lhs_bc, rhs_bc = _prepare_contraction_views(
+    frame, lhs_bc, rhs_bc = _prepare_contraction_views(
         lhs_val,
         rhs_val,
         pairs,
         shared,
         total,
         split,
+        slots_l,
+        slots_r,
         keep_l=[d != "l" for d in demote],
         keep_r=[d != "r" for d in demote],
         keep_sl=keep_sl,
@@ -1184,13 +1335,11 @@ def _execute_block_sparse_contraction(lhs_val, rhs_val, pairs, ctx: "Ctx"):
     if split_fold != 1:
         scalar *= float(split_fold)
         is_lazy = True
-    lhs_leftover = list(lhs_view.shape[3 * N :])
-    rhs_leftover = list(rhs_view.shape[3 * N :])
+    lhs_leftover = frame.lhs_leftover
+    rhs_leftover = frame.rhs_leftover
     # ONE einsum, straight into the canonical output order. No broadcast to
     # line the operands up, no squeeze of a demoted twin, no transpose back.
-    res_raw = _frame_contract(
-        lhs_view, rhs_view, pairs, len(lhs_leftover), len(rhs_leftover)
-    )
+    res_raw = _frame_contract(frame, pairs)
     grid, final_lhs_lens, final_rhs_lens = _finalize_output(
         N,
         res_raw,
@@ -2120,9 +2269,13 @@ def _execute_tiled(ctx, rhs_dims):
     bail on, including LCM-mismatched outer sizes, spatial sparse pairs,
     and broadcast / unmaterialized val axes."""
     lhs_val, rhs_val = _val_or_one(ctx.lhs), _val_or_one(ctx.rhs)
-    lhs_val, rhs_val = _prepare_physical_arrays(lhs_val, rhs_val, ctx.pairs)
+    lhs_val, rhs_val, slots_l, slots_r = _prepare_physical_arrays(
+        lhs_val, rhs_val, ctx.pairs
+    )
     grid, shared, lhs_lens, rhs_lens, scalar, lazy_info = (
-        _execute_block_sparse_contraction(lhs_val, rhs_val, ctx.pairs, ctx)
+        _execute_block_sparse_contraction(
+            lhs_val, rhs_val, ctx.pairs, ctx, slots_l, slots_r
+        )
     )
     res = CRes(
         grid=grid,
