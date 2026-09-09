@@ -16,7 +16,7 @@ MEASURED (2026-09-09, probe ``t93_nominal.py``; nn256 =
 ``VmappedNeuralNetwork``/mnist and TLM = ``TransformerLM``/wikitext at the
 campaign shapes, minimum-Markowitz order, THREE random ``Diag`` + THREE
 ``Compress`` + THREE ``Quant`` per sample on distinct vertices and faces;
-100 nn256 samples and 26 TLM samples, every stored edge censused by wrapping
+70 nn256 samples and 26 TLM samples, every stored edge censused by wrapping
 ``core._set_inner``):
 
   * class (c) -- genuinely different extents, or a different rank -- NEVER
@@ -280,9 +280,10 @@ def _store_census(monkeypatch, face_transforms=None, order="rev"):
         return orig(outer, k1, k2, v)
 
     monkeypatch.setattr(gxcore, "_set_inner", _wrapped)
-    jax.block_until_ready(
-        jax.jit(jacve(_mlp_batch_xent, order, argnums=_ARGNUMS,
-                      face_transforms=face_transforms))(*_ARGS))
+    # Every edge is stored while the elimination is TRACED, so tracing is
+    # enough -- no XLA compile per census (the sweep below runs one per face).
+    jax.make_jaxpr(jacve(_mlp_batch_xent, order, argnums=_ARGNUMS,
+                         face_transforms=face_transforms))(*_ARGS)
     return recs
 
 
@@ -293,9 +294,10 @@ def _counts(recs):
     return out
 
 
-def _first_face(order_name="rev"):
-    """``(vertex, face_key)`` for the FIRST vertex of the order, whose faces
-    are enumerable on the untouched graph.
+def _all_faces(order_name="rev"):
+    """Every ``(vertex, face_key)`` of the order, enumerated the way the env
+    does: on a replay that has already eliminated the earlier vertices, since
+    a face key is only valid on the graph its vertex is eliminated from.
 
     ``jacve`` inlines call primitives before it eliminates, so the vertex
     numbering a face key is built against has to come from the INLINED jaxpr
@@ -303,12 +305,14 @@ def _first_face(order_name="rev"):
     """
     closed = jax.make_jaxpr(_mlp_batch_xent)(*_ARGS)
     jaxpr, consts = inline_call_primitives(closed.jaxpr, closed.literals)
-    consts = list(consts)
     order = _checkify_order(order_name, jaxpr, set())
-    ij = IncrementalJaxpr(jaxpr, tuple(_ARGNUMS), consts, list(_ARGS))
-    v = int(order[0])
-    keys = faces_of(ij.graph, ij.tgraph, v, jaxpr)
-    return v, keys[0]
+    ij = IncrementalJaxpr(jaxpr, tuple(_ARGNUMS), list(consts), list(_ARGS))
+    out = []
+    for v in order:
+        v = int(v)
+        out += [(v, k) for k in faces_of(ij.graph, ij.tgraph, v, jaxpr)]
+        ij.eliminate(v, (), None)
+    return out
 
 
 def _pick_diag(shape):
@@ -367,29 +371,41 @@ def test_approximation_does_not_change_the_stored_shape_census(
     ``Diag`` re-factors meta against block, ``Quant`` moves only the dtype. So
     the exact-AD census and the armed census of the SAME elimination order
     must agree class for class.
+
+    Swept over EVERY face of the model, all three slots (``lhs``/``rhs``/
+    ``res``) hooked, and checked at every face where the approximation
+    actually landed -- a face that declines it proves nothing.
     """
     exact = _counts(_store_census(monkeypatch))
 
-    v, key = _first_face()
-    log = []
-    ft = {v: {key: (None, None, _best_effort(action, log))}}
-    armed = _counts(_store_census(monkeypatch, face_transforms=ft))
+    landed = 0
+    for v, key in _all_faces():
+        log = []
+        hook = _best_effort(action, log)
+        ft = {v: {key: (hook, hook, hook)}}
+        armed = _counts(_store_census(monkeypatch, face_transforms=ft))
+        if not any(e[0] == "applied" for e in log):
+            continue
+        landed += 1
+        assert armed == exact, (
+            f"{action!r} on face {key} of vertex {v} moved the stored-edge "
+            f"census: exact {exact} -> armed {armed}  (hook log {log})")
 
-    assert any(e[0] == "applied" for e in log), (
-        f"{action!r} never landed on the face -- the armed run approximated "
-        f"nothing, so this comparison would be vacuous. log={log}")
-    assert armed == exact, (
-        f"{action!r} moved the stored-edge census: exact {exact} -> armed "
-        f"{armed}")
+    assert landed, (
+        f"{action!r} never landed on ANY of the {len(_all_faces())} faces -- "
+        f"the sweep approximated nothing, so it would be vacuous")
 
 
 def test_no_stored_edge_ever_loses_an_extent(monkeypatch):
     """Class (c) is the serious bug -- an approximation dropping metadata.
     It was never observed on either campaign target, exact or armed."""
-    v, key = _first_face()
-    log = []
-    ft = {v: {key: (None, None, _best_effort(Quant(dtype="bfloat16"), log))}}
-    for transforms in (None, ft):
+    fts = [None]
+    for v, key in _all_faces():
+        for act in (Quant(dtype="bfloat16"), Compress(axes=(0,), kind="mean"),
+                    "diag"):
+            hook = _best_effort(act, [])
+            fts.append({v: {key: (hook, hook, hook)}})
+    for transforms in fts:
         recs = _store_census(monkeypatch, face_transforms=transforms)
         bad = [r for r in recs if r[0] == "c"]
         assert not bad, f"class (c) stored edge(s): {bad}"
