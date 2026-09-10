@@ -29,9 +29,14 @@ WHAT IS *NOT* CLAIMED
 =====================
 Nothing here says the engine is dot-free. ``contract_B_B`` / ``contract_D_B``
 and the matmul kernels SHOULD emit dots: they contract. The claim is narrower
-and is the one that matters: a refactoring of a block-diagonal axis is a
-permutation of stored numbers plus structural zeros, so its cost is a copy and
-its arithmetic is exact.
+and is the one that matters: a refactoring of a block-diagonal axis MOVES stored
+numbers (and, when refining, DROPS the ones off the finer diagonal). It never
+combines two numbers into one, so its cost is a copy and its arithmetic is exact
+-- which is why a dot has no business appearing in it.
+
+Note the two directions are not symmetric, and the value tests below say so:
+coarsening preserves the dense form bit for bit, subdividing masks it. Getting
+that backwards was this file's own first mistake.
 """
 import unittest
 
@@ -143,18 +148,52 @@ class TestNoDataMovementDot(unittest.TestCase):
 
         self._assert_dot_free(rebuild, t.val, "_coarsen_coupled_blockdiag")
 
-    # The exactness claim the dot-freedom buys, asserted directly: refactoring
-    # is a permutation of stored numbers, so the dense form is BIT-identical,
-    # not merely close. This is the assertion a widened tolerance would destroy.
-    def test_subdivide_is_bit_identical_in_the_dense_form(self):
+    # The exactness claim the dot-freedom buys, asserted directly. Note the two
+    # directions have DIFFERENT contracts, and conflating them is easy:
+    #
+    #   * COARSENING is lossless. A coarser meta block holds its finer blocks on
+    #     the sub-diagonal and the new off-sub-diagonal positions are EXPLICIT
+    #     stored zeros, so the dense form is unchanged, bit for bit.
+    #   * SUBDIVIDING is a REFINEMENT. It imposes a FINER block-diagonal mask, so
+    #     entries off the finer diagonal are dropped. The dense form is NOT
+    #     preserved -- MEASURED max diff 4.55 on the tensor below, which is the
+    #     mask doing its job, not an error. The contract (per the docstring) is
+    #     that it equals the dense form MASKED to ``factor`` blocks, byte for
+    #     byte -- no arithmetic, so no rounding.
+    #
+    # Asserting bit-identity of the dense form for BOTH was this file's own first
+    # mistake; the subdivide oracle below is the correct statement.
+    def test_subdivide_equals_the_masked_dense_form_exactly(self):
         t = _block2()
-        before = np.asarray(t.dense())
+        before = np.asarray(t.dense())          # (N*b1, 10, N*b2, extra)
+        factor = 4
         out = _subdivide_coupled_blockdiag(
-            t, True, 0, t.out_dims[0], False, 0, t.primal_dims[0], 4)
+            t, True, 0, t.out_dims[0], False, 0, t.primal_dims[0], factor)
         after = np.asarray(out.dense())
-        self.assertEqual(np.abs(before - after).max(), 0.0)
+        self.assertEqual(after.shape, before.shape)
+
+        # Keep [i, :, j, :] iff i and j land in the same one of ``factor``
+        # meta-diagonal blocks. The refinement is a subset of the mask the
+        # tensor already carried, so this only ever removes.
+        rows, cols = before.shape[0], before.shape[2]
+        i = np.arange(rows)[:, None]
+        j = np.arange(cols)[None, :]
+        keep = (i // (rows // factor)) == (j // (cols // factor))
+        oracle = before * keep[:, None, :, None]
+
+        self.assertEqual(np.abs(after - oracle).max(), 0.0,
+                         "subdivide must equal the dense form masked to "
+                         "`factor` meta-diagonal blocks, EXACTLY -- any nonzero "
+                         "difference means the refinement did arithmetic")
+        # And it really did drop something, so the oracle is not trivially equal.
+        self.assertGreater(np.abs(before - after).max(), 0.0)
 
     def test_coarsen_is_bit_identical_in_the_dense_form(self):
+        """Coarsening only ADDS explicit zeros, so the dense form is untouched.
+
+        (``coarsen_blockdiag_test.py`` covers this more widely; it is repeated
+        here as the contrast that makes the subdivide contract above readable.)
+        """
         t = _diag16()
         before = np.asarray(t.dense())
         out = _coarsen_coupled_blockdiag(
