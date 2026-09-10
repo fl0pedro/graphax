@@ -64,6 +64,8 @@ __all__ = [
     "structural_ones",
     "structural_zero",
     "unify_containers",
+    "pairing_of",
+    "loosen_to_pairing",
     "support_projection_rules",
     "project_onto_support",
     "reconcile_addends",
@@ -191,6 +193,69 @@ def unify_containers(a, b):
 
 # --- projecting one addend onto the other's support -------------------------
 
+def pairing_of(st) -> dict:
+    """dim id -> the partner id it is stored DIAGONALLY with, or ``None``.
+
+    A dim can be diagonal with AT MOST ONE partner -- that is what
+    :func:`~graphax.sparse.micro_actions.apply_diag` enforces, and the reason a
+    coercion cannot simply request the target's pairing: re-pairing an already
+    paired dim raises ``Diag pair conflict``.
+    """
+    return {int(d.id): (None if d.other_id is None else int(d.other_id))
+            for d in st.dims}
+
+
+def loosen_to_pairing(st, target):
+    """``st`` re-laid-out so no dim is paired with a partner ``target`` does not
+    pair it with. LOSSLESS -- it only ever WIDENS the container.
+
+    THE STEP THAT WAS MISSING, and the measurement that found it: on TLM the
+    fresh contraction and the old edge routinely pair DIFFERENT dims of the same
+    Jacobian block -- the fresh one couples ``(out1, primal3)`` while the old
+    one couples ``(out0, primal2)``. Asking ``apply_diag`` for the target's pair
+    then raises ``Diag pair conflict: logical index 2 is already paired``
+    (3 of 13 merge faces, measured). A dim must be FREED before it can be
+    re-paired, and freeing is a lossless widening with no micro-action of its
+    own.
+
+    Implemented as one union add against a structural zero whose dims carry
+    ``target``'s pairing and nothing else: the union of a diagonal pair with an
+    unpaired dim is the unpaired dim (meta ``gcd(K, 1) = 1``), so exactly the
+    pairs ``target`` does not want are broken, and the pairs it does want are
+    left for the ``Diag`` rules below to create. Every extent is IMPLICIT, so
+    the zero costs one scalar and the add does no real work where nothing
+    widens.
+    """
+    from graphax.sparse.indexes import DenseIndex, DiagonalIndex
+    from graphax.sparse.tensor import SparseTensor
+
+    t_pair = pairing_of(target)
+    s_pair = pairing_of(st)
+    if all(s_pair.get(i) in (None, t_pair.get(i)) for i in s_pair):
+        return st                      # nothing is mis-paired: no work
+    t_by = {int(d.id): d for d in target.dims}
+
+    def _mk(d):
+        i = int(d.id)
+        o = t_pair.get(i)
+        n = int(d.logical_size)
+        if o is None or o not in t_by:
+            return DenseIndex(i, n, None)
+        td = t_by[i]
+        blk = td.block_size
+        # keep the target's meta/block split so the zero does not ALSO widen a
+        # pair the target wants finer than `st` has it.
+        return DiagonalIndex(i, int(td.size), None, o,
+                             None if blk is None else int(blk), None)
+
+    dt = st.dtype
+    z = SparseTensor(tuple(_mk(d) for d in st.out_dims),
+                     tuple(_mk(d) for d in st.primal_dims),
+                     None, scalar_mult=jnp.zeros((), dt), fill_value=None,
+                     check_consistency=False)
+    return st + z
+
+
 def support_projection_rules(src, target) -> tuple:
     """The micro-actions that make ``src``'s support fit inside ``target``'s.
 
@@ -211,6 +276,11 @@ def support_projection_rules(src, target) -> tuple:
     ``target``'s along that dim, and :func:`unify_containers` lifts it the rest
     of the way without losing anything.
 
+    CALL IT ON A LOOSENED ``src`` (:func:`loosen_to_pairing`). A ``Diag`` on a
+    dim that is already paired with a different partner RAISES, so the pairing
+    must be freed first; this function reports the rules for the layout it is
+    given and does not silently drop a pair it cannot create.
+
     This is a SUPPORT question, so it is deliberately silent about an
     implicit dim on the ``src`` side: implicitness is a uniform-VALUE
     restriction, not a smaller support.
@@ -219,6 +289,7 @@ def support_projection_rules(src, target) -> tuple:
 
     s_by, t_by = _dims_by_id(src), _dims_by_id(target)
     pos = _logical_pos(src)
+    s_pair = pairing_of(src)
     rules: list = []
     used: set[int] = set()
 
@@ -235,8 +306,12 @@ def support_projection_rules(src, target) -> tuple:
         sd, so = s_by.get(tid), s_by.get(oid)
         if sd is None or so is None:
             continue
-        src_meta = int(sd.size) if (sd.is_sparse
-                                    and int(sd.other_id or -1) == oid) else 1
+        # A dim already paired with a DIFFERENT partner cannot be re-paired;
+        # `loosen_to_pairing` is what removes that case, and if it is still
+        # here the rule is not emitted rather than raising inside apply_diag.
+        if s_pair.get(tid) not in (None, oid) or s_pair.get(oid) not in (None, tid):
+            continue
+        src_meta = int(sd.size) if s_pair.get(tid) == oid else 1
         tgt_meta = int(td.size)
         if tgt_meta <= src_meta:
             continue                      # src already at least as fine
@@ -259,39 +334,46 @@ def support_projection_rules(src, target) -> tuple:
         sd = s_by.get(tid)
         if sd is None:
             continue
-        p = pos.get(tid)
-        if p is None or p in used:
+        pp = pos.get(tid)
+        if pp is None or pp in used:
             continue
         if td.axis is None and sd.axis is not None and int(sd.size) > 1:
             rules.append(Compress(axes=(int(sd.axis),), kind="mean"))
-            used.add(p)
+            used.add(pp)
     return tuple(rules)
 
 
 def project_onto_support(src, target):
     """``src`` restricted to ``target``'s support, values otherwise untouched.
 
-    Two steps, both existing machinery:
+    Three steps, all existing machinery:
 
-    1. the :func:`support_projection_rules` micro-actions, which are the only
-       way to reach ``target``'s IMPLICIT dims and its finer meta blocks from
-       ``src``'s layout;
-    2. ``elementwise(src, structural_ones(target), multiply,
+    1. :func:`loosen_to_pairing` -- free any dim ``src`` pairs with a partner
+       ``target`` does not. Lossless, and required: ``apply_diag`` refuses to
+       re-pair an already paired dim.
+    2. the :func:`support_projection_rules` micro-actions, which are the only
+       way to reach ``target``'s IMPLICIT dims and its finer meta blocks.
+    3. ``elementwise(src, structural_ones(target), multiply,
        is_intersection=True)`` -- the INTERSECTION container rule, which
        zeroes everything outside ``target``'s support and demotes the result to
        the narrower of the two containers.
 
-    Step 2 does the support arithmetic; step 1 exists because a multiply cannot
+    Step 3 does the support arithmetic; step 2 exists because a multiply cannot
     make a spelled-out dim uniform (an implicit dim has FULL support -- it is
     a value restriction, not a support one) nor subdivide a block.
+
+    Returns ``(projected, rules)``; ``rules`` is where the information was
+    actually lost.
     """
     from graphax.sparse.micro_actions import apply_micro_actions
     from graphax.sparse.ops.elementwise import elementwise
 
-    src = apply_micro_actions(src, support_projection_rules(src, target))
+    src = loosen_to_pairing(src, target)
+    rules = support_projection_rules(src, target)
+    src = apply_micro_actions(src, rules)
     ind = structural_ones(target, src.dtype)
     out = elementwise(src, ind, jnp.multiply, is_intersection=True)
-    return src if out is None else out
+    return (src if out is None else out), rules
 
 
 # --- the policies -----------------------------------------------------------
@@ -339,9 +421,18 @@ def reconcile_addends(fresh, old, mode: str):
         raise ValueError(
             f"reconcile_addends: unknown join mode {mode!r}; expected "
             "'lossless' or 'lossy'.")
-    want = container_of(fresh)
-    rules = support_projection_rules(old, fresh)
-    old_p = project_onto_support(old, fresh)
+    # THE TARGET IS ``fresh``'s CANONICAL container, not ``fresh``'s literal
+    # one. Every path out of this function ends in `unify_containers`, which
+    # rebuilds the result's physical axes canonically from the left operand's
+    # dim order, so a `fresh` that happens to be stored non-canonically (an
+    # out dim on a later axis than a primal dim, say) can never be returned
+    # byte-for-byte. Comparing against the literal container would report
+    # "wider than target" for a reconciliation that in fact landed exactly on
+    # the head's chosen structure -- measured: 0 of 10 "matched" before this
+    # was fixed, with the addends nonetheless identical and the error at
+    # float noise.
+    want = container_of(unify_containers(fresh, fresh)[0])
+    old_p, rules = project_onto_support(old, fresh)
     f2, o2 = unify_containers(fresh, old_p)
     got = container_of(f2)
     return f2, o2, JoinOutcome(mode, got, want, got == want, rules)
