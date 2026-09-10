@@ -48,8 +48,19 @@ CPU while reporting itself green on the GPU, for an unknown number of runs
 backend, not away from a test that must NOT have it -- and it leaks into
 anything that imports the suite.
 
-The autouse fixture below is equivalent where the pin is wanted and scoped
-everywhere else:
+The replacement is two scoped context managers, which together cover exactly
+what the global write covered:
+
+* ``pytest_collection`` wraps the COLLECTION phase. Several modules build a
+  numerical reference at import time -- ``dense_edges_test.REF`` is a
+  ``jax.grad`` evaluated while the module is being collected -- and a reference
+  computed at one precision cannot be compared against a test body run at
+  another. MEASURED: with the per-test fixture alone, the three
+  ``dense_edges_test.py::test_the_exact_plan_equals_jax_grad`` cases fail at
+  ~3e-4 against TOL_EXACT=1e-5, purely from that mismatch. The context unwinds
+  when collection ends, so nothing is left set.
+
+* an autouse fixture wraps each TEST CALL, which is where the pin is scoped:
 
 * ON GPU ONLY. On a CPU (and on any backend with no tensor-core dot) an f32
   ``dot_general`` is already f32-accurate, so the pin buys nothing and the
@@ -127,6 +138,26 @@ def _backend_needs_the_pin() -> bool:
         # No backend yet / a backend that failed to initialise. Either way there
         # is nothing to pin, and a conftest must not be the thing that raises.
         return False
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_collection(session):
+    """Pin ``highest`` for the COLLECTION phase, on GPU.
+
+    A test module that evaluates a numerical reference at import time (the
+    ``jax.grad`` behind ``dense_edges_test.REF``) must compute it at the same
+    precision its test bodies run at. This is a wrapper, not a config write: the
+    setting is unwound as soon as collection finishes.
+
+    It applies regardless of the ``device_matmul_precision`` marker, because a
+    marker is a per-test fact and collection is not per-test. That is the right
+    way round anyway -- an opted-out test wants its ENGINE on the device's
+    arithmetic, not its ground truth degraded.
+    """
+    if not _backend_needs_the_pin():
+        return (yield)
+    with jax.default_matmul_precision("highest"):
+        return (yield)
 
 
 @pytest.fixture(autouse=True)

@@ -270,13 +270,24 @@ def test_a_rank_zero_edge_keeps_rank_zero_through_the_adapter():
 
 
 # ---------------------------------------------------------------------------
-# The Quant tests opt OUT of the suite's GPU "highest" matmul pin
-# (``tests/conftest.py``). Their subject IS a numeric approximation, so the
-# arithmetic they measure it on must be the device's own -- QUANT_MARGIN below
-# was measured that way. The pin does NOT undo a Quant (measured 2026-09-10: a
-# bf16 operand's 1.66e-3 survives ``highest`` intact, which only strips the
-# 2.1e-4 of TF32 noise riding on it), so this marker is about keeping the two
-# quantities unconfusable, not about making anything pass.
+# The tests whose ASSERTION IS THE SIZE OF A bfloat16 APPROXIMATION opt out of
+# the suite's GPU "highest" matmul pin (``tests/conftest.py``): the arithmetic a
+# narrow dtype's cost is measured on has to be the device's own, and
+# QUANT_MARGIN below was measured that way.
+#
+# The marker is deliberately NOT on every test that merely mentions a Quant.
+# ``test_quant_keeps_the_narrow_dtype_only_when_both_operands_are_narrow``
+# asserts dtypes, and ``test_the_census_survives_the_two_op_face_form`` asserts
+# a CENSUS -- its value comparison is a sanity check on one face and sits within
+# 2% of its own bound (1.289e-3 against 1.264e-3), so it needs the accurate dot
+# like every other comparison in the suite.
+#
+# The marker does NOT make anything pass, and it is not what these tests were
+# failing on. MEASURED 2026-09-10: the pin does not undo a Quant -- a bf16
+# operand's 1.66e-3 survives ``highest`` intact, which strips only the 2.1e-4 of
+# TF32 noise riding on it -- and every number below is byte-identical pinned and
+# unpinned. What removes the approximation is XLA:GPU's optimizer deleting the
+# dense engine's bf16 casts under jit; see the note in tests/conftest.py.
 # ---------------------------------------------------------------------------
 DEVICE_PRECISION = pytest.mark.device_matmul_precision
 
@@ -461,7 +472,6 @@ def test_the_quant_tolerance_is_the_measured_bound():
                     "this machine, so the bound is untested here")
 
 
-@DEVICE_PRECISION
 def test_quant_keeps_the_narrow_dtype_only_when_both_operands_are_narrow():
     """The ruling of 2026-09-06: the engine never narrows or widens on its own,
     and a contraction of two narrow operands stays narrow."""
@@ -530,7 +540,6 @@ def test_the_census_matches_for_a_literal_plan_and_the_values_are_compared():
     assert _rel(dn, sp) <= TOL_EXACT
 
 
-@DEVICE_PRECISION
 def test_the_census_survives_the_two_op_face_form():
     """``((lhs, rhs, new), (jl, jr, jres))`` is wrapped slot by slot, so a
     two-op plan is censused exactly like its flat equivalent."""
