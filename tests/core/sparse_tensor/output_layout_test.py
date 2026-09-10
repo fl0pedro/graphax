@@ -27,7 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from graphax import faces_of, jacve
+from graphax import SKIP_FACE, faces_of, jacve
 from graphax.incremental import IncrementalJaxpr
 from graphax.sparse.micro_actions import quant, compress
 from graphax.sparse.ops.output_layout import is_parameter_layout
@@ -98,6 +98,10 @@ def _plans(order):
         "exact": None,
         "quant_lhs": {v0: {key0: (quant("bfloat16"), None, None)}},
         "compress_lhs": {v0: {key0: (compress("mean", 0), None, None)}},
+        # The most aggressive thing a face can carry: the whole contraction is
+        # dropped. Needed here because it is the one class that can leave a
+        # gradient with NO tensor at all (dsnn-3qm.72).
+        "skip_face": {v0: {key0: SKIP_FACE}},
     }
 
 
@@ -167,6 +171,45 @@ def test_approximated_sparse_equals_its_dense_return_form(order_name, plan):
     for a, b in zip(sp, dn):
         assert a.shape == b.shape
         np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("order_name", sorted(ORDERS))
+@pytest.mark.parametrize("plan", ["exact", "quant_lhs", "compress_lhs",
+                                  "skip_face"])
+def test_the_logical_gradient_is_recoverable_for_every_plan_class(
+        order_name, plan):
+    """THE ONLY COMPARISON A CONSUMER MAY MAKE (ticket dsnn-3qm.72).
+
+    ``test_exact_and_approximated_share_one_structure`` above covers exact and
+    quant only, and that is not an oversight: a Compress changes ``val``'s rank
+    and a SKIP_FACE can leave a gradient with no tensor at all, so the sparse
+    return's PYTREE STRUCTURE is not a function of the logical tensor and a
+    consumer cannot ``tree_map`` the pair. Measured on nn256/mnist with twelve
+    random per-face plans per order: the structures differed in 1 of 12 plans
+    on fwd and 11 of 12 on rev once SKIP_FACE was in the family, and comparing
+    the raw pytree CHILDREN scored 11 of those 12 plans at the worst possible
+    quality while their true grad-cosines ran up to 0.965.
+
+    What IS guaranteed, and what the reward path must therefore use, is this:
+    the LOGICAL tensor is always recoverable and always matches the dense
+    return form -- for every class, including the two that break the
+    structure. ``None`` means a structurally zero gradient, the same thing the
+    dense branch spells ``zeros_like``."""
+    order = ORDERS[order_name]
+    ft = _plans(order)[plan]
+    sp = _run(order, ft, True)
+    dn = _run(order, ft, False)
+    assert len(sp) == len(dn) == len(ARGNUMS)
+    for t, d in zip(sp, dn):
+        ref = np.asarray(d, np.float64)
+        if t is None:
+            # the sparse branch's spelling of a structurally zero gradient
+            got = np.zeros_like(ref)
+        else:
+            assert isinstance(t, SparseTensor)
+            got = np.asarray(t.dense(), np.float64)
+        assert got.shape == ref.shape, (order_name, plan, got.shape, ref.shape)
+        np.testing.assert_allclose(got, ref, rtol=1e-5, atol=1e-6)
 
 
 def test_a_diagonal_pair_output_passes_the_contract():
