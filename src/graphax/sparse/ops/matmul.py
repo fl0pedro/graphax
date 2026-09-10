@@ -1640,8 +1640,11 @@ def _build_output_tensor(ctx, rhs_dims, res):
         out_dims, primal_dims = update(out_dims), update(primal_dims)
     else:
         values = grid_view
-    final_out = tuple(sorted(out_dims, key=lambda d: d.id))
-    final_primal = tuple(sorted(primal_dims, key=lambda d: d.id))
+    lhs_order = {d.id: i for i, d in enumerate(ctx.lhs.out_dims)}
+    final_out = tuple(sorted(out_dims, key=lambda d: lhs_order.get(d.id, 999)))
+    rhs_primal_dims = rhs_dims[len(getattr(ctx.rhs, "out_dims", ())):]
+    rhs_order = {d.id: i for i, d in enumerate(rhs_primal_dims)}
+    final_primal = tuple(sorted(primal_dims, key=lambda d: rhs_order.get(d.id, 999)))
     id_map = {d.id: i for i, d in enumerate(final_out + final_primal)}
 
     def finalize(d, new_id):
@@ -2248,8 +2251,11 @@ def _output_dims(ctx, rhs_dims, res):
             ]
 
         out_dims, primal_dims = update(out_dims), update(primal_dims)
-    final_out = tuple(sorted(out_dims, key=lambda d: d.id))
-    final_primal = tuple(sorted(primal_dims, key=lambda d: d.id))
+    lhs_order = {d.id: i for i, d in enumerate(ctx.lhs.out_dims)}
+    final_out = tuple(sorted(out_dims, key=lambda d: lhs_order.get(d.id, 999)))
+    rhs_primal_dims = rhs_dims[len(getattr(ctx.rhs, "out_dims", ())):]
+    rhs_order = {d.id: i for i, d in enumerate(rhs_primal_dims)}
+    final_primal = tuple(sorted(primal_dims, key=lambda d: rhs_order.get(d.id, 999)))
     id_map = {d.id: i for i, d in enumerate(final_out + final_primal)}
 
     def finalize(d, new_id):
@@ -2293,7 +2299,10 @@ def _execute_tiled(ctx, rhs_dims):
             true_lhs_block_lens=t_fll,
             true_rhs_block_lens=t_frl,
         )
-    return _build_output_tensor(ctx, rhs_dims, res)
+    out = _build_output_tensor(ctx, rhs_dims, res)
+    assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in ctx.lhs.out_dims)
+    assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in ctx.rhs.primal_dims)
+    return out
 
 
 
@@ -2441,6 +2450,10 @@ def matmul(lhs, rhs, count: bool = False):
     _folded = _fold_both_implicit(lhs, rhs, count)
     if _folded is not None:
         _record_path("both_implicit_fold")
+        _out = _folded[0] if count else _folded
+        if hasattr(_out, "out_dims") and hasattr(lhs, "out_dims") and hasattr(rhs, "primal_dims"):
+            assert tuple(d.logical_size for d in _out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+            assert tuple(d.logical_size for d in _out.primal_dims) == tuple(d.logical_size for d in rhs.primal_dims)
         return _folded
 
     from graphax.sparse.elemental.dispatch import try_elemental_matmul
@@ -2448,6 +2461,10 @@ def matmul(lhs, rhs, count: bool = False):
     _elem = try_elemental_matmul(lhs, rhs, count=count)
     if _elem is not None:
         _record_path("elemental")
+        _out = _elem[0] if count else _elem
+        if hasattr(_out, "out_dims") and hasattr(lhs, "out_dims") and hasattr(rhs, "primal_dims"):
+            assert tuple(d.logical_size for d in _out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+            assert tuple(d.logical_size for d in _out.primal_dims) == tuple(d.logical_size for d in rhs.primal_dims)
         return _elem
     # Densify path: handles non-zero ``fill_value`` correctly (the tiled
     # path's contraction assumes implicit positions are zero, which is wrong
@@ -2466,6 +2483,9 @@ def matmul(lhs, rhs, count: bool = False):
         if _densify_is_safe(lhs, rhs):
             _record_path("densify")
             out = _matmul_via_densify(lhs, rhs)
+            if hasattr(out, "out_dims") and hasattr(lhs, "out_dims") and hasattr(rhs, "primal_dims"):
+                assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+                assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in rhs.primal_dims)
             if count:
                 return out, _compute_matmul_count(lhs, rhs, out)
             return out
@@ -2499,6 +2519,9 @@ def matmul(lhs, rhs, count: bool = False):
     ctx = Ctx(lhs=lhs, rhs=rhs, pairs=pairs, rhs_id_offset=rhs_id_offset)
     _record_path("tiled")
     out = _execute_tiled(ctx, rhs_dims)
+    if hasattr(out, "out_dims") and hasattr(lhs, "out_dims") and hasattr(rhs, "primal_dims"):
+        assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+        assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in rhs.primal_dims)
     if count:
         return out, _compute_matmul_count(lhs, rhs, out)
     return out

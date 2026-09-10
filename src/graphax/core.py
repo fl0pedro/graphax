@@ -1966,7 +1966,7 @@ def _eliminate_vertex(
                     _dp = DeferredOutputProduct(_post_val, _pre_val)
                     _record_edge_store(_dp)
                     _set_inner(graph, in_edge, out_edge, _dp)
-                    _set_inner(transpose_graph, out_edge, in_edge, _dp)
+                    _set_inner(transpose_graph, out_edge, in_edge, _dp, is_transpose=True)
                     if _face_sink is not None:
                         _face_sink.close_face()
                     continue
@@ -2122,8 +2122,7 @@ def _eliminate_vertex(
                     # redesign a permuted edge from an approximated vertex legally
                     # reaches a NON-approx vertex's merge — the per-vertex gate
                     # alone is stale there (ViT layer_norm case).
-                    from .sparse.elemental.dispatch import approx_active as _aa
-                    if not _perpath and not _is_approx_cfg and not _aa():
+                    if not _perpath and not _is_approx_cfg:
                         edge_shape = tuple(
                             list(out_edge.aval.shape) + list(in_edge.aval.shape)
                         )
@@ -2167,12 +2166,7 @@ def _eliminate_vertex(
                 # and its transform is irrelevant to Diag (which ValueError-skips
                 # a non-fitting edge anyway). Gated on the approx config so
                 # EXACT-AD (``transforms == ()``) stays byte-identical.
-                if (
-                    _is_approx_cfg
-                    and (edge_outval.pre_transforms or edge_outval.post_transforms)
-                    and edge_outval.val is not None
-                    and (edge_outval.out_dims or edge_outval.primal_dims)
-                ):
+                if edge_outval.pre_transforms or edge_outval.post_transforms:
                     # Drain queued transforms (NO densify) so the legacy per-vertex
                     # Diag/Compress below sees a clean edge; the sparse ops reconcile
                     # downstream — there is no normalization to nominal any more.
@@ -2308,7 +2302,7 @@ def _eliminate_vertex(
 
                 _record_edge_store(edge_outval)
                 _set_inner(graph, in_edge, out_edge, edge_outval)
-                _set_inner(transpose_graph, out_edge, in_edge, edge_outval)
+                _set_inner(transpose_graph, out_edge, in_edge, edge_outval, is_transpose=True)
                 if _face_sink is not None:
                     _face_sink.close_face()
 
@@ -2332,8 +2326,13 @@ def _is_persistent(obj) -> bool:
     return isinstance(obj, immutables.Map) or hasattr(obj, "finish")
 
 
-def _set_inner(outer, k1, k2, v):
+def _set_inner(outer, k1, k2, v, is_transpose=False):
     """Set ``outer[k1][k2] = v`` for both nested-defaultdict and immutables.Map proxies."""
+    out_var, in_var = (k1, k2) if is_transpose else (k2, k1)
+    if hasattr(out_var, "aval") and hasattr(in_var, "aval") and hasattr(v, "shape"):
+        expected = tuple(out_var.aval.shape) + tuple(in_var.aval.shape)
+        assert v.shape == expected, f"Stored edge shape {v.shape} does not match expected {expected}"
+
     inner = outer.get(k1)
     if _is_persistent(outer) or _is_persistent(inner):
         if inner is None:

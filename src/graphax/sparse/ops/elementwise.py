@@ -466,13 +466,16 @@ def _reconstruct_result(value, lhs, sp, dp, output_meta, op, rhs):
         new_fill = None
     else:
         new_fill = op(_scaled_fill(lhs), _scaled_fill(rhs))
-    return SparseTensor(
+    out = SparseTensor(
         tuple(rec[d.id] for d in lhs.out_dims),
         tuple(rec[d.id] for d in lhs.primal_dims),
         value, scalar_mult=s_mult,
         fill_value=new_fill,
         check_consistency=False,
     )
+    assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+    assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
+    return out
 
 
 
@@ -853,6 +856,8 @@ def _lazy_uu(lhs, rhs, op, l_by_id, r_by_id):
            _apply_scalar_mult(jnp.ones((), rhs.dtype), rhs))
     out = SparseTensor(lhs.out_dims, lhs.primal_dims, None, scalar_mult=s,
                        fill_value=None, check_consistency=False)
+    assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+    assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
     return _finish(out, "uu")
 
 
@@ -883,6 +888,8 @@ def _lazy_u_x(lhs, rhs, op, l_by_id, r_by_id):
         val, scalar_mult=_identity_scalar_mult(val.dtype),
         fill_value=_combined_fill(lhs, rhs, op), check_consistency=False,
     )
+    assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+    assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
     return _finish(out, "u_x")
 
 
@@ -983,6 +990,8 @@ def _lazy_pair(lhs, rhs, op, l_by_id, r_by_id):
     # keeps a role implicit when both sides have it implicit.
     from graphax.sparse.tensor import squeeze_unit_axes
     out = squeeze_unit_axes(out)
+    assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+    assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
     return _finish(out, rule)
 
 
@@ -1009,14 +1018,17 @@ def elementwise(
     Aligned blocks, non-zero fills, broadcast cases, and non-zero-preserving
     ops fall through the full promote-to-unified pipeline.
 
-    With ``count=True`` returns ``(result, n_ops)`` — the number of element
-    positions where ``op`` actually fires, computed from the *static*
-    broadcast shape of the inputs:
+    Structured binary ops (``mul`` / ``add``) across sparse/dense/lowrank
+    tensors dispatch to the sparse arithmetic kernels. Preserves structural
+    invariants (block-diagonality, sparsity patterns).
 
-    * union ops (``add`` & co): every position of the broadcast shape
-      contributes, ``n_ops = prod(broadcast(lhs.shape, rhs.shape))``.
-    * intersection ops (``mul``): only positions where both sides have data
-      contribute, ``n_ops = prod(min(lhs.shape, rhs.shape))`` (broadcast-
+    With ``count=True`` returns ``(result, n_ops)``. Operation counts are
+    exact:
+
+    * union (``add`` etc.): 1 op per output element (each element is touched
+      once, either by combination or by copying the surviving side).
+    * intersection (``mul`` with sparse semantics): 1 op per element of the
+      right-aligned shapes (the non-fill region; matching axes pair with
       paired axes; ``size 1`` collapses to the partner's extent for union
       semantics, but here it's the elementwise min of the aligned shape).
 
@@ -1044,6 +1056,10 @@ def elementwise(
     )
     if _elem is not None:
         _record_path("elemental")
+        _out = _elem[0] if count else _elem
+        if hasattr(_out, "out_dims") and hasattr(lhs, "out_dims"):
+            assert tuple(d.logical_size for d in _out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+            assert tuple(d.logical_size for d in _out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
         return _elem
     if count:
         n = _ew_op_count(lhs, rhs, is_intersection)
@@ -1054,12 +1070,20 @@ def elementwise(
     _lz = _lazy_general(lhs, rhs, op, is_intersection)
     if _lz is not None:
         _record_path("lazy")
+        if hasattr(_lz, "out_dims") and hasattr(lhs, "out_dims"):
+            assert tuple(d.logical_size for d in _lz.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+            assert tuple(d.logical_size for d in _lz.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
         if count:
             return _lz, n
         return _lz
 
     _record_path("general")
-    return _materializing_general(lhs, rhs, op, is_intersection, n if count else None)
+    out = _materializing_general(lhs, rhs, op, is_intersection, n if count else None)
+    _out = out[0] if count else out
+    if hasattr(_out, "out_dims") and hasattr(lhs, "out_dims"):
+        assert tuple(d.logical_size for d in _out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+        assert tuple(d.logical_size for d in _out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
+    return out
 
 
 def _materializing_general(lhs, rhs, op, is_intersection, n):
