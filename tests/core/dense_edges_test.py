@@ -270,32 +270,46 @@ def test_a_rank_zero_edge_keeps_rank_zero_through_the_adapter():
 
 
 # ---------------------------------------------------------------------------
-# The tests whose ASSERTION IS THE SIZE OF A bfloat16 APPROXIMATION opt out of
-# the suite's GPU "highest" matmul pin (``tests/conftest.py``): the arithmetic a
-# narrow dtype's cost is measured on has to be the device's own, and
-# QUANT_MARGIN below was measured that way.
-#
-# The marker is deliberately NOT on every test that merely mentions a Quant.
-# ``test_quant_keeps_the_narrow_dtype_only_when_both_operands_are_narrow``
-# asserts dtypes, and ``test_the_census_survives_the_two_op_face_form`` asserts
-# a CENSUS -- its value comparison is a sanity check on one face and sits within
-# 2% of its own bound (1.289e-3 against 1.264e-3), so it needs the accurate dot
-# like every other comparison in the suite.
-#
-# The marker does NOT make anything pass, and it is not what these tests were
-# failing on. MEASURED 2026-09-10: the pin does not undo a Quant -- a bf16
-# operand's 1.66e-3 survives ``highest`` intact, which strips only the 2.1e-4 of
-# TF32 noise riding on it -- and every number below is byte-identical pinned and
-# unpinned. What removes the approximation is XLA:GPU's optimizer deleting the
-# dense engine's bf16 casts under jit; see the note in tests/conftest.py.
+# WHY THE Quant TESTS HERE ARE **NOT** EXEMPTED FROM THE SUITE'S MATMUL PIN
 # ---------------------------------------------------------------------------
-DEVICE_PRECISION = pytest.mark.device_matmul_precision
+# ``tests/conftest.py`` pins ``jax_default_matmul_precision = "highest"`` on a
+# GPU and offers a ``device_matmul_precision`` marker to opt a test out. The
+# obvious thing would be to put that marker on the bfloat16 Quant tests below,
+# on the theory that a test measuring what a narrow dtype costs should measure it
+# on the device's own arithmetic. It was TRIED (2026-09-10) and it is WRONG here,
+# for two independent reasons.
+#
+# 1. ``REF`` above is a ``jax.grad`` evaluated AT IMPORT, i.e. during pytest's
+#    collection phase, which the conftest pins. A marker is a per-test fact and
+#    cannot reach back into collection, so an opted-out test would compare an
+#    UNPINNED engine against a PINNED ground truth. MEASURED: the
+#    ``approximation`` figure for (reverse, Quant on slot lhs) then reads
+#    1.652e-4 -- TF32 noise between the two precisions -- instead of the honest
+#    1.121e-7, so the ``approximation > 1e-4`` precondition starts PASSING for
+#    the one reason it exists to rule out. That is worse than no exemption.
+#
+# 2. The exemption is not needed, because the pin does not touch a Quant.
+#    ``highest`` changes how a dot ACCUMULATES; it cannot restore mantissa bits
+#    a cast already threw away. MEASURED on an RTX 3090, one 128x256x64 dot with
+#    the lhs rounded to bfloat16: 1.6662e-3 from the exact answer unpinned and
+#    1.6555e-3 pinned, i.e. the cast's full cost survives and only the 2.1e-4 of
+#    tensor-core noise riding on it is removed. Every number this file measures
+#    is byte-identical pinned and unpinned, and identical at the pre-pin commit
+#    dc1aabc.
+#
+# What DOES remove the approximation is XLA:GPU's optimizer deleting the dense
+# engine's bf16 casts under ``jax.jit``: ``make_jaxpr`` shows all 10
+# ``convert_element_type[bfloat16]`` and the pre-optimisation StableHLO 60 bf16
+# mentions, while the OPTIMIZED HLO has ZERO bf16 and one fused ``dot``. The same
+# program on XLA:CPU keeps 7 bf16 converts and 11 dots, which is why these cases
+# passed while the suite was accidentally running on the CPU. See the long note
+# in tests/conftest.py.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
 # the packing check that is NOT an oracle (finding 61 verdict 4)
 # ---------------------------------------------------------------------------
-@DEVICE_PRECISION
 @pytest.mark.parametrize("order_name", sorted(ORDERS))
 def test_sparse_representation_false_is_only_the_output_packing(order_name):
     """Bit-identical to ``sparse_representation=True`` on an APPROXIMATED plan:
@@ -311,12 +325,7 @@ def test_sparse_representation_false_is_only_the_output_packing(order_name):
 # the oracle itself
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("order_name", sorted(ORDERS))
-@pytest.mark.parametrize("cls", [
-    # only the QUANT arm opts out: the Reduce arm is an exact-class comparison
-    # at TOL_EXACT and NEEDS the pin.
-    pytest.param("quant", marks=DEVICE_PRECISION),
-    "reduce",
-])
+@pytest.mark.parametrize("cls", ["quant", "reduce"])
 def test_an_approximated_plan_agrees_with_the_sparse_engine(order_name, cls):
     """The real check: the same plan, two independent accumulations.
 
@@ -440,7 +449,6 @@ def test_a_skipped_face_is_skipped_in_both_engines():
     assert _rel(dn, REF) > 1e-4, "the SKIP did not drop anything"
 
 
-@DEVICE_PRECISION
 def test_the_quant_tolerance_is_the_measured_bound():
     """The Quant bound is MEASURED here, not picked by hand (ruling D10).
 

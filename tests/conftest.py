@@ -60,7 +60,7 @@ what the global write covered:
   ~3e-4 against TOL_EXACT=1e-5, purely from that mismatch. The context unwinds
   when collection ends, so nothing is left set.
 
-* an autouse fixture wraps each TEST CALL, which is where the pin is scoped:
+* an autouse fixture wraps each TEST CALL. That is where the pin is scoped:
 
 * ON GPU ONLY. On a CPU (and on any backend with no tensor-core dot) an f32
   ``dot_general`` is already f32-accurate, so the pin buys nothing and the
@@ -69,10 +69,24 @@ what the global write covered:
   and 1.53e-7 pinned; on this machine's CPU 2.86e-7 BOTH pinned and unpinned.
   The pin is a no-op on the CPU, so it should not be on there.
 
-* NOT on a test marked ``device_matmul_precision``. Those tests MEASURE what a
-  narrow dtype costs, so the arithmetic they run on has to be the device's own;
-  a suite-wide precision override is the one thing that must not be able to be
-  confused with the quantity under test.
+* NOT on a test marked ``device_matmul_precision``. The escape hatch for a test
+  whose SUBJECT the pin would perturb -- one that measures what a narrow dtype
+  costs, or that asserts on a jaxpr the pin writes a ``precision`` param into.
+  NOTHING CARRIES IT TODAY, deliberately, and the reason is worth recording.
+
+  The obvious candidates were the bfloat16 Quant tests in
+  ``tests/core/dense_edges_test.py``. Marking them was TRIED and MEASURED, and
+  it makes those tests LIE: their ground truth ``REF`` is a ``jax.grad``
+  evaluated at IMPORT, i.e. under the collection pin above, which a per-test
+  marker cannot reach. An opted-out test therefore compares an UNPINNED engine
+  against a PINNED reference, and the ``approximation`` figure for (reverse,
+  Quant on slot lhs) reads 1.652e-4 of pure TF32 noise instead of the honest
+  1.121e-7 -- so the ``approximation > 1e-4`` precondition starts passing for
+  exactly the reason it exists to rule out. The full rationale, with numbers, is
+  in that file above its Quant tests.
+
+  The exemption is also unnecessary there, per the measurement below: the pin
+  does not touch a Quant at all.
 
 ``precision=HIGHEST`` reaching the jaxpr is also what produced the
 ``jaxpr tokenizer: uncaptured value rendered as '?': 'HIGHEST'`` warning from
