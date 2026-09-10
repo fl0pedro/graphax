@@ -36,6 +36,7 @@ from .sparse.tensor import _assert_sparse_tensor_consistency
 from .sparse.micro_actions import (
     Compress, Diag, Quant, apply_compress, apply_diag, apply_quant,
 )
+from .sparse.ops.join import FaceJoinPolicy
 from .sparse.utils import zeros_like
 from .sparse.tracer import (
     get_face_sink as _get_face_sink,
@@ -1205,12 +1206,26 @@ def _iter_face_hooks(slots):
     two-op entry that carries the very same micro-action a flat 3-tuple would
     arm. Both arming sites (the per-vertex ``_is_approx_cfg`` and the global
     dispatch flag in :func:`jacve`) iterate through here so they cannot drift.
+
+    A :class:`~graphax.sparse.ops.join.FaceJoinPolicy` at the ``jr`` position
+    is yielded AS ITSELF and its ``pre`` hook yielded beside it. The policy is
+    not callable (it takes two tensors), so the arming tests name its type
+    explicitly; a ``lossy`` policy DROPS values, so it must arm the approx
+    config exactly as a ``Diag`` does.
     """
+    from .sparse.ops.join import FaceJoinPolicy as _FJP
+
+    def _one(_t):
+        yield _t
+        if isinstance(_t, _FJP) and _t.pre is not None:
+            yield _t.pre
+
     for _t in (slots if isinstance(slots, (tuple, list)) else ()):
         if isinstance(_t, (tuple, list)):
-            yield from _t
+            for _u in _t:
+                yield from _one(_u)
         else:
-            yield _t
+            yield from _one(_t)
 
 
 def _unpack_face_slots(slots, vertex):
@@ -1238,6 +1253,25 @@ def _unpack_face_slots(slots, vertex):
     Returned as ``(lhs, rhs, jres, new, (jl, jr))`` so the elimination loop's
     ``res``-slot variable carries ``jres`` unchanged and the flat path needs no
     branch of its own.
+
+    THE ``jr`` POSITION MAY HOLD A POLICY, not a hook. Every hook position sees
+    ONE tensor, so none of them can express "make these two addends share one
+    container" -- that is inherently a BINARY operation on the pair. A
+    :class:`~graphax.sparse.ops.join.FaceJoinPolicy` placed at ``jr`` is handed
+    BOTH addends by the elimination loop and returns both. ``jr`` is the right
+    position for it because ``jr`` is the old edge's slot and the old edge is
+    what moves. The policy carries its own single-tensor ``pre`` hook for the
+    old edge, so a learned approximation of the old edge still has a slot;
+    ``jl`` and ``jres`` are untouched and stay ordinary hook positions.
+
+    WHY THIS IS NOT A HOOK WITH A SECOND ARGUMENT. The asymmetry the policy
+    removes is the reason it exists: the two addends of a merge share their
+    logical dims but not their STORAGE, so a single approximation rule applied
+    at both sites is a legal subdivision on one tensor and an idempotent no-op
+    on the other, and one legality mask cannot describe both (alphagrad finding
+    72 / ticket dsnn-3qm.59 fault 1). Expressing that as two independent
+    single-tensor hooks is what produced the defect; the binary form is the
+    fix, not a convenience.
 
     MERGE-FREE FACES (documented, pinned by
     ``tests/misc/test_face_two_op_form.py``). ``jl``/``jr`` are applied ONLY
@@ -1617,7 +1651,7 @@ def _eliminate_vertex(
         # forms took DIFFERENT code paths for the same request.
         _is_approx_cfg = _is_approx_cfg or any(
             _slots is SKIP_FACE or any(
-                isinstance(_t, (Diag, Compress))
+                isinstance(_t, (Diag, Compress, FaceJoinPolicy))
                 for _t in _iter_face_hooks(_slots)
             )
             for _slots in face_transforms.values()
@@ -2063,7 +2097,27 @@ def _eliminate_vertex(
                                 edge_outval, _jl_t, "res", vertex,
                                 _face_sink, in_edge, out_edge, _xlog,
                                 log_slot="res:jl")
-                        if _jr_t is not None:
+                        if isinstance(_jr_t, FaceJoinPolicy):
+                            # A JOIN POLICY, not a hook. "Make these two
+                            # addends share one container" is inherently a
+                            # BINARY operation: every hook position sees one
+                            # tensor, so none of them can express it, and the
+                            # asymmetry it removes is what made one legality
+                            # mask unable to describe both addend sites
+                            # (finding 72 / dsnn-3qm.59 fault 1). The ``jr``
+                            # position carries it because ``jr`` is the old
+                            # edge's slot and the old edge is what moves; the
+                            # policy's own ``pre`` hook is the single-tensor
+                            # slot a learned approximation of the old edge
+                            # occupies, and it runs inside ``reconcile`` so the
+                            # reconciliation still has the last word on the
+                            # structure. ``jl`` (above) and ``jres`` (below)
+                            # stay ordinary hook positions.
+                            edge_outval, _edge = _jr_t.reconcile(
+                                edge_outval, _edge)
+                            _assert_sparse_tensor_consistency(edge_outval)
+                            _assert_sparse_tensor_consistency(_edge)
+                        elif _jr_t is not None:
                             _edge = _apply_face_transform(
                                 _edge, _jr_t, "res", vertex,
                                 _face_sink, in_edge, out_edge, _xlog,
@@ -3152,9 +3206,12 @@ def vertex_elimination_jaxpr(
                     yield _v
         _approx_on = any(
             _slots is SKIP_FACE or any(
-                isinstance(_t, (Diag, Compress)) or callable(_t)
+                isinstance(_t, (Diag, Compress, FaceJoinPolicy))
+                or callable(_t)
                 # two-op form nests triples one level deep -- flatten, or the
                 # dispatch flag lies (tuples are neither Diag nor callable).
+                # A FaceJoinPolicy is named explicitly because it is NOT
+                # callable: it takes the two addends, not one tensor.
                 for _t in _iter_face_hooks(_slots)
             )
             for _slots in _face_slot_iter(face_transforms)
