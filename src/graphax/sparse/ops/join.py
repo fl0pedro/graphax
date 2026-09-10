@@ -327,6 +327,35 @@ def decouple_trivial_pairs(st):
 _MAX_PROJECTION_STEPS = 16
 
 
+def _slot_of_dim(st) -> dict:
+    """dim id -> its META slot in :func:`canonical_axis_order`.
+
+    A coupled pair contributes its meta slot at the FIRST of the two dims and
+    (when ``block_size`` is set) a block slot after it; the partner shares that
+    storage and gets no slot of its own. Both ids map to the pair's meta slot,
+    which is the one a Compress of "this dim's extent" must name.
+    """
+    out: dict = {}
+    slot = 0
+    seen: set = set()
+    for d in st.dims:
+        oid = getattr(d, "other_id", None)
+        if oid is not None:
+            key = frozenset((int(d.id), int(oid)))
+            if key in seen:
+                continue
+            seen.add(key)
+            out[int(d.id)] = slot
+            out[int(oid)] = slot
+            slot += 1
+            if d.block_size is not None:
+                slot += 1
+            continue
+        out[int(d.id)] = slot
+        slot += 1
+    return out
+
+
 def next_projection_rule(src, target):
     """The NEXT micro-action that brings ``src``'s support inside ``target``'s,
     or ``None`` when it is already inside.
@@ -359,7 +388,8 @@ def next_projection_rule(src, target):
     requested: ``apply_diag`` raises on a re-pair, and
     :func:`loosen_to_pairing` is what removes that case beforehand.
     """
-    from graphax.sparse.micro_actions import Compress, Diag
+    from graphax.sparse.micro_actions import (
+        Compress, Diag, canonical_axis_order)
 
     s_by, t_by = _dims_by_id(src), _dims_by_id(target)
     pos = _logical_pos(src)
@@ -398,17 +428,28 @@ def next_projection_rule(src, target):
             continue                      # not nestable in src's blocks
         return Diag(i=i, j=j, factor=tgt_meta)
 
-    # 2. a dim `target` stores implicitly that `src` spells out
+    # 2. a dim `target` stores implicitly that `src` spells out.
+    #
+    # ``Compress.axes`` are CANONICAL SLOTS (``canonical_axis_order``), NOT raw
+    # physical ``val`` axes -- they coincide only for a fully dense canonical
+    # layout. Naming the physical axis instead is silently a NO-OP whenever the
+    # slot it lands on is implicit (``apply_compress`` computes
+    # ``drops = {_canon[a] ...}``, gets the empty set, and returns ``st``
+    # unchanged), so the derivation asks for the same rule again and never
+    # terminates: measured, 16 identical ``Compress(axes=(1,))`` on TLM before
+    # the loop bound stopped it (job 64658).
+    canon = canonical_axis_order(src)
+    slot_of = _slot_of_dim(src)
     for tid, td in sorted(t_by.items()):
         sd = s_by.get(tid)
         if sd is None or td.axis is not None or sd.axis is None:
             continue
         if int(sd.size) <= 1:
             continue                      # already one slice: nothing to fold
-        ax = int(sd.axis)
-        if not (0 <= ax < max(n_slots, n_ax)):
-            continue                      # no physical axis to name
-        return Compress(axes=(ax,), kind="mean")
+        k = slot_of.get(tid)
+        if k is None or not (0 <= k < len(canon)) or canon[k] is None:
+            continue                      # the component is already implicit
+        return Compress(axes=(k,), kind="mean")
     return None
 
 
@@ -455,8 +496,19 @@ def project_onto_support(src, target):
         rule = next_projection_rule(src, target)
         if rule is None:
             break
+        before = container_of(src)
         src = apply_micro_actions(src, (rule,))
         rules.append(rule)
+        if container_of(src) == before:
+            # A rule that moves NOTHING would be asked for again for ever.
+            # Stop and say so rather than spin: the projection is then
+            # incomplete, `unify_containers` still returns identical addends,
+            # and JoinOutcome.matched_target reports the container as wider
+            # than the target -- which is the honest answer.
+            raise RuntimeError(
+                f"project_onto_support: {rule!r} left the container "
+                f"unchanged, so the derivation cannot make progress. "
+                f"src={before} target={container_of(target)}")
     else:
         raise RuntimeError(
             f"project_onto_support did not converge in "
