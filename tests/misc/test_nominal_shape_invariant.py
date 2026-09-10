@@ -202,29 +202,62 @@ def test_no_approximation_class_changes_the_logical_shape(action):
 # LIST is transposed -- which is why nothing downstream notices and why the
 # defect surfaces as transposed parameter gradients (.62).
 def _drifted_edge():
-    """The nn256 vertex-7 edge, rebuilt by hand in nominal order."""
+    """The nn256 vertex-7 edge, rebuilt by hand from the recorded dims."""
     val = jnp.asarray(
         np.arange(10 * 63, dtype=np.float32).reshape(10, 63) / 101.0)
     return SparseTensor(
         out_dims=(),
-        primal_dims=(DenseIndex(0, 10, 0), DenseIndex(1, 63, 1)),
+        primal_dims=(DenseIndex(0, 63, 1), DenseIndex(1, 10, 0)),
         val=val,
     )
 
 
 def test_drifted_edge_carries_nominal_data():
-    """The edge is nominal: ``val`` is in nominal order and every dim
-    points at the right physical axis. Dims and val are in nominal order."""
+    """The drift is BOOKKEEPING: ``val`` is in nominal order and every dim
+    points at the right physical axis. Only the dim list is transposed."""
     st = _drifted_edge()
     assert st.val.shape == (10, 63)                      # nominal order
-    assert [d.axis for d in st.dims] == [0, 1]           # pointers agree
-    assert [d.logical_size for d in st.dims] == [10, 63]  # list is nominal
+    assert [d.axis for d in st.dims] == [1, 0]           # pointers agree
+    assert [d.logical_size for d in st.dims] == [63, 10]  # list is reversed
 
 
 def test_stored_edge_shape_is_nominal_ordered():
-    """core.py's own invariant, on the recorded edge (now nominal by construction)."""
-    nominal = () + (10, 63)          # out_edge.aval.shape + in_edge.aval.shape
-    assert _drifted_edge().shape == nominal
+    """core.py's own invariant on the edge produced by the engine for nn256 vertex 7.
+
+    With the op returning operands' dim order by construction (dsnn-3qm.71),
+    the stored edge is nominal ordered ((10, 63)), curing the historical drift
+    exhibited by _drifted_edge().
+    """
+    recs = []
+    prev = [None, None, None]
+    orig_set = gxcore._set_inner
+
+    def _wrapped(outer, k1, k2, v, *args, **kwargs):
+        mirror = (prev[0] is v and prev[1] is k2 and prev[2] is k1)
+        prev[0], prev[1], prev[2] = v, k1, k2
+        if not mirror:
+            nominal = (tuple(int(n) for n in k2.aval.shape) + tuple(int(n) for n in k1.aval.shape))
+            stored = tuple(int(d.logical_size) for d in v.dims)
+            recs.append((nominal, stored))
+        return orig_set(outer, k1, k2, v, *args, **kwargs)
+
+    # Mini nn256 with hidden=63 and output=10 (where vertex 7 drift occurred):
+    W1 = jnp.zeros((63, 784))
+    W2 = jnp.zeros((10, 63))
+    x = jnp.zeros((16, 784))
+    y = jnp.zeros((16, 10))
+    def mlp(W1, W2, x, y):
+        logits = jax.vmap(lambda xi: W2 @ jnp.tanh(W1 @ xi))(x)
+        return jnp.mean(jnp.sum(-(y * jnp.log(jax.nn.softmax(logits, axis=-1))), axis=-1))
+
+    gxcore._set_inner = _wrapped
+    try:
+        jax.make_jaxpr(jacve(mlp, "rev", argnums=[0, 1]))(W1, W2, x, y)
+    finally:
+        gxcore._set_inner = orig_set
+
+    stores_10_63 = [stored for nom, stored in recs if nom == (10, 63)]
+    assert stores_10_63 == [(10, 63)]
 
 
 def test_drift_is_a_permutation_and_never_a_different_extent():
@@ -234,12 +267,7 @@ def test_drift_is_a_permutation_and_never_a_different_extent():
     metadata -- that is the serious bug, and it was never observed.
     """
     nominal = (10, 63)
-    drifted = SparseTensor(
-        out_dims=(),
-        primal_dims=(DenseIndex(0, 63, 1), DenseIndex(1, 10, 0)),
-        val=jnp.zeros((10, 63)),
-    )
-    stored = drifted.shape
+    stored = _drifted_edge().shape
     assert sorted(stored) == sorted(nominal), "class (c): extents were lost"
     assert len(stored) == len(nominal), "class (c): the rank changed"
     assert stored != nominal, "this fixture is supposed to be drifted"
@@ -316,7 +344,8 @@ def _store_census(monkeypatch, face_transforms=None, order="rev"):
         if not mirror:
             nominal = (tuple(int(n) for n in k2.aval.shape)
                        + tuple(int(n) for n in k1.aval.shape))
-            stored = tuple(int(d.logical_size) for d in v.dims)
+            drained = gxcore._drain_transforms(v) if (getattr(v, "pre_transforms", ()) or getattr(v, "post_transforms", ())) else v
+            stored = tuple(int(d.logical_size) for d in drained.dims)
             recs.append((_classify(nominal, stored), nominal, stored))
         return orig(outer, k1, k2, v, *args, **kwargs)
 

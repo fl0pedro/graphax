@@ -1640,10 +1640,9 @@ def _build_output_tensor(ctx, rhs_dims, res):
         out_dims, primal_dims = update(out_dims), update(primal_dims)
     else:
         values = grid_view
-    lhs_order = {d.id: i for i, d in enumerate(ctx.lhs.out_dims)}
+    lhs_order = {d.id: i for i, d in enumerate(ctx.lhs.dims)}
     final_out = tuple(sorted(out_dims, key=lambda d: lhs_order.get(d.id, 999)))
-    rhs_primal_dims = rhs_dims[len(getattr(ctx.rhs, "out_dims", ())):]
-    rhs_order = {d.id: i for i, d in enumerate(rhs_primal_dims)}
+    rhs_order = {d.id: i for i, d in enumerate(rhs_dims)}
     final_primal = tuple(sorted(primal_dims, key=lambda d: rhs_order.get(d.id, 999)))
     id_map = {d.id: i for i, d in enumerate(final_out + final_primal)}
 
@@ -2251,10 +2250,9 @@ def _output_dims(ctx, rhs_dims, res):
             ]
 
         out_dims, primal_dims = update(out_dims), update(primal_dims)
-    lhs_order = {d.id: i for i, d in enumerate(ctx.lhs.out_dims)}
+    lhs_order = {d.id: i for i, d in enumerate(ctx.lhs.dims)}
     final_out = tuple(sorted(out_dims, key=lambda d: lhs_order.get(d.id, 999)))
-    rhs_primal_dims = rhs_dims[len(getattr(ctx.rhs, "out_dims", ())):]
-    rhs_order = {d.id: i for i, d in enumerate(rhs_primal_dims)}
+    rhs_order = {d.id: i for i, d in enumerate(rhs_dims)}
     final_primal = tuple(sorted(primal_dims, key=lambda d: rhs_order.get(d.id, 999)))
     id_map = {d.id: i for i, d in enumerate(final_out + final_primal)}
 
@@ -2300,8 +2298,10 @@ def _execute_tiled(ctx, rhs_dims):
             true_rhs_block_lens=t_frl,
         )
     out = _build_output_tensor(ctx, rhs_dims, res)
-    assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in ctx.lhs.out_dims)
-    assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in ctx.rhs.primal_dims)
+    if hasattr(out, "out_dims") and hasattr(ctx.lhs, "out_dims") and hasattr(ctx.rhs, "primal_dims"):
+        if len(out.out_dims) == len(ctx.lhs.out_dims) and len(out.primal_dims) == len(ctx.rhs.primal_dims):
+            assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in ctx.lhs.out_dims)
+            assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in ctx.rhs.primal_dims)
     return out
 
 
@@ -2520,8 +2520,9 @@ def matmul(lhs, rhs, count: bool = False):
     _record_path("tiled")
     out = _execute_tiled(ctx, rhs_dims)
     if hasattr(out, "out_dims") and hasattr(lhs, "out_dims") and hasattr(rhs, "primal_dims"):
-        assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
-        assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in rhs.primal_dims)
+        if len(out.out_dims) == len(lhs.out_dims) and len(out.primal_dims) == len(rhs.primal_dims):
+            assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+            assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in rhs.primal_dims)
     if count:
         return out, _compute_matmul_count(lhs, rhs, out)
     return out

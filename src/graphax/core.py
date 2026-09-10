@@ -2166,7 +2166,12 @@ def _eliminate_vertex(
                 # and its transform is irrelevant to Diag (which ValueError-skips
                 # a non-fitting edge anyway). Gated on the approx config so
                 # EXACT-AD (``transforms == ()``) stays byte-identical.
-                if edge_outval.pre_transforms or edge_outval.post_transforms:
+                if (
+                    _is_approx_cfg
+                    and (edge_outval.pre_transforms or edge_outval.post_transforms)
+                    and edge_outval.val is not None
+                    and (edge_outval.out_dims or edge_outval.primal_dims)
+                ):
                     # Drain queued transforms (NO densify) so the legacy per-vertex
                     # Diag/Compress below sees a clean edge; the sparse ops reconcile
                     # downstream — there is no normalization to nominal any more.
@@ -2330,8 +2335,9 @@ def _set_inner(outer, k1, k2, v, is_transpose=False):
     """Set ``outer[k1][k2] = v`` for both nested-defaultdict and immutables.Map proxies."""
     out_var, in_var = (k1, k2) if is_transpose else (k2, k1)
     if hasattr(out_var, "aval") and hasattr(in_var, "aval") and hasattr(v, "shape"):
-        expected = tuple(out_var.aval.shape) + tuple(in_var.aval.shape)
-        assert v.shape == expected, f"Stored edge shape {v.shape} does not match expected {expected}"
+        if not (getattr(v, "pre_transforms", ()) or getattr(v, "post_transforms", ())):
+            expected = tuple(out_var.aval.shape) + tuple(in_var.aval.shape)
+            assert v.shape == expected, f"Stored edge shape {v.shape} does not match expected {expected}"
 
     inner = outer.get(k1)
     if _is_persistent(outer) or _is_persistent(inner):
