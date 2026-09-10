@@ -65,6 +65,7 @@ __all__ = [
     "structural_zero",
     "unify_containers",
     "pairing_of",
+    "decouple_trivial_pairs",
     "loosen_to_pairing",
     "next_projection_rule",
     "support_projection_rules",
@@ -254,7 +255,70 @@ def loosen_to_pairing(st, target):
                      tuple(_mk(d) for d in st.primal_dims),
                      None, scalar_mult=jnp.zeros((), dt), fill_value=None,
                      check_consistency=False)
-    return st + z
+    # The union widens the unwanted pair to meta 1 -- one full block, no
+    # sparsity -- but keeps its ``other_id``, which apply_diag still treats as
+    # a conflict. Demote it to two dense dims so the pair is genuinely free.
+    return decouple_trivial_pairs(st + z)
+
+
+def decouple_trivial_pairs(st):
+    """Rewrite every META-1 block pair as two DENSE dims. Pure metadata.
+
+    A pair with ``size == 1`` and ``block_size == N`` is ONE full N x N block:
+    it stores every cell, so it carries no sparsity at all. But ``other_id`` is
+    still set, and :func:`~graphax.sparse.micro_actions.apply_diag` refuses to
+    re-pair ANY dim whose ``other_id`` names a different partner -- so a
+    structurally dense "pair" blocks the very re-pairing it no longer
+    constrains. Measured: :func:`loosen_to_pairing` correctly widened a
+    mismatched pair to meta 1 and the following ``Diag`` still raised
+    ``Diag pair conflict``.
+
+    The union add that does the widening cannot drop ``other_id`` itself --
+    ``elementwise._reconstruct_dim_pair`` rebuilds a sparse pair from the left
+    operand's dim, partner included -- so the demotion is done here, after it:
+    the shared meta axis is size 1 and is squeezed out, and each dim moves onto
+    its own former ``block_axis``. No value is read or written.
+    """
+    from graphax.sparse.indexes import DenseIndex
+    from graphax.sparse.tensor import SparseTensor
+    from dataclasses import replace as _replace
+
+    triv = {int(d.id) for d in st.dims if d.is_sparse and int(d.size) == 1}
+    if not triv:
+        return st
+    drop = sorted({int(d.axis) for d in st.dims
+                   if int(d.id) in triv and d.axis is not None})
+    val = st.val
+    if val is not None and drop:
+        for a in drop:
+            if int(val.shape[a]) != 1:
+                raise RuntimeError(
+                    f"decouple_trivial_pairs: meta axis {a} of a size-1 pair "
+                    f"has extent {val.shape[a]}, not 1 -- the tensor's dims "
+                    f"and val disagree, which is a consistency failure, not "
+                    f"something to squeeze through.")
+        val = jnp.squeeze(val, axis=tuple(drop))
+    remap = {}
+    n = 0
+    for a in range(0 if val is None else int((st.val).ndim)):
+        if a in drop:
+            continue
+        remap[a] = n
+        n += 1
+
+    def _mv(a):
+        return None if a is None else remap.get(int(a))
+
+    def _mk(d):
+        if int(d.id) in triv:
+            return DenseIndex(int(d.id), int(d.logical_size),
+                              _mv(d.block_axis))
+        return _replace(d, axis=_mv(d.axis), block_axis=_mv(d.block_axis))
+
+    return SparseTensor(tuple(_mk(d) for d in st.out_dims),
+                        tuple(_mk(d) for d in st.primal_dims),
+                        val, scalar_mult=st.scalar_mult,
+                        fill_value=st.fill_value, check_consistency=False)
 
 
 # A coercion cannot need more rules than there are dims (each rule consumes at
