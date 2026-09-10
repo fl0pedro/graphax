@@ -37,12 +37,11 @@ from graphax import jacve, tree_allclose
 # asked for.
 @pytest.fixture(scope="module", autouse=True)
 def _cpu_backend_for_this_module():
-    _prev = jax.config.jax_platform_name
-    jax.config.update("jax_platform_name", "cpu")
-    try:
+    # ``jax.config`` exposes no readable ``jax_platform_name`` attribute to save
+    # and put back, so use the documented context manager, which restores the
+    # previous value on exit whatever it was.
+    with jax.default_device(jax.devices("cpu")[0]):
         yield
-    finally:
-        jax.config.update("jax_platform_name", _prev)
 
 
 N_DRAWS = 10  # random input arrays per config
