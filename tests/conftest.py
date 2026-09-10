@@ -55,10 +55,11 @@ what the global write covered:
   numerical reference at import time -- ``dense_edges_test.REF`` is a
   ``jax.grad`` evaluated while the module is being collected -- and a reference
   computed at one precision cannot be compared against a test body run at
-  another. MEASURED: with the per-test fixture alone, the three
-  ``dense_edges_test.py::test_the_exact_plan_equals_jax_grad`` cases fail at
-  ~3e-4 against TOL_EXACT=1e-5, purely from that mismatch. The context unwinds
-  when collection ends, so nothing is left set.
+  another. MEASURED: with the per-test fixture alone, all three
+  ``dense_edges_test.py::test_the_exact_plan_equals_jax_grad`` cases fail --
+  9.9e-5 absolute on O(0.1) gradient entries, i.e. the TF32 band -- purely from
+  the import-time reference and the test body disagreeing about precision. The
+  context unwinds when collection ends, so nothing is left set.
 
 * an autouse fixture wraps each TEST CALL. That is where the pin is scoped:
 
