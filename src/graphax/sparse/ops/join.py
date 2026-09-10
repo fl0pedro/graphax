@@ -66,6 +66,7 @@ __all__ = [
     "unify_containers",
     "pairing_of",
     "loosen_to_pairing",
+    "next_projection_rule",
     "support_projection_rules",
     "project_onto_support",
     "reconcile_addends",
@@ -256,124 +257,152 @@ def loosen_to_pairing(st, target):
     return st + z
 
 
-def support_projection_rules(src, target) -> tuple:
-    """The micro-actions that make ``src``'s support fit inside ``target``'s.
+# A coercion cannot need more rules than there are dims (each rule consumes at
+# least one dim of the target's layout), so this bound can only be hit by a
+# derivation that fails to make progress -- which is a defect, not an input.
+_MAX_PROJECTION_STEPS = 16
 
-    Returns a tuple of :class:`~graphax.sparse.micro_actions.Diag` /
-    :class:`~graphax.sparse.micro_actions.Compress` to apply to ``src``, in
-    order. Only the differences a micro-action can CLOSE are emitted:
 
-    * ``target`` holds a dim pair as a meta-block-diagonal with ``size``
-      (meta count) FINER than ``src``'s -> ``Diag(i, j, factor=target.size)``.
-      Going finer drops the off-block values, which is the lossy step.
-    * ``target`` stores a dim IMPLICITLY (one copy broadcast on read) where
-      ``src`` stores every slice -> ``Compress`` of the physical axis holding
-      those slices. ``kind="mean"`` is the reduction the approximation search
-      already uses for a collapsed axis.
+def next_projection_rule(src, target):
+    """The NEXT micro-action that brings ``src``'s support inside ``target``'s,
+    or ``None`` when it is already inside.
 
-    Differences in the OTHER direction -- ``src`` already finer, or already
-    implicit -- need no rule: ``src``'s support is then already inside
-    ``target``'s along that dim, and :func:`unify_containers` lifts it the rest
-    of the way without losing anything.
+    ONE rule at a time, deliberately. Both rule kinds RENUMBER what the next
+    one has to name: ``Diag`` takes LOGICAL dim positions and ``Compress``
+    takes PHYSICAL axes, and applying either shifts the physical axis numbering
+    of everything after it. Deriving a whole sequence from one snapshot
+    therefore produces rules that name the wrong axis by the time they run --
+    measured, before this was split: ``Compress.axes entry 3 out of range:
+    tensor has 3 logical component slots``, plus two ``Compress(axes=(0,))``
+    emitted for two dims that SHARE physical axis 0 (a coupled pair), which
+    would have compressed one axis twice.
 
-    CALL IT ON A LOOSENED ``src`` (:func:`loosen_to_pairing`). A ``Diag`` on a
-    dim that is already paired with a different partner RAISES, so the pairing
-    must be freed first; this function reports the rules for the layout it is
-    given and does not silently drop a pair it cannot create.
+    The two differences a micro-action can close, in this order:
 
-    This is a SUPPORT question, so it is deliberately silent about an
-    implicit dim on the ``src`` side: implicitness is a uniform-VALUE
-    restriction, not a smaller support.
+    * ``target`` holds a dim pair as a meta-block-diagonal FINER than ``src``'s
+      -> ``Diag(i, j, factor=target.size)``. Going finer drops the off-block
+      values: this is the lossy step.
+    * ``target`` stores a dim IMPLICITLY (one copy, broadcast on read) where
+      ``src`` spells every slice out -> ``Compress`` of the physical axis
+      holding them, ``kind="mean"`` (the reduction the approximation search
+      already uses for a collapsed axis).
+
+    Differences the other way -- ``src`` already finer, or already implicit --
+    need no rule: ``src``'s support is then already inside ``target``'s there,
+    and :func:`unify_containers` lifts it the rest of the way losslessly.
+
+    A dim already paired with a DIFFERENT partner is SKIPPED rather than
+    requested: ``apply_diag`` raises on a re-pair, and
+    :func:`loosen_to_pairing` is what removes that case beforehand.
     """
     from graphax.sparse.micro_actions import Compress, Diag
 
     s_by, t_by = _dims_by_id(src), _dims_by_id(target)
     pos = _logical_pos(src)
-    s_pair = pairing_of(src)
-    rules: list = []
-    used: set[int] = set()
+    s_pair, t_pair = pairing_of(src), pairing_of(target)
+    n_slots = len(src.dims)
+    n_ax = 0 if src.val is None else int(src.val.ndim)
 
-    # 1. pair subdivision, once per coupled pair of `target`
-    done_pairs: set[tuple[int, int]] = set()
-    for tid, td in t_by.items():
+    # 1. a pair `target` holds FINER than `src` does
+    for tid, td in sorted(t_by.items()):
         if not td.is_sparse:
             continue
         oid = int(td.other_id)
-        key = (min(tid, oid), max(tid, oid))
-        if key in done_pairs or oid not in t_by:
-            continue
-        done_pairs.add(key)
+        if oid not in t_by or oid < tid:
+            continue                      # each pair once, lower id first
         sd, so = s_by.get(tid), s_by.get(oid)
         if sd is None or so is None:
             continue
-        # A dim already paired with a DIFFERENT partner cannot be re-paired;
-        # `loosen_to_pairing` is what removes that case, and if it is still
-        # here the rule is not emitted rather than raising inside apply_diag.
-        if s_pair.get(tid) not in (None, oid) or s_pair.get(oid) not in (None, tid):
-            continue
+        if s_pair.get(tid) not in (None, oid) or \
+                s_pair.get(oid) not in (None, tid):
+            continue                      # mis-paired: loosen_to_pairing's job
         src_meta = int(sd.size) if s_pair.get(tid) == oid else 1
         tgt_meta = int(td.size)
         if tgt_meta <= src_meta:
-            continue                      # src already at least as fine
+            continue
         i, j = pos.get(tid), pos.get(oid)
-        if i is None or j is None:
+        if i is None or j is None or i == j:
+            continue
+        # apply_diag requires one OUT and one PRIMAL index.
+        n_out = len(src.out_dims)
+        if (i < n_out) == (j < n_out):
             continue
         n_i, n_j = int(sd.logical_size), int(so.logical_size)
         if n_i % tgt_meta or n_j % tgt_meta:
             continue                      # not a divisor: no legal Diag
         if src_meta > 1 and tgt_meta % src_meta:
             continue                      # not nestable in src's blocks
-        if i in used or j in used:
-            continue
-        used.add(i)
-        used.add(j)
-        rules.append(Diag(i=i, j=j, factor=tgt_meta))
+        return Diag(i=i, j=j, factor=tgt_meta)
 
-    # 2. dims `target` stores implicitly that `src` spells out
-    for tid, td in t_by.items():
+    # 2. a dim `target` stores implicitly that `src` spells out
+    for tid, td in sorted(t_by.items()):
         sd = s_by.get(tid)
-        if sd is None:
+        if sd is None or td.axis is not None or sd.axis is None:
             continue
-        pp = pos.get(tid)
-        if pp is None or pp in used:
-            continue
-        if td.axis is None and sd.axis is not None and int(sd.size) > 1:
-            rules.append(Compress(axes=(int(sd.axis),), kind="mean"))
-            used.add(pp)
-    return tuple(rules)
+        if int(sd.size) <= 1:
+            continue                      # already one slice: nothing to fold
+        ax = int(sd.axis)
+        if not (0 <= ax < max(n_slots, n_ax)):
+            continue                      # no physical axis to name
+        return Compress(axes=(ax,), kind="mean")
+    return None
+
+
+def support_projection_rules(src, target) -> tuple:
+    """The whole micro-action sequence :func:`project_onto_support` will apply.
+
+    Derived by actually APPLYING each rule to a working copy, because that is
+    the only way to see the renumbering the next rule has to name -- see
+    :func:`next_projection_rule`. Callers that want the projected tensor as
+    well should use :func:`project_onto_support`, which does the same walk once.
+    """
+    return project_onto_support(src, target)[1]
 
 
 def project_onto_support(src, target):
-    """``src`` restricted to ``target``'s support, values otherwise untouched.
+    """``(projected, rules)`` -- ``src`` restricted to ``target``'s support,
+    values otherwise untouched.
 
-    Three steps, all existing machinery:
+    Three stages, all existing machinery:
 
     1. :func:`loosen_to_pairing` -- free any dim ``src`` pairs with a partner
        ``target`` does not. Lossless, and required: ``apply_diag`` refuses to
        re-pair an already paired dim.
-    2. the :func:`support_projection_rules` micro-actions, which are the only
-       way to reach ``target``'s IMPLICIT dims and its finer meta blocks.
+    2. :func:`next_projection_rule`, applied one at a time until none is left.
+       Each application renumbers what the next rule names, so the sequence is
+       derived as it is applied, never from one snapshot.
     3. ``elementwise(src, structural_ones(target), multiply,
-       is_intersection=True)`` -- the INTERSECTION container rule, which
-       zeroes everything outside ``target``'s support and demotes the result to
-       the narrower of the two containers.
+       is_intersection=True)`` -- the INTERSECTION container rule, which zeroes
+       everything outside ``target``'s support and demotes the result to the
+       narrower of the two containers.
 
-    Step 3 does the support arithmetic; step 2 exists because a multiply cannot
-    make a spelled-out dim uniform (an implicit dim has FULL support -- it is
-    a value restriction, not a support one) nor subdivide a block.
+    Stage 3 does the support arithmetic; stage 2 exists because a multiply
+    cannot make a spelled-out dim uniform (an implicit dim has FULL support --
+    it is a value restriction, not a support one) nor subdivide a block.
 
-    Returns ``(projected, rules)``; ``rules`` is where the information was
-    actually lost.
+    ``rules`` is where the information was actually lost.
     """
     from graphax.sparse.micro_actions import apply_micro_actions
     from graphax.sparse.ops.elementwise import elementwise
 
     src = loosen_to_pairing(src, target)
-    rules = support_projection_rules(src, target)
-    src = apply_micro_actions(src, rules)
+    rules: list = []
+    for _ in range(_MAX_PROJECTION_STEPS):
+        rule = next_projection_rule(src, target)
+        if rule is None:
+            break
+        src = apply_micro_actions(src, (rule,))
+        rules.append(rule)
+    else:
+        raise RuntimeError(
+            f"project_onto_support did not converge in "
+            f"{_MAX_PROJECTION_STEPS} rules: {rules}. Each rule must remove a "
+            f"difference, so a loop means the derivation is not making "
+            f"progress -- a defect in next_projection_rule, not an input to "
+            f"tolerate.")
     ind = structural_ones(target, src.dtype)
     out = elementwise(src, ind, jnp.multiply, is_intersection=True)
-    return (src if out is None else out), rules
+    return (src if out is None else out), tuple(rules)
 
 
 # --- the policies -----------------------------------------------------------
