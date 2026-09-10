@@ -270,8 +270,21 @@ def test_a_rank_zero_edge_keeps_rank_zero_through_the_adapter():
 
 
 # ---------------------------------------------------------------------------
+# The Quant tests opt OUT of the suite's GPU "highest" matmul pin
+# (``tests/conftest.py``). Their subject IS a numeric approximation, so the
+# arithmetic they measure it on must be the device's own -- QUANT_MARGIN below
+# was measured that way. The pin does NOT undo a Quant (measured 2026-09-10: a
+# bf16 operand's 1.66e-3 survives ``highest`` intact, which only strips the
+# 2.1e-4 of TF32 noise riding on it), so this marker is about keeping the two
+# quantities unconfusable, not about making anything pass.
+# ---------------------------------------------------------------------------
+DEVICE_PRECISION = pytest.mark.device_matmul_precision
+
+
+# ---------------------------------------------------------------------------
 # the packing check that is NOT an oracle (finding 61 verdict 4)
 # ---------------------------------------------------------------------------
+@DEVICE_PRECISION
 @pytest.mark.parametrize("order_name", sorted(ORDERS))
 def test_sparse_representation_false_is_only_the_output_packing(order_name):
     """Bit-identical to ``sparse_representation=True`` on an APPROXIMATED plan:
@@ -287,7 +300,12 @@ def test_sparse_representation_false_is_only_the_output_packing(order_name):
 # the oracle itself
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("order_name", sorted(ORDERS))
-@pytest.mark.parametrize("cls", ["quant", "reduce"])
+@pytest.mark.parametrize("cls", [
+    # only the QUANT arm opts out: the Reduce arm is an exact-class comparison
+    # at TOL_EXACT and NEEDS the pin.
+    pytest.param("quant", marks=DEVICE_PRECISION),
+    "reduce",
+])
 def test_an_approximated_plan_agrees_with_the_sparse_engine(order_name, cls):
     """The real check: the same plan, two independent accumulations.
 
@@ -411,6 +429,7 @@ def test_a_skipped_face_is_skipped_in_both_engines():
     assert _rel(dn, REF) > 1e-4, "the SKIP did not drop anything"
 
 
+@DEVICE_PRECISION
 def test_the_quant_tolerance_is_the_measured_bound():
     """The Quant bound is MEASURED here, not picked by hand (ruling D10).
 
@@ -442,6 +461,7 @@ def test_the_quant_tolerance_is_the_measured_bound():
                     "this machine, so the bound is untested here")
 
 
+@DEVICE_PRECISION
 def test_quant_keeps_the_narrow_dtype_only_when_both_operands_are_narrow():
     """The ruling of 2026-09-06: the engine never narrows or widens on its own,
     and a contraction of two narrow operands stays narrow."""
@@ -510,6 +530,7 @@ def test_the_census_matches_for_a_literal_plan_and_the_values_are_compared():
     assert _rel(dn, sp) <= TOL_EXACT
 
 
+@DEVICE_PRECISION
 def test_the_census_survives_the_two_op_face_form():
     """``((lhs, rhs, new), (jl, jr, jres))`` is wrapped slot by slot, so a
     two-op plan is censused exactly like its flat equivalent."""
