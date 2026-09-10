@@ -290,6 +290,41 @@ class PrimitiveTest(unittest.TestCase):
     #     self.assertTrue(tree_allclose(veres, revres)) 
 
 
+# ---------------------------------------------------------------------------
+# SATURATED tanh: the derivative must not lose digits to cancellation
+# ---------------------------------------------------------------------------
+def test_the_tanh_derivative_survives_saturation():
+    """``d tanh/dx == 1 - t**2`` must be FACTORED as ``(1 - t)(1 + t)``.
+
+    As tanh saturates, ``t**2`` and ``1`` both approach 1 and their difference
+    cancels: the ~1 ULP rounding of ``t**2`` becomes an absolute error of a
+    result of size ``1 - t**2``, so the relative error is amplified by
+    ``1/(1 - t**2)``. At x == 8 that factor is about 9.8e6, which is far past
+    what f32 can absorb. The factored form has no such step -- ``1 - t`` is
+    EXACT in binary floating point for t in [0.5, 2] (Sterbenz) -- so the error
+    stays at ~1 ULP however deep the saturation goes.
+
+    jax factors it the same way, so the two engines are compared at a tolerance
+    that only the factored form can meet. Evaluating ``1 - t**2`` instead fails
+    this from about x == 3 onward (MEASURED 5.0e-6 relative at x == 3.5, against
+    the 1e-6 asserted here).
+    """
+    def f(x):
+        return jnp.tanh(x)
+
+    # Well past saturation: tanh(8) == 0.99999977, derivative ~4.5e-7.
+    x = jnp.array([0.5, 1.0, 2.0, 3.5, 5.0, 8.0])
+    got = jacve(f, order="fwd", argnums=(0,))(x)[0]
+    want = jax.jacfwd(f)(x)
+    # Diagonal only; the off-diagonal zeros are structural on both sides.
+    got_d = jnp.diagonal(got)
+    want_d = jnp.diagonal(want)
+    assert jnp.allclose(got_d, want_d, rtol=1e-6, atol=0.0), (
+        "saturated tanh derivative lost precision: "
+        f"got {got_d}, want {want_d}, "
+        f"max rel {jnp.max(jnp.abs(got_d - want_d) / jnp.abs(want_d))}")
+
+
 if __name__ == "__main__":
     unittest.main()
         

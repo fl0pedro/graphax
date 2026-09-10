@@ -33,7 +33,36 @@ defelemental(lax.sinh_p, lax.cosh)
 defelemental(lax.asinh_p, lambda x: 1.0 / lax.sqrt(1.0 + x**2))
 defelemental(lax.cosh_p, lax.sinh)
 defelemental(lax.acosh_p, lambda x: 1.0 / lax.sqrt(x**2 - 1.0))
-defelemental2(lax.tanh_p, lambda out, primal, accuracy: 1.0 - out**2)
+# d tanh/dx == 1 - tanh(x)**2, but FACTORED as (1 - t)(1 + t) rather than
+# evaluated as ``1 - t**2``. Algebraically identical, numerically not:
+#
+#   * ``1 - t**2`` rounds ``t**2`` first, then subtracts two numbers that are
+#     both near 1 as tanh saturates. The rounding error of ``t**2`` (~1 ULP, so
+#     ~6e-8 near 1) survives the cancellation as an ABSOLUTE error of a result
+#     whose own size is ``1 - t**2``, i.e. it is amplified by 1/(1 - t**2).
+#   * ``(1 - t)(1 + t)`` has no such step: for t in [0.5, 2] the subtraction
+#     ``1 - t`` is EXACT in binary floating point (Sterbenz), so the only
+#     rounding is the final multiply -- ~1 ULP, independent of saturation.
+#
+# MEASURED at x == 3.5 (t == 0.998178, derivative 0.00364, amplification ~275):
+# the ``1 - t**2`` form disagreed with ``jax.jacfwd`` by 5.0e-6 relative
+# (0.00728154182434082 against 0.00728157814592123) -- a real loss of four
+# digits, not a tolerance artifact, and the reason
+# output_layout_test.py::test_a_diagonal_pair_output_passes_the_contract failed
+# its rtol=1e-6 on GPU. It passed on the CPU only because both sides happened
+# to round the same way there.
+#
+# This is also exactly how jax defines its own tanh JVP
+# (``mul(add(g, mul(g, ans)), sub(_one(x), ans))`` == ``g (1 + t)(1 - t)``), so
+# the two engines now agree to the last ULP on saturated tanh instead of
+# differing by the conditioning factor. That matters for the saturating
+# activations in the SNN and transformer suites, not just for this one test.
+defelemental2(lax.tanh_p,
+              lambda out, primal, accuracy: (1.0 - out) * (1.0 + out))
+# NOTE: ``atanh``, ``tan``, ``asin`` and ``acos`` below carry the SAME
+# cancelling ``1 -/+ x**2`` shape and are NOT changed here: no test in the suite
+# exercises them near their saturation point, so there is no measurement to
+# justify touching them. They are a known, currently unexercised risk.
 defelemental(lax.atanh_p, lambda x: 1.0 / (1.0 - x**2))
 
 defelemental(lax.erf_p, lambda x: 2.0 * lax.exp(-(x**2)) / lax.sqrt(jnp.pi))
