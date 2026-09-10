@@ -26,7 +26,24 @@ from jax import lax
 import graphax
 from graphax import jacve, tree_allclose
 
-jax.config.update("jax_platform_name", "cpu")
+# This module pins the CPU backend for its own tolerances. It used to do that
+# with a bare module-level ``jax.config.update``, which is process-global and was
+# never restored -- and pytest collects this file FIRST in tests/core, so 99.9
+# percent of the suite inherited it and ran on CPU even under
+# JAX_PLATFORMS=cuda,cpu. Every "green on GPU" result was green on CPU.
+#
+# An autouse module-scoped fixture sets it for this file only and restores the
+# previous value afterwards, so the rest of the suite runs on whatever the job
+# asked for.
+@pytest.fixture(scope="module", autouse=True)
+def _cpu_backend_for_this_module():
+    _prev = jax.config.jax_platform_name
+    jax.config.update("jax_platform_name", "cpu")
+    try:
+        yield
+    finally:
+        jax.config.update("jax_platform_name", _prev)
+
 
 N_DRAWS = 10  # random input arrays per config
 
