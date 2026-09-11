@@ -1223,15 +1223,17 @@ def _vidx_for(jaxpr):
 
 
 def _known_none_edge(edge) -> bool:
-    """True iff ``_force(edge)`` is KNOWN to be ``None`` WITHOUT forcing.
+    """True iff ``_force(edge)`` is ``None``.
 
-    A :class:`LazyEdge` whose thunk has not run yet emits jax equations when
-    forced, so a read-only enumeration (:func:`faces_of`) must not touch it:
-    such an edge reports ``False`` ("not known to be None") and its face is
-    listed even though the elimination may later skip it.
+    Evaluating an unset LazyEdge here resolves whether an edge carries a real
+    Jacobian or forces to None (e.g. stop_gradient, is_finite, select_n predicate,
+    or zero-gradient paths). Faces whose edges are None will never be visited by
+    _eliminate_vertex, so pruning them here ensures faces_of returns the true
+    eliminated faces rather than an over-reported optimistic superset (ticket
+    dsnn-3qm.74).
     """
     if isinstance(edge, LazyEdge):
-        return edge._value is not _UNSET and edge._value is None
+        return edge.value is None
     return edge is None
 
 
@@ -1469,14 +1471,10 @@ def faces_of(graph, transpose_graph, vertex, jaxpr):
           in-edges with ITS predecessors), so keys enumerated earlier describe a
           graph that no longer exists.
         * The elimination SKIPS a face whose edge Jacobian forces to ``None``
-          (e.g. a ``stop_gradient`` blocked path). An edge that is already
-          concrete (or an already-evaluated ``LazyEdge``) is filtered out here
-          too, but an *unevaluated* ``LazyEdge`` is NOT forced — forcing emits
-          jax equations into whatever trace happens to be current, which would
-          corrupt the append-only jaxpr. Such faces are therefore listed
-          optimistically; if the elimination later skips one, its key simply
-          never matches and the transform is a no-op. The returned list is thus
-          a superset of the visited faces, never a subset.
+          (e.g. a ``stop_gradient`` blocked path). Any edge whose value forces
+          to ``None`` is filtered out via ``_known_none_edge``, so ``faces_of``
+          returns only the true reachable faces that will be eliminated (ticket
+          dsnn-3qm.74).
         * A multi-output vertex contributes the faces of every one of its
           output variables; the central variable is not part of the key (the
           mapping is per-vertex-elimination), so in the rare case where two
