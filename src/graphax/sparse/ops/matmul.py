@@ -1655,6 +1655,28 @@ def _build_output_tensor(ctx, rhs_dims, res):
     final_out = tuple(finalize(d, i) for i, d in enumerate(final_out))
     n_out = len(final_out)
     final_primal = tuple(finalize(d, n_out + i) for i, d in enumerate(final_primal))
+    if values is not None and values.ndim > 1:
+        seen = set()
+        order = []
+        for d in final_out + final_primal:
+            for a in (d.axis, getattr(d, "block_axis", None)):
+                if a is not None and a not in seen:
+                    seen.add(a)
+                    order.append(a)
+        if sorted(order) == list(range(values.ndim)) and order != list(range(values.ndim)):
+            values = values.transpose(order)
+            new_of_old = {a: i for i, a in enumerate(order)}
+
+            def _renum(d):
+                kw = {}
+                if d.axis is not None:
+                    kw["axis"] = new_of_old[d.axis]
+                if d.is_sparse and d.block_axis is not None:
+                    kw["block_axis"] = new_of_old[d.block_axis]
+                return replace(d, **kw) if kw else d
+
+            final_out = tuple(_renum(d) for d in final_out)
+            final_primal = tuple(_renum(d) for d in final_primal)
     has_val = any(d.axis is not None for d in final_out + final_primal) or any(
         d.is_sparse and d.block_axis is not None
         for d in final_out + final_primal
