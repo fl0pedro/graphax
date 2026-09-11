@@ -9,6 +9,7 @@ import immutables
 import jax
 import numpy as np
 import jax._src.core as core
+import jax.lax as lax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 from jax._src.core import ShapeDtypeStruct
