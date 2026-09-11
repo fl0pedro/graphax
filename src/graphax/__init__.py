@@ -2,8 +2,14 @@ import sys
 
 from .core import (
     SKIP_FACE,
+    FaceContraction,
+    FaceOperands,
     FaceSpec,
+    contract_face,
+    contract_face_operands,
+    face_config_is_approx,
     face_specs_of,
+    prepare_face_operands,
     faces_of,
     grad,
     jacve,

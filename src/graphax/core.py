@@ -1392,6 +1392,39 @@ def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
     return out
 
 
+def face_config_is_approx(face_transforms) -> bool:
+    """Does this ``face_transforms`` dict arm the APPROX contraction path?
+
+    :func:`_eliminate_vertex` calls this to set its ``_is_approx_cfg``, which
+    gates the reconciler peel and the re-evaluation of ``need_contract`` from
+    the PEELED operands -- i.e. the ``approx`` argument of
+    :func:`prepare_face_operands`. It is public because a caller that computes a
+    face's result STRUCTURE outside the elimination (alphagrad's per-vertex
+    approximation mask) has to pass the flag the elimination will use, and
+    guessing it is how a mask goes stale.
+
+    A ``SKIP_FACE`` arms it (a dropped path deviates from the exact structure at
+    least as much as a ``Diag`` does) and so does a ``Diag`` / ``Compress`` /
+    :class:`FaceJoinPolicy` anywhere in any face's hooks. A plain CALLABLE hook
+    does NOT: a chooser or a frame-decoding hook is opaque here, which is why a
+    per-vertex callable transform (``transforms=(fn,)``) is the thing that arms
+    it on the recording-probe path.
+
+    Iterated through ``_iter_face_hooks`` so the TWO-OP form
+    ``((lhs, rhs, new), (jl, jr, jres))`` arms this exactly as its flat
+    equivalent does.
+    """
+    if not face_transforms:
+        return False
+    return any(
+        _slots is SKIP_FACE or any(
+            isinstance(_t, (Diag, Compress, FaceJoinPolicy))
+            for _t in _iter_face_hooks(_slots)
+        )
+        for _slots in face_transforms.values()
+    )
+
+
 def faces_of(graph, transpose_graph, vertex, jaxpr):
     """The FACE KEYS of ``vertex``, in the order the elimination will visit them.
 
@@ -1569,6 +1602,278 @@ _jtu.register_pytree_node(
 )
 
 
+
+class FaceOperands(NamedTuple):
+    """One face's two operands, DRAINED and ready for the contraction.
+
+    ``post`` / ``pre`` are the working copies
+    :func:`contract_face_operands` consumes; ``need_contract`` is the decision
+    between a real contraction and an identity pass-through;
+    ``pre_reattach`` / ``post_reattach`` are the Jacobian transforms that ride
+    onto the RESULT rather than through it.
+    """
+    post: Any
+    pre: Any
+    need_contract: bool
+    pre_reattach: Any
+    post_reattach: Any
+    #: the ``approx`` flag the operands were prepared under, and the STORED
+    #: (un-drained) ``pre_val``. Both are needed by
+    #: :func:`contract_face_operands`'s identity-pass-through branch, which
+    #: asks a DIFFERENT operand's ``val`` depending on the flag -- EXACT AD
+    #: keeps the stored tensor's test and is byte-identical.
+    approx: bool = False
+    stored_pre: Any = None
+
+
+def prepare_face_operands(post_val, pre_val, *, approx: bool = False,
+                          pre_hook=None, post_hook=None) -> FaceOperands:
+    """Drain one face's two stored edge Jacobians into contraction operands.
+
+    THE FIRST HALF OF THE FACE CONTRACTION, and the only copy of it:
+    :func:`_eliminate_vertex` calls this, so a caller that needs a face's
+    RESULT STRUCTURE before the elimination runs (alphagrad's per-vertex
+    approximation mask) gets it from the same code the measurement will use.
+
+    Args:
+        post_val: the out-edge Jacobian, ``graph[central][out_edge]`` forced.
+        pre_val: the in-edge Jacobian, ``transpose_graph[central][in_edge]``
+            forced.
+        approx: the elimination's ``_perpath or _is_approx_cfg`` -- whether the
+            reconciler peel is performed and ``need_contract`` recomputed from
+            the PEELED operands. EXACT AD passes ``False`` and is
+            byte-identical to the pre-extraction code.
+        pre_hook: the per-path ``pre`` hook (``_h_pre``), or None.
+        post_hook: the per-path ``post`` hook (``_h_post``), or None.
+
+    Returns:
+        FaceOperands
+    """
+    # Handle stuff like reshape, squeeze etc.
+    # Apply Jacobian transforms where applicable. ``unload_*``
+    # already returns a fresh tensor, so only copy in the no-
+    # transform branch — copying *then* overwriting with the unload
+    # result (the old code) wasted a full tensor copy per edge.
+    if len(pre_val.post_transforms) > 0 and post_val.val is not None:
+        _post_val = unload_post_transforms(post_val, pre_val)
+    else:
+        _post_val = post_val.copy()
+
+    # Seed-aware draining (shared with the triplet path).
+    _post_val, _pre_val = _drain_or_unload_pre(
+        post_val, pre_val, _post_val)
+
+    # Multiply the two values of the edges if applicable. The real
+    # contraction runs whenever both edges carry values OR a
+    # ``val is None`` operand is a non-identity structural Jacobian
+    # (a broadcast / reduction — see ``_acts_as_identity``); the
+    # pass-through shortcuts below are only valid when the val-less
+    # operand truly acts as the identity.
+    _need_contract = (
+        (pre_val.val is not None and post_val.val is not None)
+        or (post_val.val is None and not _acts_as_identity(_post_val))
+        or (pre_val.val is None and not _acts_as_identity(_pre_val))
+    )
+    # Per-path contraction-operand hooks (pre -> in-edge Jacobian,
+    # post -> out-edge Jacobian). Applied to the working copies that
+    # feed the contraction, mirroring face_env (pre->cf[u], post->cf[w]).
+    if pre_hook is not None:
+        _pre_val = pre_hook(_pre_val)
+    if post_hook is not None:
+        _post_val = post_hook(_post_val)
+
+    # Reconciliation drain (2026-07-21). An operand can carry
+    # ``seed_drainable`` transforms — concatenate slot embed/slice,
+    # head slices, position-embed broadcast — that reconcile its
+    # non-nominal STORED shape back to nominal (a concat slot is
+    # stored at the FULL concat width and sliced to its own width on
+    # drain; the stored edge is a bare identity-seed: empty dims,
+    # ``val is None``, only the queued reconciler). The old code rode
+    # those transforms THROUGH the contraction and re-attached them to
+    # the OUTPUT. That is correct only while the reconcilable axis
+    # stays a free dim: a diagonal ``dW/dV`` contracted against such a
+    # ``dV/dU`` couples W's axis to U's axis in a block-diagonal pair
+    # that PINS the full concat width onto ``U`` — a transform-free
+    # NON-NOMINAL edge (logical 32 on a nominal-16/-1 axis) that then
+    # broadcasts through every sibling merge until an ``N`` vs ``M``
+    # (neither 1) collision crashes ``_reconcile_broadcast_dims`` (the
+    # ViT-compress ``(1,32,8,16)`` vs ``(1,32,8,32)`` merge). Folding
+    # the reconciler into the OPERAND here feeds the contraction a
+    # nominal ``U`` so no coupling forms. Only the RELABEL remainder
+    # (``_pre_reattach`` / ``_post_reattach``) rides the re-attach.
+    # Gated on the approx config so EXACT AD (``transforms == ()``)
+    # keeps the operands' full queues and is byte-identical.
+    _pre_reattach = pre_val.pre_transforms
+    _post_reattach = post_val.post_transforms
+    if approx:
+        if _pre_val.pre_transforms or _pre_val.post_transforms:
+            _pre_val, _pre_rem_pre, _pre_rem_post = (
+                _peel_reconciler_transforms(_pre_val)
+            )
+            _pre_reattach = _pre_rem_pre
+        if _post_val.pre_transforms or _post_val.post_transforms:
+            _post_val, _post_rem_pre, _post_rem_post = (
+                _peel_reconciler_transforms(_post_val)
+            )
+            _post_reattach = _post_rem_post
+        # Recompute the contraction decision from the PEELED operands.
+        # ``_need_contract`` above was computed from the STORED
+        # operands, where a concatenate/slice edge is a bare
+        # identity-seed — ``_acts_as_identity`` sees the scalar seed
+        # and chooses the pass-through. Peeling MATERIALISES that seed
+        # into a real RECTANGULAR Jacobian (e.g. ``(8,32,8,16)`` for a
+        # concat slot), which must be CONTRACTED, not passed through:
+        # the stale decision returns the other operand verbatim
+        # (``(8,32,8,32)``), pinning the concat width onto the input
+        # axis. Only re-evaluated in the approx path, so EXACT AD is
+        # untouched.
+        _need_contract = (
+            (_pre_val.val is not None and _post_val.val is not None)
+            or (_post_val.val is None
+                and not _acts_as_identity(_post_val))
+            or (_pre_val.val is None
+                and not _acts_as_identity(_pre_val))
+        )
+    return FaceOperands(_post_val, _pre_val, _need_contract,
+                        _pre_reattach, _post_reattach,
+                        approx=bool(approx), stored_pre=pre_val)
+
+
+class FaceContraction(NamedTuple):
+    """The contracted face edge plus the op counts the count path accumulates."""
+    val: Any
+    adds: int
+    muls: int
+    fmas: int
+    mem: int
+
+
+def contract_face_operands(ops: FaceOperands, *, count_ops: bool = False,
+                           demand_dense: bool = False) -> FaceContraction:
+    """Contract one face's prepared operands into the new edge Jacobian.
+
+    THE SECOND HALF OF THE FACE CONTRACTION, and the only copy of it. The three
+    special cases are all here and stay here: scalar x scalar
+    (``sparse_matmul`` rejects 0-rank operands), the ``count_ops`` path, and
+    demand-dense.
+
+    The STRUCTURE of the result -- ``val.shape``, ``out_dims``,
+    ``primal_dims``, the transform queues -- is a pure function of the two
+    operands' structures, which is what lets alphagrad compute a face's
+    ``res:new`` approximation mask from the operands alone, with no speculative
+    elimination. Calling THIS function is what keeps that mask from being a
+    second copy of the structure algebra.
+
+    Args:
+        ops: the result of :func:`prepare_face_operands`.
+        count_ops: accumulate adds / muls / fmas / mem (the cost path).
+        demand_dense: the elimination's ``out_edge in _demand_head_vars``.
+
+    Returns:
+        FaceContraction
+    """
+    _post_val, _pre_val = ops.post, ops.pre
+    _need_contract = ops.need_contract
+    _pre_reattach, _post_reattach = ops.pre_reattach, ops.post_reattach
+    adds = muls = fmas = mem = 0
+    if _need_contract:
+        # A scalar × scalar contraction is an elementwise multiply:
+        # ``sparse_matmul`` rejects 0-rank operands, so it must NEVER
+        # be routed through matmul — on either the count or non-count
+        # path (the count path used to crash here).
+        if _is_scalar_st(_post_val) and _is_scalar_st(_pre_val):
+            edge_outval = _post_val * _pre_val
+            if count_ops:
+                muls += 1
+        elif count_ops:
+            edge_outval, (_a, _m, _f) = _with_demand_dense(
+                demand_dense,
+                lambda: sparse_matmul(_post_val, _pre_val, count=True),
+            )
+            adds += int(_a)
+            muls += int(_m)
+            fmas += int(_f)
+        else:
+            edge_outval = _with_demand_dense(
+                demand_dense,
+                lambda: _post_val @ _pre_val,
+            )
+        if count_ops:
+            post_size = (
+                _post_val.val.size if _post_val.val is not None else 0
+            )
+            pre_size = _pre_val.val.size if _pre_val.val is not None else 0
+            out_size = (
+                edge_outval.val.size
+                if edge_outval.val is not None
+                else 0
+            )
+            mem += max(
+                post_size * _post_val.dtype.itemsize,
+                pre_size * _pre_val.dtype.itemsize,
+                out_size * edge_outval.dtype.itemsize,
+            )
+
+    elif (_pre_val.val is not None if ops.approx
+          else ops.stored_pre.val is not None):
+        # post is a pure-diagonal identity up to its scalar_mult:
+        # pass pre through, FOLDING post's scalar_mult (a scalar /
+        # scaled-identity edge multiplies by it; dropping it was the
+        # ``sum(z*sum(z))`` bug — 10·pre became pre). In the approx
+        # path a peeled operand's own ``val`` decides which side is the
+        # identity (the stored ``pre_val`` may be a since-materialised
+        # seed); EXACT AD keeps the original ``pre_val.val`` test and
+        # is byte-identical.
+        edge_outval = _identity_passthrough(_pre_val, _post_val, "pre")
+        if count_ops:
+            muls += 1
+    else:
+        # pre is the identity (up to scalar_mult): pass post through.
+        edge_outval = _identity_passthrough(_post_val, _pre_val, "post")
+        if count_ops:
+            muls += 1
+    # Offload the remaining (un-peeled) Jacobian transforms to the
+    # output tensor. ``_post_reattach`` / ``_pre_reattach`` are the
+    # operands' full queues on EXACT AD (byte-identical to the old
+    # ``prepend_post_transforms`` / ``append_pre_transforms``) and the
+    # RELABEL remainder after a reconciler peel in an approx config.
+    if len(_post_reattach) > 0:
+        edge_outval.post_transforms = (
+            tuple(_post_reattach) + tuple(edge_outval.post_transforms)
+        )
+
+    if len(_pre_reattach) > 0:
+        edge_outval.pre_transforms = (
+            tuple(_pre_reattach) + tuple(edge_outval.pre_transforms)
+        )
+
+    # A misaligned-contract matmul can emit a compressed output
+    # (BandedIndex / SetIndex). The consistency check and the
+    # Diag / Compress micro-actions below consume only plain
+    # {Dense, Diagonal} dims, so densify the compressed pair to
+    # its compact equivalent here (keeps the M× meta-block-diagonal
+    # form where the structure reduces to a diagonal).
+    if _compressed_dims(edge_outval):
+        edge_outval = _materialize_for_op(edge_outval)
+    return FaceContraction(edge_outval, adds, muls, fmas, mem)
+
+
+def contract_face(post_val, pre_val, *, approx: bool = False,
+                  count_ops: bool = False, demand_dense: bool = False,
+                  pre_hook=None, post_hook=None) -> FaceContraction:
+    """:func:`prepare_face_operands` then :func:`contract_face_operands`.
+
+    The whole face contraction in one call, for a caller that does not need to
+    interpose between the two halves. :func:`_eliminate_vertex` does need to
+    (the deferred-output fast path of #46 sits between them), so it calls the
+    two halves; everything else should call this.
+    """
+    return contract_face_operands(
+        prepare_face_operands(post_val, pre_val, approx=approx,
+                              pre_hook=pre_hook, post_hook=post_hook),
+        count_ops=count_ops, demand_dense=demand_dense)
+
+
 def _eliminate_vertex(
     vertex: int,
     jaxpr: core.Jaxpr,
@@ -1702,13 +2007,8 @@ def _eliminate_vertex(
         # armed the approx config in one form and not the other — and this
         # flag gates the reconciler peel and the pre-Diag drain, so the two
         # forms took DIFFERENT code paths for the same request.
-        _is_approx_cfg = _is_approx_cfg or any(
-            _slots is SKIP_FACE or any(
-                isinstance(_t, (Diag, Compress, FaceJoinPolicy))
-                for _t in _iter_face_hooks(_slots)
-            )
-            for _slots in face_transforms.values()
-        )
+        _is_approx_cfg = _is_approx_cfg or face_config_is_approx(
+            face_transforms)
 
     # Output vars of the whole jaxpr: edges stored onto these heads feed the
     # output boundary's mandatory densify (demand-driven materialization).
@@ -1881,91 +2181,21 @@ def _eliminate_vertex(
 
                 # TODO implement a process that discards unnecessary edges from the computation
 
-                # Handle stuff like reshape, squeeze etc.
-                # Apply Jacobian transforms where applicable. ``unload_*``
-                # already returns a fresh tensor, so only copy in the no-
-                # transform branch — copying *then* overwriting with the unload
-                # result (the old code) wasted a full tensor copy per edge.
-                if len(pre_val.post_transforms) > 0 and post_val.val is not None:
-                    _post_val = unload_post_transforms(post_val, pre_val)
-                else:
-                    _post_val = post_val.copy()
-
-                # Seed-aware draining (shared with the triplet path).
-                _post_val, _pre_val = _drain_or_unload_pre(
-                    post_val, pre_val, _post_val)
-
-                # Multiply the two values of the edges if applicable. The real
-                # contraction runs whenever both edges carry values OR a
-                # ``val is None`` operand is a non-identity structural Jacobian
-                # (a broadcast / reduction — see ``_acts_as_identity``); the
-                # pass-through shortcuts below are only valid when the val-less
-                # operand truly acts as the identity.
-                _need_contract = (
-                    (pre_val.val is not None and post_val.val is not None)
-                    or (post_val.val is None and not _acts_as_identity(_post_val))
-                    or (pre_val.val is None and not _acts_as_identity(_pre_val))
-                )
-                # Per-path contraction-operand hooks (pre -> in-edge Jacobian,
-                # post -> out-edge Jacobian). Applied to the working copies that
-                # feed the contraction, mirroring face_env (pre->cf[u], post->cf[w]).
-                if _perpath and _h_pre is not None:
-                    _pre_val = _h_pre(_pre_val)
-                if _perpath and _h_post is not None:
-                    _post_val = _h_post(_post_val)
-
-                # Reconciliation drain (2026-07-21). An operand can carry
-                # ``seed_drainable`` transforms — concatenate slot embed/slice,
-                # head slices, position-embed broadcast — that reconcile its
-                # non-nominal STORED shape back to nominal (a concat slot is
-                # stored at the FULL concat width and sliced to its own width on
-                # drain; the stored edge is a bare identity-seed: empty dims,
-                # ``val is None``, only the queued reconciler). The old code rode
-                # those transforms THROUGH the contraction and re-attached them to
-                # the OUTPUT. That is correct only while the reconcilable axis
-                # stays a free dim: a diagonal ``dW/dV`` contracted against such a
-                # ``dV/dU`` couples W's axis to U's axis in a block-diagonal pair
-                # that PINS the full concat width onto ``U`` — a transform-free
-                # NON-NOMINAL edge (logical 32 on a nominal-16/-1 axis) that then
-                # broadcasts through every sibling merge until an ``N`` vs ``M``
-                # (neither 1) collision crashes ``_reconcile_broadcast_dims`` (the
-                # ViT-compress ``(1,32,8,16)`` vs ``(1,32,8,32)`` merge). Folding
-                # the reconciler into the OPERAND here feeds the contraction a
-                # nominal ``U`` so no coupling forms. Only the RELABEL remainder
-                # (``_pre_reattach`` / ``_post_reattach``) rides the re-attach.
-                # Gated on the approx config so EXACT AD (``transforms == ()``)
-                # keeps the operands' full queues and is byte-identical.
-                _pre_reattach = pre_val.pre_transforms
-                _post_reattach = post_val.post_transforms
-                if _perpath or _is_approx_cfg:
-                    if _pre_val.pre_transforms or _pre_val.post_transforms:
-                        _pre_val, _pre_rem_pre, _pre_rem_post = (
-                            _peel_reconciler_transforms(_pre_val)
-                        )
-                        _pre_reattach = _pre_rem_pre
-                    if _post_val.pre_transforms or _post_val.post_transforms:
-                        _post_val, _post_rem_pre, _post_rem_post = (
-                            _peel_reconciler_transforms(_post_val)
-                        )
-                        _post_reattach = _post_rem_post
-                    # Recompute the contraction decision from the PEELED operands.
-                    # ``_need_contract`` above was computed from the STORED
-                    # operands, where a concatenate/slice edge is a bare
-                    # identity-seed — ``_acts_as_identity`` sees the scalar seed
-                    # and chooses the pass-through. Peeling MATERIALISES that seed
-                    # into a real RECTANGULAR Jacobian (e.g. ``(8,32,8,16)`` for a
-                    # concat slot), which must be CONTRACTED, not passed through:
-                    # the stale decision returns the other operand verbatim
-                    # (``(8,32,8,32)``), pinning the concat width onto the input
-                    # axis. Only re-evaluated in the approx path, so EXACT AD is
-                    # untouched.
-                    _need_contract = (
-                        (_pre_val.val is not None and _post_val.val is not None)
-                        or (_post_val.val is None
-                            and not _acts_as_identity(_post_val))
-                        or (_pre_val.val is None
-                            and not _acts_as_identity(_pre_val))
-                    )
+                # THE FACE CONTRACTION, FIRST HALF (``prepare_face_operands``).
+                # Extracted so the structure algebra has exactly ONE
+                # implementation: alphagrad's per-vertex approximation mask
+                # needs a face's RESULT STRUCTURE before this elimination runs,
+                # and a second copy of this arithmetic is what produced
+                # finding 72's fault 1.
+                _ops = prepare_face_operands(
+                    post_val, pre_val,
+                    approx=bool(_perpath or _is_approx_cfg),
+                    pre_hook=_h_pre if _perpath else None,
+                    post_hook=_h_post if _perpath else None)
+                _post_val, _pre_val = _ops.post, _ops.pre
+                _need_contract = _ops.need_contract
+                _pre_reattach, _post_reattach = (_ops.pre_reattach,
+                                                 _ops.post_reattach)
                 if (
                     _FACTORED
                     and _need_contract
@@ -2013,85 +2243,21 @@ def _eliminate_vertex(
                     if _face_sink is not None:
                         _face_sink.close_face()
                     continue
-                if _need_contract:
-                    # A scalar × scalar contraction is an elementwise multiply:
-                    # ``sparse_matmul`` rejects 0-rank operands, so it must NEVER
-                    # be routed through matmul — on either the count or non-count
-                    # path (the count path used to crash here).
-                    if _is_scalar_st(_post_val) and _is_scalar_st(_pre_val):
-                        edge_outval = _post_val * _pre_val
-                        if count_ops:
-                            muls += 1
-                    elif count_ops:
-                        edge_outval, (_a, _m, _f) = _with_demand_dense(
-                            out_edge in _demand_head_vars,
-                            lambda: sparse_matmul(_post_val, _pre_val, count=True),
-                        )
-                        adds += int(_a)
-                        muls += int(_m)
-                        fmas += int(_f)
-                    else:
-                        edge_outval = _with_demand_dense(
-                            out_edge in _demand_head_vars,
-                            lambda: _post_val @ _pre_val,
-                        )
-                    if count_ops:
-                        post_size = (
-                            _post_val.val.size if _post_val.val is not None else 0
-                        )
-                        pre_size = _pre_val.val.size if _pre_val.val is not None else 0
-                        out_size = (
-                            edge_outval.val.size
-                            if edge_outval.val is not None
-                            else 0
-                        )
-                        mem += max(
-                            post_size * _post_val.dtype.itemsize,
-                            pre_size * _pre_val.dtype.itemsize,
-                            out_size * edge_outval.dtype.itemsize,
-                        )
-
-                elif (_pre_val.val is not None if (_perpath or _is_approx_cfg)
-                      else pre_val.val is not None):
-                    # post is a pure-diagonal identity up to its scalar_mult:
-                    # pass pre through, FOLDING post's scalar_mult (a scalar /
-                    # scaled-identity edge multiplies by it; dropping it was the
-                    # ``sum(z*sum(z))`` bug — 10·pre became pre). In the approx
-                    # path a peeled operand's own ``val`` decides which side is the
-                    # identity (the stored ``pre_val`` may be a since-materialised
-                    # seed); EXACT AD keeps the original ``pre_val.val`` test and
-                    # is byte-identical.
-                    edge_outval = _identity_passthrough(_pre_val, _post_val, "pre")
-                    if count_ops:
-                        muls += 1
-                else:
-                    # pre is the identity (up to scalar_mult): pass post through.
-                    edge_outval = _identity_passthrough(_post_val, _pre_val, "post")
-                    if count_ops:
-                        muls += 1
-                # Offload the remaining (un-peeled) Jacobian transforms to the
-                # output tensor. ``_post_reattach`` / ``_pre_reattach`` are the
-                # operands' full queues on EXACT AD (byte-identical to the old
-                # ``prepend_post_transforms`` / ``append_pre_transforms``) and the
-                # RELABEL remainder after a reconciler peel in an approx config.
-                if len(_post_reattach) > 0:
-                    edge_outval.post_transforms = (
-                        tuple(_post_reattach) + tuple(edge_outval.post_transforms)
-                    )
-
-                if len(_pre_reattach) > 0:
-                    edge_outval.pre_transforms = (
-                        tuple(_pre_reattach) + tuple(edge_outval.pre_transforms)
-                    )
-
-                # A misaligned-contract matmul can emit a compressed output
-                # (BandedIndex / SetIndex). The consistency check and the
-                # Diag / Compress micro-actions below consume only plain
-                # {Dense, Diagonal} dims, so densify the compressed pair to
-                # its compact equivalent here (keeps the M× meta-block-diagonal
-                # form where the structure reduces to a diagonal).
-                if _compressed_dims(edge_outval):
-                    edge_outval = _materialize_for_op(edge_outval)
+                # THE FACE CONTRACTION, SECOND HALF
+                # (``contract_face_operands``) -- the same function alphagrad's
+                # mask composes face structures with.
+                # ``_ops`` verbatim: the deferred-output guard between the two
+                # halves only READS the operands, so the second half consumes
+                # exactly what the first produced.
+                _fc = contract_face_operands(
+                    _ops, count_ops=count_ops,
+                    demand_dense=out_edge in _demand_head_vars)
+                edge_outval = _fc.val
+                if count_ops:
+                    adds += _fc.adds
+                    muls += _fc.muls
+                    fmas += _fc.fmas
+                    mem += _fc.mem
 
                 # Per-path contraction-RESULT hook (``new``). The face engine
                 # applies its ``new`` to the product; here we apply it to the
