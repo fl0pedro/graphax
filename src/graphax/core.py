@@ -3,7 +3,7 @@ import os
 import threading
 from collections import defaultdict
 from functools import wraps
-from typing import Any, Callable, Dict, Sequence, Set, Tuple, Union, cast
+from typing import Any, Callable, Dict, NamedTuple, Sequence, Set, Tuple, Union, cast
 
 import immutables
 import jax
@@ -1436,13 +1436,63 @@ def faces_of(graph, transpose_graph, vertex, jaxpr):
           output variables share the same ``(in_edge, out_edge)`` pair their key
           collides and one entry configures both faces.
     """
+    return [fs.key for fs in face_specs_of(graph, transpose_graph, vertex,
+                                           jaxpr)]
+
+
+class FaceSpec(NamedTuple):
+    """One face of a vertex elimination, named by its three VARIABLES.
+
+    :func:`faces_of` returns only ``key``, which is what ``face_transforms`` is
+    indexed by; a caller that has to compute a face's OPERANDS (the two edge
+    Jacobians the contraction consumes) needs the variables themselves, and a
+    caller that has to detect the multi-output collision documented on
+    :func:`faces_of` needs ``central`` as well -- ``key`` omits it, so two
+    output variables of one equation that share an ``(in_edge, out_edge)`` pair
+    produce the SAME key and one ``face_transforms`` entry configures both
+    faces.
+
+    Attributes:
+        key: ``(vidx[in_edge], vidx[out_edge])`` -- the ``face_transforms`` key.
+        central: the output variable of ``vertex``'s equation this face runs
+            through. NOT part of ``key``.
+        in_edge: the predecessor variable; ``transpose_graph[central][in_edge]``
+            is the face's ``lhs`` operand.
+        out_edge: the successor variable; ``graph[central][out_edge]`` is the
+            face's ``rhs`` operand.
+        f: the face's position in elimination order, i.e. the index
+            ``faces_of`` lists it at and the ``f`` every per-face array in
+            alphagrad is indexed by.
+    """
+    key: tuple
+    central: Any
+    in_edge: Any
+    out_edge: Any
+    f: int
+
+
+def face_specs_of(graph, transpose_graph, vertex, jaxpr):
+    """:func:`faces_of` with the three VARIABLES of each face, same order.
+
+    THE ONE ENUMERATION. ``faces_of`` is a projection of this onto ``key``, so
+    a caller that needs the operands or the central variable cannot drift from
+    the key list the elimination looks up -- there is one loop, not two.
+
+    Every caveat on :func:`faces_of` applies verbatim, in particular that an
+    unevaluated ``LazyEdge`` is listed OPTIMISTICALLY (forcing it here would
+    emit equations into whatever trace is current), so the result is a SUPERSET
+    of the faces the elimination visits.
+
+    Returns:
+        list[FaceSpec]: one entry per face, in elimination order.
+    """
     eqn = jaxpr.eqns[int(vertex) - 1]
     vidx = _vidx_for(jaxpr)
 
     def _ordered(keys):
         return sorted(keys, key=lambda v: vidx.get(v, 1 << 30))
 
-    keys = []
+    out = []
     for central_var in eqn.outvars:
         if central_var not in graph:
             continue  # dead or already-eliminated vertex
@@ -1455,8 +1505,11 @@ def faces_of(graph, transpose_graph, vertex, jaxpr):
             for in_edge in _ordered(_in_edges.keys()):
                 if _known_none_edge(_in_edges[in_edge]):
                     continue
-                keys.append((vidx.get(in_edge), vidx.get(out_edge)))
-    return keys
+                out.append(FaceSpec(
+                    key=(vidx.get(in_edge), vidx.get(out_edge)),
+                    central=central_var, in_edge=in_edge, out_edge=out_edge,
+                    f=len(out)))
+    return out
 
 
 import math

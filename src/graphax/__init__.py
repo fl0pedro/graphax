@@ -2,6 +2,8 @@ import sys
 
 from .core import (
     SKIP_FACE,
+    FaceSpec,
+    face_specs_of,
     faces_of,
     grad,
     jacve,
