@@ -37,7 +37,7 @@ def test_stop_gradient_edge_pruned_from_faces_of():
 
 def test_select_n_predicate_edge_pruned_from_faces_of():
     def f(pred, a, b):
-        return lax.select_n(pred, a, b)
+        return jnp.sum(lax.select_n(pred, a, b))
 
     pred = jnp.array(0, dtype=jnp.int32)
     a = jnp.ones((4,))
@@ -49,12 +49,13 @@ def test_select_n_predicate_edge_pruned_from_faces_of():
     keys = faces_of(ij.graph, ij.tgraph, 1, cj.jaxpr)
     # The in-edges should only be a and b (indices 1 and 2), NOT pred (index 0)
     # pred is non-differentiable (NO_EDGE)
+    assert len(keys) > 0, f"Expected faces for select_n but got {keys}"
     in_indices = {k[0] for k in keys}
     assert 0 not in in_indices, f"Non-differentiable pred var (index 0) should not appear in in_edges: {keys}"
 
 
 def test_every_enumerated_face_is_visited_in_mlp():
-    """Verify that in an MLP, every face returned by faces_of has non-None operands."""
+    """Verify that in an MLP, every face returned by faces_of is actually visited during eliminate."""
     def loss_fn(w, x):
         return jnp.sum(jnp.tanh(x @ w))
 
@@ -65,12 +66,8 @@ def test_every_enumerated_face_is_visited_in_mlp():
 
     for v in range(1, len(cj.jaxpr.eqns) + 1):
         keys = faces_of(ij.graph, ij.tgraph, v, cj.jaxpr)
-        # Check that for every key, the edges actually exist and are non-None
-        eqn = cj.jaxpr.eqns[v - 1]
-        for central_var in eqn.outvars:
-            if central_var not in ij.graph:
-                continue
-            for out_edge, out_e in ij.graph[central_var].items():
-                val_out = out_e.value if hasattr(out_e, "value") else out_e
-                assert val_out is not None, f"Edge {central_var}->{out_edge} forced to None!"
-        ij.eliminate(v, (), None)
+        visited = []
+        face_transforms = {k: (lambda t, k=k: visited.append(k) or t, None, None) for k in keys}
+        ij.eliminate(v, (), face_transforms=face_transforms)
+        assert set(visited) == set(keys), f"At vertex {v}, expected to visit {keys} but visited {visited}"
+

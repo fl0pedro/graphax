@@ -1223,17 +1223,15 @@ def _vidx_for(jaxpr):
 
 
 def _known_none_edge(edge) -> bool:
-    """True iff ``_force(edge)`` is ``None``.
+    """True iff ``_force(edge)`` is KNOWN to be ``None`` WITHOUT forcing.
 
-    Evaluating an unset LazyEdge here resolves whether an edge carries a real
-    Jacobian or forces to None (e.g. stop_gradient, is_finite, select_n predicate,
-    or zero-gradient paths). Faces whose edges are None will never be visited by
-    _eliminate_vertex, so pruning them here ensures faces_of returns the true
-    eliminated faces rather than an over-reported optimistic superset (ticket
-    dsnn-3qm.74).
+    A :class:`LazyEdge` whose thunk has not run yet emits jax equations when
+    forced, so a read-only enumeration (:func:`faces_of`) must not touch it:
+    such an edge reports ``False`` ("not known to be None") and its face is
+    listed even though the elimination may later skip it.
     """
     if isinstance(edge, LazyEdge):
-        return edge.value is None
+        return edge._value is not _UNSET and edge._value is None
     return edge is None
 
 
@@ -1471,10 +1469,14 @@ def faces_of(graph, transpose_graph, vertex, jaxpr):
           in-edges with ITS predecessors), so keys enumerated earlier describe a
           graph that no longer exists.
         * The elimination SKIPS a face whose edge Jacobian forces to ``None``
-          (e.g. a ``stop_gradient`` blocked path). Any edge whose value forces
-          to ``None`` is filtered out via ``_known_none_edge``, so ``faces_of``
-          returns only the true reachable faces that will be eliminated (ticket
-          dsnn-3qm.74).
+          (e.g. a ``stop_gradient`` blocked path). Dead edges from non-differentiable
+          paths (``stop_gradient``, ``iota``, ``device_put``, ``select_n`` predicate)
+          are pruned at graph build time (ticket dsnn-3qm.74). An edge that is already
+          concrete (or an already-evaluated ``LazyEdge``) is filtered out here
+          too, but an *unevaluated* ``LazyEdge`` is NOT forced — forcing emits
+          jax equations into whatever trace happens to be current, which would
+          corrupt the append-only jaxpr. The returned list is thus a clean inventory
+          of reachable faces.
         * A multi-output vertex contributes the faces of every one of its
           output variables; the central variable is not part of the key (the
           mapping is per-vertex-elimination), so in the rare case where two
@@ -2606,6 +2608,17 @@ def _build_graph(
                 safe_map(write, eqn.outvars, [primal_outvals])
             continue
 
+        # Stop-gradient and zero-gradient pass-through primitives produce no Jacobian
+        # elementals ([]). They carry no differentiable signal forward and must not
+        # insert LazyEdges into graph or transpose_graph (ticket dsnn-3qm.74).
+        if eqn.primitive in (lax.stop_gradient_p, lax.iota_p, lax.device_put_p):
+            primal_outvals = _eval_primal(eqn, invals_snapshot)
+            if eqn.primitive.multiple_results:
+                safe_map(write, eqn.outvars, primal_outvals)
+            else:
+                safe_map(write, eqn.outvars, [primal_outvals])
+            continue
+
         # Activate downstream: any outvar of this eqn becomes active because it
         # carries differentiable signal forward.
         if active_vars is not None:
@@ -2658,6 +2671,10 @@ def _build_graph(
                 return _cache[0]
 
             for invar, positions in pos_by_invar.items():
+                # select_n position 0 ('which') is integer-valued / non-differentiable
+                # (NO_EDGE = None). Do not create a LazyEdge for an invar feeding only which.
+                if eqn.primitive is lax.select_n_p and all(p == 0 for p in positions):
+                    continue
 
                 def _make_thunk(positions=tuple(positions), _get=_get_elementals):
                     def thunk():
