@@ -3149,65 +3149,10 @@ def vertex_elimination_jaxpr(
     else:
         eliminator = _get_eliminator(jaxpr, args, consts, tuple(argnums))
     order = _checkify_order(order, jaxpr, vo_vertices)
-    # Flag whether this elimination carries a Diag/Compress approximation.
-    # _eliminate_vertex reads it to relax the nominal-shape asserts (a permuted
-    # edge from an approximated vertex legally reaches a non-approx vertex's
-    # merge), and alphagrad's legality oracle / face probes drive it around
-    # their own replays. It no longer gates the elemental kernel layer — that
-    # is GRAPHAX_ELEMENTAL alone now (dsnn-3qm.28.2).
-    # vertex_elimination_jaxpr RECURSES (topology build, jit/cond macro-vertices),
-    # so SAVE+RESTORE the prior value rather than hard-resetting to False — a
-    # nested non-approx elimination must not clear an outer approx elimination's
-    # flag mid-flight (that would silently drop the outer's approx handling).
-    from .sparse.elemental.dispatch import approx_active, set_approx_active
-    # Same rule as `_is_approx_cfg`: a transform is an approximation if it is a
-    # Diag/Compress instance OR a CALLABLE (the documented
-    # "(SparseTensor) -> SparseTensor escape hatch"). The isinstance-only test made a
-    # callable set _approx_on=False, which back when this flag still gated the
-    # elemental dispatch short-circuited it entirely, so contract_implicit was NEVER
-    # REACHED (telemetry: matmul_pure_dense_skip=11, DISPATCH_FALLBACK_LOG empty). The
-    # implicit (Compress-away) dim was therefore never consumed by the contraction and
-    # rode through as a phantom out dim, which _normalize_approx_edge then could not
-    # regroup ("per-side logical-extent mismatch — edge (out 10 | primal 8) vs nominal
-    # (out () | primal (8,))"). The flag still selects the approx handling below, so
-    # the callable rule stays.
-    _approx_on = any(
-        isinstance(_t, (Diag, Compress)) or callable(_t)
-        for _spec in (transforms or ())
-        for _t in (_spec[1] if isinstance(_spec, (tuple, list)) and len(_spec) == 2 else ())
+    graph, _, adds, muls, fmas, mem, counts = eliminator.eliminate(
+        order, jaxpr, transforms, vo_vertices, count_ops,
+        face_transforms=face_transforms,
     )
-    # PER-FACE transforms approximate exactly as much as per-vertex ones, so
-    # they arm the dispatch flag by the SAME rule (Diag/Compress instance, the
-    # documented callable escape hatch, or a SKIP_FACE sentinel). Without this
-    # no approx-mode machinery (the elemental kernels) can ever see a face-hook
-    # elimination — the flag lied about what the elimination carries. Handles
-    # both the nested
-    # {vertex: {face_key: slots}} and the per-vertex flat layout.
-    if not _approx_on and face_transforms:
-        def _face_slot_iter(ft):
-            for _v in ft.values():
-                if isinstance(_v, dict):
-                    yield from _v.values()
-                else:
-                    yield _v
-        _approx_on = any(
-            _slots is SKIP_FACE or any(
-                isinstance(_t, (Diag, Compress)) or callable(_t)
-                # two-op form nests triples one level deep -- flatten, or the
-                # dispatch flag lies (tuples are neither Diag nor callable).
-                for _t in _iter_face_hooks(_slots)
-            )
-            for _slots in _face_slot_iter(face_transforms)
-        )
-    _prev_approx = approx_active()
-    set_approx_active(_approx_on)
-    try:
-        graph, _, adds, muls, fmas, mem, counts = eliminator.eliminate(
-            order, jaxpr, transforms, vo_vertices, count_ops,
-            face_transforms=face_transforms,
-        )
-    finally:
-        set_approx_active(_prev_approx)
 
     # Offloading all remaining Jacobian transforms to the output variables
     # before densification! Mutate via a single .mutate() proxy on the outer

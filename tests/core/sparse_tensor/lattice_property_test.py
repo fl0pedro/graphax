@@ -24,7 +24,6 @@ from graphax.sparse.lattice import L, classify
 from graphax.sparse.ops.elementwise import elementwise
 from graphax.sparse.ops.matmul import matmul
 from graphax.sparse.tensor import SparseTensor
-from graphax.sparse.elemental.dispatch import set_approx_active
 
 N_CASES = int(os.environ.get("LATTICE_CASES", "60"))
 BASE_SEED = int(os.environ.get("LATTICE_SEED", "20260802"))
@@ -190,28 +189,24 @@ class TestContractOracle(unittest.TestCase):
             lhs = _mk(rng, lo, lp)
             rhs = _mk(rng, rο, rp)
             want = _dense_mat(lhs) @ _dense_mat(rhs)
-            for eng, approx in (("incumbent", False), ("planner", True)):
-                set_approx_active(approx)
-                try:
-                    got = matmul(lhs, rhs)
-                    gm = _dense_mat(got)
-                except Exception as e:
-                    fails.append((i, f"{eng} RAISE {type(e).__name__}: "
-                                     f"{str(e)[:90]}",
-                                  [classify(d).value for d in lhs.dims],
-                                  [classify(d).value for d in rhs.dims]))
-                    continue
-                finally:
-                    set_approx_active(False)
-                if gm.shape != want.shape:
-                    fails.append((i, f"{eng} SHAPE {gm.shape} vs {want.shape}",
-                                  [classify(d).value for d in lhs.dims],
-                                  [classify(d).value for d in rhs.dims]))
-                elif not np.allclose(gm, want, atol=TOL, rtol=TOL):
-                    err = float(np.abs(gm - want).max())
-                    fails.append((i, f"{eng} VALUE max|d|={err:.2e}",
-                                  [classify(d).value for d in lhs.dims],
-                                  [classify(d).value for d in rhs.dims]))
+            try:
+                got = matmul(lhs, rhs)
+                gm = _dense_mat(got)
+            except Exception as e:
+                fails.append((i, f"RAISE {type(e).__name__}: "
+                                 f"{str(e)[:90]}",
+                              [classify(d).value for d in lhs.dims],
+                              [classify(d).value for d in rhs.dims]))
+                continue
+            if gm.shape != want.shape:
+                fails.append((i, f"SHAPE {gm.shape} vs {want.shape}",
+                              [classify(d).value for d in lhs.dims],
+                              [classify(d).value for d in rhs.dims]))
+            elif not np.allclose(gm, want, atol=TOL, rtol=TOL):
+                err = float(np.abs(gm - want).max())
+                fails.append((i, f"VALUE max|d|={err:.2e}",
+                              [classify(d).value for d in lhs.dims],
+                              [classify(d).value for d in rhs.dims]))
         msg = "\n".join(f"  case {i}: {m}  lhs={a} rhs={b}"
                         for i, m, a, b in fails[:15])
         self.assertEqual(
@@ -239,24 +234,20 @@ class TestAddOracle(unittest.TestCase):
 
             a, b = one(), one()
             want = _dense_mat(a) + _dense_mat(b)
-            for eng, approx in (("incumbent", False), ("planner", True)):
-              set_approx_active(approx)
-              try:
+            try:
                 got = elementwise(a, b, jnp.add)
                 gm = _dense_mat(got)
-              except Exception as e:
-                fails.append((i, f"{eng} RAISE {type(e).__name__}: {str(e)[:90]}",
+            except Exception as e:
+                fails.append((i, f"RAISE {type(e).__name__}: {str(e)[:90]}",
                               [classify(d).value for d in a.dims],
                               [classify(d).value for d in b.dims]))
                 continue
-              finally:
-                set_approx_active(False)
-              if gm.shape != want.shape:
-                fails.append((i, f"{eng} SHAPE {gm.shape} vs {want.shape}",
+            if gm.shape != want.shape:
+                fails.append((i, f"SHAPE {gm.shape} vs {want.shape}",
                               [classify(d).value for d in a.dims],
                               [classify(d).value for d in b.dims]))
-              elif not np.allclose(gm, want, atol=TOL, rtol=TOL):
-                fails.append((i, f"{eng} VALUE "
+            elif not np.allclose(gm, want, atol=TOL, rtol=TOL):
+                fails.append((i, f"VALUE "
                                  f"max|d|={float(np.abs(gm-want).max()):.2e}",
                               [classify(d).value for d in a.dims],
                               [classify(d).value for d in b.dims]))

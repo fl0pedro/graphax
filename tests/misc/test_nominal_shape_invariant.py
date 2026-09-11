@@ -6,11 +6,9 @@
 
 ``SparseTensor.shape`` is ``tuple(d.logical_size for d in self.dims)`` -- an
 ORDERED tuple -- so the assert is a statement about dim ORDER as well as about
-extents. The assert is currently gated off whenever an approximation is armed::
-
-    if not _perpath and not _is_approx_cfg and not approx_active():
-
-with the comment "an approximation can leave an edge sparse/permuted".
+extents. (Historically the assert was gated off whenever an approximation was
+armed via ``if not _perpath and not _is_approx_cfg and not approx_active():``;
+this gate was retired under dsnn-3qm.71 / dsnn-3qm.65).
 
 MEASURED (2026-09-09, probe ``t93_nominal.py``; nn256 =
 ``VmappedNeuralNetwork``/mnist and TLM = ``TransformerLM``/wikitext at the

@@ -1,8 +1,7 @@
 """Property suite for the edge-level LowRank lattice class (L3).
 
 Random factored pairs vs the float64 dense oracle, through the REAL op
-entries (``matmul`` / ``elementwise``), under BOTH engines
-(``set_approx_active`` toggles incumbent / planner for the factor-side ops).
+entries (``matmul`` / ``elementwise``), under the single contraction engine.
 Covers: dense round-trip, factor_left / factor_right / middle_fold
 contraction, rank-concat add (+ subtract), the max-rank spill, dense-absorb
 spill, multiply spill, and count=True plumbing.
@@ -20,7 +19,6 @@ from graphax.sparse.lowrank import LOWRANK_STATS, LowRankTensor
 from graphax.sparse.ops.elementwise import elementwise
 from graphax.sparse.ops.matmul import matmul
 from graphax.sparse.tensor import SparseTensor
-from graphax.sparse.elemental.dispatch import set_approx_active
 
 N_CASES = int(os.environ.get("LOWRANK_CASES", "20"))
 BASE_SEED = int(os.environ.get("LOWRANK_SEED", "20260803"))
@@ -64,12 +62,7 @@ def _oracle(t):
 
 
 def _engines():
-    for label, approx in (("incumbent", False), ("planner", True)):
-        set_approx_active(approx)
-        try:
-            yield label
-        finally:
-            set_approx_active(False)
+    yield "single"
 
 
 class LowRankPropertyTest(unittest.TestCase):

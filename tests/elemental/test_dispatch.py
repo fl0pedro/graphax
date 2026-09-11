@@ -30,17 +30,6 @@ from graphax.sparse.ops.matmul import matmul
 from graphax.sparse.tensor import SparseTensor
 
 
-@pytest.fixture(autouse=True)
-def _approx_active():
-    """The dispatch no longer reads ``approx_active`` (GRAPHAX_ELEMENTAL is its
-    only gate now), but ``core`` still keys its approx handling off the flag, so
-    these routing tests set it for the duration of each test — as a real approx
-    elimination would — and reset afterwards."""
-    DSP.set_approx_active(True)
-    try:
-        yield
-    finally:
-        DSP.set_approx_active(False)
 
 
 def _dense_st(seed, out_sizes, primal_sizes):
