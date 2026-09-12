@@ -453,7 +453,7 @@ def test_the_reference_densifier_agrees_with_graphax_dense():
         try:
             got = np.asarray(t.dense(), np.float64)
         except Exception as exc:
-            refused.append((t.dims, f"{type(exc).__name__}: {exc}"))
+            refused.append((t, t.dims, f"{type(exc).__name__}: {exc}"))
             continue
         want = _ref_dense(t)
         assert got.shape == want.shape, (t.dims, got.shape, want.shape)
@@ -463,9 +463,14 @@ def test_the_reference_densifier_agrees_with_graphax_dense():
     # Every refusal must be one graphax itself routes through dense(hard=True):
     # a pair whose meta or block axis is absent, or a uniform (val=None) pair.
     # Anything else is a NEW refusal and this test is where it surfaces.
-    for dims, err in refused:
-        routed = any(
-            d.is_sparse and (d.axis is None or d.block_axis is None) for d in dims)
+    for t, dims, err in refused:
+        # The two documented routes into dense(hard=True): a pair whose meta or
+        # block axis is absent, and a UNIFORM (val is None) pair -- the latter
+        # being defect D2, ops/dense.py:129 seeding a rank-0 buffer.
+        routed = any(d.is_sparse for d in dims) and (
+            t.val is None
+            or any(d.is_sparse and (d.axis is None or d.block_axis is None)
+                   for d in dims))
         assert routed, (
             f"dense() refused a structure for a NEW reason, so the second "
             f"oracle's coverage is no longer understood: {dims} -> {err}")
