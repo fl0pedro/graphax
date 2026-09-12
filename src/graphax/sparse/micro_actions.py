@@ -760,7 +760,14 @@ def canonical_axis_order(st: SparseTensor) -> tuple[int | None, ...]:
     Slots are LOGICAL COMPONENTS, derived from dims metadata alone, in
     ``(*out_dims, *primal_dims)`` traversal order:
 
-      * a dense dim contributes one slot — its extent component;
+      * a dense dim contributes one slot — its extent component. That holds for
+        a BLOCKED DENSE dim (``other_id is None`` with a ``block_size``, ticket
+        dsnn-3qm.62) too, deliberately: its block is already implicit, so the
+        only thing left to fold is the dim as a whole, and one slot is what
+        "fold this dim" means. A second slot would address an extent no layout
+        stores AND would renumber every later slot, invalidating every recorded
+        action. ``_slot_of_dim`` in ``ops/join.py`` mirrors this and must stay
+        in lockstep;
       * a coupled pair contributes, at its FIRST appearance, a meta slot and
         (iff ``block_size is not None``) a block slot; the partner dim is
         skipped (shared storage);
@@ -868,12 +875,15 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
         return p - sum(1 for d in drops if d < p)
 
     def _remap(d: Index) -> Index:
+        # A BLOCKED DENSE dim (dsnn-3qm.62) keeps its ``block_size`` through
+        # ``replace``: dropping its physical axis leaves ``axis=None`` with the
+        # block still implicit, i.e. a fully uniform dim of the same
+        # ``logical_size`` -- which is exactly what compressing its one slot
+        # means. Only a PAIR owns a second (block) axis to shift.
         new_axis = _shift_after_drops(getattr(d, "axis", None))
         if d.is_sparse:
             new_block_axis = _shift_after_drops(d.block_axis)
             return replace(d, axis=new_axis, block_axis=new_block_axis)
-        if not d.is_sparse:
-            return replace(d, axis=new_axis)
         return replace(d, axis=new_axis)
 
     new_out = tuple(_remap(d) for d in st.out_dims)

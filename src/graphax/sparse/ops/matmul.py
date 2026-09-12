@@ -175,6 +175,49 @@ def _dim_vals(dim, is_outer=False):
     return (dim.block_size if dim.block_size is not None else 1), dim.block_axis
 
 
+def _is_blocked_dense(dim) -> bool:
+    """True for a BLOCKED DENSE dim (ticket dsnn-3qm.62): ``other_id is None``
+    (so no partner, so ``is_sparse`` is False) yet ``block_size`` is set, with
+    ``block_axis is None``.
+
+    It is what a COMPRESS of the val axis of a DIAG'd block leaves behind: the
+    dim still spans ``size * block_size`` logical positions, ``val`` stores one
+    entry per block along ``axis``, and the block extent is IMPLICIT — uniform
+    inside each block, expanded by ``dense()`` like any other implicit extent.
+
+    The discriminator matters because the frame reads a DiagonalIndex's meta off
+    its PARTNER (``_full_pair_data``'s ``lo`` / ``ri``). A blocked dense dim has
+    no partner, so its meta has to come from the dim itself."""
+    return (
+        dim is not None
+        and not dim.is_sparse
+        and getattr(dim, "block_size", None) is not None
+    )
+
+
+def _reject_blocked_dense(where: str, *dims) -> None:
+    """Raise on a BLOCKED DENSE dim in a role this module cannot express yet.
+
+    Project rule: an unimplemented path raises, it never silently passes. The
+    two BATCH pairings multiply the two operands POSITION BY POSITION along the
+    shared dim, so an implicit block would have to be materialized on the side
+    that carries one — exactly the densification the blocked form exists to
+    avoid. There is no correct answer to give here, so say which dim and which
+    pairing rather than reading ``size`` as the whole extent and returning a
+    wrong-shaped product."""
+    for d in dims:
+        if _is_blocked_dense(d):
+            raise ValueError(
+                f"matmul: a blocked dense dim (id={d.id} size={d.size} "
+                f"block_size={d.block_size} logical_size={d.logical_size}) is an "
+                f"operand of a '{where}' pairing, which is not implemented "
+                f"(ticket dsnn-3qm.62). The pairing would have to materialize "
+                f"the implicit block to align the two sides position by "
+                f"position. Densify the operand before the matmul, or contract "
+                f"the dim instead of batching it."
+            )
+
+
 def _outer_v(dim, sibling):
     """Outer axis for `dim`, falling back to its sibling's axis if dim itself is unmaterialized."""
     if dim is None:
@@ -199,15 +242,31 @@ def _full_pair_data(lo, li, ro, ri, swap_rhs=False):
     l_shared, l_shared_v = _dim_vals(li, False)
     r_block, r_block_v = _dim_vals(ro, False)
     r_shared, r_shared_v = _dim_vals(ri, False)
+    l_outer_v = _outer_v(lo, li)
+    r_outer_v = _outer_v(ri if swap_rhs else ro, ro if swap_rhs else ri)
+    # A BLOCKED DENSE dim being CONTRACTED (``li`` on the lhs, ``ro`` on the rhs)
+    # factors its own contracted extent into ``size`` stored blocks x an IMPLICIT
+    # ``block_size`` (ticket dsnn-3qm.62). That is the same shape of statement a
+    # DiagonalIndex's meta makes, but it has no partner dim to read the meta off,
+    # so ``_dim_vals(lo, True)`` / ``_dim_vals(ri, True)`` see nothing: the meta
+    # comes from the contracted dim itself and its block becomes the (unstored)
+    # contracted slot, from where the frame lcm-refines it against the other
+    # side's factoring of the same extent without materializing anything.
+    if _is_blocked_dense(li):
+        l_outer, l_outer_v = li.size, li.axis
+        l_shared, l_shared_v = li.block_size, li.block_axis
+    if _is_blocked_dense(ro):
+        r_outer, r_outer_v = ro.size, ro.axis
+        r_block, r_block_v = ro.block_size, ro.block_axis
     return (
         PairData(
-            l_outer, l_block, l_shared, _outer_v(lo, li), l_block_v, l_shared_v, lo, li
+            l_outer, l_block, l_shared, l_outer_v, l_block_v, l_shared_v, lo, li
         ),
         PairData(
             r_outer,
             r_block,
             r_shared,
-            _outer_v(ri if swap_rhs else ro, ro if swap_rhs else ri),
+            r_outer_v,
             r_block_v,
             r_shared_v,
             ro,
@@ -242,6 +301,7 @@ def _matched_pair(lout, lprimal, rout, rprimal):
             *_full_pair_data(lout, lprimal, rout, rprimal, swap_rhs=True),
         )
     if lout and rout:
+        _reject_blocked_dense("batch_out", lout, rout)
         l_len, l_v = _dim_vals(lout, False)
         r_len, r_v = _dim_vals(rout, False)
         return Pair(
@@ -251,6 +311,7 @@ def _matched_pair(lout, lprimal, rout, rprimal):
             PairData(r_len, 1, 1, r_v, None, None, rout),
         )
     if lprimal and rprimal:
+        _reject_blocked_dense("batch_primal", lprimal, rprimal)
         l_len, l_v = _dim_vals(lprimal, False)
         r_len, r_v = _dim_vals(rprimal, False)
         return Pair(
@@ -366,8 +427,11 @@ def _resolve_contract_pair(lp, ro, lhs_out_map, rhs_primal_map):
         Pair(
             # logical_element_count = elements per contraction unit: the block
             # size, or the dim size when the dim carries no block (block_size is
-            # present-but-None for dense/scalar contracting dims, so a getattr
-            # default never fires — use ``or`` to fall through), or 1.
+            # present-but-None for PLAIN dense/scalar contracting dims, so a
+            # getattr default never fires — use ``or`` to fall through), or 1.
+            # A BLOCKED DENSE contracting dim (dsnn-3qm.62) has a block_size too,
+            # and ``block_size`` is the right reading there as well: its meta is
+            # the block COUNT, so the unit is still one block.
             "contract",
             (getattr(lp, "block_size", None) or getattr(lp, "size", None) or 1),
             *_full_pair_data(lo, lp, ro, rp, swap_rhs=True),
@@ -1439,6 +1503,78 @@ def _build_sparse(
     )
 
 
+def _dense_survivor(dim_id, logical, phys, axis, pres):
+    """The surviving DENSE dim of one side of a contraction.
+
+    ``logical`` is the extent the topology says the dim spans; ``phys`` is what
+    the grid axis ``axis`` actually holds. The lazy frame (dsnn-3qm.67) leaves an
+    extent at 1 when no operand stores it, so the two differ whenever part of
+    this dim rides implicitly, and the job here is to describe which part:
+
+    * nothing physical — one implicit dense dim of the full logical extent,
+      ``axis=None``; ``dense()`` broadcasts it back.
+    * all of it physical — a plain dense dim.
+    * the META physical and the BLOCK implicit — a BLOCKED DENSE dim
+      (dsnn-3qm.62): ``size`` is the stored meta, ``block_size`` the implicit
+      block, ``block_axis`` None. This is the COMPRESS'd-block Jacobian: ``val``
+      keeps one entry per block, the block extent is uniform inside each block,
+      and the contraction materializes NONE of it. ``logical % phys == 0`` is
+      what makes the statement well formed — ``phys`` blocks of ``logical //
+      phys`` positions each, in that order, because ``axis`` is the OUTER
+      pointer of an ``Index``.
+
+    The fourth combination — the block physical but the meta implicit — is an
+    "implicit outer, explicit inner" dim no ``Index`` can describe, so it raises
+    instead of mislabelling the stored axis as the meta."""
+    if not pres or phys <= 1:
+        return DenseIndex(dim_id, logical, axis=None)
+    if phys == logical:
+        return DenseIndex(dim_id, logical, axis=axis)
+    if logical % phys == 0:
+        return Index(dim_id, phys, axis, None, logical // phys, None)
+    raise ValueError(
+        f"matmul: contraction survivor id={dim_id} spans {logical} logical "
+        f"positions but its grid axis {axis} holds {phys}, which does not "
+        f"divide it. A blocked dense survivor needs the stored extent to be "
+        f"the OUTER (block-count) factor of the logical one (dsnn-3qm.62)."
+    )
+
+
+def _blocked_pair_error(side: str, dim_id, logical, phys, axis) -> ValueError:
+    """A surviving DiagonalIndex whose block is only partly stored.
+
+    Unimplemented, so it raises (project rule). The blocked DENSE form of
+    dsnn-3qm.62 does not help here: the pair already spends ``size`` on its meta
+    and ``block_size`` on the surviving extent, so there is no third field left
+    to say how much of the block is implicit. Densify the operand, or COMPRESS
+    the whole pair instead of one side of it."""
+    return ValueError(
+        f"matmul: surviving diagonal {side} dim id={dim_id} spans {logical} "
+        f"positions but its grid axis {axis} holds only {phys}; a DiagonalIndex "
+        f"cannot state a PARTLY implicit block (ticket dsnn-3qm.62)."
+    )
+
+
+def _with_implicit_block(dim, src):
+    """Re-attach a PASS-THROUGH dim's implicit block.
+
+    A spatial (uncontracted) pairing carries the source dim's PHYSICAL extent
+    through the frame and nothing else: the contraction never reads, splits or
+    sums it. So a blocked dense source dim's ``block_size`` is metadata that
+    comes back verbatim — only the ``size`` had to survive the frame, and the
+    guard below states exactly that."""
+    if not _is_blocked_dense(src) or dim is None:
+        return dim
+    if int(dim.size) != int(src.size) or dim.block_size is not None:
+        raise ValueError(
+            f"matmul: pass-through of blocked dense dim id={src.id} "
+            f"(size={src.size} block_size={src.block_size}) came out of the "
+            f"frame as size={dim.size} block_size={dim.block_size}; the frame "
+            f"was expected to carry its stored extent unchanged (dsnn-3qm.62)."
+        )
+    return replace(dim, block_size=src.block_size, block_axis=None)
+
+
 def _build_pair_dims(pm, i, sa, la, ra, res, next_id):
     """Build (out_dim, primal_dim, next_id) for one pair, dispatching on pairing_type."""
     # Sizes come from the LOGICAL topology; the axis maps come from the buffer.
@@ -1451,6 +1587,12 @@ def _build_pair_dims(pm, i, sa, la, ra, res, next_id):
         else res.true_rhs_block_lens
     final_l = (pm.lhs.outer_len // sf) * _lbl[i]
     final_r = (pm.rhs.outer_len // sf) * _rbl[i]
+    # The PHYSICAL extents of the same two grid axes, read off the effective
+    # (buffer) frame exactly as ``_resolve_output_shape`` read the shape off it.
+    # ``final_* != phys_*`` is a part of the dim the buffer does not store.
+    _eff = pm if res.eff_pairs is None else res.eff_pairs[i]
+    phys_l = (_eff.lhs.outer_len // res.shared_factors[i]) * res.lhs_block_lens[i]
+    phys_r = (_eff.rhs.outer_len // res.shared_factors[i]) * res.rhs_block_lens[i]
     z = _NO_LAZY if res.lazy is None else res.lazy[i]
     pres_shared = pm.lhs.outer_axis is not None or pm.rhs.outer_axis is not None
     pres_lhs = pm.lhs.outer_axis is not None or pm.lhs.block_axis is not None
@@ -1492,6 +1634,17 @@ def _build_pair_dims(pm, i, sa, la, ra, res, next_id):
     out_dim = primal_dim = None
     if pt == "contract":
         if pm.lhs.dim and pm.rhs.shared_dim:
+            # The pair SURVIVES as a pair, on both sides. ``_build_sparse`` puts
+            # the surviving extent in ``block_size`` and points ``block_axis`` at
+            # the grid axis, so a part of it the buffer does not store can only
+            # be described by leaving ``block_axis`` None (``inner_pres`` False,
+            # which the lazy frame's own ``z`` already does). Anything else is
+            # metadata that lies about the buffer — say so here rather than in
+            # SparseTensor's topology check.
+            if pres_lhs and phys_l != final_l:
+                raise _blocked_pair_error("out", l_id, final_l, phys_l, la)
+            if pres_rhs and phys_r != final_r:
+                raise _blocked_pair_error("primal", rs_id, final_r, phys_r, ra)
             out_dim = _build_sparse(
                 l_id, rs_id, sf, sa, pres_shared, final_l, la, pres_lhs
             )
@@ -1499,9 +1652,9 @@ def _build_pair_dims(pm, i, sa, la, ra, res, next_id):
                 rs_id, l_id, sf, sa, pres_shared, final_r, ra, pres_rhs
             )
         elif pm.lhs.dim:
-            out_dim = DenseIndex(l_id, final_l, axis=la if pres_lhs else None)
+            out_dim = _dense_survivor(l_id, final_l, phys_l, la, pres_lhs)
         elif pm.rhs.shared_dim:
-            primal_dim = DenseIndex(rs_id, final_r, axis=ra if pres_rhs else None)
+            primal_dim = _dense_survivor(rs_id, final_r, phys_r, ra, pres_rhs)
     elif pt == "batch_out":
         out_dim = DenseIndex(
             l_id if pm.lhs.dim else ls_id, sf, axis=sa if pres_shared else None
@@ -1511,10 +1664,14 @@ def _build_pair_dims(pm, i, sa, la, ra, res, next_id):
             l_id if pm.lhs.dim else ls_id, sf, axis=sa if pres_shared else None
         )
     elif pt == "spatial_out_lhs":
-        out_dim = DenseIndex(l_id, final_l, axis=la if pres_lhs else None)
+        out_dim = _with_implicit_block(
+            DenseIndex(l_id, final_l, axis=la if pres_lhs else None), pm.lhs.dim
+        )
     elif pt == "spatial_out_rhs":
         out_pres = getattr(pm.rhs, "block_axis", None) is not None
-        out_dim = DenseIndex(r_id, final_r, axis=ra if out_pres else None)
+        out_dim = _with_implicit_block(
+            DenseIndex(r_id, final_r, axis=ra if out_pres else None), pm.rhs.dim
+        )
     elif pt == "spatial_primal_lhs":
         # A one-sided PRIMAL dim rides in ``PairData.shared_block_len``, which
         # ``_finalize_output`` folds into the RHS half of the grid (``split`` ->
@@ -1524,9 +1681,15 @@ def _build_pair_dims(pm, i, sa, la, ra, res, next_id):
         # order, Reduce on slot ``new``, where the chain ends in ``X @ scalar``
         # and every primal dim of ``X`` is such a pair.
         prim_pres = pm.lhs.shared_block_axis is not None
-        primal_dim = DenseIndex(ls_id, final_r, axis=ra if prim_pres else None)
+        primal_dim = _with_implicit_block(
+            DenseIndex(ls_id, final_r, axis=ra if prim_pres else None),
+            pm.lhs.shared_dim,
+        )
     elif pt == "spatial_primal_rhs":
-        primal_dim = DenseIndex(rs_id, final_r, axis=ra if pres_rhs else None)
+        primal_dim = _with_implicit_block(
+            DenseIndex(rs_id, final_r, axis=ra if pres_rhs else None),
+            pm.rhs.shared_dim,
+        )
     elif pt == "batch_sparse":
         out_dim = _build_sparse(l_id, rs_id, sf, sa, pres_shared, final_l, la, pres_lhs)
         primal_dim = _build_sparse(
@@ -1581,9 +1744,36 @@ def _build_pair_dims(pm, i, sa, la, ra, res, next_id):
     return out_dim, primal_dim, next_id
 
 
-def _build_output_tensor(ctx, rhs_dims, res):
-    from graphax.sparse.tensor import SparseTensor
+def _meta_is_summed(pm) -> bool:
+    """True when pair ``pm``'s grid axes hold PARTIAL sums the output must add up.
 
+    A contract pair's meta rides through to the output only because a surviving
+    DiagonalIndex carries it there — ``lhs.dim`` on the out side, or
+    ``rhs.shared_dim`` on the primal side. A BLOCKED DENSE contracted dim
+    (dsnn-3qm.62) factors its OWN contracted extent into stored blocks x an
+    implicit block and has no such partner, so the meta is part of the
+    contraction: the einsum leaves one partial sum per block group and they must
+    be added, not sliced.
+
+    With neither side carrying a surviving dim, every pre-.62 pair had meta 1 on
+    both sides (a meta > 1 came from a DiagonalIndex, which always survives), so
+    this sums a single element and is the incumbent behaviour there."""
+    return (
+        pm.pairing_type == "contract"
+        and pm.lhs.dim is None
+        and pm.rhs.shared_dim is None
+    )
+
+
+def _pair_output_dims(ctx, rhs_dims, res):
+    """The metadata half of the output build.
+
+    Returns ``(out_dims, primal_dims, shape, squeeze, summed)``: the per-pair
+    dims in pair order, the grid shape they were read off, the grid axes no dim
+    claims that are UNIFORM (slice 0 is exact), and the ones that carry live
+    partial sums (``_meta_is_summed``). ``_build_output_tensor`` and
+    ``_output_dims`` each carried a verbatim copy of this; they call it now so
+    the dims a contraction REPORTS cannot drift from the ones it BUILDS."""
     shape, (sh_map, lhs_map, rhs_map), squeeze = _resolve_output_shape(ctx, res)
     next_id = (
         builtins.max([d.id for d in ctx.lhs.dims] + [d.id for d in rhs_dims] + [-1]) + 1
@@ -1603,11 +1793,25 @@ def _build_output_tensor(ctx, rhs_dims, res):
             used_axes.add(d.axis)
         if getattr(d, "block_axis", None) is not None:
             used_axes.add(d.block_axis)
-    for i in range(len(ctx.pairs)):
+    summed = []
+    for i, pm in enumerate(ctx.pairs):
         for ax in (sh_map[i], lhs_map[i], rhs_map[i]):
             if ax not in used_axes:
-                squeeze.append(ax)
+                (summed if _meta_is_summed(pm) else squeeze).append(ax)
+    return out_dims, primal_dims, shape, squeeze, summed
+
+
+def _build_output_tensor(ctx, rhs_dims, res):
+    from graphax.sparse.tensor import SparseTensor
+
+    out_dims, primal_dims, shape, squeeze, summed = _pair_output_dims(
+        ctx, rhs_dims, res
+    )
     grid_view = res.grid.reshape(shape) if res.grid.shape != tuple(shape) else res.grid
+    if summed:
+        # keepdims so every axis index below still means what it meant.
+        grid_view = grid_view.sum(axis=tuple(sorted(set(summed))), keepdims=True)
+    squeeze = squeeze + summed
     if squeeze:
         unique_sq = tuple(sorted(set(squeeze)))
         final_shape = [s for i, s in enumerate(shape) if i not in unique_sq]
@@ -2274,30 +2478,12 @@ def _compact_block_lens(pairs, shared, total, split):
 
 def _output_dims(ctx, rhs_dims, res):
     """Canonical output dims (ids/sizes/axis) — the pure metadata half of
-    _build_output_tensor, derived from res.grid.shape (no val touched)."""
-    shape, (sh_map, lhs_map, rhs_map), squeeze = _resolve_output_shape(ctx, res)
-    next_id = (
-        builtins.max([d.id for d in ctx.lhs.dims] + [d.id for d in rhs_dims] + [-1]) + 1
+    _build_output_tensor, derived from res.grid.shape (no val touched). Both
+    halves read the same ``_pair_output_dims``, so they cannot disagree."""
+    out_dims, primal_dims, _shape, squeeze, summed = _pair_output_dims(
+        ctx, rhs_dims, res
     )
-    out_dims, primal_dims = [], []
-    for i, pm in enumerate(ctx.pairs):
-        od, pd, next_id = _build_pair_dims(
-            pm, i, sh_map[i], lhs_map[i], rhs_map[i], res, next_id
-        )
-        if od:
-            out_dims.append(od)
-        if pd:
-            primal_dims.append(pd)
-    used_axes = set()
-    for d in out_dims + primal_dims:
-        if d.axis is not None:
-            used_axes.add(d.axis)
-        if getattr(d, "block_axis", None) is not None:
-            used_axes.add(d.block_axis)
-    for i in range(len(ctx.pairs)):
-        for ax in (sh_map[i], lhs_map[i], rhs_map[i]):
-            if ax not in used_axes:
-                squeeze.append(ax)
+    squeeze = squeeze + summed
     if squeeze:
         unique_sq = tuple(sorted(set(squeeze)))
 

@@ -520,7 +520,7 @@ class SparseTensor(SparseMathMixin):
         fully-dense ``val is None`` tensor has no pairs ⇒ every cell is structure
         (all ones); a diagonal pair contributes its ``N·B_row·B_col`` blocks."""
         if self.val is not None:
-            return self.val.size
+            return self.val.size * self._implicit_block_factor
         n = self.size
         seen = set()
         for d in self.dims:
@@ -529,6 +529,22 @@ class SparseTensor(SparseMathMixin):
                 if key not in seen:
                     seen.add(key)
                     n //= d.size
+        return n
+
+    @property
+    def _implicit_block_factor(self) -> int:
+        """How many times each stored cell REPEATS because a dim's block is
+        implicit — a BLOCKED DENSE dim (``other_id is None`` with a
+        ``block_size``, ticket dsnn-3qm.62) stores one entry per block and the
+        value is uniform inside it.
+
+        Those positions are ON-STRUCTURE, not fill: without this factor
+        ``_n_fill_cells`` reports the whole block as implicit fill and every
+        reduction folds ``fill_value`` over cells that hold real values."""
+        n = 1
+        for d in self.dims:
+            if not d.is_sparse and d.block_size is not None:
+                n *= int(d.block_size)
         return n
 
     @property
@@ -548,7 +564,8 @@ class SparseTensor(SparseMathMixin):
             return self.val
         return jnp.ones(self._structural_val_size, dtype=self.dtype)
 
-    def _reduce(self, reduce_fn, fold_fn, *, weighted: bool = False) -> Array:
+    def _reduce(self, reduce_fn, fold_fn, *, weighted: bool = False,
+                repeat_fn=None) -> Array:
         """Shared skeleton for all/any/sum/prod (NOT max/min — see ``_extremum``,
         which can't seed an identity without introducing ``-inf``).
 
@@ -563,6 +580,13 @@ class SparseTensor(SparseMathMixin):
         * otherwise (all/any): an idempotent fold applied only when fill cells
           exist; ``fold_fn`` maps the fill's truthiness itself."""
         val_part = reduce_fn(_scaled_mul(self._stored_val(), self.scalar_mult))
+        # An implicit block stores one cell per block and means the rest, so the
+        # reduction has to account for the repetitions ``val`` does not hold:
+        # ``repeat_fn`` is the op's own weighting (``* n`` for sum, ``** n`` for
+        # prod; all/any are idempotent and pass None).
+        rep = self._implicit_block_factor
+        if rep > 1 and repeat_fn is not None:
+            val_part = repeat_fn(val_part, rep)
         scaled_fill = _scaled_mul(self._eff_fill, self.scalar_mult)
         # weighted (sum/prod) always folds (branchless, vanishes when n_fill==0);
         # all/any fold only when fill cells exist.
@@ -580,11 +604,13 @@ class SparseTensor(SparseMathMixin):
 
     @_on_materialized
     def sum(self) -> Array:
-        return self._reduce(jnp.sum, lambda v, f, n: v + f * n, weighted=True)
+        return self._reduce(jnp.sum, lambda v, f, n: v + f * n, weighted=True,
+                            repeat_fn=lambda v, n: v * n)
 
     @_on_materialized
     def prod(self) -> Array:
-        return self._reduce(jnp.prod, lambda v, f, n: v * f ** n, weighted=True)
+        return self._reduce(jnp.prod, lambda v, f, n: v * f ** n, weighted=True,
+                            repeat_fn=lambda v, n: v ** n)
 
     def _extremum(self, reduce_fn, fold_fn) -> Array:
         """Shared skeleton for max()/min(): scale BEFORE the extremum (a negative

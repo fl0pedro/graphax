@@ -185,6 +185,17 @@ def _normalize_inputs(lhs, rhs):
 
 def _promote_dense(d, partner_id):
     """Wrap a DenseIndex into a synthetic 1-block DiagonalIndex paired with `partner_id`."""
+    if getattr(d, "block_size", None) is not None:
+        # A BLOCKED DENSE dim (dsnn-3qm.62) already spends ``block_size`` on its
+        # own implicit block, and the promotion needs that field for the
+        # synthetic 1-meta pair. Unimplemented, so raise (project rule) rather
+        # than overwrite it and silently lose the block factor.
+        raise ValueError(
+            f"Topology mismatch: cannot promote blocked dense dim id={d.id} "
+            f"(size={d.size} block_size={d.block_size}) to a 1-block diagonal "
+            f"paired with id={partner_id}: the block field is already in use "
+            f"(ticket dsnn-3qm.62). Densify the operand first."
+        )
     return DiagonalIndex(d.id, 1, axis=None, other_id=partner_id,
                            block_size=d.size, block_axis=d.axis)
 
@@ -217,6 +228,17 @@ def _resolve_dim_pairing(i, ldims, rdims, processed):
             raise ValueError(
                 f"Topology mismatch: dense lhs dim id {ld.id} has no dense rhs "
                 f"partner (rhs ids {[(int(d.id), d.is_sparse) for d in rdims]})."
+            )
+        # Same id, same LOGICAL extent, different BLOCK grid: one side is a
+        # BLOCKED DENSE dim (dsnn-3qm.62) storing one cell per block and the
+        # other spells every position out. ``_ew_pair_axes`` would then hand the
+        # two sides different target shapes for the same logical axis. Say
+        # "Topology mismatch" so the caller densifies both and combines there.
+        if (ld.block_size or 1) != (rdims[rj].block_size or 1):
+            raise ValueError(
+                f"Topology mismatch: dense dim id {ld.id} block grid "
+                f"{ld.block_size or 1} (lhs) vs {rdims[rj].block_size or 1} "
+                f"(rhs) — one side stores an implicit block."
             )
         processed.add(i); return "dense", (ld, rdims[rj])
     # Pair the SPARSE primary dims by id too (mirror the dense branch): two
@@ -593,6 +615,13 @@ def _match_structure(l_by_id, r_by_id):
             return "sparse_dense_mix"
         if ld.logical_size != rd.logical_size:
             return "extent_mismatch"
+        # The block grid has to agree for DENSE dims too: a BLOCKED DENSE dim
+        # (dsnn-3qm.62) and a plain dense dim of the same LOGICAL extent store
+        # different numbers of cells along their one physical axis, so a lazy
+        # per-slot pairing of the two would combine a block-count against a
+        # position count. Skip to the densify fallback instead.
+        if (ld.block_size or 1) != (rd.block_size or 1):
+            return "block_grid_mismatch"
         if ld.is_sparse:
             if (ld.other_id != rd.other_id or ld.size != rd.size
                     or (ld.block_size or 1) != (rd.block_size or 1)):
@@ -945,6 +974,14 @@ def _lazy_pair(lhs, rhs, op, l_by_id, r_by_id):
         rec[ld1.id] = replace(ld1, axis=new_axis, block_axis=nb1, block_size=_bs(ld1, nb1))
         rec[ld2.id] = replace(ld2, axis=new_axis, block_axis=nb2, block_size=_bs(ld2, nb2))
     for ld, rd in dp:
+        # A BLOCKED DENSE dim (dsnn-3qm.62) spans ``logical_size`` positions on a
+        # physical axis of extent ``size``, so it fits neither the slot extent
+        # below nor the ``(ext, 1)`` check after it. The two sides agree here (
+        # ``_match_structure`` rejects a block-grid mismatch), so the lazy rule
+        # could be taught this layout, but nothing needs it yet: skip to the
+        # general path rather than state a slot extent the buffer contradicts.
+        if ld.block_size is not None:
+            return _skip("implicit_block")
         new_axis = _slot(ld.axis, rd.axis, ld.logical_size)
         rec[ld.id] = ld if new_axis is None else replace(ld, axis=new_axis)
 

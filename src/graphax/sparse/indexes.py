@@ -10,8 +10,25 @@ class Index:
     """Unified dim descriptor.
 
     Discriminator: ``other_id is None`` ⇒ dense; otherwise sparse-paired.
-    ``block_size`` / ``block_axis`` are only meaningful for sparse pairs
-    (block-diagonal storage) and stay ``None`` for dense and plain sparse.
+
+    ``block_size`` splits the dim's ``logical_size`` into ``size`` blocks of
+    ``block_size`` positions each, and ``block_axis`` says whether ``val``
+    carries the block physically. It is meaningful in TWO forms:
+
+    * a SPARSE PAIR (``other_id`` set): block-diagonal storage, where the two
+      partners' blocks are the rows and columns of each diagonal block;
+    * a BLOCKED DENSE dim (``other_id is None``, ``block_axis is None``, ticket
+      dsnn-3qm.62): ``val`` stores ONE entry per block along ``axis`` and the
+      block extent is IMPLICIT — the value is uniform inside each block, and
+      ``dense()`` expands it like any other implicit extent. This is what a
+      COMPRESS of the val axis of a DIAG'd block leaves behind, and what a
+      contraction emits for the survivor of such a pair: ``logical_size`` stays
+      the dim's true extent while ``val.shape[axis] == size``.
+
+    ``block_axis`` without ``other_id`` ("implicit outer, explicit inner") is
+    NOT a form: ``axis`` is the outer pointer, so there is nothing for the outer
+    extent to hang off. Both stay ``None`` for a plain dense dim and for a plain
+    (pure-diagonal) sparse pair.
 
     The ``DenseIndex`` and ``DiagonalIndex`` factory functions below construct
     this class with the appropriate field set. These two are the ONLY index
@@ -39,6 +56,14 @@ class Index:
         if self.block_size is not None and self.block_size <= 0:
             raise ValueError(
                 f"Index block_size must be positive, got {self.block_size}"
+            )
+        if self.other_id is None and self.block_axis is not None:
+            raise ValueError(
+                f"Index {self.id}: block_axis={self.block_axis} with "
+                f"other_id=None. A dim with no partner can only carry an "
+                f"IMPLICIT block (see the class docstring): ``axis`` is the "
+                f"outer pointer, so an explicit block axis would leave the "
+                f"outer extent nothing to hang off."
             )
 
     @property

@@ -61,6 +61,71 @@ if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
 
 
+# --- Blocked dense dims (ticket dsnn-3qm.62) ------------------------------
+def _is_blocked_dense(d) -> bool:
+    """A dim with ``other_id is None`` (no partner, so ``is_sparse`` is False)
+    that nevertheless carries a ``block_size``: ``val`` stores ONE entry per
+    block along ``axis`` and the block extent is implicit — uniform inside each
+    block. It is what a COMPRESS of the val axis of a DIAG'd block leaves, and
+    what ``matmul`` now emits for a survivor of such a contraction."""
+    return (
+        d is not None
+        and not d.is_sparse
+        and getattr(d, "block_size", None) is not None
+    )
+
+
+def _expand_implicit_blocks(tensor: "SparseTensor") -> "SparseTensor":
+    """Turn every BLOCKED DENSE dim into a plain dense dim of its full extent.
+
+    Densifying is exactly where an implicit extent is supposed to be paid for,
+    and every other densify helper in this module discriminates on ``is_sparse``
+    to decide whether to look at the block fields at all. Rather than teach each
+    of them a third form, normalize first: repeat ``val`` along the implicit
+    block and fold it into the stored axis. That is a RANK-PRESERVING rewrite —
+    ``(…, size, …)`` -> ``(…, size, block, …)`` -> ``(…, size * block, …)`` — so
+    no other dim's ``axis`` / ``block_axis`` moves, and the result is an ordinary
+    tensor the whole module already handles.
+
+    Returns ``tensor`` itself when there is nothing to expand, which is every
+    call that does not involve an approximated edge."""
+    if not any(_is_blocked_dense(d) for d in tensor.dims):
+        return tensor
+    from graphax.sparse.tensor import SparseTensor
+
+    val, new_dims = tensor.val, list(tensor.dims)
+    for i, d in enumerate(new_dims):
+        if not _is_blocked_dense(d):
+            continue
+        if d.block_axis is not None:
+            raise ValueError(
+                f"dense: dim id={d.id} has other_id=None with block_axis="
+                f"{d.block_axis}; a dim with no partner cannot own a physical "
+                f"block axis (ticket dsnn-3qm.62)."
+            )
+        n, b, ax = int(d.size), int(d.block_size), d.axis
+        if ax is None or val is None or ax >= val.ndim:
+            # Nothing stored along it at all: one plain implicit dense dim of the
+            # full extent, which the generic implicit path then broadcasts.
+            new_dims[i] = DenseIndex(d.id, n * b, axis=None)
+            continue
+        shp = list(val.shape)
+        val = jnp.broadcast_to(
+            jnp.expand_dims(val, ax + 1), shp[:ax] + [n, b] + shp[ax + 1 :]
+        )
+        val = val.reshape(shp[:ax] + [n * b] + shp[ax + 1 :])
+        new_dims[i] = DenseIndex(d.id, n * b, axis=ax)
+    n_out = len(tensor.out_dims)
+    return SparseTensor(
+        tuple(new_dims[:n_out]),
+        tuple(new_dims[n_out:]),
+        val,
+        scalar_mult=tensor.scalar_mult,
+        fill_value=tensor.fill_value,
+        check_consistency=False,
+    )
+
+
 # --- Public API ----------------------------------------------------------
 def dense(
     tensor: SparseTensor, axes: Sequence[int] | None = None, hard: bool = False
@@ -104,6 +169,9 @@ def dense(
     ``axes`` selects which logical dim positions to densify (``None`` = all).
     ``hard=True`` also materializes dims whose val axis is implicit (``None``).
     """
+    # A BLOCKED DENSE dim's implicit block is paid for here, before any helper
+    # below gets to discriminate on ``is_sparse`` (ticket dsnn-3qm.62).
+    tensor = _expand_implicit_blocks(tensor)
     logical_indices = set(range(tensor.ndim)) if axes is None else set(axes)
     id_to_idx = {dim.id: i for i, dim in enumerate(tensor.dims)}
     implicit = _get_implicit_indices(tensor, logical_indices, hard)
@@ -218,6 +286,7 @@ def dense_for_matmul(tensor: SparseTensor, *,
     cannot fuse into a cuBLAS GEMM custom call, so the eager fold
     materialized scaled HBM copies of both operands.
     """
+    tensor = _expand_implicit_blocks(tensor)   # dsnn-3qm.62, see ``dense``
     if defer_scale:
         _one = jnp.array(1.0, dtype=tensor.dtype)
         _sm = _one  # identity: every _scaled_mul below becomes a no-op cast
