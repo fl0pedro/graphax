@@ -3495,8 +3495,18 @@ def vertex_elimination_jaxpr(
                 tensor = _force(edge) if edge is not None else None
                 if isinstance(tensor, SparseTensor):
                     tensor = canonical_output_layout(tensor)
-                    if not any(isinstance(d, CompressedIndex) for d in tensor.dims):
-                        assert is_parameter_layout(tensor), (
+                    if (not any(isinstance(d, CompressedIndex) for d in tensor.dims)
+                            and not is_parameter_layout(tensor)):
+                        # RAISE, not ``assert``: this is the only guard between
+                        # a transposed-in-storage gradient and a consumer that
+                        # scores it, and a SQUARE leaf is invisible to every
+                        # shape check downstream (measured 2026-09-12: with the
+                        # predicate stubbed, a transposed 4x4 leaf reaches
+                        # alphagrad's grad-cosine and returns 0.88 with no
+                        # fault). A bare ``assert`` is removed by ``python -O``,
+                        # which would silently reopen that hole -- the same
+                        # reason ``_assert_sparse_tensor_consistency`` raises.
+                        raise AssertionError(
                             "OUTPUT LAYOUT CONTRACT VIOLATED: the gradient "
                             f"d{outvar}/d{invar} is not stored in parameter "
                             f"layout after canonicalization: dims={tensor.dims} "
