@@ -1916,9 +1916,21 @@ def _fold_both_implicit(lhs, rhs, count):
         new_lhs.out_dims == () and new_lhs.primal_dims == ()
         and new_rhs.out_dims == () and new_rhs.primal_dims == ()
     )
+    _lhs_scalar = new_lhs.out_dims == () and new_lhs.primal_dims == ()
+    _rhs_scalar = new_rhs.out_dims == () and new_rhs.primal_dims == ()
     if _both_scalar:
         out = new_lhs * new_rhs
         cnt = (0, 1, 0)  # one scalar multiply
+    elif _lhs_scalar or _rhs_scalar:
+        # Exactly ONE operand folded to rank-0. The caller passed two ranked
+        # tensors, so core's scalar routing could not see this; the scale is
+        # routed here, where the scalar first exists (ticket dsnn-3qm.68).
+        _tn, _sc = (new_rhs, new_lhs) if _lhs_scalar else (new_lhs, new_rhs)
+        res = scale_by_scalar(_tn, _sc, count=count)
+        if count:
+            out, cnt = res
+        else:
+            out = res
     else:
         res = matmul(new_lhs, new_rhs, count=count)
         if count:
