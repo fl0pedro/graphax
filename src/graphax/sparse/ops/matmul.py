@@ -1926,6 +1926,30 @@ def _fold_both_implicit(lhs, rhs, count):
         # tensors, so core's scalar routing could not see this; the scale is
         # routed here, where the scalar first exists (ticket dsnn-3qm.68).
         _tn, _sc = (new_rhs, new_lhs) if _lhs_scalar else (new_lhs, new_rhs)
+        # The remainder still carries the operand's ids (built above with
+        # check_consistency=False). matmul renumbers on its own output path;
+        # this path must do the same before the tensor is checked again.
+        _dims = tuple(_tn.out_dims) + tuple(_tn.primal_dims)
+        _id_map = {d.id: i for i, d in enumerate(_dims)}
+        for d in _dims:
+            if d.is_sparse and d.other_id not in _id_map:
+                raise ValueError(
+                    "both-implicit fold: sparse dim "
+                    f"{d.id} lost its partner {d.other_id}; the remainder "
+                    "cannot be expressed as a SparseTensor (dsnn-3qm.68)."
+                )
+
+        def _renum(d):
+            kw = {"id": _id_map[d.id]}
+            if d.is_sparse:
+                kw["other_id"] = _id_map[d.other_id]
+            return replace(d, **kw)
+
+        _tn = SparseTensor(
+            tuple(_renum(d) for d in _tn.out_dims),
+            tuple(_renum(d) for d in _tn.primal_dims),
+            _tn.val, scalar_mult=_tn.scalar_mult, fill_value=_tn.fill_value,
+        )
         res = scale_by_scalar(_tn, _sc, count=count)
         if count:
             out, cnt = res
