@@ -42,7 +42,17 @@ def classify_edge(t) -> L | None:
 
 
 def classify(d) -> L:
-    """Lattice class of one Index."""
+    """Lattice class of one Index.
+
+    GAP, stated not papered over (ticket dsnn-3qm.62): a BLOCKED DENSE dim
+    (``other_id is None`` with a ``block_size``, ``block_axis`` None) is DENSE in
+    its stored meta and IMPLICIT in its block — one dim in two classes at once,
+    which this enum cannot name, and it comes out ``DENSE`` below. The tables
+    keyed on ``DENSE`` are still SOUND for it wherever the engine treats its
+    block as the implicit extent it is (which is what ``matmul`` and ``dense()``
+    do); they are simply silent about the block. Naming it would mean a sixth
+    class and a row and column in every table, with the property suite to
+    match — an owner decision, not a local one."""
     if getattr(d, "other_id", None) is not None:
         return L.DEGENERATE if int(d.size) == 1 else L.BLOCKDIAG
     return L.IMPLICIT if getattr(d, "axis", None) is None else L.DENSE

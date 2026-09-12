@@ -1356,6 +1356,23 @@ def _apply_block_diagonal(
         v2 = None
 
     val = st.val
+    # A dim whose block is IMPLICIT stores FEWER positions than its
+    # ``logical_size`` — a BLOCKED DENSE dim (dsnn-3qm.62) keeps one cell per
+    # block — so ``size x b`` is a split of the LOGICAL extent that its val axis
+    # cannot carry. Refuse it here, once, for every branch below: the documented
+    # best-effort contract is a ValueError, which is also what
+    # ``action_is_legal`` reads, so the legality MASK and the applier agree that
+    # this Diag is not available. (Reaching the reshape instead raised TypeError
+    # and took the whole trace down: TLM, job 65102.)
+    for _v, _b, _d in ((v1, b1, d1), (v2, b2, d2)):
+        if _v is not None and int(val.shape[_v]) != size * _b:
+            raise ValueError(
+                f"block-diagonal split {size}x{_b} does not fit val axis {_v} "
+                f"of extent {val.shape[_v]} (dim id={_d.id}, "
+                f"logical_size={_d.logical_size}, block_size="
+                f"{getattr(_d, 'block_size', None)}); an implicit block is not "
+                f"splittable."
+            )
     new_K_axis: int | None = None
     new_b1_axis: int | None = None
     new_b2_axis: int | None = None

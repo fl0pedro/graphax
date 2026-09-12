@@ -1526,10 +1526,15 @@ def _dense_survivor(dim_id, logical, phys, axis, pres):
     The fourth combination — the block physical but the meta implicit — is an
     "implicit outer, explicit inner" dim no ``Index`` can describe, so it raises
     instead of mislabelling the stored axis as the meta."""
-    if not pres or phys <= 1:
+    if not pres:
         return DenseIndex(dim_id, logical, axis=None)
     if phys == logical:
+        # Including 1 == 1: a size-1 survivor keeps its physical axis, as it
+        # always has. Demoting it to implicit here orphans that val axis and
+        # takes a compressible axis off the micro-action slot list.
         return DenseIndex(dim_id, logical, axis=axis)
+    if phys == 1:
+        return DenseIndex(dim_id, logical, axis=None)
     if logical % phys == 0:
         return Index(dim_id, phys, axis, None, logical // phys, None)
     raise ValueError(
