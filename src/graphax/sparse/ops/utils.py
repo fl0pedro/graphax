@@ -446,3 +446,31 @@ def _swap_back_axes(st: "SparseTensor") -> "SparseTensor":
         new_primal.append(nd)
 
     return _copy(st, val=new_val, out_dims=tuple(new_out), primal_dims=tuple(new_primal))
+
+
+class NominalOrderViolation(ValueError):
+    """An op returned ``out_dims`` / ``primal_dims`` whose logical extents are
+    not in its operands' nominal order (ticket dsnn-3qm.71).
+
+    The ops build their output dim lists from the operands' own dim order, so
+    this is a postcondition of the op, not a property of the inputs. It RAISES
+    (a ``ValueError`` subclass) rather than ``assert``-ing: ``python -O``
+    deletes an ``assert``, and a contract that disappears under a flag is not
+    a contract.
+    """
+
+
+def check_nominal_order(out, out_src, primal_src, where: str) -> None:
+    """Raise :class:`NominalOrderViolation` unless ``out.out_dims`` carry the
+    logical extents of ``out_src.out_dims`` in order and ``out.primal_dims``
+    those of ``primal_src.primal_dims`` in order."""
+    got_o = tuple(int(d.logical_size) for d in out.out_dims)
+    exp_o = tuple(int(d.logical_size) for d in out_src.out_dims)
+    got_p = tuple(int(d.logical_size) for d in out.primal_dims)
+    exp_p = tuple(int(d.logical_size) for d in primal_src.primal_dims)
+    if got_o != exp_o or got_p != exp_p:
+        raise NominalOrderViolation(
+            f"{where}: the result's dim order is not the operands' nominal "
+            f"order -- out_dims {got_o} (operand {exp_o}), primal_dims "
+            f"{got_p} (operand {exp_p})."
+        )

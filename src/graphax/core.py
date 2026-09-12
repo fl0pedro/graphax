@@ -2601,13 +2601,26 @@ def _is_persistent(obj) -> bool:
     return isinstance(obj, immutables.Map) or hasattr(obj, "finish")
 
 
+class StoredEdgeShapeMismatch(ValueError):
+    """A stored edge's ``SparseTensor.shape`` is not ``out_edge.aval.shape +
+    in_edge.aval.shape`` (ticket dsnn-3qm.71). The check is UNGATED -- an
+    approximation never changes an edge's logical shape (measured, see
+    ``tests/misc/test_nominal_shape_invariant.py``) -- and it RAISES rather
+    than ``assert``-ing, because ``python -O`` deletes an ``assert``. An edge
+    with a queued JacobianTransform is exempt: its shape is nominal only once
+    drained."""
+
+
 def _set_inner(outer, k1, k2, v, is_transpose=False):
     """Set ``outer[k1][k2] = v`` for both nested-defaultdict and immutables.Map proxies."""
     out_var, in_var = (k1, k2) if is_transpose else (k2, k1)
     if hasattr(out_var, "aval") and hasattr(in_var, "aval") and hasattr(v, "shape"):
         if not (getattr(v, "pre_transforms", ()) or getattr(v, "post_transforms", ())):
             expected = tuple(out_var.aval.shape) + tuple(in_var.aval.shape)
-            assert v.shape == expected, f"Stored edge shape {v.shape} does not match expected {expected}"
+            if tuple(v.shape) != expected:
+                raise StoredEdgeShapeMismatch(
+                    f"Stored edge shape {tuple(v.shape)} does not match the "
+                    f"nominal {expected} (out {out_var} x in {in_var})")
 
     inner = outer.get(k1)
     if _is_persistent(outer) or _is_persistent(inner):
@@ -3520,7 +3533,7 @@ def vertex_elimination_jaxpr(
         # One transpose at the boundary, or nothing when the layout already
         # holds; asserted, never silently skipped.
         from .sparse.ops.output_layout import (
-            canonical_output_layout, is_parameter_layout)
+            canonical_output_layout, require_parameter_layout)
         from .sparse.tensor import SparseTensor
 
         jac_vals = []
@@ -3531,12 +3544,8 @@ def vertex_elimination_jaxpr(
                 tensor = _force(edge) if edge is not None else None
                 if isinstance(tensor, SparseTensor):
                     tensor = canonical_output_layout(tensor)
-                    assert is_parameter_layout(tensor), (
-                        "OUTPUT LAYOUT CONTRACT VIOLATED: the gradient "
-                        f"d{outvar}/d{invar} is not stored in parameter "
-                        f"layout after canonicalization: dims={tensor.dims} "
-                        f"val.shape={None if tensor.val is None else tensor.val.shape}"
-                    )
+                    require_parameter_layout(
+                        tensor, f"the gradient d{outvar}/d{invar}")
                 jac_vals.append(tensor)
     else:
         jac_vals = []

@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
+from .utils import check_nominal_order
 from .utils import (
     _arr2st, _is_sparse, _val_or_one, _prepare_physical_array, _is_zero_fill,
     _apply_scalar_mult, _scaled_fill, _copy,
@@ -473,8 +474,7 @@ def _reconstruct_result(value, lhs, sp, dp, output_meta, op, rhs):
         fill_value=new_fill,
         check_consistency=False,
     )
-    assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
-    assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
+    check_nominal_order(out, lhs, lhs, 'elementwise._reconstruct_result')
     return out
 
 
@@ -856,8 +856,7 @@ def _lazy_uu(lhs, rhs, op, l_by_id, r_by_id):
            _apply_scalar_mult(jnp.ones((), rhs.dtype), rhs))
     out = SparseTensor(lhs.out_dims, lhs.primal_dims, None, scalar_mult=s,
                        fill_value=None, check_consistency=False)
-    assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
-    assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
+    check_nominal_order(out, lhs, lhs, 'elementwise._lazy_uu')
     return _finish(out, "uu")
 
 
@@ -888,8 +887,7 @@ def _lazy_u_x(lhs, rhs, op, l_by_id, r_by_id):
         val, scalar_mult=_identity_scalar_mult(val.dtype),
         fill_value=_combined_fill(lhs, rhs, op), check_consistency=False,
     )
-    assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
-    assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
+    check_nominal_order(out, lhs, lhs, 'elementwise._lazy_u_x')
     return _finish(out, "u_x")
 
 
@@ -990,8 +988,7 @@ def _lazy_pair(lhs, rhs, op, l_by_id, r_by_id):
     # keeps a role implicit when both sides have it implicit.
     from graphax.sparse.tensor import squeeze_unit_axes
     out = squeeze_unit_axes(out)
-    assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
-    assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
+    check_nominal_order(out, lhs, lhs, 'elementwise._lazy_pair')
     return _finish(out, rule)
 
 
@@ -1058,8 +1055,7 @@ def elementwise(
         _record_path("elemental")
         _out = _elem[0] if count else _elem
         if hasattr(_out, "out_dims") and hasattr(lhs, "out_dims"):
-            assert tuple(d.logical_size for d in _out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
-            assert tuple(d.logical_size for d in _out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
+            check_nominal_order(_out, lhs, lhs, 'elementwise.elementwise')
         return _elem
     if count:
         n = _ew_op_count(lhs, rhs, is_intersection)
@@ -1071,8 +1067,7 @@ def elementwise(
     if _lz is not None:
         _record_path("lazy")
         if hasattr(_lz, "out_dims") and hasattr(lhs, "out_dims"):
-            assert tuple(d.logical_size for d in _lz.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
-            assert tuple(d.logical_size for d in _lz.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
+            check_nominal_order(_lz, lhs, lhs, 'elementwise.elementwise')
         if count:
             return _lz, n
         return _lz
@@ -1081,8 +1076,7 @@ def elementwise(
     out = _materializing_general(lhs, rhs, op, is_intersection, n if count else None)
     _out = out[0] if count else out
     if hasattr(_out, "out_dims") and hasattr(lhs, "out_dims"):
-        assert tuple(d.logical_size for d in _out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
-        assert tuple(d.logical_size for d in _out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
+        check_nominal_order(_out, lhs, lhs, 'elementwise.elementwise')
     return out
 
 

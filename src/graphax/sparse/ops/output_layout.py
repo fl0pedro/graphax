@@ -78,6 +78,23 @@ def is_parameter_layout(st) -> bool:
     return axes == list(range(val.ndim))
 
 
+class OutputLayoutViolation(ValueError):
+    """A returned sparse gradient is not in parameter layout after
+    :func:`canonical_output_layout` (ticket dsnn-3qm.62). Raised, never
+    asserted: ``python -O`` deletes an ``assert``."""
+
+
+def require_parameter_layout(st, what: str) -> None:
+    """Raise :class:`OutputLayoutViolation` unless ``st`` is in parameter
+    layout. ``what`` names the gradient for the message."""
+    if not is_parameter_layout(st):
+        raise OutputLayoutViolation(
+            f"OUTPUT LAYOUT CONTRACT VIOLATED: {what} is not stored in "
+            f"parameter layout after canonicalization: dims={st.dims} "
+            f"val.shape={None if st.val is None else st.val.shape}"
+        )
+
+
 def canonical_output_layout(st):
     """Return ``st`` with ``val`` in parameter layout (see the module doc).
 
