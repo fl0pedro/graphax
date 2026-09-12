@@ -192,6 +192,87 @@ def test_the_exact_side_may_be_the_structured_one():
 
 
 # --------------------------------------------------------------------------
+# 4b. THE DEGENERATE PAIR FORMS -- the ones Helmholtz actually produces
+#
+# Refusing these was a REGRESSION: tests/landscape_map_sweep_test.py::
+# test_measure_singleton_and_stacks went red on all four plan classes (skip,
+# quant, compress, diag) because alphagrad's grad-cosine on Helmholtz compares
+# exactly this pair of forms. The dims below are transcribed verbatim from job
+# 65010's census, so these two tests are the regression pinned.
+# --------------------------------------------------------------------------
+def st_one_block_pair(val):
+    """``size=1, axis=None, block_size=B, block_axis=0/1``: ONE meta block, so
+    the dense form is just ``val``. Helmholtz's EXACT Jacobian leaf."""
+    bo, bi = val.shape
+    d0 = DiagonalIndex(0, 1, axis=None, other_id=1, block_size=bo, block_axis=0)
+    d1 = DiagonalIndex(1, 1, axis=None, other_id=0, block_size=bi, block_axis=1)
+    return SparseTensor((d0,), (d1,), val, check_consistency=False)
+
+
+def st_pure_diagonal(diag):
+    """``size=N, axis=0, block_size=None, block_axis=None``: ``val (N,)`` is the
+    diagonal of a logical ``(N, N)``. Helmholtz's APPROXIMATED leaf after a
+    SKIP / QUANT / COMPRESS / DIAG."""
+    n = int(diag.shape[0])
+    d0 = DiagonalIndex(0, n, axis=0, other_id=1)
+    d1 = DiagonalIndex(1, n, axis=0, other_id=0)
+    return SparseTensor((d0,), (d1,), diag, check_consistency=False)
+
+
+def test_a_one_block_pair_is_a_dense_matrix():
+    t = st_one_block_pair(_rng(16, 60).reshape(4, 4))
+    assert t.shape == (4, 4)
+    got = float(squared_norm(t, F32))
+    want = float((_oracle(t) ** 2).sum())
+    assert got == pytest.approx(want, rel=2e-5)
+    _check(_rng(16, 61).reshape(4, 4), t)
+
+
+def test_a_pure_diagonal_pair():
+    t = st_pure_diagonal(_rng(4, 62))
+    assert t.shape == (4, 4)
+    _check(_rng(16, 63).reshape(4, 4), t)
+
+
+def test_THE_HELMHOLTZ_PAIR_one_block_exact_against_a_pure_diagonal_approx():
+    """The exact combination that made landscape_map_sweep_test red."""
+    e = st_one_block_pair(_rng(16, 64).reshape(4, 4))
+    a = st_pure_diagonal(_rng(4, 65))
+    _check(e, a)
+    # and the other order, since _gradient_similarity sees both
+    _check(a, e)
+
+
+def test_two_one_block_pairs_against_each_other():
+    """Also in the Helmholtz census: both sides the one-block form."""
+    _check(st_one_block_pair(_rng(16, 66).reshape(4, 4)),
+           st_one_block_pair(_rng(16, 67).reshape(4, 4)))
+
+
+def test_a_broadcast_meta_pair_with_N_gt_1():
+    """``size=N>1, axis=None``: the SAME block on every diagonal position -- a
+    broadcast along the meta, not a missing axis."""
+    d0 = DiagonalIndex(0, 3, axis=None, other_id=1, block_size=2, block_axis=0)
+    d1 = DiagonalIndex(1, 3, axis=None, other_id=0, block_size=2, block_axis=1)
+    t = SparseTensor((d0,), (d1,), _rng(4, 68).reshape(2, 2),
+                     scalar_mult=jnp.asarray(0.5, F32), check_consistency=False)
+    assert t.shape == (6, 6)
+    _check(_rng(36, 69).reshape(6, 6), t)
+    assert float(squared_norm(t, F32)) == pytest.approx(
+        float((_oracle(t) ** 2).sum()), rel=2e-5)
+
+
+def test_a_broadcast_block_axis():
+    """``block_size=2, block_axis=None``: the block content is constant."""
+    d0 = DiagonalIndex(0, 3, axis=0, other_id=1, block_size=2, block_axis=None)
+    d1 = DiagonalIndex(1, 3, axis=0, other_id=0, block_size=2, block_axis=1)
+    t = SparseTensor((d0,), (d1,), _rng(6, 70).reshape(3, 2),
+                     check_consistency=False)
+    assert t.shape == (6, 6)
+    _check(_rng(36, 71).reshape(6, 6), t)
+
+
+# --------------------------------------------------------------------------
 # 5. THE CLAIM: nothing materializes
 # --------------------------------------------------------------------------
 def test_no_operand_is_ever_densified(monkeypatch):
@@ -238,12 +319,17 @@ def test_mismatched_logical_shapes_raise():
 
 
 def test_two_DIFFERENT_structures_raise_instead_of_densifying():
-    """A pair against an implicit-dim tensor of the same logical shape: no
-    common compact frame. This must RAISE, not fall back to .dense()."""
-    e = st_pair(4, 1, 1, seed=31)                       # logical (4, 4)
-    a = st_dense(_rng(4, 32), (4, 4), implicit=(0,))    # logical (4, 4)
-    with pytest.raises(LazyContractionUnsupported, match="no compact frame"):
+    """Two operands that BOTH carry a broadcast or a fill, with different
+    frames: a pure diagonal (fill over 12 of its 16 cells) against an
+    implicit-dim tensor (a broadcast over its rows), same logical shape. Neither
+    can serve as a gather source and the frames differ, so there is no honest
+    lazy contraction -- this must RAISE, not fall back to .dense()."""
+    e = st_pair(4, 1, 1, seed=31)                       # logical (4, 4), n_fill 12
+    a = st_dense(_rng(4, 32), (4, 4), implicit=(0,))    # logical (4, 4), n_bcast 4
+    with pytest.raises(LazyContractionUnsupported, match="share no frame"):
         bilinear_accumulators(e, a, dtype=F32)
+    with pytest.raises(LazyContractionUnsupported, match="share no frame"):
+        bilinear_accumulators(a, e, dtype=F32)
 
 
 def test_stale_layout_metadata_raises():
@@ -317,9 +403,13 @@ def _ref_dense(st: SparseTensor) -> np.ndarray:
         for (po, pi) in pairs:
             Bo = int(dims[po].block_size or 1)
             Bi = int(dims[pi].block_size or 1)
-            phys[int(dims[po].axis)] = idx[po] // Bo
-            phys[int(dims[po].block_axis)] = idx[po] % Bo
-            phys[int(dims[pi].block_axis)] = idx[pi] % Bi
+            meta_ax = dims[po].axis if dims[po].axis is not None else dims[pi].axis
+            if meta_ax is not None:                 # else a broadcast meta
+                phys[int(meta_ax)] = idx[po] // Bo
+            if dims[po].block_axis is not None:     # else a broadcast block
+                phys[int(dims[po].block_axis)] = idx[po] % Bo
+            if dims[pi].block_axis is not None:
+                phys[int(dims[pi].block_axis)] = idx[pi] % Bi
         for pos, d in enumerate(dims):
             if d.is_sparse or d.axis is None:
                 continue
@@ -356,6 +446,8 @@ def test_the_reference_densifier_agrees_with_graphax_dense():
         st_pair(3, 2, 2, val=_UNIFORM, sm=1.25),
         SparseTensor((), (DenseIndex(0, 4, axis=None), DenseIndex(1, 3, axis=None)),
                      None, scalar_mult=jnp.asarray(0.0, F32), check_consistency=False),
+        st_one_block_pair(_rng(16, 96).reshape(4, 4)),
+        st_pure_diagonal(_rng(4, 97)),
     ]
     for t in fixtures:
         try:
@@ -368,10 +460,17 @@ def test_the_reference_densifier_agrees_with_graphax_dense():
         assert np.allclose(got, want, atol=1e-5), (t.dims, got, want)
         checked += 1
     assert checked >= 6, "the cross-check covered too little"
-    # a val=None diagonal pair is the known refusal; anything else is NEW
+    # Every refusal must be one graphax itself routes through dense(hard=True):
+    # a pair whose meta or block axis is absent, or a uniform (val=None) pair.
+    # Anything else is a NEW refusal and this test is where it surfaces.
     for dims, err in refused:
-        assert any(d.is_sparse for d in dims) and "out of bounds" in err, (
-            f"dense() refused a structure for a NEW reason: {dims} -> {err}")
+        routed = any(
+            d.is_sparse and (d.axis is None or d.block_axis is None) for d in dims)
+        assert routed, (
+            f"dense() refused a structure for a NEW reason, so the second "
+            f"oracle's coverage is no longer understood: {dims} -> {err}")
+        print("dense() refuses (known, routed via dense(hard=True)): %s -> %s"
+              % (dims, err))
 
 
 @pytest.mark.parametrize("maker", [

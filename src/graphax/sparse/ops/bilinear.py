@@ -64,15 +64,31 @@ degenerate dead leaf the owner named ("only implicit dims and
 ``scalar_mult = 0`` is cheap and equal to a dense zero tensor") never
 materializes. Nothing here builds an array of the logical shape.
 
-WHAT IS REFUSED, LOUDLY. Two structured operands whose structures are neither
-equal nor "one of them fully materialized" have no common compact frame, and
-there is no honest lazy contraction for them here, so
-:func:`bilinear_accumulators` RAISES :class:`LazyContractionUnsupported` naming
-both structures. It does NOT fall back to ``.dense()``: a comparison that
-materializes one layer down is the same defect with a longer stack trace. The
-same applies to a compressed (``BandedIndex`` / ``SetIndex``) dim and to a pair
-whose meta or block axis is itself implicit -- both of which graphax reaches
-only through ``dense(hard=True)``.
+A PAIR AXIS MAY ITSELF BE A BROADCAST, and that is not an exotic case -- it is
+how Helmholtz's exact Jacobian arrives. Two degenerate forms occur and both are
+handled rather than refused (measured 2026-09-12, job 65010):
+
+  * ``size=1, axis=None, block_size=4, block_axis=0/1`` -- ONE meta block, i.e.
+    a plain dense 4x4 matrix that happens to be stored as a pair. Its structure
+    covers every logical cell with no broadcast, so it is a GATHER SOURCE.
+  * ``size=4, axis=0, block_size=None, block_axis=None`` -- a pure diagonal,
+    ``val (4,)`` for a logical ``(4, 4)``. The 1x1 blocks carry no axis.
+
+Refusing these (which an earlier draft did, on the grounds that graphax itself
+only reaches them through ``dense(hard=True)``) turned
+``tests/landscape_map_sweep_test.py::test_measure_singleton_and_stacks`` red on
+all four plan classes -- a REGRESSION against a previously-working measurement.
+Generally: a frame axis with no ``val`` axis is a BROADCAST along that axis (the
+value is constant, not absent), and it is summed out of the other operand first.
+
+WHAT IS REFUSED, LOUDLY. Two operands that BOTH carry a broadcast or a fill and
+whose structure frames differ share no frame, and there is no honest lazy
+contraction for them here, so :func:`bilinear_accumulators` RAISES
+:class:`LazyContractionUnsupported` naming both. It does NOT fall back to
+``.dense()``: a comparison that materializes one layer down is the same defect
+with a longer stack trace. A compressed (``BandedIndex`` / ``SetIndex``) dim is
+refused too -- ``_gradient_similarity`` already rejects one in a returned
+gradient outright.
 """
 from __future__ import annotations
 
@@ -96,74 +112,101 @@ def _is_sparse_tensor(x) -> bool:
 
 @dataclass(frozen=True)
 class _View:
-    """One operand's compact structural view. ``G`` holds the STORED (unscaled)
-    values; ``scale`` is folded in at the end."""
+    """One operand in its STRUCTURE FRAME.
+
+    The frame has one coordinate axis per diagonal pair (its meta, extent ``N``)
+    followed by one per logical dim (a pair member's block extent ``B``, a
+    non-pair dim's logical extent). ``frame`` holds those full extents and
+    enumerates EXACTLY the on-structure logical cells, one to one. ``stored``
+    is ``frame`` with every BROADCAST axis collapsed to 1 -- an axis is
+    broadcast when no ``val`` axis carries it (``axis is None`` on a dim, a
+    pair with no meta axis, a pair member with no block axis), which means the
+    value is constant along it rather than absent. ``G`` has shape ``stored``
+    and holds the STORED values unscaled; ``scale`` is folded into the scalar
+    result so no scaled copy of ``val`` is built.
+    """
     logical: tuple[int, ...]
-    metas: tuple[int, ...]                  # N per diagonal pair, in pair order
     pair_pos: tuple[tuple[int, int], ...]   # (out dim position, in dim position)
-    implicit: tuple[int, ...]               # dim positions with axis None
-    compact: tuple[int, ...]                # per dim position; 1 for implicit
-    G: Array | None                         # (metas..., *compact); None <=> uniform
+    frame: tuple[int, ...]                  # len == n_pairs + ndim
+    stored: tuple[int, ...]                 # same length; 1 where broadcast
+    G: Array | None                         # shape == stored; None <=> uniform
     uniform: bool                           # val is None: every stored cell is 1
-    scale: Array                            # scalar_mult
+    scale: Array
     fill: Array | None                      # raw fill_value; None <=> statically 0
     n_fill: int                             # off-structure logical cells
 
     @property
-    def n_bcast(self) -> int:
-        return prod(int(self.logical[p]) for p in self.implicit) if self.implicit else 1
+    def n_struct(self) -> int:
+        """On-structure logical cells."""
+        return prod(self.frame)
 
     @property
-    def n_struct(self) -> int:
-        """Stored cells in the compact frame (``G.size``, built or not)."""
-        return prod(self.metas) * prod(self.compact)
+    def n_stored(self) -> int:
+        return prod(self.stored)
+
+    @property
+    def n_bcast(self) -> int:
+        return self.n_struct // max(self.n_stored, 1)
 
     @property
     def n_logical(self) -> int:
         return prod(self.logical)
 
     @property
-    def is_materialized(self) -> bool:
-        """No pairs and no implicit dims, so the compact frame IS the logical
-        shape: this operand can serve as the ``x`` of a gather."""
-        return not self.metas and not self.implicit
+    def is_gather_source(self) -> bool:
+        """The structure covers every logical cell exactly once and nothing is
+        broadcast, so ``G`` reshaped to ``logical`` IS the dense form and this
+        operand can be read at the other's structure.
+
+        ``n_fill == 0`` with pairs present forces every meta to 1 (a pair's
+        logical extents are ``N*B_out`` by ``N*B_in`` while its structure holds
+        ``N*B_out*B_in``, so they agree only at ``N == 1``), and the frame's
+        meta axes are then all extent 1 -- dropping them leaves the per-dim
+        extents in dim order, which is the logical shape. That is why a
+        DEGENERATE pair (one meta block, i.e. a plain dense matrix that happens
+        to be stored as a pair) lands here instead of being refused: it is the
+        form Helmholtz's exact Jacobian arrives in.
+        """
+        return self.n_fill == 0 and self.n_bcast == 1
 
     @property
     def key(self):
-        """Structural identity: equal keys share a compact frame."""
-        return (self.logical, self.metas, self.pair_pos, self.implicit, self.compact)
+        """Structural identity: equal keys share a frame."""
+        return (self.logical, self.pair_pos, self.frame, self.stored)
 
     def describe(self) -> str:
-        return ("logical=%s pairs=%s metas=%s implicit=%s compact=%s "
-                "stored=%s fill=%s" % (
-                    self.logical, self.pair_pos, self.metas, self.implicit,
-                    self.compact,
-                    "uniform(val=None)" if self.uniform else tuple(self.G.shape),
-                    "0" if self.fill is None else "set"))
+        return ("logical=%s pairs=%s frame=%s stored=%s n_fill=%d G=%s fill=%s"
+                % (self.logical, self.pair_pos, self.frame, self.stored,
+                   self.n_fill, "uniform(val=None)" if self.uniform
+                   else tuple(self.G.shape), "0" if self.fill is None else "set"))
 
-    # --- the three reductions every formula is built from -----------------
+    # --- the reductions every formula is built from -----------------------
     def sum_abs2_G(self) -> Array:
         if self.uniform:
-            return jnp.asarray(self.n_struct, self.scale.dtype)
+            return jnp.asarray(self.n_stored, self.scale.dtype)
         return jnp.sum(jnp.abs(self.G) ** 2)
 
     def sum_G(self) -> Array:
         if self.uniform:
-            return jnp.asarray(self.n_struct, self.scale.dtype)
+            return jnp.asarray(self.n_stored, self.scale.dtype)
         return jnp.sum(self.G)
 
     def sum_G_times(self, other: Array) -> Array:
-        """``sum G * other`` for an ``other`` already in this compact frame."""
+        """``sum G * other`` for an ``other`` already in this stored frame."""
         if self.uniform:
             return jnp.sum(other)
         return jnp.sum(self.G * other)
+
+    def dense_form(self) -> Array:
+        """Only valid when :attr:`is_gather_source`."""
+        return self.G.reshape(self.logical)
 
 
 def _view_of_array(arr, dtype) -> _View:
     a = jnp.asarray(arr).astype(dtype)
     shape = tuple(int(v) for v in a.shape)
-    return _View(logical=shape, metas=(), pair_pos=(), implicit=(), compact=shape,
-                 G=a, uniform=False, scale=jnp.ones((), dtype), fill=None, n_fill=0)
+    return _View(logical=shape, pair_pos=(), frame=shape, stored=shape, G=a,
+                 uniform=False, scale=jnp.ones((), dtype), fill=None, n_fill=0)
 
 
 def _view_of_sparse(st, dtype) -> _View:
@@ -174,77 +217,84 @@ def _view_of_sparse(st, dtype) -> _View:
             f"dims {dims}")
 
     logical = tuple(int(d.logical_size) for d in dims)
-    implicit, pair_pos, seen = [], [], set()
-    for pos, d in enumerate(dims):
-        if d.is_sparse:
-            key = frozenset((int(d.id), int(d.other_id)))
-            if key in seen:
-                continue
-            partner = next((q for q, x in enumerate(dims)
-                            if q != pos and x.is_sparse
-                            and int(x.id) == int(d.other_id)), None)
-            if partner is None:
-                raise LazyContractionUnsupported(
-                    f"dim {d} is half of a diagonal pair whose partner is not "
-                    f"in this tensor: dims {dims}")
-            seen.add(key)
-            pair_pos.append((pos, partner))
-        elif d.axis is None:
-            implicit.append(pos)
+    ndim = len(dims)
 
-    metas, compact = [], [0] * len(dims)
-    for pos in implicit:
-        compact[pos] = 1
+    # --- pair the diagonal dims -------------------------------------------
+    pair_pos, seen = [], set()
     for pos, d in enumerate(dims):
-        if not d.is_sparse and d.axis is not None:
-            compact[pos] = int(d.logical_size)
-    for (po, pi) in pair_pos:
+        if not d.is_sparse:
+            continue
+        key = frozenset((int(d.id), int(d.other_id)))
+        if key in seen:
+            continue
+        partner = next((q for q, x in enumerate(dims)
+                        if q != pos and x.is_sparse
+                        and int(x.id) == int(d.other_id)), None)
+        if partner is None:
+            raise LazyContractionUnsupported(
+                f"dim {d} is half of a diagonal pair whose partner is not in "
+                f"this tensor: dims {dims}")
+        seen.add(key)
+        pair_pos.append((pos, partner))
+    n_pair = len(pair_pos)
+    pair_of = {}
+    for k, (po, pi) in enumerate(pair_pos):
+        pair_of[po] = k
+        pair_of[pi] = k
+
+    # --- the frame, and which of its axes val actually carries -------------
+    # val_axis[i] is the val axis carrying frame axis i, or None (broadcast).
+    frame: list[int] = [0] * (n_pair + ndim)
+    val_axis: list[int | None] = [None] * (n_pair + ndim)
+    for k, (po, pi) in enumerate(pair_pos):
         d_o, d_i = dims[po], dims[pi]
         if int(d_o.size) != int(d_i.size):
             raise LazyContractionUnsupported(
                 f"diagonal pair meta sizes disagree: {d_o} vs {d_i}")
-        metas.append(int(d_o.size))
-        compact[po] = int(d_o.block_size or 1)
-        compact[pi] = int(d_i.block_size or 1)
+        frame[k] = int(d_o.size)
+        if d_o.axis is not None and d_i.axis is not None and int(d_o.axis) != int(d_i.axis):
+            raise LazyContractionUnsupported(
+                f"diagonal pair members name different meta axes: {d_o} / {d_i}")
+        # A pair with NO meta axis in val is a BROADCAST along the meta: the
+        # same block sits on every diagonal position. At N == 1 that is the
+        # degenerate "one block" pair, i.e. a plain dense matrix.
+        meta_ax = d_o.axis if d_o.axis is not None else d_i.axis
+        val_axis[k] = None if meta_ax is None else int(meta_ax)
+    for p, d in enumerate(dims):
+        i = n_pair + p
+        if p in pair_of:
+            frame[i] = int(d.block_size or 1)
+            # block_axis None with block_size 1 carries no extent; with
+            # block_size > 1 it is a broadcast along the block.
+            val_axis[i] = None if d.block_axis is None else int(d.block_axis)
+        else:
+            frame[i] = int(d.logical_size)
+            val_axis[i] = None if d.axis is None else int(d.axis)
+    stored = [1 if val_axis[i] is None else frame[i] for i in range(len(frame))]
 
+    n_struct = prod(frame)
+    n_fill = prod(logical) - n_struct
+    if n_fill < 0:
+        raise LazyContractionUnsupported(
+            f"structure cells {n_struct} exceed the logical size "
+            f"{prod(logical)}: dims {dims} val "
+            f"{None if st.val is None else tuple(st.val.shape)}")
+
+    # --- the stored values, in frame order ---------------------------------
     sm = jnp.asarray(st.scalar_mult).astype(dtype)
-    target = tuple(metas) + tuple(compact)
-
     G, uniform = None, True
     if st.val is not None:
         uniform = False
         val = jnp.asarray(st.val).astype(dtype)
-        order: list[int] = []
-        for (po, pi) in pair_pos:
-            d_o, d_i = dims[po], dims[pi]
-            if d_o.axis is None or d_i.axis is None:
-                raise LazyContractionUnsupported(
-                    f"a diagonal pair with an IMPLICIT meta axis is reachable "
-                    f"only through dense(hard=True): {d_o} / {d_i}")
-            if int(d_o.axis) != int(d_i.axis):
-                raise LazyContractionUnsupported(
-                    f"diagonal pair members do not share their meta axis: "
-                    f"{d_o} / {d_i}")
-            order.append(int(d_o.axis))
-        for pos, d in enumerate(dims):
-            if pos in implicit:
-                continue
-            ax = d.block_axis if d.is_sparse else d.axis
-            if ax is None:
-                raise LazyContractionUnsupported(
-                    f"dim {d} names no val axis and is not implicit; reachable "
-                    f"only through dense(hard=True)")
-            order.append(int(ax))
+        order = [val_axis[i] for i in range(len(frame)) if val_axis[i] is not None]
+        want = [frame[i] for i in range(len(frame)) if val_axis[i] is not None]
         if len(set(order)) != len(order):
             raise LazyContractionUnsupported(
-                f"two dims claim the same val axis: order {order}, dims {dims}")
-        if max(order, default=-1) >= val.ndim:
+                f"two frame axes claim the same val axis: {order}, dims {dims}")
+        if order and max(order) >= val.ndim:
             raise LazyContractionUnsupported(
                 f"a dim names val axis {max(order)} but val has rank "
                 f"{val.ndim}: dims {dims}")
-        # each claim must match the extent it claims -- the same check
-        # ops/dense.py makes before it trusts a dim's .axis
-        want = list(metas) + [compact[p] for p in range(len(dims)) if p not in implicit]
         got = [int(val.shape[a]) for a in order]
         if want != got:
             raise LazyContractionUnsupported(
@@ -259,83 +309,66 @@ def _view_of_sparse(st, dtype) -> _View:
                 f"are named by no dim and are not size-1: refusing to drop "
                 f"data; val {tuple(val.shape)} dims {dims}")
         G = val.transpose(order + leftover)
-        G = G.reshape(G.shape[:len(order)]).reshape(target)
+        G = G.reshape(G.shape[:len(order)]).reshape(tuple(stored))
 
-    n_bcast = prod(int(logical[p]) for p in implicit) if implicit else 1
-    n_fill = prod(logical) - prod(target) * n_bcast
-    if n_fill < 0:
-        raise LazyContractionUnsupported(
-            f"structure cells {prod(target) * n_bcast} exceed the logical size "
-            f"{prod(logical)}: dims {dims} val "
-            f"{None if st.val is None else tuple(st.val.shape)}")
     fill = None
     if n_fill and st.fill_value is not None:
         fill = jnp.asarray(st.fill_value).astype(dtype)
 
-    return _View(logical=logical, metas=tuple(metas), pair_pos=tuple(pair_pos),
-                 implicit=tuple(implicit), compact=tuple(compact), G=G,
-                 uniform=uniform, scale=sm, fill=fill, n_fill=int(n_fill))
+    return _View(logical=logical, pair_pos=tuple(pair_pos), frame=tuple(frame),
+                 stored=tuple(stored), G=G, uniform=uniform, scale=sm,
+                 fill=fill, n_fill=int(n_fill))
 
 
 def view_of(x, dtype) -> _View:
-    """The compact structural view of an Array or a ``SparseTensor``."""
+    """The structure frame of an Array or a ``SparseTensor``."""
     return _view_of_sparse(x, dtype) if _is_sparse_tensor(x) else _view_of_array(x, dtype)
 
 
 def _gather_into(view: _View, x: Array) -> Array:
-    """``x`` (an array of the logical shape) read at ``view``'s structure, in
-    ``view``'s compact frame ``(metas..., *compact)``.
+    """``x`` (an array of the logical shape) read at ``view``'s structure and
+    reduced onto ``view``'s STORED frame.
 
-    ``view``'s implicit dims are SUMMED OUT of ``x`` first: ``view``'s value is
-    constant along them, so ``<bcast(G), x> = <G, sum_implicit(x)>``. What
-    remains is one flat gather of ``n_struct`` elements, its index array built
-    by broadcasting -- no array of the logical shape is created.
+    The gather enumerates the on-structure cells only -- ``n_struct`` elements,
+    never ``n_logical`` -- from an index array built by broadcasting. The sum
+    over the broadcast axes afterwards is the identity
+    ``<bcast(G), x> = <G, sum_over_bcast(x)>``, which is what the implicit-dim
+    comparison has used since ticket .62 landed, now applied to a pair's meta
+    and block axes as well.
     """
-    imp = set(view.implicit)
-    if view.implicit:
-        x = jnp.sum(x, axis=view.implicit, keepdims=True)
-    red = tuple(1 if p in imp else int(view.logical[p])
-                for p in range(len(view.logical)))
-    x = x.reshape(red)
-    target = tuple(view.metas) + tuple(view.compact)
-    if not view.metas:
-        return x.reshape(target)
-
-    strides, acc = [1] * len(red), 1
-    for p in range(len(red) - 1, -1, -1):
-        strides[p] = acc
-        acc *= int(red[p])
-
-    n_ax = len(view.metas)
-    rank = n_ax + len(view.logical)
+    n_pair = len(view.pair_pos)
+    rank = len(view.frame)
     pair_of = {}
     for k, (po, pi) in enumerate(view.pair_pos):
         pair_of[po] = k
         pair_of[pi] = k
 
+    strides, acc = [1] * len(view.logical), 1
+    for p in range(len(view.logical) - 1, -1, -1):
+        strides[p] = acc
+        acc *= int(view.logical[p])
+
     flat = jnp.zeros((), jnp.int32)
     for p in range(len(view.logical)):
-        if p in imp:
-            continue                       # coordinate 0: contributes nothing
+        i = n_pair + p
+        ext = int(view.frame[i])
+        sh = [1] * rank
+        sh[i] = ext
+        coord = jnp.arange(ext, dtype=jnp.int32).reshape(sh)
         if p in pair_of:
             k = pair_of[p]
-            N, B = int(view.metas[k]), int(view.compact[p])
-            sh = [1] * rank
-            sh[k] = N
-            n_idx = jnp.arange(N, dtype=jnp.int32).reshape(sh)
-            sh2 = [1] * rank
-            sh2[n_ax + p] = B
-            b_idx = jnp.arange(B, dtype=jnp.int32).reshape(sh2)
-            coord = n_idx * B + b_idx
-        else:
-            ext = int(view.compact[p])
-            sh = [1] * rank
-            sh[n_ax + p] = ext
-            coord = jnp.arange(ext, dtype=jnp.int32).reshape(sh)
+            N = int(view.frame[k])
+            shn = [1] * rank
+            shn[k] = N
+            coord = jnp.arange(N, dtype=jnp.int32).reshape(shn) * ext + coord
         flat = flat + coord * jnp.asarray(strides[p], jnp.int32)
 
-    flat = jnp.broadcast_to(flat, target)
-    return x.reshape(-1)[flat.reshape(-1)].reshape(target)
+    flat = jnp.broadcast_to(flat, view.frame)
+    g = x.reshape(-1)[flat.reshape(-1)].reshape(view.frame)
+    bax = tuple(i for i in range(rank) if view.stored[i] != view.frame[i])
+    if bax:
+        g = jnp.sum(g, axis=bax, keepdims=True)
+    return g.reshape(view.stored)
 
 
 def squared_norm(x, dtype) -> Array:
@@ -351,27 +384,28 @@ def _norm2(v: _View) -> Array:
 
 
 def _dot_dense_struct(dense: _View, other: _View) -> Array:
-    """``<dense, other>`` with ``dense`` fully materialized (no pairs, no
-    implicit dims), so it can be read at ``other``'s structure."""
+    """``<dense, other>`` with ``dense`` a gather source."""
     if dense.uniform:
-        # dense form is all-ones: sum over structure is sum_G, sum over the
-        # complement is exactly the fill-cell count
-        on = other.sum_G()
-        if other.n_fill and other.fill is not None:
-            on = on + other.fill * other.n_fill
+        # the dense form is all ones: the gather is the constant n_bcast per
+        # stored cell, and the complement is exactly the fill-cell count
+        on = other.n_bcast * other.sum_G()
+        g_sum = jnp.asarray(other.n_struct, other.scale.dtype)
+        x_sum = jnp.asarray(other.n_logical, other.scale.dtype)
     else:
-        x = dense.G.reshape(dense.logical)
+        x = dense.dense_form()
         g = _gather_into(other, x)
         on = other.sum_G_times(g)
-        if other.n_fill and other.fill is not None:
-            on = on + other.fill * (jnp.sum(x) - jnp.sum(g))
+        g_sum = jnp.sum(g)
+        x_sum = jnp.sum(x)
+    if other.n_fill and other.fill is not None:
+        on = on + other.fill * (x_sum - g_sum)
     return dense.scale * other.scale * on
 
 
 def _dot_same_frame(u: _View, v: _View) -> Array:
-    """``<u, v>`` for two operands sharing one compact frame."""
+    """``<u, v>`` for two operands sharing one frame."""
     if u.uniform and v.uniform:
-        inner = jnp.asarray(u.n_struct, u.scale.dtype)
+        inner = jnp.asarray(u.n_stored, u.scale.dtype)
     elif u.uniform:
         inner = v.sum_G()
     elif v.uniform:
@@ -395,8 +429,8 @@ def bilinear_accumulators(e, a, *, dtype=None):
     same algebraic form the implicit-dim comparison has used since ticket .62
     landed.
 
-    Raises :class:`LazyContractionUnsupported` when the two storage forms have
-    no common compact frame. It never densifies as a fallback.
+    Raises :class:`LazyContractionUnsupported` when the two storage forms share
+    no frame. It never densifies as a fallback.
     """
     if dtype is None:
         dtype = jnp.promote_types(
@@ -406,19 +440,19 @@ def bilinear_accumulators(e, a, *, dtype=None):
     if ve.logical != va.logical:
         raise LazyContractionUnsupported(
             f"logical shapes differ: {ve.logical} vs {va.logical}")
-    if ve.is_materialized:
+    if ve.is_gather_source:
         dot = _dot_dense_struct(ve, va)
-    elif va.is_materialized:
+    elif va.is_gather_source:
         dot = _dot_dense_struct(va, ve)
     elif ve.key == va.key:
         dot = _dot_same_frame(ve, va)
     else:
         raise LazyContractionUnsupported(
-            "neither operand is fully materialized and their structures "
-            "differ, so they share no compact frame. Densifying one of them "
-            "here would defeat the no-materialize contract (ticket "
-            "dsnn-3qm.62 ruling (c)), so this raises instead. Extend this "
-            "module rather than calling .dense().\n"
+            "neither operand covers its logical shape without a broadcast or a "
+            "fill, and their structure frames differ, so they share no frame. "
+            "Densifying one of them here would defeat the no-materialize "
+            "contract (ticket dsnn-3qm.62 ruling (c)), so this raises instead. "
+            "Extend this module rather than calling .dense().\n"
             f"  lhs: {ve.describe()}\n"
             f"  rhs: {va.describe()}")
     return dot, _norm2(ve), _norm2(va)
