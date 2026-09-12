@@ -38,9 +38,7 @@ def _check(e, a, *, atol=2e-5):
     """``bilinear_accumulators(e, a)`` against the dense oracle."""
     dot, e2, a2 = bilinear_accumulators(e, a, dtype=F32)
     rr = float(e2) - 2.0 * float(dot) + float(a2)
-    ed = e.dense() if isinstance(e, SparseTensor) else e
-    ad = a.dense() if isinstance(a, SparseTensor) else a
-    want = _dense_acc(ed, ad)
+    want = _dense_acc(_oracle(e), _oracle(a))
     got = (float(dot), float(e2), float(a2), rr)
     scale = max(1.0, max(abs(x) for x in want))
     for name, g, w in zip(("dot", "||e||^2", "||a||^2", "||e-a||^2"), got, want):
@@ -266,6 +264,116 @@ def test_an_orphan_val_axis_raises():
 # --------------------------------------------------------------------------
 # 7. squared_norm agrees with dense() on everything above
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# the oracle, and the ONE structure graphax's own densifier refuses
+# --------------------------------------------------------------------------
+def _ref_dense(st: SparseTensor) -> np.ndarray:
+    """A plain-numpy dense form, built from the structural model by index
+    arithmetic -- the SECOND oracle.
+
+    ``dense()`` is the primary oracle everywhere it works, and every test below
+    checks against it. It does NOT work for a ``val is None`` DIAGONAL PAIR:
+    ``ops/dense.py:129`` seeds ``values = jnp.array(1.0)`` (rank 0) and then
+    ``_broadcast_and_append_dimensions`` only grows axes for dims whose ``axis``
+    is None -- a uniform pair's dims all HAVE axes, so the rank-0 buffer reaches
+    the scatter and jax raises ``ValueError: axis 0 is out of bounds for array
+    of dimension 0`` (measured 2026-09-12, job 65007). That is a defect in
+    ``dense()``, reported separately and deliberately not fixed here. For that
+    one structure this reference is the oracle instead, and
+    :func:`test_the_reference_densifier_agrees_with_graphax_dense` pins the two
+    against each other everywhere both exist so the weaker oracle is not
+    trusted blind.
+    """
+    dims = st.dims
+    logical = tuple(int(d.logical_size) for d in dims)
+    sm = float(np.asarray(st.scalar_mult))
+    fill = 0.0 if st.fill_value is None else float(np.asarray(st.fill_value))
+    pairs, seen = [], set()
+    for pos, d in enumerate(dims):
+        if d.is_sparse:
+            key = frozenset((int(d.id), int(d.other_id)))
+            if key in seen:
+                continue
+            seen.add(key)
+            partner = next(q for q, x in enumerate(dims)
+                           if q != pos and int(x.id) == int(d.other_id))
+            pairs.append((pos, partner))
+    out = np.full(logical, fill, np.float64)
+    val = None if st.val is None else np.asarray(st.val, np.float64)
+    for idx in np.ndindex(*logical):
+        on = True
+        for (po, pi) in pairs:
+            Bo = int(dims[po].block_size or 1)
+            Bi = int(dims[pi].block_size or 1)
+            if idx[po] // Bo != idx[pi] // Bi:
+                on = False
+                break
+        if not on:
+            continue
+        if val is None:
+            out[idx] = 1.0
+            continue
+        phys = [0] * val.ndim
+        for (po, pi) in pairs:
+            Bo = int(dims[po].block_size or 1)
+            Bi = int(dims[pi].block_size or 1)
+            phys[int(dims[po].axis)] = idx[po] // Bo
+            phys[int(dims[po].block_axis)] = idx[po] % Bo
+            phys[int(dims[pi].block_axis)] = idx[pi] % Bi
+        for pos, d in enumerate(dims):
+            if d.is_sparse or d.axis is None:
+                continue
+            phys[int(d.axis)] = idx[pos]
+        out[idx] = val[tuple(phys)]
+    return out * sm
+
+
+def _oracle(x):
+    """The dense form of one operand: ``dense()`` when it works, the numpy
+    reference when ``dense()`` raises -- and the reference is cross-checked
+    against ``dense()`` by its own test below."""
+    if not isinstance(x, SparseTensor):
+        return np.asarray(x, np.float64)
+    try:
+        return np.asarray(x.dense(), np.float64)
+    except Exception:
+        return _ref_dense(x)
+
+
+def test_the_reference_densifier_agrees_with_graphax_dense():
+    """Everywhere ``dense()`` works, the two oracles must agree -- otherwise the
+    weaker one cannot be trusted for the case where ``dense()`` raises. Also
+    RECORDS which fixtures ``dense()`` refuses, so the defect stays visible."""
+    refused = []
+    checked = 0
+    fixtures = [
+        st_dense(_rng(12, 90).reshape(4, 3), (4, 3), sm=0.5),
+        st_dense(_rng(3, 91), (4, 3), implicit=(0,), sm=-2.0),
+        st_dense(_rng(6, 92).reshape(3, 2), (4, 3, 2), implicit=(0,)),
+        st_pair(4, 1, 1, seed=93),
+        st_pair(3, 2, 2, sm=0.5, seed=94),
+        st_pair(2, 3, 2, fill=jnp.asarray(1.5, F32), seed=95),
+        st_pair(3, 2, 2, val=_UNIFORM, sm=1.25),
+        SparseTensor((), (DenseIndex(0, 4, axis=None), DenseIndex(1, 3, axis=None)),
+                     None, scalar_mult=jnp.asarray(0.0, F32), check_consistency=False),
+    ]
+    for t in fixtures:
+        try:
+            got = np.asarray(t.dense(), np.float64)
+        except Exception as exc:
+            refused.append((t.dims, f"{type(exc).__name__}: {exc}"))
+            continue
+        want = _ref_dense(t)
+        assert got.shape == want.shape, (t.dims, got.shape, want.shape)
+        assert np.allclose(got, want, atol=1e-5), (t.dims, got, want)
+        checked += 1
+    assert checked >= 6, "the cross-check covered too little"
+    # a val=None diagonal pair is the known refusal; anything else is NEW
+    for dims, err in refused:
+        assert any(d.is_sparse for d in dims) and "out of bounds" in err, (
+            f"dense() refused a structure for a NEW reason: {dims} -> {err}")
+
+
 @pytest.mark.parametrize("maker", [
     lambda: st_pair(3, 2, 2, seed=37),
     lambda: st_pair(3, 2, 2, val=_UNIFORM, sm=0.5),
@@ -276,5 +384,5 @@ def test_an_orphan_val_axis_raises():
 def test_squared_norm_equals_the_dense_one(maker):
     t = maker()
     got = float(squared_norm(t, F32))
-    want = float(jnp.sum(jnp.asarray(t.dense(), jnp.float64) ** 2))
+    want = float((_oracle(t) ** 2).sum())
     assert got == pytest.approx(want, rel=2e-5, abs=1e-5)
