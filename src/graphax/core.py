@@ -9,6 +9,7 @@ import immutables
 import jax
 import numpy as np
 import jax._src.core as core
+import jax.lax as lax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 from jax._src.core import ShapeDtypeStruct
@@ -1536,14 +1537,14 @@ def faces_of(graph, transpose_graph, vertex, jaxpr):
           in-edges with ITS predecessors), so keys enumerated earlier describe a
           graph that no longer exists.
         * The elimination SKIPS a face whose edge Jacobian forces to ``None``
-          (e.g. a ``stop_gradient`` blocked path). An edge that is already
+          (e.g. a ``stop_gradient`` blocked path). Dead edges from non-differentiable
+          paths (``stop_gradient``, ``iota``, ``device_put``, ``select_n`` predicate)
+          are pruned at graph build time (ticket dsnn-3qm.74). An edge that is already
           concrete (or an already-evaluated ``LazyEdge``) is filtered out here
           too, but an *unevaluated* ``LazyEdge`` is NOT forced — forcing emits
           jax equations into whatever trace happens to be current, which would
-          corrupt the append-only jaxpr. Such faces are therefore listed
-          optimistically; if the elimination later skips one, its key simply
-          never matches and the transform is a no-op. The returned list is thus
-          a superset of the visited faces, never a subset.
+          corrupt the append-only jaxpr. The returned list is thus a clean inventory
+          of reachable faces.
         * A multi-output vertex contributes the faces of every one of its
           output variables; the central variable is not part of the key (the
           mapping is per-vertex-elimination), so in the rare case where two
@@ -2891,6 +2892,17 @@ def _build_graph(
                 safe_map(write, eqn.outvars, [primal_outvals])
             continue
 
+        # Stop-gradient and zero-gradient pass-through primitives produce no Jacobian
+        # elementals ([]). They carry no differentiable signal forward and must not
+        # insert LazyEdges into graph or transpose_graph (ticket dsnn-3qm.74).
+        if eqn.primitive in (lax.stop_gradient_p, lax.iota_p, lax.device_put_p):
+            primal_outvals = _eval_primal(eqn, invals_snapshot)
+            if eqn.primitive.multiple_results:
+                safe_map(write, eqn.outvars, primal_outvals)
+            else:
+                safe_map(write, eqn.outvars, [primal_outvals])
+            continue
+
         # Activate downstream: any outvar of this eqn becomes active because it
         # carries differentiable signal forward.
         if active_vars is not None:
@@ -2943,6 +2955,10 @@ def _build_graph(
                 return _cache[0]
 
             for invar, positions in pos_by_invar.items():
+                # select_n position 0 ('which') is integer-valued / non-differentiable
+                # (NO_EDGE = None). Do not create a LazyEdge for an invar feeding only which.
+                if eqn.primitive is lax.select_n_p and all(p == 0 for p in positions):
+                    continue
 
                 def _make_thunk(positions=tuple(positions), _get=_get_elementals):
                     def thunk():
