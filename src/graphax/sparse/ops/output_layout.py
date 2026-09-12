@@ -95,6 +95,22 @@ def require_parameter_layout(st, what: str) -> None:
         )
 
 
+TRANSPOSE_APPLIED_COUNT: int = 0
+
+
+def get_transpose_count() -> int:
+    """The number of physical transposes applied by canonical_output_layout."""
+    return TRANSPOSE_APPLIED_COUNT
+
+
+def reset_transpose_count() -> int:
+    """Reset TRANSPOSE_APPLIED_COUNT to zero and return the count before reset."""
+    global TRANSPOSE_APPLIED_COUNT
+    prior = TRANSPOSE_APPLIED_COUNT
+    TRANSPOSE_APPLIED_COUNT = 0
+    return prior
+
+
 def canonical_output_layout(st):
     """Return ``st`` with ``val`` in parameter layout (see the module doc).
 
@@ -111,6 +127,8 @@ def canonical_output_layout(st):
         return st
     # new position of each old val axis: the rank of its pointer in dim order
     new_of_old = {a: i for i, a in enumerate(old_axes)}
+    global TRANSPOSE_APPLIED_COUNT
+    TRANSPOSE_APPLIED_COUNT += 1
     new_val = val.transpose(old_axes)
 
     def _renum(d):

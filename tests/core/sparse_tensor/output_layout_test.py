@@ -30,7 +30,8 @@ import pytest
 from graphax import SKIP_FACE, faces_of, jacve
 from graphax.incremental import IncrementalJaxpr
 from graphax.sparse.micro_actions import quant, compress
-from graphax.sparse.ops.output_layout import is_parameter_layout
+from graphax.sparse.ops.output_layout import (
+    get_transpose_count, is_parameter_layout, reset_transpose_count)
 from graphax.sparse.tensor import SparseTensor
 
 B, DIN, H, V = 4, 8, 8, 16
@@ -121,6 +122,32 @@ def _structure(out):
     return jax.tree_util.tree_structure(out)
 
 
+@pytest.fixture(autouse=True)
+def _reset_transpose_counter():
+    reset_transpose_count()
+    yield
+    assert get_transpose_count() == 0, (
+        f"canonical_output_layout applied {get_transpose_count()} transpose(s), "
+        "expected 0 (parameter layout by construction)"
+    )
+
+
+@pytest.mark.parametrize("order_name", sorted(ORDERS))
+@pytest.mark.parametrize("plan", ["exact", "quant_lhs", "compress_lhs"])
+def test_parameter_layout_by_construction_zero_transposes(order_name, plan):
+    """The transpose counter in canonical_output_layout is zero: parameter
+    layout is achieved by construction under the single contraction engine."""
+    reset_transpose_count()
+    order = ORDERS[order_name]
+    ft = _plans(order)[plan]
+    out = _run(order, ft, True)
+    assert len(out) == len(ARGNUMS)
+    assert get_transpose_count() == 0, (
+        f"{order_name}/{plan}: canonical_output_layout applied "
+        f"{get_transpose_count()} transpose(s), expected 0"
+    )
+
+
 @pytest.mark.parametrize("order_name", sorted(ORDERS))
 @pytest.mark.parametrize("plan", ["exact", "quant_lhs", "compress_lhs"])
 def test_every_returned_gradient_is_in_parameter_layout(order_name, plan):
@@ -128,6 +155,7 @@ def test_every_returned_gradient_is_in_parameter_layout(order_name, plan):
     ft = _plans(order)[plan]
     out = _run(order, ft, True)
     assert len(out) == len(ARGNUMS)
+    assert get_transpose_count() == 0
     for t in out:
         assert isinstance(t, SparseTensor)
         assert is_parameter_layout(t), (order_name, plan, t.dims, t.val.shape)

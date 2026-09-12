@@ -53,7 +53,6 @@ SCOPE / FALLBACK POLICY
 from __future__ import annotations
 
 import os
-import threading
 from typing import TYPE_CHECKING, Callable
 
 import jax
@@ -66,32 +65,19 @@ if TYPE_CHECKING:
 
 
 # --------------------------------------------------------------------------- #
-# Approximation-armed signal.
+# Approximation-armed signal (deprecated).
 #
-# ``core.vertex_elimination_jaxpr`` sets this for the duration of an elimination
-# that carries a Diag/Compress (or callable / SKIP_FACE) transform, and restores
-# the prior value on the way out — it RECURSES for jit/cond macro-vertices, so a
-# nested exact elimination must not clear an outer approx one's flag.
-#
-# It NO LONGER GATES THIS MODULE (dsnn-3qm.28.2). Its remaining readers are
-#   * ``core._eliminate_vertex``, which relaxes the nominal-shape asserts when an
-#     approximation is armed anywhere in the elimination — a permuted edge from an
-#     approximated vertex legally reaches a non-approx vertex's merge, so the
-#     per-vertex ``_is_approx_cfg`` alone is stale there (ViT layer_norm case);
-#   * alphagrad's legality oracle and face probes
-#     (``approx/common/masks.py``, ``approx/common/var_probe.py``,
-#     ``approx/live_faces.py``), which drive it around their own replays.
-# Thread-local so concurrent traces don't race.
+# Retired under dsnn-3qm.65 (single contraction engine). Kept as no-op shims
+# for backwards compatibility.
 # --------------------------------------------------------------------------- #
-_approx_state = threading.local()
-
-
 def set_approx_active(active: bool) -> None:
-    _approx_state.active = bool(active)
+    """Deprecated: approx_active is retired under dsnn-3qm.65 (single contraction engine)."""
+    pass
 
 
 def approx_active() -> bool:
-    return getattr(_approx_state, "active", False)
+    """Deprecated: approx_active is retired under dsnn-3qm.65 (single contraction engine)."""
+    return False
 
 
 # --------------------------------------------------------------------------- #
