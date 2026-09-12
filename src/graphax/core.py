@@ -3473,12 +3473,35 @@ def vertex_elimination_jaxpr(
 
     # Collect outputs
     if sparse_representation:
+        # THE OUTPUT-LAYOUT CONTRACT (ticket dsnn-3qm.62): every returned
+        # SparseTensor is stored in PARAMETER LAYOUT (its val axes in the
+        # order of its dims, axis == position once dense). The tiled engine
+        # leaves a 2-D weight gradient transposed in storage while the
+        # planner does not; the Index tuple is pytree aux data, so two
+        # gradients that differ only in axis assignment have different
+        # pytree structure and a consumer cannot tree_map them (finding 60).
+        # One transpose at the boundary, or nothing when the layout already
+        # holds; asserted, never silently skipped.
+        from .sparse.ops.output_layout import (
+            canonical_output_layout, is_parameter_layout)
+        from .sparse.indexes import CompressedIndex
+        from .sparse.tensor import SparseTensor
+
         jac_vals = []
         for outvar in jaxpr.outvars:
             for invar in jaxpr_invars:
                 inner = graph.get(invar)
                 edge = inner.get(outvar) if inner is not None else None
                 tensor = _force(edge) if edge is not None else None
+                if isinstance(tensor, SparseTensor):
+                    tensor = canonical_output_layout(tensor)
+                    if not any(isinstance(d, CompressedIndex) for d in tensor.dims):
+                        assert is_parameter_layout(tensor), (
+                            "OUTPUT LAYOUT CONTRACT VIOLATED: the gradient "
+                            f"d{outvar}/d{invar} is not stored in parameter "
+                            f"layout after canonicalization: dims={tensor.dims} "
+                            f"val.shape={None if tensor.val is None else tensor.val.shape}"
+                        )
                 jac_vals.append(tensor)
     else:
         jac_vals = []
