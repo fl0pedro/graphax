@@ -1545,21 +1545,6 @@ def _dense_survivor(dim_id, logical, phys, axis, pres):
     )
 
 
-def _blocked_pair_error(side: str, dim_id, logical, phys, axis) -> ValueError:
-    """A surviving DiagonalIndex whose block is only partly stored.
-
-    Unimplemented, so it raises (project rule). The blocked DENSE form of
-    dsnn-3qm.62 does not help here: the pair already spends ``size`` on its meta
-    and ``block_size`` on the surviving extent, so there is no third field left
-    to say how much of the block is implicit. Densify the operand, or COMPRESS
-    the whole pair instead of one side of it."""
-    return ValueError(
-        f"matmul: surviving diagonal {side} dim id={dim_id} spans {logical} "
-        f"positions but its grid axis {axis} holds only {phys}; a DiagonalIndex "
-        f"cannot state a PARTLY implicit block (ticket dsnn-3qm.62)."
-    )
-
-
 def _with_implicit_block(dim, src):
     """Re-attach a PASS-THROUGH dim's implicit block.
 
@@ -1580,8 +1565,48 @@ def _with_implicit_block(dim, src):
     return replace(dim, block_size=src.block_size, block_axis=None)
 
 
+class _Expand(NamedTuple):
+    """One grid axis a surviving PAIR needs at its full logical extent.
+
+    The axis holds ``(outer_eff, block_eff)`` and the dim it backs spans
+    ``(outer, block)``; each ``_eff`` is either the full extent or 1, because the
+    lazy frame only ever shrinks an extent NO operand stores — so the missing
+    positions are uniform and ``broadcast_to`` is their exact materialization.
+
+    WHY A PAIR MUST MATERIALIZE WHERE A DENSE SURVIVOR DOES NOT. A surviving
+    ``DiagonalIndex`` already spends ``size`` on the meta it shares with its
+    partner and ``block_size`` on its own extent, so a PARTLY implicit own
+    extent needs a THIRD field that ``Index`` does not have (and folding the
+    implicit factor into the meta would change the PARTNER's logical extent,
+    which is not the same tensor). A dense survivor has ``size`` free and
+    therefore states it for nothing — see ``_dense_survivor``."""
+
+    axis: int
+    outer_eff: int
+    block_eff: int
+    outer: int
+    block: int
+
+
+def _apply_expands(values, shape, expands):
+    """Materialize each ``_Expand`` on ``values``, rank-preservingly.
+
+    ``(… , outer_eff * block_eff, …)`` -> ``(…, outer_eff, block_eff, …)`` ->
+    broadcast -> ``(…, outer * block, …)``. The rank never changes, so no other
+    dim's ``axis`` moves and the caller's ``shape`` bookkeeping only has to
+    update that one entry."""
+    for e in expands:
+        pre, post = list(shape[: e.axis]), list(shape[e.axis + 1 :])
+        values = values.reshape(pre + [e.outer_eff, e.block_eff] + post)
+        values = jnp.broadcast_to(values, pre + [e.outer, e.block] + post)
+        values = values.reshape(pre + [e.outer * e.block] + post)
+        shape[e.axis] = e.outer * e.block
+    return values, shape
+
+
 def _build_pair_dims(pm, i, sa, la, ra, res, next_id):
-    """Build (out_dim, primal_dim, next_id) for one pair, dispatching on pairing_type."""
+    """Build (out_dim, primal_dim, next_id, expands) for one pair, dispatching
+    on pairing_type."""
     # Sizes come from the LOGICAL topology; the axis maps come from the buffer.
     # On the eager frame the two agree and ``true_*`` is None.
     sf = (res.shared_factors if res.true_shared_factors is None
@@ -1596,8 +1621,11 @@ def _build_pair_dims(pm, i, sa, la, ra, res, next_id):
     # (buffer) frame exactly as ``_resolve_output_shape`` read the shape off it.
     # ``final_* != phys_*`` is a part of the dim the buffer does not store.
     _eff = pm if res.eff_pairs is None else res.eff_pairs[i]
-    phys_l = (_eff.lhs.outer_len // res.shared_factors[i]) * res.lhs_block_lens[i]
-    phys_r = (_eff.rhs.outer_len // res.shared_factors[i]) * res.rhs_block_lens[i]
+    of_l = _eff.lhs.outer_len // res.shared_factors[i]
+    of_r = _eff.rhs.outer_len // res.shared_factors[i]
+    phys_l = of_l * res.lhs_block_lens[i]
+    phys_r = of_r * res.rhs_block_lens[i]
+    expands: list[_Expand] = []
     z = _NO_LAZY if res.lazy is None else res.lazy[i]
     pres_shared = pm.lhs.outer_axis is not None or pm.rhs.outer_axis is not None
     pres_lhs = pm.lhs.outer_axis is not None or pm.lhs.block_axis is not None
@@ -1647,9 +1675,13 @@ def _build_pair_dims(pm, i, sa, la, ra, res, next_id):
             # metadata that lies about the buffer — say so here rather than in
             # SparseTensor's topology check.
             if pres_lhs and phys_l != final_l:
-                raise _blocked_pair_error("out", l_id, final_l, phys_l, la)
+                expands.append(_Expand(
+                    la, of_l, res.lhs_block_lens[i],
+                    pm.lhs.outer_len // sf, _lbl[i]))
             if pres_rhs and phys_r != final_r:
-                raise _blocked_pair_error("primal", rs_id, final_r, phys_r, ra)
+                expands.append(_Expand(
+                    ra, of_r, res.rhs_block_lens[i],
+                    pm.rhs.outer_len // sf, _rbl[i]))
             out_dim = _build_sparse(
                 l_id, rs_id, sf, sa, pres_shared, final_l, la, pres_lhs
             )
@@ -1746,7 +1778,7 @@ def _build_pair_dims(pm, i, sa, la, ra, res, next_id):
             ra,
             pres_rhs,
         )
-    return out_dim, primal_dim, next_id
+    return out_dim, primal_dim, next_id, expands
 
 
 def _meta_is_summed(pm) -> bool:
@@ -1773,21 +1805,23 @@ def _meta_is_summed(pm) -> bool:
 def _pair_output_dims(ctx, rhs_dims, res):
     """The metadata half of the output build.
 
-    Returns ``(out_dims, primal_dims, shape, squeeze, summed)``: the per-pair
-    dims in pair order, the grid shape they were read off, the grid axes no dim
-    claims that are UNIFORM (slice 0 is exact), and the ones that carry live
-    partial sums (``_meta_is_summed``). ``_build_output_tensor`` and
-    ``_output_dims`` each carried a verbatim copy of this; they call it now so
-    the dims a contraction REPORTS cannot drift from the ones it BUILDS."""
+    Returns ``(out_dims, primal_dims, shape, squeeze, summed, expands)``: the
+    per-pair dims in pair order, the grid shape they were read off, the grid axes
+    no dim claims that are UNIFORM (slice 0 is exact), the ones that carry live
+    partial sums (``_meta_is_summed``), and the axes a surviving pair needs
+    materialized (``_Expand``). ``_build_output_tensor`` and ``_output_dims`` each
+    carried a verbatim copy of this; they call it now so the dims a contraction
+    REPORTS cannot drift from the ones it BUILDS."""
     shape, (sh_map, lhs_map, rhs_map), squeeze = _resolve_output_shape(ctx, res)
     next_id = (
         builtins.max([d.id for d in ctx.lhs.dims] + [d.id for d in rhs_dims] + [-1]) + 1
     )
-    out_dims, primal_dims = [], []
+    out_dims, primal_dims, expands = [], [], []
     for i, pm in enumerate(ctx.pairs):
-        od, pd, next_id = _build_pair_dims(
+        od, pd, next_id, ex = _build_pair_dims(
             pm, i, sh_map[i], lhs_map[i], rhs_map[i], res, next_id
         )
+        expands.extend(ex)
         if od:
             out_dims.append(od)
         if pd:
@@ -1803,16 +1837,18 @@ def _pair_output_dims(ctx, rhs_dims, res):
         for ax in (sh_map[i], lhs_map[i], rhs_map[i]):
             if ax not in used_axes:
                 (summed if _meta_is_summed(pm) else squeeze).append(ax)
-    return out_dims, primal_dims, shape, squeeze, summed
+    return out_dims, primal_dims, shape, squeeze, summed, expands
 
 
 def _build_output_tensor(ctx, rhs_dims, res):
     from graphax.sparse.tensor import SparseTensor
 
-    out_dims, primal_dims, shape, squeeze, summed = _pair_output_dims(
+    out_dims, primal_dims, shape, squeeze, summed, expands = _pair_output_dims(
         ctx, rhs_dims, res
     )
     grid_view = res.grid.reshape(shape) if res.grid.shape != tuple(shape) else res.grid
+    if expands:
+        grid_view, shape = _apply_expands(grid_view, list(shape), expands)
     if summed:
         # keepdims so every axis index below still means what it meant.
         grid_view = grid_view.sum(axis=tuple(sorted(set(summed))), keepdims=True)
@@ -2485,7 +2521,10 @@ def _output_dims(ctx, rhs_dims, res):
     """Canonical output dims (ids/sizes/axis) — the pure metadata half of
     _build_output_tensor, derived from res.grid.shape (no val touched). Both
     halves read the same ``_pair_output_dims``, so they cannot disagree."""
-    out_dims, primal_dims, _shape, squeeze, summed = _pair_output_dims(
+    # ``expands`` is a VAL action only: the dims it makes representable are
+    # already the ones ``_build_pair_dims`` emitted, so the metadata half needs
+    # nothing from it.
+    out_dims, primal_dims, _shape, squeeze, summed, _expands = _pair_output_dims(
         ctx, rhs_dims, res
     )
     squeeze = squeeze + summed
