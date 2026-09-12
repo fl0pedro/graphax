@@ -63,16 +63,9 @@ if TYPE_CHECKING:
 
 # --- Blocked dense dims (ticket dsnn-3qm.62) ------------------------------
 def _is_blocked_dense(d) -> bool:
-    """A dim with ``other_id is None`` (no partner, so ``is_sparse`` is False)
-    that nevertheless carries a ``block_size``: ``val`` stores ONE entry per
-    block along ``axis`` and the block extent is implicit — uniform inside each
-    block. It is what a COMPRESS of the val axis of a DIAG'd block leaves, and
-    what ``matmul`` now emits for a survivor of such a contraction."""
-    return (
-        d is not None
-        and not d.is_sparse
-        and getattr(d, "block_size", None) is not None
-    )
+    """``Index.is_blocked_dense``, tolerating ``None``. Densifying is where the
+    implicit block is paid for, so this module is its main reader."""
+    return d is not None and d.is_blocked_dense
 
 
 def _expand_implicit_blocks(tensor: "SparseTensor", only_ids=None) -> "SparseTensor":

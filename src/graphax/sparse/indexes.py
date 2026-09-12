@@ -71,6 +71,18 @@ class Index:
         return self.other_id is not None
 
     @property
+    def is_blocked_dense(self) -> bool:
+        """The BLOCKED DENSE form (ticket dsnn-3qm.62): no partner, yet a block.
+
+        ``val`` stores ONE entry per block along ``axis`` and the ``block_size``
+        positions inside each block are IMPLICIT — uniform, expanded by
+        ``dense()`` like any other implicit extent. So ``val.shape[axis] ==
+        size`` while the dim spans ``logical_size``, and any reader that takes
+        ``size`` for the whole extent (or checks ``is_sparse`` before looking at
+        the block fields at all) needs this."""
+        return self.other_id is None and self.block_size is not None
+
+    @property
     def logical_size(self) -> int:
         return self.size * (self.block_size or 1)
 

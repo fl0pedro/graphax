@@ -543,7 +543,7 @@ class SparseTensor(SparseMathMixin):
         reduction folds ``fill_value`` over cells that hold real values."""
         n = 1
         for d in self.dims:
-            if not d.is_sparse and d.block_size is not None:
+            if d.is_blocked_dense:
                 n *= int(d.block_size)
         return n
 
@@ -1333,10 +1333,7 @@ def _apply_block_diagonal(
     # axis IS the new meta and the block could stay implicit
     # (``block_axis=None``) for free. Not worth a second code path until a
     # target is measured spending time in it.
-    if any(
-        (not d.is_sparse) and getattr(d, "block_size", None) is not None
-        for d in (d1, d2)
-    ):
+    if any(d.is_blocked_dense for d in (d1, d2)):
         from graphax.sparse.ops.dense import _expand_implicit_blocks
 
         st = _expand_implicit_blocks(st, only_ids=frozenset((d1.id, d2.id)))

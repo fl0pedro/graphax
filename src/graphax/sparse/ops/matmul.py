@@ -176,23 +176,12 @@ def _dim_vals(dim, is_outer=False):
 
 
 def _is_blocked_dense(dim) -> bool:
-    """True for a BLOCKED DENSE dim (ticket dsnn-3qm.62): ``other_id is None``
-    (so no partner, so ``is_sparse`` is False) yet ``block_size`` is set, with
-    ``block_axis is None``.
+    """``Index.is_blocked_dense``, tolerating the ``None`` dims a Pair carries.
 
-    It is what a COMPRESS of the val axis of a DIAG'd block leaves behind: the
-    dim still spans ``size * block_size`` logical positions, ``val`` stores one
-    entry per block along ``axis``, and the block extent is IMPLICIT — uniform
-    inside each block, expanded by ``dense()`` like any other implicit extent.
-
-    The discriminator matters because the frame reads a DiagonalIndex's meta off
-    its PARTNER (``_full_pair_data``'s ``lo`` / ``ri``). A blocked dense dim has
-    no partner, so its meta has to come from the dim itself."""
-    return (
-        dim is not None
-        and not dim.is_sparse
-        and getattr(dim, "block_size", None) is not None
-    )
+    It matters all over this module because the frame reads a DiagonalIndex's
+    meta off its PARTNER (``_full_pair_data``'s ``lo`` / ``ri``), and a blocked
+    dense dim has no partner: its meta has to come from the dim itself."""
+    return dim is not None and dim.is_blocked_dense
 
 
 def _reject_blocked_dense(where: str, *dims) -> None:
