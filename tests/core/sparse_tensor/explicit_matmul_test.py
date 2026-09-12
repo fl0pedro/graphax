@@ -891,17 +891,21 @@ class TestExplicit(unittest.TestCase):
 
         R_inter = A_prime * jnp.expand_dims(B_prime, -1)
 
-        R = R_inter.transpose(0, 3, 1, 4, 2).reshape(2, 3, 6, 9)
+        # Canonical physical layout (dsnn-3qm.28.2, layout by construction):
+        # the val axes follow the nominal slots -- out dim 0, its block axis,
+        # out dim 1, then the dense primal axis -- so (2, 6, 3, 9), not the
+        # pre-2026-09-11 tiled (2, 3, 6, 9).
+        R = R_inter.transpose(0, 1, 4, 3, 2).reshape(2, 6, 3, 9)
 
         R_st = SparseTensor(
             (
-                DiagonalIndex(0, 2, 0, 2, 6, 2),
-                DiagonalIndex(1, 3, 1, 4),
+                DiagonalIndex(0, 2, 0, 2, 6, 1),
+                DiagonalIndex(1, 3, 2, 4),
             ),
             (
                 DiagonalIndex(2, 2, 0, 0),
                 DenseIndex(3, 9, 3),
-                DiagonalIndex(4, 3, 1, 1),
+                DiagonalIndex(4, 3, 2, 1),
             ),
             R,
         )

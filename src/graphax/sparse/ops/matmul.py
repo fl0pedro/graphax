@@ -1641,10 +1641,16 @@ def _build_output_tensor(ctx, rhs_dims, res):
         out_dims, primal_dims = update(out_dims), update(primal_dims)
     else:
         values = grid_view
+    # The operands' nominal order (dsnn-3qm.71): out_dims follow lhs.out_dims,
+    # primal_dims follow rhs.primal_dims. A dim that belongs to neither source
+    # (a partial contraction: an lhs primal dim or an rhs out dim the other
+    # operand does not carry) sits where ``lhs.dense() @ rhs.dense()`` puts
+    # it -- rhs-only out dims AFTER lhs's, lhs-only primal dims BEFORE rhs's
+    # -- so ``dense()`` of the result is the tensordot of the operands.
     lhs_order = {d.id: i for i, d in enumerate(ctx.lhs.dims)}
     final_out = tuple(sorted(out_dims, key=lambda d: lhs_order.get(d.id, 999)))
     rhs_order = {d.id: i for i, d in enumerate(rhs_dims)}
-    final_primal = tuple(sorted(primal_dims, key=lambda d: rhs_order.get(d.id, 999)))
+    final_primal = tuple(sorted(primal_dims, key=lambda d: rhs_order.get(d.id, -1)))
     id_map = {d.id: i for i, d in enumerate(final_out + final_primal)}
 
     def finalize(d, new_id):
@@ -2273,10 +2279,16 @@ def _output_dims(ctx, rhs_dims, res):
             ]
 
         out_dims, primal_dims = update(out_dims), update(primal_dims)
+    # The operands' nominal order (dsnn-3qm.71): out_dims follow lhs.out_dims,
+    # primal_dims follow rhs.primal_dims. A dim that belongs to neither source
+    # (a partial contraction: an lhs primal dim or an rhs out dim the other
+    # operand does not carry) sits where ``lhs.dense() @ rhs.dense()`` puts
+    # it -- rhs-only out dims AFTER lhs's, lhs-only primal dims BEFORE rhs's
+    # -- so ``dense()`` of the result is the tensordot of the operands.
     lhs_order = {d.id: i for i, d in enumerate(ctx.lhs.dims)}
     final_out = tuple(sorted(out_dims, key=lambda d: lhs_order.get(d.id, 999)))
     rhs_order = {d.id: i for i, d in enumerate(rhs_dims)}
-    final_primal = tuple(sorted(primal_dims, key=lambda d: rhs_order.get(d.id, 999)))
+    final_primal = tuple(sorted(primal_dims, key=lambda d: rhs_order.get(d.id, -1)))
     id_map = {d.id: i for i, d in enumerate(final_out + final_primal)}
 
     def finalize(d, new_id):
