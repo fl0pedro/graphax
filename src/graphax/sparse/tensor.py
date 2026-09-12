@@ -1320,6 +1320,29 @@ def _apply_block_diagonal(
     d1 = st.out_dims[idx1] if is_out1 else st.primal_dims[idx1]
     d2 = st.out_dims[idx2] if is_out2 else st.primal_dims[idx2]
 
+    # A dim whose BLOCK IS IMPLICIT (a blocked dense dim, ticket dsnn-3qm.62:
+    # ``other_id is None`` with a ``block_size``, one stored cell per block)
+    # stores fewer positions than the ``size x b`` split below re-cuts, so the
+    # reshape cannot reach them. Splitting those positions is what the caller
+    # ASKED for, and the mask cleared it, so PAY for the block here rather than
+    # refuse the action: expand it and carry on as a plain dense dim of the same
+    # logical extent. The rewrite is rank-preserving, so ``v1`` / ``v2`` and
+    # every other dim's ``axis`` still mean what they meant.
+    #
+    # The one case this over-pays for is ``factor == size`` -- there the stored
+    # axis IS the new meta and the block could stay implicit
+    # (``block_axis=None``) for free. Not worth a second code path until a
+    # target is measured spending time in it.
+    if any(
+        (not d.is_sparse) and getattr(d, "block_size", None) is not None
+        for d in (d1, d2)
+    ):
+        from graphax.sparse.ops.dense import _expand_implicit_blocks
+
+        st = _expand_implicit_blocks(st, only_ids=frozenset((d1.id, d2.id)))
+        d1 = st.out_dims[idx1] if is_out1 else st.primal_dims[idx1]
+        d2 = st.out_dims[idx2] if is_out2 else st.primal_dims[idx2]
+
     # SILENT PATH #1 (was: `return st`) — PARTNER MISMATCH.
     #
     # d1 is already half of a sparse pair bonded to some dim OTHER than d2, so
@@ -1356,22 +1379,21 @@ def _apply_block_diagonal(
         v2 = None
 
     val = st.val
-    # A dim whose block is IMPLICIT stores FEWER positions than its
-    # ``logical_size`` — a BLOCKED DENSE dim (dsnn-3qm.62) keeps one cell per
-    # block — so ``size x b`` is a split of the LOGICAL extent that its val axis
-    # cannot carry. Refuse it here, once, for every branch below: the documented
-    # best-effort contract is a ValueError, which is also what
-    # ``action_is_legal`` reads, so the legality MASK and the applier agree that
-    # this Diag is not available. (Reaching the reshape instead raised TypeError
-    # and took the whole trace down: TLM, job 65102.)
+    # The split has to fit the axis it re-cuts. The one-axis branch below has
+    # always checked this and its comment documents the contract: a ValueError,
+    # which is ALSO what ``action_is_legal`` reads, so the legality mask and the
+    # applier agree the action is unavailable instead of disagreeing in a crash.
+    # Hoisted here so the two-axis branch is covered too -- it reached
+    # ``jnp.reshape`` instead and took the whole trace down with a TypeError
+    # (TLM, job 65102: (16,64,4,16) into [16,64,1,4,64,1]). An implicit block
+    # cannot get here any more (it was expanded above); what remains is a rule
+    # that fits the NOMINAL axis but not THIS operand's stored extent.
     for _v, _b, _d in ((v1, b1, d1), (v2, b2, d2)):
         if _v is not None and int(val.shape[_v]) != size * _b:
             raise ValueError(
                 f"block-diagonal split {size}x{_b} does not fit val axis {_v} "
                 f"of extent {val.shape[_v]} (dim id={_d.id}, "
-                f"logical_size={_d.logical_size}, block_size="
-                f"{getattr(_d, 'block_size', None)}); an implicit block is not "
-                f"splittable."
+                f"logical_size={_d.logical_size})"
             )
     new_K_axis: int | None = None
     new_b1_axis: int | None = None

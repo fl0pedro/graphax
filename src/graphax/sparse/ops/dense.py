@@ -75,8 +75,11 @@ def _is_blocked_dense(d) -> bool:
     )
 
 
-def _expand_implicit_blocks(tensor: "SparseTensor") -> "SparseTensor":
+def _expand_implicit_blocks(tensor: "SparseTensor", only_ids=None) -> "SparseTensor":
     """Turn every BLOCKED DENSE dim into a plain dense dim of its full extent.
+
+    ``only_ids`` restricts it to those dim ids, for a caller that needs ONE dim
+    spelled out (``_apply_block_diagonal``) and must not pay for the others.
 
     Densifying is exactly where an implicit extent is supposed to be paid for,
     and every other densify helper in this module discriminates on ``is_sparse``
@@ -89,13 +92,16 @@ def _expand_implicit_blocks(tensor: "SparseTensor") -> "SparseTensor":
 
     Returns ``tensor`` itself when there is nothing to expand, which is every
     call that does not involve an approximated edge."""
-    if not any(_is_blocked_dense(d) for d in tensor.dims):
+    def _wanted(d):
+        return _is_blocked_dense(d) and (only_ids is None or d.id in only_ids)
+
+    if not any(_wanted(d) for d in tensor.dims):
         return tensor
     from graphax.sparse.tensor import SparseTensor
 
     val, new_dims = tensor.val, list(tensor.dims)
     for i, d in enumerate(new_dims):
-        if not _is_blocked_dense(d):
+        if not _wanted(d):
             continue
         if d.block_axis is not None:
             raise ValueError(

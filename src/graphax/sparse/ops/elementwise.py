@@ -620,7 +620,12 @@ def _match_structure(l_by_id, r_by_id):
         # different numbers of cells along their one physical axis, so a lazy
         # per-slot pairing of the two would combine a block-count against a
         # position count. Skip to the densify fallback instead.
-        if (ld.block_size or 1) != (rd.block_size or 1):
+        # NOT for a sparse pair: its block grid is checked below and reported as
+        # ``sparse_meta_mismatch``, which is the reason ``_lazy_rule`` routes to
+        # ``_reframe_misaligned`` -- answering with a different string there
+        # costs the lcm reframe and drops the whole edge to the general path
+        # (analyze_and_smoke_test::test_03_logical_or_unaligned_union).
+        if not ld.is_sparse and (ld.block_size or 1) != (rd.block_size or 1):
             return "block_grid_mismatch"
         if ld.is_sparse:
             if (ld.other_id != rd.other_id or ld.size != rd.size
