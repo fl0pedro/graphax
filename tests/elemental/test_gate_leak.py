@@ -1,13 +1,15 @@
-"""Regression: the approximation-active gate must survive a NESTED
-``vertex_elimination_jaxpr`` (lax.cond / lax.switch macro-vertices recurse).
+"""Regression: an approximation survives a NESTED ``vertex_elimination_jaxpr``
+(lax.cond / lax.switch macro-vertices recurse).
 
-``core.vertex_elimination_jaxpr`` sets ``approx_active()`` for the duration of
-an elimination that carries an approximation. That call RECURSES for cond/switch
-macro-vertices; if the nested call hard-reset the flag to ``False`` on exit
-(instead of restoring the parent's value), the rest of an OUTER approx
-elimination would run as if it were exact — the nominal-shape asserts in
-``_eliminate_vertex`` would fire on its remaining Diag/Compress edges, and
-alphagrad's replays would read a stale flag. This pins the save/restore.
+``vertex_elimination_jaxpr`` recurses for cond/switch macro-vertices. This
+pins that a Diag carried through that recursion is applied as the dense
+block-diagonal oracle says, and that the exact path through the same cond
+still matches ``jax.jacrev``.
+
+Until dsnn-3qm.65 the elimination also set a process-wide ``approx_active``
+flag for its duration and this module pinned its save/restore across the
+recursion; the flag went with the second contraction engine, so that half of
+the test is gone.
 """
 
 from __future__ import annotations
@@ -19,7 +21,6 @@ import jax.tree_util as tu
 import pytest
 
 from graphax import jacve
-from graphax.sparse.elemental import dispatch as DSP
 from graphax.sparse.indexes import DenseIndex
 from graphax.sparse.micro_actions import Diag
 from graphax.sparse.tensor import SparseTensor
@@ -108,5 +109,3 @@ def test_approx_gate_survives_nested_cond():
     assert np.isfinite(nat).all()
     cos = float(nat @ ref / (np.linalg.norm(nat) * np.linalg.norm(ref)))
     assert abs(1 - cos) < 1e-4, f"native vs dense-Diag oracle cos={cos}"
-    # the thread-local must be restored after the (recursing) elimination
-    assert DSP.approx_active() is False

@@ -65,22 +65,6 @@ if TYPE_CHECKING:
 
 
 # --------------------------------------------------------------------------- #
-# Approximation-armed signal (deprecated).
-#
-# Retired under dsnn-3qm.65 (single contraction engine). Kept as no-op shims
-# for backwards compatibility.
-# --------------------------------------------------------------------------- #
-def set_approx_active(active: bool) -> None:
-    """Deprecated: approx_active is retired under dsnn-3qm.65 (single contraction engine)."""
-    pass
-
-
-def approx_active() -> bool:
-    """Deprecated: approx_active is retired under dsnn-3qm.65 (single contraction engine)."""
-    return False
-
-
-# --------------------------------------------------------------------------- #
 # The kernel-layer gate — the ONLY gate on this module.
 #
 # Default OFF (2026-08-02): with the face-transform gate armed, this layer
