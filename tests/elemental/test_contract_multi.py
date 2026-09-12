@@ -28,7 +28,7 @@ pytestmark = pytest.mark.skipif(
     reason="elemental kernel zoo default-off; slated for deletion",
 )
 
-from graphax.sparse.indexes import DenseIndex, DiagonalIndex
+from graphax.sparse.indexes import DenseIndex, DiagonalIndex, Index
 from graphax.sparse.tensor import SparseTensor
 from graphax.sparse.elemental.contract_multi import contract_multi_structured
 
@@ -95,8 +95,8 @@ def _assert(lhs, rhs):
     got = np.asarray(res.dense())
     assert got.shape == oracle.shape, (got.shape, oracle.shape)
     np.testing.assert_allclose(got, oracle, atol=ATOL)
-    for d in res.dims:
-        assert not d.is_compressed
+    # closure: every result dim is Dense or Diagonal — the only two forms.
+    assert all(isinstance(d, Index) for d in res.dims)
     return res
 
 

@@ -130,7 +130,7 @@ from graphax.sparse.elemental._common import (
     dense_op_fallback,
     emit_dense_result,
 )
-from graphax.sparse.indexes import DiagonalIndex, Index
+from graphax.sparse.indexes import DiagonalIndex, Index, static_eye
 from graphax.sparse.ops.utils import _compute_dtype, _is_zero_fill
 
 if TYPE_CHECKING:
@@ -214,7 +214,7 @@ def _scatter_blocks_onto_grid(dense_grid, new_blocks, N, B_o, B_i):
     # broadcast to (g, r, h, c, *L) by inserting the h axis.
     nb = new_blocks.reshape((N, B_o, 1, B_i) + L)
     nb = jnp.broadcast_to(nb, (N, B_o, N, B_i) + L)
-    eye = jnp.eye(N, dtype=jnp.bool_).reshape((N, 1, N, 1) + (1,) * len(L))
+    eye = static_eye(N, bool).reshape((N, 1, N, 1) + (1,) * len(L))
     out4 = jnp.where(eye, nb, g4)
     return out4.reshape((N * B_o, N * B_i) + L)
 

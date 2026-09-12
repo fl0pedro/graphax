@@ -12,7 +12,6 @@ elemental operation between a specific pair of structured dims:
   * ``contract_implicit``              — an implicit (Compress-away) contracted dim
   * ``elementwise_dense_block_diagonal``— ``D (+|*) B`` / ``B op B``
   * ``elementwise_implicit``           — an implicit dim under an elementwise op
-  * ``materialize_compressed``         — expand a CompressedIndex → ``{D, B}``
 
 Each kernel handles EXACTLY ONE structured contracted pair plus ride-through free
 dims.  A real jacve contraction, however, may contract SEVERAL dims at once of
@@ -67,18 +66,22 @@ if TYPE_CHECKING:
 
 
 # --------------------------------------------------------------------------- #
-# Approximation-active gate.
+# Approximation-armed signal.
 #
-# DESIGN INVARIANT: with NO approximation (``Diag``/``Compress``) active, reverse
-# (and forward) vertex elimination must be EXACT and byte-identical to the
-# pre-elemental path — the existing matmul/elementwise already exploit block-
-# diagonal / zero-fill structure correctly there. The elemental kernels exist
-# only to make the APPROXIMATION edges (rectangular Diag blocks, Compress implicit
-# dims) contract legally; firing them on the intrinsic-diagonal edges that arise
-# in plain exact AD restructures those edges and breaks a downstream contraction
-# (e.g. a broadcast-bias Jacobian -> ``size mismatch 1 vs N``). So the dispatch is
-# a hard no-op unless ``core`` has flagged that this elimination carries a
-# Diag/Compress transform. Thread-local so concurrent traces don't race.
+# ``core.vertex_elimination_jaxpr`` sets this for the duration of an elimination
+# that carries a Diag/Compress (or callable / SKIP_FACE) transform, and restores
+# the prior value on the way out — it RECURSES for jit/cond macro-vertices, so a
+# nested exact elimination must not clear an outer approx one's flag.
+#
+# It NO LONGER GATES THIS MODULE (dsnn-3qm.28.2). Its remaining readers are
+#   * ``core._eliminate_vertex``, which relaxes the nominal-shape asserts when an
+#     approximation is armed anywhere in the elimination — a permuted edge from an
+#     approximated vertex legally reaches a non-approx vertex's merge, so the
+#     per-vertex ``_is_approx_cfg`` alone is stale there (ViT layer_norm case);
+#   * alphagrad's legality oracle and face probes
+#     (``approx/common/masks.py``, ``approx/common/var_probe.py``,
+#     ``approx/live_faces.py``), which drive it around their own replays.
+# Thread-local so concurrent traces don't race.
 # --------------------------------------------------------------------------- #
 _approx_state = threading.local()
 
@@ -87,17 +90,28 @@ def set_approx_active(active: bool) -> None:
     _approx_state.active = bool(active)
 
 
+def approx_active() -> bool:
+    return getattr(_approx_state, "active", False)
+
+
+# --------------------------------------------------------------------------- #
+# The kernel-layer gate — the ONLY gate on this module.
+#
 # Default OFF (2026-08-02): with the face-transform gate armed, this layer
 # fired in production for the first time and was measured pathological on the
 # nn256 single-face ablation (runs killed on time/memory; COMPRESS +256 ms
 # mean), while the general planner + tiled path handle every case it owned.
 # GRAPHAX_ELEMENTAL=1 restores it for comparison.
+#
+# It used to be ANDed with ``approx_active()`` above, which kept the kernels off
+# exact AD even with the env var on. That second condition is gone: with
+# GRAPHAX_ELEMENTAL=1 the kernels now run for exact AD too. Nothing sets the var
+# in production (the campaign's SHARED_ENV does not), so this module is dead code
+# there either way, but a debugging run with the var on is no longer restricted
+# to approximation edges.
+# --------------------------------------------------------------------------- #
 _ELEMENTAL_ENABLED = os.environ.get("GRAPHAX_ELEMENTAL", "0") not in (
     "", "0", "false", "False")
-
-
-def approx_active() -> bool:
-    return getattr(_approx_state, "active", False)
 
 
 # --------------------------------------------------------------------------- #
@@ -179,7 +193,6 @@ def _is_implicit(d) -> bool:
     (``axis is None``) while its logical size is the broadcast size > 1."""
     return (
         not d.is_sparse
-        and not d.is_compressed
         and d.axis is None
         and int(d.logical_size) > 1
     )
@@ -189,10 +202,6 @@ def _has_structured_dim(st: "SparseTensor") -> bool:
     """Whether ANY dim of ``st`` is block-diagonal or implicit — i.e. the
     operand is structured and a dense path would be wasteful / wrong-shaped."""
     return any(_is_block_diagonal(d) or _is_implicit(d) for d in st.dims)
-
-
-def _has_compressed_dim(st: "SparseTensor") -> bool:
-    return any(d.is_compressed for d in st.dims)
 
 
 # --------------------------------------------------------------------------- #
@@ -277,14 +286,10 @@ def try_elemental_matmul(lhs: "SparseTensor", rhs: "SparseTensor", count: bool =
     ``count=True``, ``(result, (adds, muls, fmas))``) built with the canonical
     output-id convention so downstream contractions align.
     """
-    # EXACT-AD GUARD: no approximation active -> defer entirely to the existing
-    # (block-diagonal/zero-fill-efficient) path so reverse/forward stay exact and
-    # byte-identical. The elemental kernels only handle approximation edges.
-    # GRAPHAX_ELEMENTAL=0 disables the whole kernel layer (the general planner
-    # or the tiled path then own every structured contraction) — the separable
-    # control that lets measurements attribute costs to THIS layer vs the
-    # approx_active signal itself.
-    if not approx_active() or not _ELEMENTAL_ENABLED:
+    # KERNEL-LAYER GATE: GRAPHAX_ELEMENTAL=0 (the default, and what production
+    # runs) disables the whole kernel layer — the tiled path then owns every
+    # structured contraction and reverse/forward stay exact and byte-identical.
+    if not _ELEMENTAL_ENABLED:
         _bump("matmul_pure_dense_skip")
         return None
 
@@ -308,40 +313,33 @@ def try_elemental_matmul(lhs: "SparseTensor", rhs: "SparseTensor", count: bool =
     from graphax.sparse.dtype_compute import _unify_operand_dtypes
     lhs, rhs = _unify_operand_dtypes(lhs, rhs)
 
-    # Expand any compressed operand into {D, B} so the kernels can consume it.
-    lhs_m, rhs_m = _materialize_both(lhs, rhs)
-
     # Find the contracted pairs and classify them. If NONE is structured the
     # contraction is pure-dense — bail so the existing path stays byte-identical.
     try:
-        pairs = _contracted_pairs(lhs_m, rhs_m)
+        pairs = _contracted_pairs(lhs, rhs)
     except Exception:
         return None
     kinds = [_classify_pair(ld, rd) for ld, rd in pairs]
     structured = [k for k in kinds if k != "dense"]
 
-    if not structured and not _has_structured_dim(lhs_m) and not _has_structured_dim(rhs_m):
+    if not structured and not _has_structured_dim(lhs) and not _has_structured_dim(rhs):
         _bump("matmul_pure_dense_skip")
         return None
 
     # Only intercept contractions the existing path can't do byte-identically:
     # plain-diagonal / pure-dense contractions stay on the existing path (no
     # float reassociation), preserving EXACT-AD.
-    if not _needs_elemental(pairs, kinds, lhs_m, rhs_m):
+    if not _needs_elemental(pairs, kinds, lhs, rhs):
         _bump("matmul_pure_dense_skip")
         return None
 
-    result = _dispatch_matmul(lhs_m, rhs_m, pairs, kinds)
+    result = _dispatch_matmul(lhs, rhs, pairs, kinds)
     if result is None:
         return None
     if count:
         from graphax.sparse.ops.matmul import _compute_matmul_count
 
-        # Count from the operands ACTUALLY contracted (post-materialization):
-        # for a compressed operand, lhs/rhs have a different shape/topology than
-        # the expanded lhs_m/rhs_m the kernel ran on, so the un-materialized
-        # operands give a wrong op count.
-        return result, _compute_matmul_count(lhs_m, rhs_m, result)
+        return result, _compute_matmul_count(lhs, rhs, result)
     return result
 
 
@@ -435,13 +433,12 @@ def _dispatch_matmul(lhs, rhs, pairs, kinds):
     # Before densifying BOTH operands: fold any BOTH-IMPLICIT contracting pair
     # analytically (scale-by-N into scalar_mult) so we never materialize a
     # broadcast contraction axis. Returns None when there is no such pair.
-    from graphax.sparse.ops.matmul import matmul as _matmul, _fold_both_implicit, _KEEP_BLOCKDIAG_MM
+    from graphax.sparse.ops.matmul import matmul as _matmul, _fold_both_implicit
 
-    if _KEEP_BLOCKDIAG_MM:
-        _folded = _fold_both_implicit(lhs, rhs, False)
-        if _folded is not None:
-            _bump("matmul_composed_dense")
-            return _folded
+    _folded = _fold_both_implicit(lhs, rhs, False)
+    if _folded is not None:
+        _bump("matmul_composed_dense")
+        return _folded
 
     _bump("matmul_composed_dense")
     lhs_d = _to_dense_st(lhs)
@@ -549,25 +546,24 @@ def try_elemental_elementwise(
     shape is outside the pairwise kernels' 2-D core (the general tiled path then
     owns it).
     """
-    # EXACT-AD GUARD (see try_elemental_matmul): no-op unless approximation active.
-    if not approx_active() or not _ELEMENTAL_ENABLED:
+    # KERNEL-LAYER GATE (see try_elemental_matmul): no-op unless GRAPHAX_ELEMENTAL=1.
+    if not _ELEMENTAL_ENABLED:
         _bump("elementwise_pure_dense_skip")
         return None
     if not (_is_zero_fill(lhs) and _is_zero_fill(rhs)):
         _bump("elementwise_nonzero_fill_skip")
         return None
 
-    lhs_m, rhs_m = _materialize_both(lhs, rhs)
-    if lhs_m.shape != rhs_m.shape:
+    if lhs.shape != rhs.shape:
         return None
 
-    l_struct = _has_structured_dim(lhs_m)
-    r_struct = _has_structured_dim(rhs_m)
+    l_struct = _has_structured_dim(lhs)
+    r_struct = _has_structured_dim(rhs)
     if not l_struct and not r_struct:
         _bump("elementwise_pure_dense_skip")
         return None
 
-    out = _dispatch_elementwise(lhs_m, rhs_m, op, is_intersection)
+    out = _dispatch_elementwise(lhs, rhs, op, is_intersection)
     if out is None:
         return None
     if count:
@@ -613,17 +609,6 @@ def _dispatch_elementwise(lhs, rhs, op, is_intersection):
 # --------------------------------------------------------------------------- #
 # Shared helpers
 # --------------------------------------------------------------------------- #
-def _materialize_both(lhs, rhs):
-    """Expand compressed operands to ``{D, B}`` (no-op when none are compressed)."""
-    from graphax.sparse.elemental.materialize_C import materialize_compressed
-
-    if _has_compressed_dim(lhs):
-        lhs = materialize_compressed(lhs)
-    if _has_compressed_dim(rhs):
-        rhs = materialize_compressed(rhs)
-    return lhs, rhs
-
-
 def _to_dense_st(st: "SparseTensor") -> "SparseTensor":
     """Expand a structured operand to a plain ``DenseIndex``-only SparseTensor,
     PRESERVING each dim's id and logical order so the downstream id-based
@@ -633,7 +618,7 @@ def _to_dense_st(st: "SparseTensor") -> "SparseTensor":
     order (each block-diagonal / implicit dim expanded to its full logical
     size), so a fresh ``DenseIndex`` per logical dim — same ids, same sizes,
     physical axis = logical position — describes that array exactly. The result
-    has no block-diagonal / implicit / compressed dims, so a recursive matmul on
+    has no block-diagonal / implicit dims, so a recursive matmul on
     it cannot re-enter the structured fast path (no infinite recursion).
     """
     from graphax.sparse.indexes import DenseIndex

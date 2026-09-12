@@ -29,7 +29,7 @@ from .sparse.ops import add_w_counts
 from .sparse.dtype_compute import _scaled_mul as _scaled_mul_promote
 from .sparse.ops.matmul import matmul as sparse_matmul
 from .sparse.ops.utils import (
-    _compressed_dims, _materialize_for_op, _is_approx,
+    _is_approx,
     _squeeze_unreferenced_val_axes,
 )
 from .sparse.tensor import _assert_sparse_tensor_consistency
@@ -433,6 +433,8 @@ def jacve(
     has_aux: bool = False,
     count_ops: bool = False,
     sparse_representation: bool = False,
+    dense_edges: bool = False,
+    dense_max_bytes: int = None,
     transforms: Sequence[
         Tuple[
             int,
@@ -469,10 +471,30 @@ def jacve(
                                     just ``jacobian``. Defaults to False.
         sparse_representation (bool, optional): Return the Jacobian in a sparse
                                             representation. Defaults to `False`.
+        dense_edges (bool, optional): Run the DENSE-CONTRACTION mode of
+            :mod:`graphax.dense_edges` instead of the sparse engine: every edge
+            is a plain array of shape ``out_shape + primal_shape`` and every
+            contraction is a ``jnp.tensordot`` over the eliminated variable's
+            axes. This is the VALUE ORACLE for an approximated plan
+            (ticket dsnn-3qm.69) -- ``sparse_representation`` changes the return
+            form only, so it cannot serve as one. Independent of
+            ``sparse_representation``, whose ``True`` setting has nothing to
+            return here and therefore raises. Not a measurement path: a dense
+            edge is ``out_size * primal_size`` numbers. Defaults to `False`.
+        dense_max_bytes (int, optional): Ceiling on the total bytes of the live
+            dense edges under ``dense_edges=True``; ``None`` takes
+            :data:`graphax.dense_edges.DEFAULT_MAX_BYTES` (2 GiB). Over the
+            ceiling raises instead of letting the job be killed.
 
     Returns:
         Callable: The function that returns the Jacobian of `fun`.
     """
+    if dense_edges and sparse_representation:
+        raise ValueError(
+            "dense_edges=True with sparse_representation=True: the dense mode "
+            "has no SparseTensor to return, every edge is a plain array. "
+            "Silently ignoring the requested return form is how a measurement "
+            "lies, so this combination raises. Drop sparse_representation.")
 
     @wraps(fun)
     def jacfun(*args, **kwargs):
@@ -497,6 +519,8 @@ def jacve(
             argnums=argnums,
             count_ops=count_ops,
             sparse_representation=sparse_representation,
+            dense_edges=dense_edges,
+            dense_max_bytes=dense_max_bytes,
             fresh_eliminator=was_inlined,
             transforms=transforms,
             face_transforms=face_transforms,
@@ -754,7 +778,34 @@ def _drain_or_unload_pre(post_val, pre_val, _post_val):
             _post_val = _t.apply_inverse(_post_val)
         _assert_sparse_tensor_consistency(_post_val)
         _pre_val = pre_val.copy()
-    elif len(_pre_transforms) > 0 and pre_val.val is not None:
+    elif len(_pre_transforms) > 0 and (pre_val.val is not None or pre_val.dims):
+        # ``pre_val.val is None`` (a UNIFORM operand) used to fall through to
+        # the pass-through below, which DROPS the transform. That is not a
+        # cheaper route, it is a wrong one: ``post_val``'s pre_transform carries
+        # the contracted dimension's relabelling, and the tensor it sits on is a
+        # rank-0 uniform stand-in with no dims of its own, so once the transform
+        # is gone nothing states the edge's shape. The store then writes a
+        # rank-0 tensor for an edge whose nominal shape is, for example, (1, 3),
+        # and core.py's nominal-shape assertion fires.
+        #
+        # It stayed hidden because a uniform ``pre_val`` was rare: the
+        # materializing elementwise path wrote a buffer for almost every edge,
+        # so ``val is not None`` held and the transform was resolved. Turning
+        # ``_lazy_uu`` on makes uniform operands common and the hole shows
+        # immediately. The fault is here, not in the lazy rule.
+        # The transform reshapes and slices ``val``, so a uniform operand needs
+        # a buffer first. ``materialize_uniform`` gives it the block-diagonal
+        # storage it would occupy, not the dense one.
+        #
+        # A DIMS-LESS uniform operand is excluded above and keeps the
+        # pass-through. It has no contracted axis for the transform to relabel,
+        # so there is nothing to unload onto: materializing it yields a rank-0
+        # buffer and the slice/concat transforms raise on it (IndexError on
+        # roll / gather / multi-head attention). The case this branch exists
+        # for is the one with dims and no buffer.
+        if pre_val.val is None:
+            from .sparse.tensor import materialize_uniform
+            pre_val = materialize_uniform(pre_val)
         _pre_val = unload_pre_transforms(post_val, pre_val)
     else:
         _pre_val = pre_val.copy()
@@ -1038,7 +1089,7 @@ def _micro_applied(before, after) -> bool:
 
     ``apply_quant`` returns its input UNCHANGED (the same object) for a
     structural ``val is None`` edge or an already-matching dtype, and
-    ``_materialize_compressed`` / ``apply_*`` may likewise short-circuit — so a
+    ``apply_*`` may likewise short-circuit — so a
     dispatched micro-action is not evidence that an approximation happened. The
     identity check is the reliable signal (every real micro-action builds a new
     :class:`SparseTensor`); the field-wise fallback additionally catches a fresh
@@ -1332,6 +1383,17 @@ def _unpack_face_slots(slots, vertex):
     return lhs, rhs, res, None, None
 
 
+class FaceTransformIllegal(ValueError):
+    """A per-face transform the caller asked for cannot be applied to that
+    operand (ticket dsnn-3qm.70).
+
+    Raised instead of skipping, so a measured plan is always the plan that was
+    asked for. It subclasses ``ValueError`` so an existing ``except ValueError``
+    higher up still catches it, but the message names the vertex, the slot, the
+    action and the operand's structure.
+    """
+
+
 def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
                           out_edge=None, _xlog=None, log_slot=None):
     """Apply ONE per-face slot transform to ONE Jacobian operand.
@@ -1343,10 +1405,20 @@ def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
     :class:`TransformLog` when one is), any other callable is handed the tensor
     directly, and anything else raises ``TypeError``.
 
-    A ``ValueError`` is the documented best-effort miss — the transform does not
-    fit THIS operand's geometry — so the transform is skipped, the operand is
-    returned unchanged, and NOTHING is recorded, which keeps the record
-    truthful. ``TypeError`` is deliberately NOT caught (see the per-vertex loop).
+    An action that does not fit THIS operand's geometry RAISES
+    :class:`FaceTransformIllegal` (ticket dsnn-3qm.70, owner ruling D11). It used
+    to be swallowed and the operand returned unchanged, which made a measured
+    plan differ from the plan the caller asked for with no sign in the record:
+    on the CPU toy under the Markowitz order a literal ``Diag`` was dropped on
+    5 of 6 planned faces.
+
+    The caller decides what to do about an illegal action. A caller that cannot
+    know the operand's index structure until this moment — which is every
+    policy, because these operands are join intermediates — must pass a CHOOSER
+    callable instead of a literal action, and return ``None`` from it to skip.
+    That is the one legal way to decline, and it is recorded as a decline.
+    :func:`~graphax.sparse.micro_actions.action_is_legal` answers the same
+    question without applying anything.
 
     ``slot`` is the FaceSink's positional tag; ``log_slot`` (default: ``slot``)
     the transform log's finer one — see :func:`_record_micro`.
@@ -1386,8 +1458,17 @@ def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
                 "Compress, Quant, or a callable taking a SparseTensor and "
                 "returning either a SparseTensor or a chosen micro-action."
             )
-    except ValueError:
-        return val
+    except ValueError as exc:
+        raise FaceTransformIllegal(
+            f"Face transform {_t!r} cannot be applied to the operand in slot "
+            f"{slot!r} at vertex {vertex}: {exc}. The operand's dims are "
+            f"{tuple(type(d).__name__ for d in val.dims)} with logical sizes "
+            f"{tuple(int(d.logical_size) for d in val.dims)} and out/primal "
+            f"split {len(val.out_dims)}/{len(val.primal_dims)}. This used to be "
+            "skipped silently (ticket dsnn-3qm.70). Fix the caller: check with "
+            "action_is_legal, or pass a chooser callable that returns None to "
+            "decline."
+        ) from exc
     _assert_sparse_tensor_consistency(out)
     return out
 
@@ -1748,14 +1829,14 @@ class FaceContraction(NamedTuple):
     mem: int
 
 
-def contract_face_operands(ops: FaceOperands, *, count_ops: bool = False,
-                           demand_dense: bool = False) -> FaceContraction:
+def contract_face_operands(ops: FaceOperands, *,
+                           count_ops: bool = False) -> FaceContraction:
     """Contract one face's prepared operands into the new edge Jacobian.
 
     THE SECOND HALF OF THE FACE CONTRACTION, and the only copy of it. The three
     special cases are all here and stay here: scalar x scalar
-    (``sparse_matmul`` rejects 0-rank operands), the ``count_ops`` path, and
-    demand-dense.
+    (``sparse_matmul`` rejects 0-rank operands), ONE scalar operand (a scale,
+    ticket dsnn-3qm.68), and the ``count_ops`` path.
 
     The STRUCTURE of the result -- ``val.shape``, ``out_dims``,
     ``primal_dims``, the transform queues -- is a pure function of the two
@@ -1767,7 +1848,6 @@ def contract_face_operands(ops: FaceOperands, *, count_ops: bool = False,
     Args:
         ops: the result of :func:`prepare_face_operands`.
         count_ops: accumulate adds / muls / fmas / mem (the cost path).
-        demand_dense: the elimination's ``out_edge in _demand_head_vars``.
 
     Returns:
         FaceContraction
@@ -1785,19 +1865,29 @@ def contract_face_operands(ops: FaceOperands, *, count_ops: bool = False,
             edge_outval = _post_val * _pre_val
             if count_ops:
                 muls += 1
+        elif _is_scalar_st(_post_val) or _is_scalar_st(_pre_val):
+            # ONE rank-0 edge. A scalar has no axes to contract, so
+            # the chain rule here is a SCALE, not a matmul. This
+            # used to fall through to ``@``, which rerouted it
+            # silently inside matmul; matmul now raises
+            # (ScalarMatmul, ticket dsnn-3qm.68) and the routing
+            # belongs here, at the site that knows it is composing.
+            from graphax.sparse.ops.matmul import scale_by_scalar
+            _sc, _tn = ((_post_val, _pre_val)
+                        if _is_scalar_st(_post_val)
+                        else (_pre_val, _post_val))
+            edge_outval = scale_by_scalar(_tn, _sc)
+            if count_ops:
+                muls += int(edge_outval.size)
         elif count_ops:
-            edge_outval, (_a, _m, _f) = _with_demand_dense(
-                demand_dense,
-                lambda: sparse_matmul(_post_val, _pre_val, count=True),
+            edge_outval, (_a, _m, _f) = sparse_matmul(
+                _post_val, _pre_val, count=True
             )
             adds += int(_a)
             muls += int(_m)
             fmas += int(_f)
         else:
-            edge_outval = _with_demand_dense(
-                demand_dense,
-                lambda: _post_val @ _pre_val,
-            )
+            edge_outval = _post_val @ _pre_val
         if count_ops:
             post_size = (
                 _post_val.val.size if _post_val.val is not None else 0
@@ -1846,20 +1936,11 @@ def contract_face_operands(ops: FaceOperands, *, count_ops: bool = False,
         edge_outval.pre_transforms = (
             tuple(_pre_reattach) + tuple(edge_outval.pre_transforms)
         )
-
-    # A misaligned-contract matmul can emit a compressed output
-    # (BandedIndex / SetIndex). The consistency check and the
-    # Diag / Compress micro-actions below consume only plain
-    # {Dense, Diagonal} dims, so densify the compressed pair to
-    # its compact equivalent here (keeps the M× meta-block-diagonal
-    # form where the structure reduces to a diagonal).
-    if _compressed_dims(edge_outval):
-        edge_outval = _materialize_for_op(edge_outval)
     return FaceContraction(edge_outval, adds, muls, fmas, mem)
 
 
 def contract_face(post_val, pre_val, *, approx: bool = False,
-                  count_ops: bool = False, demand_dense: bool = False,
+                  count_ops: bool = False,
                   pre_hook=None, post_hook=None) -> FaceContraction:
     """:func:`prepare_face_operands` then :func:`contract_face_operands`.
 
@@ -1871,7 +1952,7 @@ def contract_face(post_val, pre_val, *, approx: bool = False,
     return contract_face_operands(
         prepare_face_operands(post_val, pre_val, approx=approx,
                               pre_hook=pre_hook, post_hook=post_hook),
-        count_ops=count_ops, demand_dense=demand_dense)
+        count_ops=count_ops)
 
 
 def _eliminate_vertex(
@@ -2009,43 +2090,6 @@ def _eliminate_vertex(
         # forms took DIFFERENT code paths for the same request.
         _is_approx_cfg = _is_approx_cfg or face_config_is_approx(
             face_transforms)
-
-    # Output vars of the whole jaxpr: edges stored onto these heads feed the
-    # output boundary's mandatory densify (demand-driven materialization).
-    # The per-vertex approx gate is VACUOUS for edges that reach the output
-    # head during a LATER (exact) elimination -- the dominant case: a pair
-    # made at the approximated vertex rides passthrough/add into the
-    # boundary. Under GRAPHAX_DEMAND_EMIT the store-time densify below
-    # therefore keys on the GLOBAL approx arming instead. Exact AD stays
-    # untouched: flag off (default), or no approx anywhere in the jacve call.
-    # PLANNER-ONLY (2026-08-04). On the TILED path this store-time densify
-    # was the 12-826x approx blow-up: ``dense()`` expands COUPLED pairs, and
-    # a vmapped graph's output-headed edges carry the BATCH DiagonalIndex
-    # pair (per-sample block-diagonal, val ``(B, 10, ...)``). Expanding it
-    # materialises the full cross-batch tensor (``(B, 10, B, 256)`` — 512x
-    # at batch 512, off-diagonal blocks exact zeros) and every consumer
-    # contraction then drags BOTH batch axes. The "boundary materialises it
-    # dense anyway" premise below is planner-specific: on tiled, later
-    # eliminations CONTRACT the pair away as a batched GEMM and the boundary
-    # never sees it. The +46 MB coexistence win this channel encodes was
-    # measured on the sparse planner only, so it keys on the planner gate;
-    # exact AD is untouched either way (requires the approx arming).
-    from .sparse.ops.matmul import _einsum_general_enabled as _egen
-    if os.environ.get("GRAPHAX_DEMAND_EMIT", "0") == "1":
-        from .sparse.elemental.dispatch import approx_active as _aa_demand
-        _demand_store = (_is_approx_cfg or _aa_demand()) and _egen()
-    else:
-        _demand_store = _is_approx_cfg and _egen()
-    _demand_dense_vars = (
-        set(jaxpr.outvars) if _demand_store else frozenset()
-    )
-    # L5 demand-emit channel: output-headed is a property of the EDGE, not of
-    # whether THIS vertex elimination carries the approx config -- a pair
-    # created at an approximated vertex is contracted onto the output head
-    # during a LATER (exact) elimination. Unconditional; the planner-side
-    # gate (GRAPHAX_DEMAND_EMIT + planner engagement + surviving pairs)
-    # makes it a no-op everywhere else.
-    _demand_head_vars = set(jaxpr.outvars)
 
     # Path tokenization sink (None on the exact-AD hot path -> zero overhead,
     # every contraction/accumulation runs inline exactly as before).
@@ -2239,7 +2283,7 @@ def _eliminate_vertex(
                     _dp = DeferredOutputProduct(_post_val, _pre_val)
                     _record_edge_store(_dp)
                     _set_inner(graph, in_edge, out_edge, _dp)
-                    _set_inner(transpose_graph, out_edge, in_edge, _dp)
+                    _set_inner(transpose_graph, out_edge, in_edge, _dp, is_transpose=True)
                     if _face_sink is not None:
                         _face_sink.close_face()
                     continue
@@ -2249,9 +2293,7 @@ def _eliminate_vertex(
                 # ``_ops`` verbatim: the deferred-output guard between the two
                 # halves only READS the operands, so the second half consumes
                 # exactly what the first produced.
-                _fc = contract_face_operands(
-                    _ops, count_ops=count_ops,
-                    demand_dense=out_edge in _demand_head_vars)
+                _fc = contract_face_operands(_ops, count_ops=count_ops)
                 edge_outval = _fc.val
                 if count_ops:
                     adds += _fc.adds
@@ -2350,8 +2392,7 @@ def _eliminate_vertex(
                     # redesign a permuted edge from an approximated vertex legally
                     # reaches a NON-approx vertex's merge — the per-vertex gate
                     # alone is stale there (ViT layer_norm case).
-                    from .sparse.elemental.dispatch import approx_active as _aa
-                    if not _perpath and not _is_approx_cfg and not _aa():
+                    if not _perpath and not _is_approx_cfg:
                         edge_shape = tuple(
                             list(out_edge.aval.shape) + list(in_edge.aval.shape)
                         )
@@ -2534,37 +2575,9 @@ def _eliminate_vertex(
                 if os.environ.get("GX_NO_SQUEEZE", "0") != "1":
                     edge_outval = _squeeze_unreferenced_val_axes(edge_outval)
 
-                # DEMAND-DRIVEN MATERIALIZATION (approx mode, PLANNER path
-                # only — see ``_demand_store`` above; on tiled this decoupled
-                # the vmap batch pair: the 12-826x blow-up). An edge
-                # whose head is a GRAPH OUTPUT is materialized dense by the
-                # output boundary regardless -- its dense extent is a hard
-                # demand. Materializing HERE lets XLA fuse the expansion into
-                # the producing contraction's epilogue instead of carrying
-                # block form to the boundary and paying peak memory for BOTH
-                # forms (measured +46 MB avg DIAG coexistence on nn256 with
-                # the sparse planner). ``dense(hard=False)`` expands coupled
-                # pairs only (implicit broadcast dims stay implicit -- the
-                # boundary broadcast fuses fine); scalar_mult stays deferred.
-                # Exact AD is untouched: exact edges carry no coupled pairs
-                # here beyond what the boundary already handles, and the gate
-                # requires the approx config.
-                if (
-                    _demand_store
-                    and edge_outval.val is not None
-                    and out_edge in _demand_dense_vars
-                    and any(d.is_sparse for d in edge_outval.dims)
-                ):
-                    from .sparse.ops.dense import dense as _dense_st
-                    try:
-                        edge_outval = _dense_st(edge_outval)
-                        _assert_sparse_tensor_consistency(edge_outval)
-                    except Exception:
-                        pass  # keep the sparse form; boundary handles it
-
                 _record_edge_store(edge_outval)
                 _set_inner(graph, in_edge, out_edge, edge_outval)
-                _set_inner(transpose_graph, out_edge, in_edge, edge_outval)
+                _set_inner(transpose_graph, out_edge, in_edge, edge_outval, is_transpose=True)
                 if _face_sink is not None:
                     _face_sink.close_face()
 
@@ -2583,29 +2596,19 @@ def _eliminate_vertex(
     return adds, muls, fmas, mem
 
 
-def _with_demand_dense(active, thunk):
-    """L5 demand channel: contractions run via the ``@`` operator (no kwargs
-    can travel), so an output-headed edge's hard dense demand reaches the
-    einsum planner as a contextvar; ``_lower`` then emits the dense layout
-    directly from the single einsum (no block/dense buffer coexistence).
-    Gated inside the planner by GRAPHAX_DEMAND_EMIT (default off)."""
-    if not active:
-        return thunk()
-    from .sparse.lower import matmul as _lm
-    tok = _lm._DEMAND_DENSE.set(True)
-    try:
-        return thunk()
-    finally:
-        _lm._DEMAND_DENSE.reset(tok)
-
-
 def _is_persistent(obj) -> bool:
     """True for `immutables.Map` and its `MapMutation` proxy."""
     return isinstance(obj, immutables.Map) or hasattr(obj, "finish")
 
 
-def _set_inner(outer, k1, k2, v):
+def _set_inner(outer, k1, k2, v, is_transpose=False):
     """Set ``outer[k1][k2] = v`` for both nested-defaultdict and immutables.Map proxies."""
+    out_var, in_var = (k1, k2) if is_transpose else (k2, k1)
+    if hasattr(out_var, "aval") and hasattr(in_var, "aval") and hasattr(v, "shape"):
+        if not (getattr(v, "pre_transforms", ()) or getattr(v, "post_transforms", ())):
+            expected = tuple(out_var.aval.shape) + tuple(in_var.aval.shape)
+            assert v.shape == expected, f"Stored edge shape {v.shape} does not match expected {expected}"
+
     inner = outer.get(k1)
     if _is_persistent(outer) or _is_persistent(inner):
         if inner is None:
@@ -3321,6 +3324,8 @@ def vertex_elimination_jaxpr(
     argnums: Sequence[int] = (0,),
     count_ops: bool = False,
     sparse_representation: bool = False,
+    dense_edges: bool = False,
+    dense_max_bytes: int = None,
     fresh_eliminator: bool = False,
     transforms: Sequence[
         Tuple[
@@ -3371,6 +3376,35 @@ def vertex_elimination_jaxpr(
                                         by `jacve`.
     """
 
+    # THE DENSE-CONTRACTION MODE (ticket dsnn-3qm.69). A whole separate engine
+    # in ``graphax.dense_edges``: every edge a plain array, every contraction a
+    # ``jnp.tensordot``. It is the VALUE ORACLE for an approximated plan, and an
+    # oracle that shared the contraction code with the engine would prove only
+    # the output packing (finding 61 verdict 4) -- so this is an early return,
+    # not a flag threaded through ``_eliminate_vertex``. Nothing below runs, and
+    # no line below changed, so ``dense_edges=False`` is bit-identical by
+    # construction.
+    if dense_edges:
+        if sparse_representation:
+            raise ValueError(
+                "dense_edges=True with sparse_representation=True: the dense "
+                "mode has no SparseTensor to return, every edge is a plain "
+                "array. Drop sparse_representation.")
+        from .dense_edges import dense_vertex_elimination
+
+        return dense_vertex_elimination(
+            jaxpr,
+            order,
+            consts,
+            *args,
+            has_aux=has_aux,
+            argnums=argnums,
+            count_ops=count_ops,
+            transforms=transforms,
+            face_transforms=face_transforms,
+            max_bytes=dense_max_bytes,
+        )
+
     jaxpr_invars = [invar for i, invar in enumerate(jaxpr.invars) if i in argnums]
     env, _, _, vo_vertices = _build_graph(jaxpr, args, consts)
 
@@ -3385,25 +3419,28 @@ def vertex_elimination_jaxpr(
     else:
         eliminator = _get_eliminator(jaxpr, args, consts, tuple(argnums))
     order = _checkify_order(order, jaxpr, vo_vertices)
-    # Flag whether this elimination carries a Diag/Compress approximation. The
-    # elemental sparse dispatch is a hard no-op unless this is set, so plain
-    # exact AD never routes through it (see dispatch.set_approx_active).
+    # Flag whether this elimination carries a Diag/Compress approximation.
+    # _eliminate_vertex reads it to relax the nominal-shape asserts (a permuted
+    # edge from an approximated vertex legally reaches a non-approx vertex's
+    # merge), and alphagrad's legality oracle / face probes drive it around
+    # their own replays. It no longer gates the elemental kernel layer — that
+    # is GRAPHAX_ELEMENTAL alone now (dsnn-3qm.28.2).
     # vertex_elimination_jaxpr RECURSES (topology build, jit/cond macro-vertices),
     # so SAVE+RESTORE the prior value rather than hard-resetting to False — a
     # nested non-approx elimination must not clear an outer approx elimination's
-    # flag mid-flight (that would silently route the outer's remaining approx
-    # edges onto the existing path).
+    # flag mid-flight (that would silently drop the outer's approx handling).
     from .sparse.elemental.dispatch import approx_active, set_approx_active
     # Same rule as `_is_approx_cfg`: a transform is an approximation if it is a
     # Diag/Compress instance OR a CALLABLE (the documented
     # "(SparseTensor) -> SparseTensor escape hatch"). The isinstance-only test made a
-    # callable set _approx_on=False -> set_approx_active(False) -> try_elemental_matmul's
-    # EXACT-AD guard (`if not approx_active(): return None`) short-circuited the ENTIRE
-    # elemental dispatch, so contract_implicit was NEVER REACHED (telemetry:
-    # matmul_pure_dense_skip=11, DISPATCH_FALLBACK_LOG empty). The implicit (Compress-away)
-    # dim was therefore never consumed by the contraction and rode through as a phantom out
-    # dim, which _normalize_approx_edge then could not regroup ("per-side logical-extent
-    # mismatch — edge (out 10 | primal 8) vs nominal (out () | primal (8,))").
+    # callable set _approx_on=False, which back when this flag still gated the
+    # elemental dispatch short-circuited it entirely, so contract_implicit was NEVER
+    # REACHED (telemetry: matmul_pure_dense_skip=11, DISPATCH_FALLBACK_LOG empty). The
+    # implicit (Compress-away) dim was therefore never consumed by the contraction and
+    # rode through as a phantom out dim, which _normalize_approx_edge then could not
+    # regroup ("per-side logical-extent mismatch — edge (out 10 | primal 8) vs nominal
+    # (out () | primal (8,))"). The flag still selects the approx handling below, so
+    # the callable rule stays.
     _approx_on = any(
         isinstance(_t, (Diag, Compress)) or callable(_t)
         for _spec in (transforms or ())
@@ -3412,9 +3449,9 @@ def vertex_elimination_jaxpr(
     # PER-FACE transforms approximate exactly as much as per-vertex ones, so
     # they arm the dispatch flag by the SAME rule (Diag/Compress instance, the
     # documented callable escape hatch, or a SKIP_FACE sentinel). Without this
-    # no approx-mode machinery (elemental kernels, einsum_general planner,
-    # struct_lower) can ever see a face-hook elimination — the flag lied about
-    # what the elimination carries. Handles both the nested
+    # no approx-mode machinery (the elemental kernels) can ever see a face-hook
+    # elimination — the flag lied about what the elimination carries. Handles
+    # both the nested
     # {vertex: {face_key: slots}} and the per-vertex flat layout.
     if not _approx_on and face_transforms:
         def _face_slot_iter(ft):
@@ -3473,12 +3510,33 @@ def vertex_elimination_jaxpr(
 
     # Collect outputs
     if sparse_representation:
+        # THE OUTPUT-LAYOUT CONTRACT (ticket dsnn-3qm.62): every returned
+        # SparseTensor is stored in PARAMETER LAYOUT (its val axes in the
+        # order of its dims, axis == position once dense). The tiled engine
+        # leaves a 2-D weight gradient transposed in storage while the
+        # planner does not; the Index tuple is pytree aux data, so two
+        # gradients that differ only in axis assignment have different
+        # pytree structure and a consumer cannot tree_map them (finding 60).
+        # One transpose at the boundary, or nothing when the layout already
+        # holds; asserted, never silently skipped.
+        from .sparse.ops.output_layout import (
+            canonical_output_layout, is_parameter_layout)
+        from .sparse.tensor import SparseTensor
+
         jac_vals = []
         for outvar in jaxpr.outvars:
             for invar in jaxpr_invars:
                 inner = graph.get(invar)
                 edge = inner.get(outvar) if inner is not None else None
                 tensor = _force(edge) if edge is not None else None
+                if isinstance(tensor, SparseTensor):
+                    tensor = canonical_output_layout(tensor)
+                    assert is_parameter_layout(tensor), (
+                        "OUTPUT LAYOUT CONTRACT VIOLATED: the gradient "
+                        f"d{outvar}/d{invar} is not stored in parameter "
+                        f"layout after canonicalization: dims={tensor.dims} "
+                        f"val.shape={None if tensor.val is None else tensor.val.shape}"
+                    )
                 jac_vals.append(tensor)
     else:
         jac_vals = []

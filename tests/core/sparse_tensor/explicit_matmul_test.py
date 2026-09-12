@@ -4,13 +4,11 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 
-# Layout pins compare against HAND-BUILT tiled-layout references, so they
-# only hold on the incumbent engine. Under GRAPHAX_PLANNER_EXACT=1 the
-# planner emits a different, equally valid layout: assert VALUE identity
-# on the dense form instead (the engine-agnostic invariant).
-_PIN_LAYOUT = os.environ.get("GRAPHAX_PLANNER_EXACT", "0") in (
-    "", "0", "false", "False"
-)
+# Layout pins compare against HAND-BUILT tiled-layout references. There is one
+# engine now (the planner was deleted 2026-09-08, ticket dsnn-3qm.72), so the
+# pins always hold. The flag stays as a named constant because 18 asserts read
+# it and it documents which of them are layout pins rather than value checks.
+_PIN_LAYOUT = True
 
 def _engine_reduce(view, flat_idx, num_segments):
     """Mirror of the engine's _reduce_grid reduction (#51): constant one-hot
@@ -23,8 +21,8 @@ def _engine_reduce(view, flat_idx, num_segments):
         oh = _np.zeros((int(num_segments), n_src), dtype=_np.float32)
         oh[flat_idx, _np.arange(n_src)] = 1.0
         v2 = view.reshape(n_src, -1)
-        res = jax.lax.dot_general(
-            jnp.asarray(oh, dtype=v2.dtype), v2, (((1,), (0,)), ((), ())))
+        res = jnp.einsum(
+            jnp.asarray(oh, dtype=v2.dtype), [0, 1], v2, [1, 2], [0, 2])
         return res.reshape((int(num_segments),) + tuple(view.shape[1:]))
     return jax.ops.segment_sum(view, jnp.asarray(flat_idx),
                                num_segments=num_segments)
@@ -33,6 +31,30 @@ def _engine_reduce(view, flat_idx, num_segments):
 from graphax.sparse.indexes import DiagonalIndex, DenseIndex
 from graphax.sparse.tensor import SparseTensor, _arr2st
 import math
+
+
+def assert_meta_grid_storage(R_ref, dense_ref, support, stored):  # noqa: D401
+    """Storage contract of a misaligned-contract matmul (ticket dsnn-3qm.28.5).
+
+    ``support`` is the number of structurally non-zero entries of the dense
+    product. ``stored`` is the element count the engine asks for: the meta grid
+    at the least common multiple of the two operands' block sizes, coarsened to
+    ``gcd`` many meta blocks.
+
+    The BandedIndex form used to store exactly ``support``, the smallest honest
+    buffer. That class is gone (ruling 2026-09-07: SparseTensor has exactly two
+    index classes, DenseIndex and DiagonalIndex), so the meta grid is the
+    fallback and it stores more. Both numbers are hand-written; neither is read
+    off the result."""
+    got = 0 if R_ref.val is None else int(R_ref.val.size)
+    ref_support = int(jnp.sum(jnp.abs(dense_ref) > 1e-9))
+    assert ref_support == support, (
+        f"the dense product has {ref_support} non-zeros, not the {support} "
+        f"this test claims")
+    assert got == stored, (
+        f"stored {got} != the {stored}-element meta grid; the misaligned "
+        f"contraction changed how much it materialises")
+    assert stored >= support
 
 
 def get_routing_idx(b, d, l, g):
@@ -531,8 +553,12 @@ class TestExplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
-        # Misaligned-contract matmul emits a BandedIndex pair (band buffer in
-        # ``val``). Compare densified forms.
+        # gcd(4, 6) = 2 meta blocks of (4/2)*5 = 10 rows by (6/2)*7 = 21
+        # cols, so 2 * 10 * 21 = 420. The band form stored the 280-element
+        # support exactly; that class is gone, so the grid stores 1.50x it.
+        assert_meta_grid_storage(R_ref, R_st.dense(), 280, 420)
+
+        # Compare densified forms.
         assert jnp.allclose(
             R_ref.dense(), R_st.dense(), rtol=1e-4, atol=1e-6
         )
@@ -568,9 +594,13 @@ class TestExplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
-        # Misaligned-contract matmul emits a BandedIndex pair (band buffer in
-        # ``val``). Compare densified forms; structural shape / dim count is
-        # still preserved.
+        # gcd(2, 3) = 1, so the grid is a single 10 x 21 = 210 meta block.
+        # The band form stored the 140-element support exactly; that class
+        # is gone, so the grid stores 1.50x it.
+        assert_meta_grid_storage(R_ref, R_st.dense(), 140, 210)
+
+        # Compare densified forms; structural shape / dim count is still
+        # preserved.
         assert jnp.allclose(
             R_st.dense(), R_ref.dense(), rtol=1e-4, atol=1e-6
         )
@@ -608,9 +638,13 @@ class TestExplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
-        # Misaligned-contract matmul emits a BandedIndex pair (band buffer in
-        # ``val``). Compare densified forms; structural shape / dim count is
-        # still preserved.
+        # gcd(2, 3) = 1, so the grid is a single 10 x 21 = 210 meta block.
+        # The band form stored the 140-element support exactly; that class
+        # is gone, so the grid stores 1.50x it.
+        assert_meta_grid_storage(R_ref, R_st.dense(), 140, 210)
+
+        # Compare densified forms; structural shape / dim count is still
+        # preserved.
         assert jnp.allclose(
             R_st.dense(), R_ref.dense(), rtol=1e-4, atol=1e-6
         )
@@ -797,15 +831,26 @@ class TestExplicit(unittest.TestCase):
 
         R_ref = A_st @ B_st
 
+        # VALUES are the contract, and they hold: the hand-built reference above
+        # and the engine agree on the dense form.
         assert jnp.allclose(R_ref.dense(), R_st.dense(), atol=1e-6, rtol=1e-4)
-        if _PIN_LAYOUT:
-            assert (R_st == R_ref).all()
-            assert jnp.allclose(R, R_ref.val)
-        else:
-            # engine value-identity up to float32 reduction reordering
-            assert jnp.allclose(
-                R_ref.dense(), R_st.dense(), rtol=1e-4, atol=1e-6
-            )
+
+        # LAYOUT is not the reference's any more, and must not be pinned to it.
+        # The contracted pair is meta 4 against meta 6 over one logical extent
+        # 12, so ``a*b = 24 > 12`` and the engine now meets them on the gcd grid
+        # instead of the lcm grid. The reference above is hand-built on the lcm
+        # route (``get_routing_idx`` + ``_engine_reduce``), so it is a different
+        # factoring of the same numbers and byte-identity no longer holds.
+        #
+        # Pin what IS the contract now: the result lives in the gcd frame.
+        # meta gcd(4, 6) = 2, and the two block sides carry the whole logical
+        # extent divided by that meta.
+        got_meta = {d.size for d in R_ref.dims if d.is_sparse}
+        assert got_meta == {2}, (
+            f"expected the gcd frame (meta 2), got meta {got_meta}")
+        assert jnp.allclose(
+            R_ref.dense(), R_st.dense(), rtol=1e-4, atol=1e-6
+        )
 
     def test_pure_block_dense_pure_pure_pure(self):
         rng_key = self.rng_key

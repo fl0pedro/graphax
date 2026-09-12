@@ -118,7 +118,7 @@ _orig_set_inner = gcore._set_inner
 
 
 def _make_dense_set_inner(active):
-    def _set_inner(outer, k1, k2, v):
+    def _set_inner(outer, k1, k2, v, *args, **kwargs):
         # graph stores graph[in_edge][out_edge]; transpose stores
         # transpose_graph[out_edge][in_edge]. Both carry .aval on the vars.
         if active["on"] and hasattr(k1, "aval") and hasattr(k2, "aval"):
@@ -132,7 +132,7 @@ def _make_dense_set_inner(active):
                     v = _densify_to_nominal(v, len(out_shape), nominal)
             except Exception:
                 pass
-        return _orig_set_inner(outer, k1, k2, v)
+        return _orig_set_inner(outer, k1, k2, v, *args, **kwargs)
     return _set_inner
 
 

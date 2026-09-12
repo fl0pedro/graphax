@@ -41,7 +41,7 @@ from typing import Callable, Sequence, Union
 
 import jax.numpy as jnp
 
-from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex, CompressedIndex
+from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
 from graphax.sparse.tensor import SparseTensor, _apply_block_diagonal, _subdivide_coupled_blockdiag
 from graphax.sparse.dtype_compute import _scaled_mul
 
@@ -842,9 +842,8 @@ def apply_compress(st: SparseTensor, action: Compress) -> SparseTensor:
     # (16 vs 4 / 16 vs 10) on high-rank edges (ViT attention, MoE experts).
     # Raise ValueError so the elimination loop's best-effort handler skips this
     # COMPRESS on this edge (leaving it exact) instead of corrupting it.
-    # DenseIndex axes (NN/ConvNet) are unaffected: not sparse, no block_axis,
-    # not a CompressedIndex.
-    # REMOVED 2026-07-15: over-conservative structural-block-axis / CompressedIndex guard.
+    # DenseIndex axes (NN/ConvNet) are unaffected: not sparse, no block_axis.
+    # REMOVED 2026-07-15: over-conservative structural-block-axis guard.
     # It raised ValueError *so the elimination loop would silently SKIP the COMPRESS*, which
     # desyncs the two edges of a shared var -> the documented root cause of the very
     # "Contraction size mismatch" family it claimed to prevent. Block-axis compress is
@@ -1252,3 +1251,53 @@ def apply_micro_actions(
                 f"got {type(action).__name__}."
             )
     return st
+
+
+def action_is_legal(st, action) -> bool:
+    """Can ``action`` be applied to ``st``? No side effect, no allocation.
+
+    The counterpart of ticket dsnn-3qm.70: `_apply_face_transform` now RAISES on
+    an action that does not fit the operand, so a caller that cannot guarantee
+    legality must either ask here first or pass a chooser callable that returns
+    ``None`` to decline.
+
+    It answers by attempting the action and reporting whether it raised. That is
+    exact by construction — it can never disagree with the applier — and it is
+    cheap: every atomic helper validates the STRUCTURE before it touches values,
+    so an illegal action raises before any array work happens. A legal one does
+    do the work, so use this to mask a choice, not inside a hot loop.
+    """
+    from graphax.core import _apply_micro
+
+    try:
+        _apply_micro(st, action)
+    except ValueError:
+        return False
+    return True
+
+
+def legal_diag_pairs(st) -> tuple[tuple[int, int, int], ...]:
+    """Every ``(i, j, factor)`` a :class:`Diag` may tie on ``st``.
+
+    A diagonal ties ONE out axis to ONE primal axis, so the candidates are the
+    out/primal crossings, with ``factor = gcd`` of the two logical sizes. Which
+    candidates are actually legal depends on more than the crossing — a dim
+    already in a pair cannot be tied again, for one — so the candidates are
+    FILTERED BY :func:`action_is_legal` rather than by a second copy of the
+    rules. Written any other way the mask and the applier drift apart, which is
+    the defect ticket dsnn-3qm.70 exists to remove.
+
+    A policy head needs the live operand to compute this: a join intermediate's
+    out/primal split is not known until the elimination reaches it.
+    """
+    import math as _math
+
+    n_out = len(st.out_dims)
+    dims = st.dims
+    out = []
+    for i in range(n_out):
+        for j in range(n_out, len(dims)):
+            f = _math.gcd(int(dims[i].logical_size), int(dims[j].logical_size))
+            if f > 1 and action_is_legal(st, Diag(i, j, f)):
+                out.append((i, j, f))
+    return tuple(out)

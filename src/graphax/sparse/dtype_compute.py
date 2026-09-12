@@ -164,13 +164,17 @@ def _scaled_mul(value, scalar_mult, *, keep_narrow: bool = False):
     sdt = getattr(scalar_mult, "dtype", None)
     if vdt is None or sdt is None:
         return value * scalar_mult
-    # bf16 narrow-compute mode implies keep_narrow for a bf16 value: the
-    # densify/materialize read (val * f32 scalar_mult) was re-promoting the
-    # Quant'd array to f32 right BEFORE the contraction consumed it, so the
-    # heavyweight dots never ran bf16 (see _quant_narrow_bf16_pair).
-    if not keep_narrow and _quant_narrow_bf16_pair(jnp.dtype(vdt),
-                                                   jnp.dtype(sdt))             and jnp.dtype(vdt) == jnp.dtype(jnp.bfloat16):
-        keep_narrow = True
+    # A mixed {bf16, f32} value / scalar_mult pair is UPCAST here, so a Quant'd
+    # array is re-promoted to f32 by the densify read before the contraction
+    # consumes it. Keeping it narrow instead was measured (2026-08, G3) and it
+    # bought nothing on the contraction: the lowered dot census and the convert
+    # count were unchanged, and the per-vertex error against exact f32 got
+    # slightly worse (relerr 2.93e-3 -> 3.17e-3). It is NOT a no-op, though. It
+    # changes the elementwise JOIN: kept narrow, ``bf16 + bf16`` keeps bf16
+    # storage; upcast, the f32 scalar_mult drain re-promotes both addends and
+    # the sum comes back f32. That is a real precision and storage trade with
+    # no measured contraction benefit, so the upcast stays. Take the trade
+    # deliberately or not at all.
     if keep_narrow and jnp.dtype(vdt) != jnp.dtype(sdt):
         _check_downcast_safe(scalar_mult, vdt, what="scalar_mult")
         return value * jnp.asarray(scalar_mult).astype(vdt)
@@ -214,46 +218,10 @@ def _unify_operand_dtypes(lhs, rhs):
     # quantizing one edge must never silently approximate its exact partner
     # (user decision; an earlier draft downcast the pair). The bf16 fast
     # path exists only when BOTH edges were made bf16: same-dtype pairs
-    # return above unchanged, and the tiled dot sites then run the bf16
-    # GEMM with f32 accumulation (matmul._gx_dot_general). The companion
-    # keep-narrow read in _scaled_mul stops a lone scalar drain from
-    # re-promoting an already-bf16 edge before that both-bf16 meeting.
+    # return above unchanged, and the contraction then asks for f32
+    # accumulation (matmul._emit_einsum).
     cdt = _compute_dtype(ldt, rdt)
     return _cast_operand(lhs, cdt), _cast_operand(rhs, cdt)
-
-
-def _quant_narrow_bf16_pair(ldt, rdt) -> bool:
-    """True iff bf16 narrow-compute handling applies to this dtype pair
-    (consumed by _scaled_mul's keep-narrow read; the operand unify above
-    deliberately does NOT use it -- mixed pairs upcast). Env read per call:
-    GRAPHAX_QUANT_NARROW_GEMM default ON, and the einsum_general planner
-    must be OFF -- the planner emits its own contractions with no
-    f32-accumulate plumbing, so narrow vals must not leak into it.
-
-    2026-08 MEASURED (G3): the stated rationale above is FALSE. The planner
-    already receives both-bf16 operand pairs -- whenever BOTH faces of a
-    contraction were quantized (the per-face ``lhs``/``rhs`` slots) -- and it
-    lowers them to genuine bf16 dots (6 on mlp2, 16 on mlp4, 26 on attn).
-    Narrow vals do not need this guard to stay out of the planner, because
-    they were never kept out of it.
-
-    Relaxing the exclusion was tried and measured. On the CONTRACTION side it
-    buys nothing: with the toggle isolated on mlp2 the lowered dot census and
-    convert count are unchanged ({f32:4, bf16:6}, 22 converts either way),
-    and the per-vertex plan's error against exact f32 gets slightly WORSE
-    (relerr 2.93e-3 -> 3.17e-3). It is NOT a no-op, though: it changes the
-    elementwise JOIN. With the exclusion removed, ``bf16 + bf16`` keeps its
-    bf16 storage (the bit-exact bf16 add, ``scalar_mult`` stored bf16);
-    with it in place the f32 ``scalar_mult`` drain re-promotes both addends
-    and the sum comes back f32. Neither introduces a rescale. That is a real
-    precision/storage trade with no measured contraction benefit, so the
-    exclusion stays until someone wants the trade deliberately."""
-    import os as _os
-    if _os.environ.get("GRAPHAX_QUANT_NARROW_GEMM", "1") == "0":
-        return False
-    if _os.environ.get("GRAPHAX_EINSUM_GENERAL", "1") != "0":
-        return False
-    return {ldt, rdt} == {jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)}
 
 
 def _cast_operand(t, cdt):

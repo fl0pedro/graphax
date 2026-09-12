@@ -33,7 +33,42 @@ defelemental(lax.sinh_p, lax.cosh)
 defelemental(lax.asinh_p, lambda x: 1.0 / lax.sqrt(1.0 + x**2))
 defelemental(lax.cosh_p, lax.sinh)
 defelemental(lax.acosh_p, lambda x: 1.0 / lax.sqrt(x**2 - 1.0))
-defelemental2(lax.tanh_p, lambda out, primal, accuracy: 1.0 - out**2)
+# d tanh/dx == 1 - t**2 (t == tanh(x)), FACTORED as (1 - t)(1 + t) because that
+# is the form jax uses for its own tanh JVP
+# (``mul(add(g, mul(g, ans)), sub(_one(x), ans))`` == ``g (1 + t)(1 - t)``).
+#
+# THIS IS AN AGREEMENT FIX, NOT AN ACCURACY FIX. Near saturation the quantity is
+# ill-conditioned no matter how it is factored: ``t`` is already a float32, so its
+# own ~1 ULP error becomes a RELATIVE error of ``eps/(1 - t**2)`` once the
+# cancellation is taken, and no rearrangement of t can recover information t does
+# not carry. MEASURED on an RTX 3090 against float64:
+#
+#     x      1 - t**2        (1 - t)(1 + t)   exact            rel err old  new
+#     3.5    0.00364077091   0.00364078907    0.00364088472    3.13e-05  2.63e-05
+#     5.0    0.000181674957  0.000181666706   0.000181583231   5.05e-04  4.60e-04
+#     8.0    0               0                4.50140598e-07   1.00e+00  1.00e+00
+#
+# Both forms are poor by x == 5 and both return exactly 0.0 at x == 8 (float32
+# ``tanh(8)`` rounds to 1.0, so ``1 - t`` is 0 exactly). Recovering accuracy there
+# would require computing from the PRIMAL instead of from the output -- jax's own
+# AccuracyMode.HIGHEST path does that with ``4 sigma(2x) sigma(-2x)``. That is a
+# larger change than this one and is NOT done here.
+#
+# What the factoring DOES buy is bit-for-bit agreement with jax.jacfwd, because
+# both sides then evaluate the same expression. That is what
+# output_layout_test.py::test_a_diagonal_pair_output_passes_the_contract asserts
+# at rtol=1e-6 -- an AGREEMENT test between the two engines, which at x == 3.5 is
+# only satisfiable if the two engines agree exactly (the shared ~3e-5 error
+# cancels in the comparison, an independent 3e-5 difference does not). With
+# ``1 - t**2`` graphax produced 0.00728154182434082 against jax's
+# 0.00728157814592123 and the test failed on GPU; it had passed on CPU only
+# because both happened to round alike there.
+defelemental2(lax.tanh_p,
+              lambda out, primal, accuracy: (1.0 - out) * (1.0 + out))
+# NOTE: ``atanh``, ``tan``, ``asin`` and ``acos`` below carry the SAME cancelling
+# ``1 -/+ x**2`` shape and are NOT changed here: no test in the suite exercises
+# them near their saturation point, so there is no measurement to justify
+# touching them. They are a known, currently unexercised risk.
 defelemental(lax.atanh_p, lambda x: 1.0 / (1.0 - x**2))
 
 defelemental(lax.erf_p, lambda x: 2.0 * lax.exp(-(x**2)) / lax.sqrt(jnp.pi))

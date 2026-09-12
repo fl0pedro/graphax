@@ -290,6 +290,48 @@ class PrimitiveTest(unittest.TestCase):
     #     self.assertTrue(tree_allclose(veres, revres)) 
 
 
+# ---------------------------------------------------------------------------
+# tanh': graphax must factor it the way jax does
+# ---------------------------------------------------------------------------
+def test_the_tanh_derivative_matches_jax_bit_for_bit():
+    """``d tanh/dx`` must be built as ``(1 - t)(1 + t)``, the form jax uses.
+
+    This is an AGREEMENT test, and deliberately not an accuracy test. As tanh
+    saturates the derivative is ill-conditioned in float32 whatever the
+    factoring: ``t`` is itself a rounded float32, so its ~1 ULP error becomes a
+    relative error of ``eps/(1 - t**2)`` once the cancellation is taken, and no
+    rearrangement of ``t`` recovers what ``t`` no longer carries. MEASURED
+    against float64 at x == 3.5: ``1 - t**2`` is 3.13e-5 relative off the true
+    value and ``(1 - t)(1 + t)`` is 2.63e-5 off -- both far outside the 1e-6
+    asserted here. At x == 8 BOTH return exactly 0.0 against a true 4.50e-7.
+
+    So the tolerance below is not a claim about accuracy. It is a claim that the
+    two engines evaluate the SAME expression, which makes their shared
+    conditioning error cancel in the comparison. jax's tanh JVP is
+    ``mul(add(g, mul(g, ans)), sub(_one(x), ans))`` == ``g (1 + t)(1 - t)``;
+    with ``1 - t**2`` graphax produced 0.00728154182434082 against jax's
+    0.00728157814592123 at x == 3.5 and a 1e-6 comparison failed on GPU. It had
+    passed on CPU only because both sides happened to round alike there.
+
+    Recovering real accuracy deep in saturation needs the derivative computed
+    from the PRIMAL rather than from the output -- jax's own
+    ``AccuracyMode.HIGHEST`` path uses ``4 sigma(2x) sigma(-2x)``. Graphax does
+    not do that, and this test does not ask it to.
+    """
+    def f(x):
+        return jnp.tanh(x)
+
+    x = jnp.array([0.5, 1.0, 2.0, 3.5, 5.0, 8.0])
+    got = jnp.diagonal(jacve(f, order="fwd", argnums=(0,))(x)[0])
+    want = jnp.diagonal(jax.jacfwd(f)(x))
+    # Exact agreement is the real contract; 1e-6 leaves room for a reassociation
+    # that is still the same expression, and is ~30x tighter than the 3e-5
+    # conditioning error, so a DIFFERENT factoring cannot sneak through.
+    assert jnp.allclose(got, want, rtol=1e-6, atol=0.0), (
+        f"graphax and jax disagree on tanh': got {got}, want {want}; "
+        "the two must evaluate the same factored expression")
+
+
 if __name__ == "__main__":
     unittest.main()
         

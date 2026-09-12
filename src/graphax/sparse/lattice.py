@@ -16,9 +16,6 @@ Classes (a dim either owns explicit physical axes with sizes, or is implicit
                sparsity information; ≡ DENSE by definition (this table entry
                is what the 2026-08-02 wrong-shaped-Jacobian fix enforces at
                the planner boundary)
-  BANDED/SET/TOEPLITZ   compressed STORAGE forms — densified to the
-               DiagonalIndex rung at every op boundary (architectural
-               invariant; they never reach contract/add as themselves)
   LOWRANK      edge-level factored tensor (U, V) — not an Index property;
                closure lives at the matmul()/elementwise() entry (L3).
 """
@@ -32,7 +29,6 @@ class L(Enum):
     IMPLICIT = "implicit"
     BLOCKDIAG = "blockdiag"
     DEGENERATE = "degenerate"
-    COMPRESSED = "compressed"
     LOWRANK = "lowrank"  # EDGE-level (whole tensor factored), not per-dim
 
 
@@ -47,8 +43,6 @@ def classify_edge(t) -> L | None:
 
 def classify(d) -> L:
     """Lattice class of one Index."""
-    if getattr(d, "is_compressed", False):
-        return L.COMPRESSED
     if getattr(d, "other_id", None) is not None:
         return L.DEGENERATE if int(d.size) == 1 else L.BLOCKDIAG
     return L.IMPLICIT if getattr(d, "axis", None) is None else L.DENSE

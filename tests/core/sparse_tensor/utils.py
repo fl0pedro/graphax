@@ -385,12 +385,352 @@ def matmul_reference(
     return _arr2st(res_dense, out_ndim=out_ndim)
 
 
+def stored_elements(st: SparseTensor) -> int:
+    """Physical element count of a SparseTensor. ``val is None`` stores nothing."""
+    return 0 if st.val is None else int(st.val.size)
+
+
+def support_size(dense_ref: jnp.ndarray, tol: float = 1e-12) -> int:
+    """Number of structurally non-zero entries of a dense reference.
+
+    With random operands a numerically zero product entry is a measure-zero
+    event, so this counts the STRUCTURAL support. It is the engine-independent
+    ceiling on honest storage: an emission may store fewer elements than the
+    support (a replicated axis kept implicit stores one copy of many equal
+    entries), but storing MORE means it materialised structure it did not need.
+    This is what ``physical_shape`` was supposed to catch and never did, because
+    every caller passed the result's own shape back in.
+    """
+    import numpy as _np
+
+    return int((_np.abs(_np.asarray(dense_ref)) > tol).sum())
+
+
+def assert_axis_pattern(st: SparseTensor, pattern: str, msg: str = ""):
+    """Pin which output dims stayed implicit, dim by dim.
+
+    One character per dim, in ``st.dims`` order:
+      ``D`` stored, physical axis        ``I`` implicit (``axis is None``)
+      ``S`` stored sparse (pair)         ``s`` implicit sparse (pair, no axis)
+    Physical axis ORDER is an engine choice and is not pinned; whether an axis
+    exists at all is the contract.
+    """
+    got = "".join(
+        ("S" if d.axis is not None else "s") if d.is_sparse
+        else ("D" if d.axis is not None else "I")
+        for d in st.dims
+    )
+    if got != pattern:
+        raise AssertionError(
+            f"{msg}Axis pattern {got} != expected {pattern}. "
+            f"An axis that should have stayed implicit was materialised "
+            f"(or the other way round)."
+        )
+
+
+# --------------------------------------------------------------------------
+# Class cover (ruling 2026-09-07, CONTEXT.md "Structural class")
+#
+# A SparseTensor cannot store an arbitrary set of entries. It stores one of two
+# structural classes: dense or block diagonal. So the
+# support is NOT the floor on honest storage. The floor is the CLASS COVER: the
+# smallest number of elements that holds the support inside the class the result
+# declares. The cover is at or above the support and differs from it whenever
+# the support is not expressible in the class -- a coprime block product covers
+# the support with a band or a meta grid, and no class can express an all-zero
+# block inside an occupied band.
+#
+# An implicit axis then divides the cover: it stores one copy of an extent-n
+# axis. So
+#
+#     honest_minimum = class_cover(support, declared class) / replication
+#
+# and that is the number a test asserts, as an EQUALITY. Storing more means the
+# engine materialised structure the class did not force. Storing less means the
+# result found a better class than it declared, which is a change to the
+# declaration and has to be made on purpose.
+# --------------------------------------------------------------------------
+
+
+def _pairs_and_singles(st: SparseTensor):
+    """(sparse pairs as (pos_a, pos_b), dense dim positions) over ``st.dims``."""
+    dims = st.dims
+    by_id = {d.id: i for i, d in enumerate(dims)}
+    pairs, seen, singles = [], set(), []
+    for i, d in enumerate(dims):
+        if not d.is_sparse:
+            singles.append(i)
+            continue
+        if i in seen:
+            continue
+        j = by_id.get(d.other_id)
+        if j is None:
+            singles.append(i)
+            continue
+        seen.add(i)
+        seen.add(j)
+        pairs.append((i, j))
+    return pairs, singles
+
+
+def _meta_block(d):
+    """(n_blocks, block_size) of one logical dim under its declared index."""
+    if d.is_sparse:
+        return int(d.size), int(d.block_size or 1)
+    return 1, int(d.size)
+
+
+def occupancy_grid(dense_ref, st: SparseTensor, tol: float = 1e-12):
+    """Boolean grid over the META axes: which declared block holds a non-zero.
+
+    ``dense_ref`` is reshaped to (n_0, b_0, n_1, b_1, ...) using the block
+    partition the RESULT declares, then reduced over every block axis.
+    """
+    import numpy as _np
+
+    ref = _np.abs(_np.asarray(dense_ref)) > tol
+    grid = [_meta_block(d) for d in st.dims]
+    want = tuple(n * b for n, b in grid)
+    if ref.shape != want:
+        raise AssertionError(
+            f"The dense reference has shape {ref.shape}, but the result "
+            f"declares logical shape {want}. The two must agree before a "
+            f"cover can be computed."
+        )
+    ref = ref.reshape([x for n, b in grid for x in (n, b)])
+    return ref.any(axis=tuple(range(1, 2 * len(grid), 2)))
+
+
+def _pair_covers(occ, ia, ib, n_a, n_b, b_a, b_b):
+    """Element counts for one sparse pair, per class family.
+
+    ``occ`` is the meta grid; every axis but ``ia`` and ``ib`` is reduced with
+    ``any``, so a cover that holds for one batch slice holds for all of them.
+    """
+    import numpy as _np
+
+    other = tuple(k for k in range(occ.ndim) if k not in (ia, ib))
+    o = occ.any(axis=other) if other else occ
+    if ia > ib:
+        o = o.T
+    cell = b_a * b_b
+    per_row = o.sum(axis=1)
+    per_col = o.sum(axis=0)
+    covers = {
+        "set": int(o.sum()) * cell,
+        "row_band": n_a * int(per_row.max()) * cell,
+        "col_band": n_b * int(per_col.max()) * cell,
+        "dense": (n_a * b_a) * (n_b * b_b),
+    }
+    diagonal = n_a == n_b and bool((o == _np.eye(n_a, dtype=bool)).all())
+    covers["diagonal"] = n_a * cell if diagonal else covers["dense"]
+    return covers
+
+
+def declared_pair_class(st: SparseTensor, ia: int, ib: int) -> str:
+    """The class family the result DECLARES for one sparse pair.
+
+    A sparse pair is always a meta-block diagonal now. The band and set classes
+    are gone with BandedIndex and SetIndex (ruling 2026-09-07), so nothing
+    declares them any more; ``_pair_covers`` still measures them because they
+    remain useful as a lower bound on what some other class COULD hold.
+    """
+    return "diagonal"
+
+
+def class_covers(dense_ref, st: SparseTensor, tol: float = 1e-12) -> dict:
+    """``{"declared": int, "best": int, "support": int, "per_class": {...}}``.
+
+    ``declared`` is the smallest cover inside the class the result declares.
+    ``best`` is the smallest cover over every class graphax can express.
+    Both count LOGICAL elements, before any implicit axis divides them.
+    """
+    occ = occupancy_grid(dense_ref, st, tol)
+    pairs, singles = _pairs_and_singles(st)
+    scale = 1
+    for i in singles:
+        scale *= int(st.dims[i].logical_size)
+    declared, best = scale, scale
+    per_class = {}
+    for ia, ib in pairs:
+        n_a, b_a = _meta_block(st.dims[ia])
+        n_b, b_b = _meta_block(st.dims[ib])
+        cov = _pair_covers(occ, ia, ib, n_a, n_b, b_a, b_b)
+        name = declared_pair_class(st, ia, ib)
+        per_class[(ia, ib)] = cov
+        declared *= cov[name]
+        best *= min(cov.values())
+    return {"declared": declared, "best": best,
+            "support": support_size(dense_ref, tol), "per_class": per_class}
+
+
+def replication_factor(st: SparseTensor) -> int:
+    """Product of every extent the result keeps implicit.
+
+    A sparse pair shares ONE meta axis, so an implicit meta counts once for the
+    pair. The two block extents are separate and count separately.
+    """
+    pairs, singles = _pairs_and_singles(st)
+    r = 1
+    for i in singles:
+        if st.dims[i].axis is None:
+            r *= int(st.dims[i].size)
+    for ia, ib in pairs:
+        if st.dims[ia].axis is None:
+            r *= int(st.dims[ia].size)
+        for k in (ia, ib):
+            d = st.dims[k]
+            if d.block_size is not None and d.block_axis is None:
+                r *= int(d.block_size)
+    return r
+
+
+def assert_constant_along_implicit(dense_ref, st: SparseTensor, tol: float = 1e-6,
+                                   msg: str = ""):
+    """Every axis the result declares implicit must really be replicated.
+
+    Without this guard an engine can declare an axis implicit, throw away the
+    variation along it, and still pass a storage equality.
+    """
+    import numpy as _np
+
+    ref = _np.asarray(dense_ref)
+    grid = [_meta_block(d) for d in st.dims]
+    blocked = ref.reshape([x for n, b in grid for x in (n, b)])
+    for pos, d in enumerate(st.dims):
+        checks = []
+        if d.axis is None and _meta_block(d)[0] > 1:
+            checks.append((2 * pos, "meta"))
+        if d.block_size is not None and d.block_axis is None and d.block_size > 1:
+            checks.append((2 * pos + 1, "block"))
+        elif not d.is_sparse and d.axis is None and d.size > 1:
+            checks.append((2 * pos + 1, "extent"))
+        for ax, what in checks:
+            first = _np.take(blocked, [0], axis=ax)
+            if not _np.allclose(blocked, first, atol=tol):
+                raise AssertionError(
+                    f"{msg}Dim {pos} declares its {what} axis implicit, but the "
+                    f"dense reference is NOT constant along it. The result "
+                    f"discarded real variation."
+                )
+
+
+def assert_honest_storage(st: SparseTensor, dense_ref, msg: str = "",
+                          tol: float = 1e-12):
+    """``stored == class_cover(declared) / replication``, checked as an equality.
+
+    Also proves that every implicit axis is genuinely replicated, so the
+    division is lossless. Returns the cover record for reporting.
+    """
+    assert_constant_along_implicit(dense_ref, st, msg=msg)
+    cov = class_covers(dense_ref, st, tol)
+    r = replication_factor(st)
+    if cov["declared"] % r:
+        raise AssertionError(
+            f"{msg}The declared cover {cov['declared']} is not divisible by the "
+            f"replication factor {r}. The implicit axes and the block partition "
+            f"disagree."
+        )
+    expect = cov["declared"] // r
+    got = stored_elements(st)
+    if got != expect:
+        raise AssertionError(
+            f"{msg}Stored {got} elements, honest minimum {expect} "
+            f"(class cover {cov['declared']} / replication {r}). "
+            f"Support {cov['support']}, best cover over all classes "
+            f"{cov['best']}. More means the result materialised structure its "
+            f"class did not force; less means it found a better class than it "
+            f"declared."
+        )
+    return cov
+
+
+EMITTABLE_CLASSES = ("diagonal", "dense")
+"""The classes ``matmul`` actually emits. The band and set covers that
+``_pair_covers`` still computes are headroom no index class can express any
+more, not a defect of the emission running."""
+
+
+def partition_covers(dense_ref, block_sizes, tol: float = 1e-12,
+                     classes=EMITTABLE_CLASSES) -> dict:
+    """Covers at a GIVEN block partition, independent of what the result declares.
+
+    ``class_covers`` measures the result against the partition the result chose,
+    so it catches padding and an over-wide band but NOT a partition that is too
+    coarse. This function takes the partition as an argument -- one block size
+    per logical dim, the finest the operands allow -- and returns the smallest
+    cover over every class at that partition. The two together separate the two
+    ways an emission can waste storage:
+
+        class_covers      "the band is wider than the support needs"
+        partition_covers  "the blocks are bigger than the operands force"
+
+    A misaligned contraction that falls back to the least common multiple grid
+    is minimal by the first measure and wasteful by the second.
+    """
+    import numpy as _np
+
+    ref = _np.abs(_np.asarray(dense_ref)) > tol
+    if len(block_sizes) != ref.ndim:
+        raise AssertionError(
+            f"partition_covers needs one block size per dim: got "
+            f"{len(block_sizes)} for a rank-{ref.ndim} reference.")
+    grid = []
+    for n, b in zip(ref.shape, block_sizes):
+        if n % b:
+            raise AssertionError(f"Block size {b} does not divide extent {n}.")
+        grid.append((n // b, b))
+    occ = ref.reshape([x for nb in grid for x in nb]).any(
+        axis=tuple(range(1, 2 * len(grid), 2)))
+    # Every axis whose partition is trivial (one block) is a plain scale.
+    axes = [k for k, (n, _) in enumerate(grid) if n > 1]
+    scale = 1
+    for k, (n, b) in enumerate(grid):
+        if n == 1:
+            scale *= n * b
+    if len(axes) < 2:
+        return {"best": scale * int(occ.sum()) *
+                _np.prod([grid[k][1] for k in axes], dtype=int) if axes else scale}
+    # Pair the partitioned axes two at a time, in order. A rank-2k output of k
+    # contracted pairs factorises, which is the shape every test here has.
+    best = floor = scale
+    for ia, ib in zip(axes[::2], axes[1::2]):
+        n_a, b_a = grid[ia]
+        n_b, b_b = grid[ib]
+        cov = _pair_covers(occ, ia, ib, n_a, n_b, b_a, b_b)
+        best *= min(cov[k] for k in classes)
+        floor *= cov["set"]
+    return {"best": best, "set_floor": floor, "occupancy": occ}
+
+
+def assert_partition_optimal(st: SparseTensor, dense_ref, block_sizes,
+                             msg: str = "", tol: float = 1e-12):
+    """``stored == best cover at the operand partition / replication``.
+
+    ``block_sizes`` is the finest partition the OPERANDS allow, one per logical
+    output dim, hand written by the test because only the test knows which
+    operand produced which axis.
+    """
+    best = partition_covers(dense_ref, block_sizes, tol)["best"]
+    r = replication_factor(st)
+    expect = best // r
+    got = stored_elements(st)
+    if got != expect:
+        raise AssertionError(
+            f"{msg}Stored {got} elements. The finest partition the operands "
+            f"allow needs {expect} ({best} / replication {r}), a ratio of "
+            f"{got / expect:.2f}. The result is minimal for the partition it "
+            f"chose and that partition is coarser than the operands force.")
+
+
 def assert_matmul_result(
     st_result: SparseTensor,
     dense_ref: jnp.ndarray,
     out_logical_shape: tuple[int, ...],
     primal_logical_shape: tuple[int, ...],
     physical_shape: tuple[int, ...] | None = None,
+    max_stored: int | None = None,
+    axis_pattern: str | None = None,
 ):
     # ``physical_shape`` pins ``val.shape`` to catch unintended densification —
     # not a semantic invariant. The SparseTensor algebra allows any axis order
@@ -432,6 +772,18 @@ def assert_matmul_result(
                     f"The matmul operation may be losing sparsity."
                 )
 
+    if max_stored is not None:
+        got = stored_elements(st_result)
+        if got > max_stored:
+            raise AssertionError(
+                f"Densification: the result stores {got} elements, more than "
+                f"the {max_stored} the dense reference has structural support "
+                f"for. The contraction materialised structure it did not need."
+            )
+
+    if axis_pattern is not None:
+        assert_axis_pattern(st_result, axis_pattern)
+
 
 def get_keys(seed=42, n=10):
     return jrand.split(jrand.PRNGKey(seed), n)
@@ -446,6 +798,12 @@ def idfn(val):
 def run_matmul_blocks_test(test_case, tensor_a, tensor_b):
     reference_result = matmul_reference(tensor_a, tensor_b)
     reference_dense = reference_result.dense()
+    # The storage expectation. ``matmul_reference`` densifies both operands, so
+    # its own ``val.shape`` is the DENSE shape and carries no expectation; the
+    # old driver passed the RESULT's shape back in, which compared the result to
+    # itself and could never fail (ticket dsnn-3qm.28.5). The structural support
+    # of the dense reference is the engine-independent ceiling instead.
+    max_stored = support_size(reference_dense)
 
     with test_case.subTest(op="sparse @ sparse"):
         result = tensor_a @ tensor_b
@@ -454,7 +812,7 @@ def run_matmul_blocks_test(test_case, tensor_a, tensor_b):
             reference_dense,
             reference_result.out_shape,
             reference_result.primal_shape,
-            result.val.shape if result.val is not None else None,
+            max_stored=max_stored,
         )
 
     with test_case.subTest(op="sparse @ dense"):
@@ -464,7 +822,7 @@ def run_matmul_blocks_test(test_case, tensor_a, tensor_b):
             reference_dense,
             reference_result.out_shape,
             reference_result.primal_shape,
-            result_s_d.val.shape if result_s_d.val is not None else None,
+            max_stored=max_stored,
         )
 
     with test_case.subTest(op="dense @ sparse"):
@@ -474,7 +832,7 @@ def run_matmul_blocks_test(test_case, tensor_a, tensor_b):
             reference_dense,
             reference_result.out_shape,
             reference_result.primal_shape,
-            result_d_s.val.shape if result_d_s.val is not None else None,
+            max_stored=max_stored,
         )
 
 

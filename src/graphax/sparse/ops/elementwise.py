@@ -9,6 +9,7 @@ Pipeline:
     5. Rebuild ``SparseTensor`` ``out_dims`` / ``primal_dims`` from the grid axes.
 """
 from __future__ import annotations
+import collections
 import math
 import os
 from dataclasses import replace
@@ -25,7 +26,7 @@ from .utils import (
 )
 from .layout import generate_block_permutation
 from graphax.sparse.dtype_compute import _unify_operand_dtypes, _compute_dtype
-from graphax.sparse.indexes import DiagonalIndex, DenseIndex
+from graphax.sparse.indexes import DiagonalIndex, DenseIndex, static_eye
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
@@ -165,13 +166,6 @@ def _normalize_inputs(lhs, rhs):
         inputs[i] = _arr2st(obj, out_ndim=len(other.out_dims) if _is_sparse(other) else None,
                             dtype=target_dtype)
     lhs, rhs = inputs
-    # Phase 8: pre-densify any compressed Index dims (BandedIndex / SetIndex)
-    # to DiagonalIndex / DenseIndex — elementwise consumes only those. XLA
-    # fuses the densify into the consumer (SMEM, not HBM). No-op when the
-    # operand carries no compressed dims.
-    from .utils import _materialize_for_op
-    lhs = _materialize_for_op(lhs)
-    rhs = _materialize_for_op(rhs)
     # Reconcile a compact broadcast dim (logical 1) against its same-id
     # materialized partner (logical N>1) so a fan-in accumulation of two
     # contributions to one vertex broadcasts instead of raising below.
@@ -380,7 +374,7 @@ def _promote_to_unified(value: Array, metrics, is_left: bool, fill: Array) -> Ar
             # loop over ``out.at[...].set(...)`` (one HLO op per slice).
             v = value.reshape(M, exp, 1, b1, b2, *rem)
             mask_shape = [1, exp, exp, 1, 1] + [1] * len(rem)
-            eye = jnp.eye(exp, dtype=jnp.bool_).reshape(mask_shape)
+            eye = static_eye(exp, bool).reshape(mask_shape)
             v = jnp.where(eye, v, fill)
             return v.transpose([0, 1, 3, 2, 4] + list(range(5, 5 + len(rem)))) \
                     .reshape(M, cb1, cb2, *rem)
@@ -401,8 +395,8 @@ def _promote_to_unified(value: Array, metrics, is_left: bool, fill: Array) -> Ar
                 # ``exp_h == exp_w``.
                 ms_h = [1] * len(exp_shape); ms_h[5 * i + 1] = exp_h; ms_h[5 * i + 2] = exp_h
                 ms_w = [1] * len(exp_shape); ms_w[5 * i + 1] = exp_w; ms_w[5 * i + 2] = exp_w
-                eye_h = jnp.eye(exp_h, dtype=jnp.bool_).reshape(ms_h)
-                eye_w = jnp.eye(exp_w, dtype=jnp.bool_).reshape(ms_w)
+                eye_h = static_eye(exp_h, bool).reshape(ms_h)
+                eye_w = static_eye(exp_w, bool).reshape(ms_w)
                 em = jnp.logical_and(eye_h, eye_w)
                 mask = em if mask is None else mask & em
         if mask is not None:
@@ -472,327 +466,533 @@ def _reconstruct_result(value, lhs, sp, dp, output_meta, op, rhs):
         new_fill = None
     else:
         new_fill = op(_scaled_fill(lhs), _scaled_fill(rhs))
-    return SparseTensor(
+    out = SparseTensor(
         tuple(rec[d.id] for d in lhs.out_dims),
         tuple(rec[d.id] for d in lhs.primal_dims),
         value, scalar_mult=s_mult,
         fill_value=new_fill,
         check_consistency=False,
     )
-
-
-
-
-# --- Phase 6b: DivisorRemainder emission (probe + helper) -----------------
-# Inhabits the *general* dispatcher branch (path string stays "general").
-# Mirrors the gating of ``_try_compressed_union`` so the new emission
-# subsumes the dispatcher fast path; the ``include_remainder`` static flag
-# is set conservatively (always True) — structural-identity detection
-# (e.g., dropping a zero side) lands in a later refinement.
-def _should_emit_divisor_remainder(lhs, rhs, op, is_intersection):
-    """Static probe: should this elementwise op emit a compressed
-    ``DivisorRemainder`` rather than eagerly building the meta-block-
-    diagonal val? Returns a dict of geometry / IDs on success, ``None``
-    otherwise.
-
-    Gates mirror the legacy ``_try_compressed_union`` (deleted in 6b.3) and
-    additionally cover ``is_intersection=True`` so multiplicative ops on
-    misaligned 2-D block-diagonals get the same compression. The
-    ``include_remainder`` field is always set to ``True`` for now —
-    structural-identity detection (drop a provably-zero side) is a future
-    refinement.
-    """
-    if op not in _ZERO_PRESERVING_OPS:
-        return None
-    # SetIndex carries no per-side fill (hashable aux_data), so densify uses
-    # the output fill_value for both sides — exact only for zero fills
-    # (op(0,0)=0). Non-zero-fill operands fall through to the general path.
-    if not (_is_zero_fill(lhs) and _is_zero_fill(rhs)):
-        return None
-    if len(lhs.dims) != 2 or len(rhs.dims) != 2:
-        return None
-    if lhs.val is None or rhs.val is None:
-        return None
-    if not (lhs.out_dims and lhs.primal_dims and rhs.out_dims and rhs.primal_dims):
-        return None
-    ao, ai = lhs.out_dims[0], lhs.primal_dims[0]
-    bo, bi = rhs.out_dims[0], rhs.primal_dims[0]
-    if not all(d.is_sparse for d in (ao, ai, bo, bi)):
-        return None
-    if ao.other_id != ai.id or ai.other_id != ao.id:
-        return None
-    if bo.other_id != bi.id or bi.other_id != bo.id:
-        return None
-    if any(d.axis is None for d in (ao, ai, bo, bi)):
-        return None
-    if any(
-        d.block_axis is None
-        for d in (ao, ai, bo, bi)
-        if d.block_size is not None and d.block_size > 1
-    ):
-        return None
-    # The K=1 emission flattens each val via reshape(-1) assuming the physical
-    # layout is (meta=axis 0, block_h=1, block_w=2). A different axis order
-    # would transpose the packed blocks; decline so the (always-correct)
-    # general path handles it instead of silently mis-packing.
-    if not all(
-        o.axis == 0 and o.block_axis == 1 and i.block_axis == 2
-        for o, i in ((ao, ai), (bo, bi))
-    ):
-        return None
-    a_b_h, a_b_w = ao.block_size or 1, ai.block_size or 1
-    b_b_h, b_b_w = bo.block_size or 1, bi.block_size or 1
-    a_n, b_n = ao.size, bo.size
-    if a_n * a_b_h != b_n * b_b_h or a_n * a_b_w != b_n * b_b_w:
-        return None
-    lcm_h = math.lcm(a_b_h, b_b_h)
-    lcm_w = math.lcm(a_b_w, b_b_w)
-    if (a_n * a_b_h) % lcm_h or (a_n * a_b_w) % lcm_w:
-        return None
-    M = (a_n * a_b_h) // lcm_h
-    n_lhs, n_rhs = a_n // M, b_n // M
-    union_size = n_lhs * a_b_h * a_b_w + n_rhs * b_b_h * b_b_w
-    meta_size = lcm_h * lcm_w
-    if union_size >= meta_size:
-        return None
-    return {
-        "M": M,
-        "n_lhs": n_lhs,
-        "n_rhs": n_rhs,
-        "a_b_h": a_b_h,
-        "a_b_w": a_b_w,
-        "b_b_h": b_b_h,
-        "b_b_w": b_b_w,
-        "lcm_h": lcm_h,
-        "lcm_w": lcm_w,
-        "semantic": "intersection" if is_intersection else "union",
-        "include_remainder": True,
-        "out_id": lhs.out_dims[0].id,
-        "primal_id": lhs.primal_dims[0].id,
-    }
-
-
-def _emit_divisor_remainder(lhs, rhs, op, geom):
-    """Construct a ``SparseTensor`` whose dims are a ``SetIndex`` pair and whose
-    ``val`` is the two per-side block buffers concatenated into a single 1-D
-    Array (so ``val`` stays a plain Array — no constructor / unary-op surgery).
-    Geometry comes from :func:`_should_emit_divisor_remainder`."""
-    from graphax.sparse.indexes import SetIndex
-    from graphax.sparse.tensor import SparseTensor
-
-    M = geom["M"]
-    n_lhs, n_rhs = geom["n_lhs"], geom["n_rhs"]
-    a_b_h, a_b_w = geom["a_b_h"], geom["a_b_w"]
-    b_b_h, b_b_w = geom["b_b_h"], geom["b_b_w"]
-    lcm_h, lcm_w = geom["lcm_h"], geom["lcm_w"]
-
-    lhs_v = _apply_scalar_mult(lhs.val, lhs)
-    rhs_v = _apply_scalar_mult(rhs.val, rhs)
-
-    lhs_shape = (M, n_lhs, a_b_h, a_b_w)
-    rhs_shape = (M, n_rhs, b_b_h, b_b_w)
-    combined = jnp.concatenate([lhs_v.reshape(-1), rhs_v.reshape(-1)])
-
-    s_mult = _identity_scalar_mult(lhs.val.dtype)
-    # Emitted only when both operands are statically zero-fill (gated upstream),
-    # so the output is statically zero-fill too: fill_value=None.
-    out_id, primal_id = geom["out_id"], geom["primal_id"]
-
-    out_ix = SetIndex(
-        id=out_id, size=M, axis=0, other_id=primal_id, block_size=lcm_h, block_axis=1,
-        semantic=geom["semantic"], lhs_shape=lhs_shape, rhs_shape=rhs_shape,
-        include_remainder=geom["include_remainder"], n_meta=1, op=op,
-    )
-    primal_ix = SetIndex(
-        id=primal_id, size=M, axis=0, other_id=out_id, block_size=lcm_w, block_axis=2,
-        semantic=geom["semantic"], lhs_shape=lhs_shape, rhs_shape=rhs_shape,
-        include_remainder=geom["include_remainder"], n_meta=1, op=op,
-    )
-    return SparseTensor(
-        (out_ix,), (primal_ix,), combined,
-        scalar_mult=s_mult, fill_value=None,
-        check_consistency=False,
-    )
-
-
-# --- Phase 9: K≥2 multi-axis SetIndex emission ----------------------------
-# A misaligned elementwise op on two operands that are each block-diagonal
-# along K≥2 sparse pairs compresses to a SetIndex pair *per axis* (2K SetIndex
-# dims) with the two operands' compact block buffers stored as W=1 multi-banded
-# buffers. Densify reuses ``_densify_multi_banded`` (band_width=1 ⇒ block-
-# diagonal) per side then applies the op — see ``utils._densify_compressed_dims``.
-def _should_emit_multi_set(lhs, rhs, op, is_intersection):
-    """Static probe for the K≥2 generalization of
-    :func:`_should_emit_divisor_remainder`. Returns per-axis geometry on
-    success (storing the compact dual buffers beats the dense LCM grid), else
-    ``None``. Same zero-fill / zero-preserving gating as the K=1 probe."""
-    if op not in _ZERO_PRESERVING_OPS:
-        return None
-    if not (_is_zero_fill(lhs) and _is_zero_fill(rhs)):
-        return None
-    if lhs.val is None or rhs.val is None:
-        return None
-    K = len(lhs.out_dims)
-    if K < 2:
-        return None
-    if (len(lhs.primal_dims) != K or len(rhs.out_dims) != K
-            or len(rhs.primal_dims) != K
-            or len(lhs.dims) != 2 * K or len(rhs.dims) != 2 * K):
-        return None
-
-    pairs = []
-    lhs_buf_size = rhs_buf_size = 1
-    meta_size = 1  # compact meta-block-diagonal size = prod(M_i·lcm_h_i·lcm_w_i)
-    for i in range(K):
-        ao, ai = lhs.out_dims[i], lhs.primal_dims[i]
-        bo, bi = rhs.out_dims[i], rhs.primal_dims[i]
-        if not all(d.is_sparse for d in (ao, ai, bo, bi)):
-            return None
-        if ao.other_id != ai.id or ai.other_id != ao.id:
-            return None
-        if bo.other_id != bi.id or bi.other_id != bo.id:
-            return None
-        if any(d.axis is None for d in (ao, ai, bo, bi)):
-            return None
-        a_b_h, a_b_w = ao.block_size or 1, ai.block_size or 1
-        b_b_h, b_b_w = bo.block_size or 1, bi.block_size or 1
-        if any(d.block_axis is None for d in (ao, ai, bo, bi)
-               if (d.block_size or 1) > 1):
-            return None
-        a_n, b_n = ao.size, bo.size
-        if a_n * a_b_h != b_n * b_b_h or a_n * a_b_w != b_n * b_b_w:
-            return None
-        lcm_h, lcm_w = math.lcm(a_b_h, b_b_h), math.lcm(a_b_w, b_b_w)
-        if (a_n * a_b_h) % lcm_h or (a_n * a_b_w) % lcm_w:
-            return None
-        M = (a_n * a_b_h) // lcm_h
-        # Symmetric per-side geometry: pair["a"]/pair["b"] each carry the
-        # operand's M axis, block axes (None when block_size==1), and sizes,
-        # so the packer indexes p[side][...] uniformly.
-        pairs.append({
-            "a": {"axis": ao.axis, "bh_axis": ao.block_axis, "bw_axis": ai.block_axis,
-                  "n": a_n, "b_h": a_b_h, "b_w": a_b_w},
-            "b": {"axis": bo.axis, "bh_axis": bo.block_axis, "bw_axis": bi.block_axis,
-                  "n": b_n, "b_h": b_b_h, "b_w": b_b_w},
-            "lcm_h": lcm_h, "lcm_w": lcm_w, "M": M,
-            "out_id": ao.id, "primal_id": ai.id,
-        })
-        lhs_buf_size *= a_n * a_b_h * a_b_w
-        rhs_buf_size *= b_n * b_b_h * b_b_w
-        meta_size *= M * lcm_h * lcm_w
-    # The packer reshapes the operand val purely from its M / block axes, so the
-    # val must have no leftover (L) axes the perm wouldn't cover.
-    def _phys(side):
-        return K + sum(p[side]["bh_axis"] is not None for p in pairs) \
-            + sum(p[side]["bw_axis"] is not None for p in pairs)
-    if lhs.val.ndim != _phys("a") or rhs.val.ndim != _phys("b"):
-        return None
-    # Restrict to a single meta-block per axis (M_i == 1). For M_i > 1 the
-    # general path already emits a *compact* meta-block-diagonal that ops consume
-    # directly; a SetIndex there would have to fully materialize (prod(M_i)×) at
-    # every op boundary — the K≥2 densify has no compact meta form yet — so it
-    # would be a boundary pessimization. The pure-win case (M_i == 1, where
-    # compact ≡ full) is what we compress.
-    if any(p["M"] != 1 for p in pairs):
-        return None
-    # Only compress when the dual buffer beats the *compact* meta-block-diagonal
-    # the general path would otherwise emit (NOT the prod(M_i)×-larger full dense).
-    if lhs_buf_size + rhs_buf_size >= meta_size:
-        return None
-    return {
-        "K": K, "pairs": pairs,
-        "semantic": "intersection" if is_intersection else "union",
-    }
-
-
-def _emit_multi_set(lhs, rhs, op, geom):
-    """Build the K≥2 multi-axis ``SetIndex`` output: each operand's block
-    structure is packed into a W=1 multi-banded buffer; the two buffers are
-    concatenated into a single 1-D ``val`` and described by 2K ``SetIndex``
-    dims. Densify reuses ``_densify_multi_banded`` per side then applies op."""
-    from graphax.sparse.indexes import SetIndex
-    from graphax.sparse.tensor import SparseTensor
-
-    K = geom["K"]
-    pairs = geom["pairs"]
-    lhs_v = _apply_scalar_mult(lhs.val, lhs)
-    rhs_v = _apply_scalar_mult(rhs.val, rhs)
-
-    def _pack(v, side):
-        # Permute operand val to (M_0..M_{K-1}, [existing Bh], [existing Bw]),
-        # then reshape to the W=1 multi-banded layout (M_0,1,M_1,1,...,Bh*,Bw*).
-        # A trivial (block_size==1) pair has no physical block axis, so it is
-        # skipped in the perm and re-inserted as a size-1 dim by the reshape.
-        g = [p[side] for p in pairs]
-        perm = ([s["axis"] for s in g]
-                + [s["bh_axis"] for s in g if s["bh_axis"] is not None]
-                + [s["bw_axis"] for s in g if s["bw_axis"] is not None])
-        t = v.transpose(perm)
-        band_shape = []
-        for s in g:
-            band_shape += [s["n"], 1]
-        band_shape += [s["b_h"] for s in g] + [s["b_w"] for s in g]
-        return t.reshape(band_shape)
-
-    lhs_band = _pack(lhs_v, "a")
-    rhs_band = _pack(rhs_v, "b")
-    combined = jnp.concatenate([lhs_band.reshape(-1), rhs_band.reshape(-1)])
-
-    s_mult = _identity_scalar_mult(lhs.val.dtype)
-    # Gated on both operands statically zero-fill → output is too (fill_value=None).
-    lhs_shape, rhs_shape = lhs_band.shape, rhs_band.shape
-    sem = geom["semantic"]
-
-    out_dims, primal_dims = [], []
-    for i, p in enumerate(pairs):
-        out_dims.append(SetIndex(
-            id=p["out_id"], size=p["M"], axis=i, other_id=p["primal_id"],
-            block_size=p["lcm_h"], block_axis=2 * K + i, semantic=sem,
-            lhs_shape=lhs_shape, rhs_shape=rhs_shape, include_remainder=True,
-            n_meta=1, op=op,
-        ))
-        primal_dims.append(SetIndex(
-            id=p["primal_id"], size=p["M"], axis=K + i, other_id=p["out_id"],
-            block_size=p["lcm_w"], block_axis=3 * K + i, semantic=sem,
-            lhs_shape=lhs_shape, rhs_shape=rhs_shape, include_remainder=True,
-            n_meta=1, op=op,
-        ))
-    return SparseTensor(
-        tuple(out_dims), tuple(primal_dims), combined,
-        scalar_mult=s_mult, fill_value=None,
-        check_consistency=False,
-    )
-
-
-# --- Sparsity-retaining general path (GRAPHAX_EINSUM_GENERAL) --------------
-# The NEW general elementwise trunk. Pairs operand dims BY ID (commit 6b1bfe9:
-# elementwise operands share ONE id space — never pair positionally) and emits
-# ONE physical ``op`` over reconciled layouts, building the output structure
-# SYMBOLICALLY: a matched implicit (axis=None) role stays implicit, a same-grid
-# block pair stays a pair, a uniform (val is None) operand stays uniform, and an
-# implicit-vs-physical role broadcasts ONLY that single size-1 axis under
-# ``op``'s numpy semantics — never the whole-tensor ``_align_value`` broadcast,
-# never the ``_promote_to_unified`` LCM densify.
-#
-# This is the ``lower_add`` prototype (graphax/sparse/lower/add.py) promoted to
-# the main op: its eq / ibroad / uu / u_x rules are already proven correct under
-# the ``GRAPHAX_STRUCT_LOWER`` differential harness, so ``_einsum_ew_general``
-# drives them directly rather than re-deriving the (correctness-critical) layout
-# algebra. Every signature the rules can't yet represent — a sparse↔dense
-# promotion pair, a MISALIGNED block grid (different block sizes ⇒ genuine LCM
-# tiling), leftover physical axes, a non-zero fill the rule can't compose —
-# returns ``None`` so ``elementwise`` falls through to the EXISTING path
-# UNCHANGED. ``None`` is always the safe answer (correct-but-partial by design).
-def _einsum_ew_general(lhs, rhs, op, is_intersection: bool = False,
-                       count: bool = False):
-    from graphax.sparse.lower.add import lower_add
-
-    out = lower_add(lhs, rhs, op, is_intersection=is_intersection)
-    if out is None:
-        return None
-    if count:
-        return out, _ew_op_count(lhs, rhs, is_intersection)
+    assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+    assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
     return out
+
+
+
+
+# --- WHAT THIS OP MATERIALIZES (measured 2026-09-08) ----------------------
+# The contraction engine stopped broadcasting on the same day (ticket
+# dsnn-3qm.72). This op did NOT. The census below counts every
+# ``broadcast_in_dim`` in the jaxpr whose output holds more elements than its
+# input, plus the compiled temp, on a 32-meta diagonal pair of 32x32 blocks:
+#
+#   aligned diagonal + diagonal            0 growing            temp 0 B
+#   diagonal + meta-implicit diagonal      1 growing, 1024 -> 32768 (32x)
+#   misaligned diagonal + diagonal         8 growing, 7 281 elements, 33 eqns
+#     (meta 4 blocks of 12 against meta 6 blocks of 8, for 1 152 stored out)
+#   uniform (val is None) + dense          1 growing, 1 -> 4096
+#
+# Row 2 is the elementwise MIRROR of the case D1 fixed in the contraction: a
+# role implicit on one side and physical on the other, at the same id-matched
+# extent. ``_align_value`` broadcasts the implicit side to the full extent
+# instead of letting the op broadcast one size-1 axis. Row 3 is
+# ``_promote_to_unified``: both operands go to the least-common-multiple meta
+# grid, with iota / eq / select machinery to build the mask. Row 4 is a union
+# op against a scalar and is unavoidable.
+#
+# Rows 2 and 3 are what ``lower_add`` existed to remove.
+
+
+# --- The lazy general path -------------------------------------------------
+# Combine two operands in the structure they ALREADY have. Dims are paired BY
+# ID -- elementwise operands share ONE id space, so they are never paired
+# positionally -- and ONE physical ``op`` runs over reconciled layouts while
+# the output structure is built symbolically. No ``_align_value`` broadcast of
+# a whole tensor, no ``_promote_to_unified`` densify.
+#
+# Four rules, from the deleted ``sparse/lower/add.py`` prototype (ticket
+# dsnn-3qm.72, owner instruction 2026-09-08 to replace the general case):
+#
+#   eq      every id-matched dim pair is structurally equal (same sparse
+#           pairing, same block grid, same implicitness; physical layouts
+#           reconciled by transpose). ``out.val = op(lhs.val * sm,
+#           rhs.val_permuted * sm)``, ``scalar_mult = 1``, metadata verbatim.
+#           Covers implicit+implicit -> implicit and same-grid block+block.
+#   ibroad  as ``eq``, but some axis ROLE is implicit on one side and physical
+#           on the other at the SAME id-matched extent. Only that role's size-1
+#           axis broadcasts, under ``op``'s own numpy semantics. A role
+#           implicit on BOTH sides stays implicit in the output.
+#   uu      both operands ``val is None``: the scalars combine and no buffer is
+#           built. Gated on statically-zero fills and a zero-preserving ``op``.
+#           OFF -- correct, but its ``val=None`` result breaks a consumer
+#           downstream. See ``_lazy_uu`` for the measurement.
+#   u_x     one operand ``val is None`` with matching structure: it contributes
+#           ONE scalar and the other's metadata rides through verbatim.
+#
+# Anything else -- a sparse-to-dense promotion pair, a MISALIGNED block grid
+# (genuine least-common-multiple tiling), leftover physical axes, a fill the
+# rule cannot compose -- returns None, and ``_materializing_general`` runs
+# unchanged. None is always the safe answer.
+#
+# The output-fill algebra is IDENTICAL to ``_reconstruct_result``: ``None``
+# (statically zero) when both inputs are statically zero AND ``op`` is
+# zero-preserving, else the concrete post-scaled combined fill.
+#
+# HISTORY, because this path once shipped wrong. Armed behind the deleted
+# ``GRAPHAX_EINSUM_EW`` flag, a float64 model diff caught it diverging by up to
+# 0.8 on ViT COMPRESS variants while every matmul in the same run stayed
+# oracle-exact, and the divergence was never localized to a rule. It is armed
+# now because ``elementwise_lazy_test.py`` settles that question directly: it
+# compares this path against ``_materializing_general`` on the DENSE form over
+# every structured signature, for a union op and an intersection op, with zero
+# and non-zero fills. A rule that cannot pass that does not ship.
+#
+# That test alone was not enough. It passed on all four rules, and the full
+# suite then failed ``RoeFlux_3d``: ``uu`` is right in isolation but returns
+# ``val=None`` where the incumbent materializes, and a consumer downstream
+# collapses an extent on it. ``uu`` is OFF for that reason, measured, in
+# ``_lazy_uu``. The lesson is that a differential test on ONE op cannot clear a
+# structural change; the whole-graph suite is the check that matters.
+#
+# ``LAZY_STATS`` is the totality ledger: every rule hit and every named
+# fallthrough. Coverage is measured, never assumed.
+LAZY_STATS: collections.Counter = collections.Counter()
+
+
+def reset_lazy_stats() -> None:
+    LAZY_STATS.clear()
+
+
+def _skip(reason: str):
+    LAZY_STATS[f"skip:{reason}"] += 1
+    return None
+
+
+def _finish(out, rule: str):
+    LAZY_STATS[f"rule:{rule}"] += 1
+    return out
+
+
+def _combined_fill(lhs, rhs, op):
+    """Same algebra as ``_reconstruct_result``: keep the static-zero ``None``
+    marker when sound, else the concrete post-scaled combined fill."""
+    if lhs.fill_value is None and rhs.fill_value is None and op in _ZERO_PRESERVING_OPS:
+        return None
+    return op(_scaled_fill(lhs), _scaled_fill(rhs))
+
+
+def _match_structure(l_by_id, r_by_id):
+    """``None`` when every id-matched dim pair is structurally compatible
+    (equal logical extent; sparse pairs share partner id / meta size / block
+    grid), else the skip reason. Physical-layout (implicit vs physical) mixes
+    are NOT checked here — they are legal for every axis role and handled
+    per-slot by the ``ibroad`` machinery in ``_lazy_pair``."""
+    for i, ld in l_by_id.items():
+        rd = r_by_id[i]
+        if ld.is_sparse != rd.is_sparse:
+            return "sparse_dense_mix"
+        if ld.logical_size != rd.logical_size:
+            return "extent_mismatch"
+        if ld.is_sparse:
+            if (ld.other_id != rd.other_id or ld.size != rd.size
+                    or (ld.block_size or 1) != (rd.block_size or 1)):
+                return "sparse_meta_mismatch"
+    return None
+
+
+def _side_axes_cover(t) -> bool:
+    """True iff ``t.val``'s physical axes are exactly the axes described by
+    ``t.dims`` (sparse pair meta axis counted once and REQUIRED equal on both
+    members). Leftover / duplicated / dangling axes ⇒ no rule."""
+    by_id = {d.id: d for d in t.dims}
+    seen: set[int] = set()
+    axes: list[int] = []
+    for d in t.dims:
+        if d.is_sparse:
+            if d.id in seen:
+                continue
+            partner = by_id.get(d.other_id)
+            if partner is None:
+                return False
+            seen.update((d.id, d.other_id))
+            if (d.axis is None) != (partner.axis is None) or (
+                    d.axis is not None and d.axis != partner.axis):
+                return False
+            if d.axis is not None:
+                axes.append(d.axis)
+            for m in (d, partner):
+                if getattr(m, "block_axis", None) is not None:
+                    axes.append(m.block_axis)
+        elif d.axis is not None:
+            axes.append(d.axis)
+    return sorted(axes) == list(range(t.val.ndim))
+
+
+def _place_axes(val, srcs):
+    """Transpose/reshape ``val`` so that source axis ``srcs[k]`` lands at
+    target position ``k`` (``None`` ⇒ a fresh size-1 axis there). Requires the
+    non-None entries to be a permutation of ``range(val.ndim)`` — guaranteed by
+    ``_side_axes_cover`` + slot construction. Pure layout: no broadcast, no
+    copy beyond the transpose."""
+    order = [a for a in srcs if a is not None]
+    if order != list(range(val.ndim)):
+        val = val.transpose(order)
+    if len(srcs) != val.ndim:
+        shape, it = [], iter(val.shape)
+        for a in srcs:
+            shape.append(1 if a is None else next(it))
+        val = val.reshape(shape)
+    return val
+
+
+def _locate_dim(t, dim_id):
+    """``(is_out, rel_index, dim)`` for ``dim_id``, or ``None``. The re-framing
+    helpers in ``tensor.py`` address a coupled pair by slot, and every step
+    rewrites the slots, so the pair is re-located by id on each step."""
+    for rel, d in enumerate(t.out_dims):
+        if d.id == dim_id:
+            return True, rel, d
+    for rel, d in enumerate(t.primal_dims):
+        if d.id == dim_id:
+            return False, rel, d
+    return None
+
+
+def _coupled_pair_ids(t):
+    """The id of each coupled block-diagonal pair, once, in dim order."""
+    seen, out = set(), []
+    for d in t.dims:
+        if not d.is_sparse or d.id in seen:
+            continue
+        if _locate_dim(t, d.other_id) is None:
+            continue
+        seen.add(d.id)
+        seen.add(d.other_id)
+        out.append((d.id, d.other_id))
+    return out
+
+
+def _apply_reframe(t, pair_ids, target_meta, coarsen: bool):
+    """Move every coupled pair of ``t`` to ``target_meta[pair_id]``."""
+    from graphax.sparse.tensor import (
+        _coarsen_coupled_blockdiag, _subdivide_coupled_blockdiag)
+    fn = _coarsen_coupled_blockdiag if coarsen else _subdivide_coupled_blockdiag
+    for i1, i2 in pair_ids:
+        want = target_meta[i1]
+        l1, l2 = _locate_dim(t, i1), _locate_dim(t, i2)
+        if l1 is None or l2 is None:
+            return None
+        if l1[2].size == want:
+            continue
+        t = fn(t, l1[0], l1[1], l1[2], l2[0], l2[1], l2[2], want)
+    return t
+
+
+def _reframe_misaligned(lhs, rhs, is_intersection: bool):
+    """``(lhs, rhs)`` re-expressed in ONE common block grid, or ``None``.
+
+    Two coupled block-diagonal operands over the same logical extent can
+    disagree about how that extent is cut into meta blocks: the left at meta
+    ``a`` with blocks ``K1``, the right at meta ``b`` with blocks ``K2``, and
+    ``a*K1 == b*K2 == L``. No rule fires on that, so it falls to the general
+    path, which sends BOTH operands to the least-common-multiple grid and
+    reduces back afterwards.
+
+    The support algebra says where the answer really lives, and it differs by
+    op:
+
+    UNION (add). A position is live if EITHER side is, so the container must
+    hold both diagonals. A block-diagonal container at meta ``m`` holds the
+    meta-``a`` diagonal only when ``m | a``, and the meta-``b`` one only when
+    ``m | b``. The finest that holds both is therefore ``m = gcd(a, b)``. That
+    is not one option among several, it IS the union container, and it is the
+    same container the LCM path already ends in. Only the route differs, so
+    coarsening both sides costs nothing in output size and skips the promote
+    entirely. MEASURED over 8 misaligned shapes: output size identical on every
+    one, 33 equations down to 3, six growing broadcasts down to zero, about 22
+    percent fewer flops, values equal.
+
+    INTERSECTION (mul). A position is live only where BOTH sides are. Coarsening
+    is exactly wrong here: MEASURED on the same 8 shapes it stores 3 times the
+    output (9216 against 3072) because it grows to the union container for an
+    op whose support shrank. The right container is the operand with the
+    SMALLER blocks, which is what the general path already reduces to.
+
+    So the intersection is re-framed only when the coarse operand can be cut
+    down to the fine one's grid directly, that is when ``a | b``. Subdividing
+    the coarse side to meta ``b`` keeps exactly the cells on the meta-``b``
+    diagonal, and every cell it drops is one where the fine operand is zero, so
+    the product is unchanged. When neither meta divides the other the general
+    path keeps the case: its output frame is already optimal for two index
+    classes, and the exact support there is a common refinement with UNEQUAL
+    block sizes, which no index class can express.
+    """
+    if lhs.fill_value is not None or rhs.fill_value is not None:
+        return _skip("reframe_nonzero_fill")
+    l_pairs = _coupled_pair_ids(lhs)
+    if not l_pairs or l_pairs != _coupled_pair_ids(rhs):
+        return _skip("reframe_pair_layout")
+
+    l_target, r_target, misaligned = {}, {}, False
+    for i1, i2 in l_pairs:
+        ld, rd = _locate_dim(lhs, i1)[2], _locate_dim(rhs, i1)[2]
+        a, b = ld.size, rd.size
+        if ld.logical_size != rd.logical_size:
+            return _skip("reframe_extent_mismatch")
+        if a == b:
+            l_target[i1] = r_target[i1] = a
+            continue
+        misaligned = True
+        if not is_intersection:
+            g = math.gcd(a, b)
+            if g <= 1:
+                # The union container at meta 1 IS the dense form, and a
+                # "block-diagonal pair" of meta 1 is a degenerate way to write
+                # it -- it carries a size-1 meta axis that the canonical dense
+                # form does not have. Coarsening must leave some block
+                # structure behind, which is the same guard the matmul
+                # re-framing uses. The general path already lands in the right
+                # container here, five equations more.
+                return _skip("reframe_gcd_1_is_dense")
+            l_target[i1] = r_target[i1] = g
+        else:
+            lo, hi = (a, b) if a < b else (b, a)
+            if hi % lo:
+                return _skip("reframe_intersection_indivisible")
+            k = hi // lo
+            coarse = ld if a < b else rd
+            i2d = _locate_dim(lhs if a < b else rhs, i2)[2]
+            if (coarse.block_size or 1) % k or (i2d.block_size or 1) % k:
+                return _skip("reframe_intersection_block_indivisible")
+            l_target[i1] = r_target[i1] = hi
+    if not misaligned:
+        return _skip("reframe_already_aligned")
+
+    new_l = _apply_reframe(lhs, l_pairs, l_target, coarsen=not is_intersection)
+    new_r = _apply_reframe(rhs, l_pairs, r_target, coarsen=not is_intersection)
+    if new_l is None or new_r is None:
+        return _skip("reframe_lost_pair")
+    LAZY_STATS["reframe:" + ("intersection" if is_intersection else "union")] += 1
+    return new_l, new_r
+
+
+def _lazy_general(lhs, rhs, op: Callable, is_intersection: bool = False):
+    """Try to lower ``op(lhs, rhs)``; ``None`` ⇒ no rule (caller falls through).
+
+    Every rule below operates on ALIGNED structure (no LCM promotion), where
+    the general path's intersection demote is a no-op by construction. A
+    misaligned pair of block grids is brought into one frame first, by
+    ``_reframe_misaligned``, which is the only place ``is_intersection``
+    changes what happens: the union frame and the intersection frame are
+    different containers.
+    """
+    l_by_id = {d.id: d for d in lhs.dims}
+    r_by_id = {d.id: d for d in rhs.dims}
+    if set(l_by_id) != set(r_by_id) or len(l_by_id) != len(lhs.dims) \
+            or len(r_by_id) != len(rhs.dims):
+        return _skip("id_mismatch")
+
+    # Misaligned coupled block grids get a common frame FIRST; the rules below
+    # all assume aligned structure, so without this they only ever skip.
+    if _match_structure(l_by_id, r_by_id) == "sparse_meta_mismatch":
+        _rf = _reframe_misaligned(lhs, rhs, is_intersection)
+        if _rf is None:
+            return None
+        lhs, rhs = _rf
+        l_by_id = {d.id: d for d in lhs.dims}
+        r_by_id = {d.id: d for d in rhs.dims}
+
+    if lhs.val is None and rhs.val is None:
+        return _lazy_uu(lhs, rhs, op, l_by_id, r_by_id)
+    if lhs.val is None or rhs.val is None:
+        return _lazy_u_x(lhs, rhs, op, l_by_id, r_by_id)
+    return _lazy_pair(lhs, rhs, op, l_by_id, r_by_id)
+
+
+def _all_implicit(t) -> bool:
+    return all(d.axis is None and getattr(d, "block_axis", None) is None
+               for d in t.dims)
+
+
+def _lazy_uu(lhs, rhs, op, l_by_id, r_by_id):
+    """U+U -> U: two pure-structure operands combine entirely in scalar_mult.
+
+    The leanest of the four rules: neither operand stores anything, the result
+    stores nothing, and the whole combination is one scalar op folded into
+    ``scalar_mult``. Without it a uniform union writes its entire output -- at
+    256 x 256 that is 65 536 elements, 262 144 bytes, 13 equations and two
+    growing broadcasts, for a tensor whose every cell holds the same number.
+
+    It was OFF, because enabling it made ``RoeFlux_3d`` fail core.py's
+    nominal-shape assertion with "edge shape (1, 1), expected (3, 1)". The fault
+    was NOT this rule's. ``_drain_or_unload_pre`` in core.py resolved a
+    ``post_val`` pre_transform only when ``pre_val.val is not None``, and a
+    uniform ``pre_val`` fell through to a branch that DROPPED the transform. The
+    transform carried the contracted dimension's relabelling and the tensor it
+    sat on was a rank-0 uniform stand-in with no dims, so once it was gone
+    nothing stated the edge's shape.
+
+    That hole was invisible while the materializing path wrote a buffer for
+    nearly every edge. This rule makes uniform operands common, which is why it
+    looked responsible. Two instruments cleared it: wrapping ``matmul`` and
+    ``elementwise`` to flag any output whose rank fell below what the op must
+    produce reported ZERO across the whole run, and the first rank-deficient
+    edge store of 12 was the elemental partial itself, not an op's output.
+
+    With core.py resolving the transform for a uniform operand, ``RoeFlux_3d``
+    runs clean.
+    """
+    reason = _match_structure(l_by_id, r_by_id)
+    if reason:
+        return _skip(reason)
+    if not (_all_implicit(lhs) and _all_implicit(rhs)):
+        return _skip("u_axes")
+    if not (lhs.fill_value is None and rhs.fill_value is None
+            and op in _ZERO_PRESERVING_OPS):
+        return _skip("uu_fill")
+    from graphax.sparse.tensor import SparseTensor
+
+    s = op(_apply_scalar_mult(jnp.ones((), lhs.dtype), lhs),
+           _apply_scalar_mult(jnp.ones((), rhs.dtype), rhs))
+    out = SparseTensor(lhs.out_dims, lhs.primal_dims, None, scalar_mult=s,
+                       fill_value=None, check_consistency=False)
+    assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+    assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
+    return _finish(out, "uu")
+
+
+def _lazy_u_x(lhs, rhs, op, l_by_id, r_by_id):
+    """U+x with matching structure: the U side is one scalar; x's metadata
+    (and val layout) are preserved verbatim."""
+    reason = _match_structure(l_by_id, r_by_id)
+    if reason:
+        return _skip(reason)
+    u, x = (lhs, rhs) if lhs.val is None else (rhs, lhs)
+    if not _all_implicit(u):
+        return _skip("u_axes")
+    # Support equality: x may not be "wider" than u along a dense dim — a dim
+    # that is implicit on u must be implicit-or-physical on x with the SAME
+    # logical extent (checked above), which makes the supports identical.
+    from graphax.sparse.tensor import SparseTensor
+
+    x_by_id = {d.id: d for d in x.dims}
+    s = _apply_scalar_mult(jnp.ones((), u.dtype), u)
+    xv = _apply_scalar_mult(x.val, x)
+    if s.dtype != xv.dtype:
+        cdt = _compute_dtype(s.dtype, xv.dtype)
+        s, xv = s.astype(cdt), xv.astype(cdt)
+    val = op(s, xv) if u is lhs else op(xv, s)
+    out = SparseTensor(
+        tuple(x_by_id[d.id] for d in lhs.out_dims),
+        tuple(x_by_id[d.id] for d in lhs.primal_dims),
+        val, scalar_mult=_identity_scalar_mult(val.dtype),
+        fill_value=_combined_fill(lhs, rhs, op), check_consistency=False,
+    )
+    assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+    assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
+    return _finish(out, "u_x")
+
+
+def _lazy_pair(lhs, rhs, op, l_by_id, r_by_id):
+    """Both sides carry a val: the eq / ibroad fast path."""
+    reason = _match_structure(l_by_id, r_by_id)
+    if reason:
+        return _skip(reason)
+    if not (_side_axes_cover(lhs) and _side_axes_cover(rhs)):
+        return _skip("leftover_axes")
+
+    # --- Pair up dims in lhs encounter order (mirrors _map_topology). ---
+    sp, dp, processed = [], [], set()
+    for d in lhs.dims:
+        if d.id in processed:
+            continue
+        rd = r_by_id[d.id]
+        if d.is_sparse:
+            processed.update((d.id, d.other_id))
+            sp.append((d, l_by_id[d.other_id], rd, r_by_id[d.other_id]))
+        else:
+            processed.add(d.id)
+            dp.append((d, rd))
+
+    # --- Canonical output layout: one target axis per axis role that is
+    # PHYSICAL on at least one side; a role implicit on BOTH sides stays
+    # implicit (retention by construction: I+I → I, implicit meta diagonals,
+    # implicit-within-block). A role physical on ONE side broadcasts that
+    # single size-1 axis under ``op`` (the ``ibroad`` rule) — extents are
+    # id-matched equal, so this is never a genuine logical-1 stretch.
+    # slots[k] = (lhs_src_axis|None, rhs_src_axis|None, target_extent).
+    slots: list[tuple[int | None, int | None, int]] = []
+    rec: dict[int, object] = {}
+    rule = "eq"
+
+    def _slot(l_ax, r_ax, extent):
+        nonlocal rule
+        if l_ax is None and r_ax is None:
+            return None  # implicit on both sides — stays implicit
+        if l_ax is None or r_ax is None:
+            rule = "ibroad"
+        slots.append((l_ax, r_ax, extent))
+        return len(slots) - 1
+
+    def _bs(d, nb):
+        # A dim that gained a (size-1) physical block axis from the partner
+        # side must carry an explicit block_size — block_axis without
+        # block_size is inconsistent metadata.
+        return 1 if (nb is not None and d.block_size is None) else d.block_size
+
+    for ld1, ld2, rd1, rd2 in sp:
+        new_axis = _slot(ld1.axis, rd1.axis, ld1.size)
+        nb1 = _slot(ld1.block_axis, rd1.block_axis, ld1.block_size or 1)
+        nb2 = _slot(ld2.block_axis, rd2.block_axis, ld2.block_size or 1)
+        rec[ld1.id] = replace(ld1, axis=new_axis, block_axis=nb1, block_size=_bs(ld1, nb1))
+        rec[ld2.id] = replace(ld2, axis=new_axis, block_axis=nb2, block_size=_bs(ld2, nb2))
+    for ld, rd in dp:
+        new_axis = _slot(ld.axis, rd.axis, ld.logical_size)
+        rec[ld.id] = ld if new_axis is None else replace(ld, axis=new_axis)
+
+    # Physical extents may legally be the full logical extent OR 1 (a
+    # stored-once axis, which _align_value stretches with broadcast_to on the
+    # general path). Anything else is malformed for these rules — fall through.
+    for l_ax, r_ax, ext in slots:
+        if l_ax is not None and lhs.val.shape[l_ax] not in (ext, 1):
+            return _skip("phys_extent")
+        if r_ax is not None and rhs.val.shape[r_ax] not in (ext, 1):
+            return _skip("phys_extent")
+
+    # --- One physical op over the reconciled layouts. ---
+    la = _place_axes(_apply_scalar_mult(lhs.val, lhs), [s[0] for s in slots])
+    ra = _place_axes(_apply_scalar_mult(rhs.val, rhs), [s[1] for s in slots])
+    if la.dtype != ra.dtype:
+        cdt = _compute_dtype(la.dtype, ra.dtype)
+        la, ra = la.astype(cdt), ra.astype(cdt)
+    res = op(la, ra)
+    target = tuple(s[2] for s in slots)
+    if res.shape != target:
+        # An axis stored once (physical extent 1, logical extent N) on BOTH
+        # sides: the output metadata is full-extent, so materialize it exactly
+        # as the general path's broadcast_to would. Counted — this is the one
+        # spot where the lowering still expands storage.
+        LAZY_STATS["note:bcast_materialize"] += 1
+        res = jnp.broadcast_to(res, target)
+
+    from graphax.sparse.tensor import SparseTensor
+
+    out = SparseTensor(
+        tuple(rec[d.id] for d in lhs.out_dims),
+        tuple(rec[d.id] for d in lhs.primal_dims),
+        res, scalar_mult=_identity_scalar_mult(res.dtype),
+        fill_value=_combined_fill(lhs, rhs, op), check_consistency=False,
+    )
+    # An accumulated Jacobian carries a dim per id it has ever touched, and
+    # nearly all of them end up extent 1. Left physical they cost rank, and rank
+    # is what the reshape and transpose traffic is made of. Squeezing here
+    # propagates: the next contraction sees compact operands and ``_slot``
+    # keeps a role implicit when both sides have it implicit.
+    from graphax.sparse.tensor import squeeze_unit_axes
+    out = squeeze_unit_axes(out)
+    assert tuple(d.logical_size for d in out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+    assert tuple(d.logical_size for d in out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
+    return _finish(out, rule)
 
 
 # --- Path tracing (test-only) ---------------------------------------------
@@ -811,23 +1011,24 @@ def elementwise(
 ):
     """Sparse elementwise op dispatcher.
 
-    Single ``general`` path that handles every case: misaligned 2-D
-    block-diagonal union AND intersection emissions land as a ``SetIndex``
-    pair (the combined per-side block buffer in ``val``) early in the path;
-    aligned blocks, non-zero fills, broadcast cases, and non-zero-preserving
-    ops fall through the full promote-to-unified pipeline. The
-    ``compressed_union`` dispatcher branch (Phase 6b.3) was folded into this
-    general path; its path label is gone. The ``divisor_fast`` dispatcher
-    branch (Phase 6a) was deleted as HLO-redundant.
+    Single ``general`` path that handles every case. Misaligned 2-D
+    block-diagonal union and intersection outputs go to the least-common-
+    multiple meta grid: the ``SetIndex`` compression that used to catch them
+    is gone (ruling 2026-09-07 — no measured target ever built a set).
+    Aligned blocks, non-zero fills, broadcast cases, and non-zero-preserving
+    ops fall through the full promote-to-unified pipeline.
 
-    With ``count=True`` returns ``(result, n_ops)`` — the number of element
-    positions where ``op`` actually fires, computed from the *static*
-    broadcast shape of the inputs:
+    Structured binary ops (``mul`` / ``add``) across sparse/dense/lowrank
+    tensors dispatch to the sparse arithmetic kernels. Preserves structural
+    invariants (block-diagonality, sparsity patterns).
 
-    * union ops (``add`` & co): every position of the broadcast shape
-      contributes, ``n_ops = prod(broadcast(lhs.shape, rhs.shape))``.
-    * intersection ops (``mul``): only positions where both sides have data
-      contribute, ``n_ops = prod(min(lhs.shape, rhs.shape))`` (broadcast-
+    With ``count=True`` returns ``(result, n_ops)``. Operation counts are
+    exact:
+
+    * union (``add`` etc.): 1 op per output element (each element is touched
+      once, either by combination or by copying the surviving side).
+    * intersection (``mul`` with sparse semantics): 1 op per element of the
+      right-aligned shapes (the non-fill region; matching axes pair with
       paired axes; ``size 1`` collapses to the partner's extent for union
       semantics, but here it's the elementwise min of the aligned shape).
 
@@ -844,41 +1045,6 @@ def elementwise(
         )
     _record_path(None)
     lhs, rhs = _normalize_inputs(lhs, rhs)
-    # Sparsity-retaining general path (GRAPHAX_EINSUM_GENERAL, default OFF):
-    # tried FIRST — before the elemental cascade and the _map_topology general
-    # path. Pairs dims by id and retains implicit/block/uniform structure
-    # instead of broadcasting implicit dims to physical. Returns None on any
-    # signature it can't yet represent ⇒ falls through UNCHANGED. When OFF this
-    # block is a single env-dict lookup, so the op is byte-identical to today.
-    # OWN flag (GRAPHAX_EINSUM_EW, default OFF), deliberately DECOUPLED from
-    # the matmul planner's GRAPHAX_EINSUM_GENERAL: the EW einsum path is
-    # UNPROVEN — with the shared flag, enabling the (proven) matmul planner
-    # silently armed this block, and the float64 model diff caught it
-    # diverging up to 0.8 on ViT COMPRESS variants (matmul calls all
-    # oracle-exact). Prove it against the lattice property suite before ever
-    # flipping this default.
-    if os.environ.get("GRAPHAX_EINSUM_EW", "0") not in ("", "0", "false", "False"):
-        _eg = _einsum_ew_general(
-            lhs, rhs, op, is_intersection=is_intersection, count=count
-        )
-        if _eg is not None:
-            _record_path("einsum_general")
-            return _eg
-    # Structure-lowering layer (GRAPHAX_STRUCT_LOWER, default OFF): compile the
-    # minimal physical computation for structurally-matched operands and build
-    # the output structure symbolically (graphax/sparse/lower/add.py). A case
-    # without a rule returns None and falls through UNCHANGED (lower.add bumps
-    # its skip counters — no silent behavior change). Flag OFF ⇒ this block is
-    # a single env-dict lookup.
-    if os.environ.get("GRAPHAX_STRUCT_LOWER", "0") not in ("", "0", "false", "False"):
-        from graphax.sparse.lower.add import lower_add
-
-        _low = lower_add(lhs, rhs, op, is_intersection=is_intersection)
-        if _low is not None:
-            _record_path("lower_add")
-            if count:
-                return _low, _ew_op_count(lhs, rhs, is_intersection)
-            return _low
     # Elemental fast path (Phase: bridge-cse): route a STRUCTURED elementwise op
     # (block-diagonal / implicit dims) through the elemental kernels. Returns
     # None for a pure-dense op so the existing general path stays byte-identical
@@ -890,30 +1056,47 @@ def elementwise(
     )
     if _elem is not None:
         _record_path("elemental")
+        _out = _elem[0] if count else _elem
+        if hasattr(_out, "out_dims") and hasattr(lhs, "out_dims"):
+            assert tuple(d.logical_size for d in _out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+            assert tuple(d.logical_size for d in _out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
         return _elem
     if count:
         n = _ew_op_count(lhs, rhs, is_intersection)
 
+    # LAZY GENERAL PATH: combine the two operands in the structure they already
+    # have. Returns None when no rule covers the signature, and the
+    # materializing path below then runs UNCHANGED. See ``_lazy_general``.
+    _lz = _lazy_general(lhs, rhs, op, is_intersection)
+    if _lz is not None:
+        _record_path("lazy")
+        if hasattr(_lz, "out_dims") and hasattr(lhs, "out_dims"):
+            assert tuple(d.logical_size for d in _lz.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+            assert tuple(d.logical_size for d in _lz.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
+        if count:
+            return _lz, n
+        return _lz
+
     _record_path("general")
-    # Phase 6b: DivisorRemainder emission for both union and intersection ops
-    # on misaligned 2-D block-diagonals. Subsumes the deleted dispatcher
-    # ``_try_compressed_union`` branch and additionally compresses
-    # intersection (mul/etc.) outputs that the dispatcher never handled.
-    _dr_geom = _should_emit_divisor_remainder(lhs, rhs, op, is_intersection)
-    if _dr_geom is not None:
-        out = _emit_divisor_remainder(lhs, rhs, op, _dr_geom)
-        if count:
-            return out, n
-        return out
-    # Phase 9: K≥2 generalization — misaligned elementwise on operands with
-    # multiple sparse pairs compresses to a multi-axis SetIndex (dual block
-    # buffers), densified by reusing the W=1 multi-banded kernel per side.
-    _ms_geom = _should_emit_multi_set(lhs, rhs, op, is_intersection)
-    if _ms_geom is not None:
-        out = _emit_multi_set(lhs, rhs, op, _ms_geom)
-        if count:
-            return out, n
-        return out
+    out = _materializing_general(lhs, rhs, op, is_intersection, n if count else None)
+    _out = out[0] if count else out
+    if hasattr(_out, "out_dims") and hasattr(lhs, "out_dims"):
+        assert tuple(d.logical_size for d in _out.out_dims) == tuple(d.logical_size for d in lhs.out_dims)
+        assert tuple(d.logical_size for d in _out.primal_dims) == tuple(d.logical_size for d in lhs.primal_dims)
+    return out
+
+
+def _materializing_general(lhs, rhs, op, is_intersection, n):
+    """The incumbent general path: align, promote to the least-common-multiple
+    meta grid, apply ``op``, demote, rebuild. It materializes -- an implicit
+    role is broadcast to its partner's full extent by ``_align_value`` and a
+    misaligned block grid goes to the LCM grid in ``_promote_to_unified``.
+
+    ``n`` is the op count, or ``None`` for no count. Kept as its own function
+    so the differential test can call it directly as the oracle, with no flag
+    to set and nothing to monkeypatch.
+    """
+    count = n is not None
     try:
         sp, dp = _map_topology(lhs, rhs)
     except ValueError as e:

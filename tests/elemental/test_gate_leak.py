@@ -1,12 +1,13 @@
 """Regression: the approximation-active gate must survive a NESTED
 ``vertex_elimination_jaxpr`` (lax.cond / lax.switch macro-vertices recurse).
 
-The elemental dispatch is a hard no-op unless ``approx_active()`` is set
-(``core.vertex_elimination_jaxpr``). That call RECURSES for cond/switch
+``core.vertex_elimination_jaxpr`` sets ``approx_active()`` for the duration of
+an elimination that carries an approximation. That call RECURSES for cond/switch
 macro-vertices; if the nested call hard-reset the flag to ``False`` on exit
-(instead of restoring the parent's value), the dispatch would be silently
-disabled for the rest of an OUTER approx elimination, routing its remaining
-Diag/Compress edges onto the existing path. This pins the save/restore.
+(instead of restoring the parent's value), the rest of an OUTER approx
+elimination would run as if it were exact — the nominal-shape asserts in
+``_eliminate_vertex`` would fire on its remaining Diag/Compress edges, and
+alphagrad's replays would read a stale flag. This pins the save/restore.
 """
 
 from __future__ import annotations

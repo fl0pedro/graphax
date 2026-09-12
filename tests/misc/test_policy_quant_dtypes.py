@@ -129,19 +129,19 @@ def test_scaled_branch_is_still_reachable_for_int_targets():
 # --------------------------------------------------------------------------#
 # MEASURED (2026-08), quantizing both addends and adding them:
 #
-#   quant      env                      result val   result scalar_mult
-#   bfloat16   EINSUM_GENERAL=1 (dflt)  float32      1.0  (f32)
-#   bfloat16   EINSUM_GENERAL=0         bfloat16     1    (bf16)
-#   float32    either                   float32      1.0  (f32)
-#   int8       either                   float32      1.0  (f32)
+#   quant      result val   result scalar_mult
+#   bfloat16   float32      1.0  (f32)
+#   float32    float32      1.0  (f32)
+#   int8       float32      1.0  (f32)
 #
 # So the JOIN never introduces a rescale -- ``scalar_mult`` stays the identity
 # for both policy dtypes and no new scale is ever stored. It does NOT keep the
-# bf16 storage under the default (planner) configuration: ``_scaled_mul``'s
-# keep-narrow read is disabled while GRAPHAX_EINSUM_GENERAL is on
-# (``dtype_compute._quant_narrow_bf16_pair``), so the f32 ``scalar_mult`` drain
-# re-promotes each addend to f32 before the add. That is a promotion, not a
-# rescale, and it is lossless with respect to the stored bf16 values.
+# bf16 storage: a mixed {bf16, f32} value / scalar_mult pair is upcast in
+# ``dtype_compute._scaled_mul``, so the f32 ``scalar_mult`` drain re-promotes
+# each addend to f32 before the add. That is a promotion, not a rescale, and it
+# is lossless with respect to the stored bf16 values. Keeping the addends
+# narrow instead is a real precision and storage trade with no measured
+# contraction benefit; see the comment in ``_scaled_mul``.
 #
 # The int8 row is the contrast that makes this meaningful: there the OPERANDS
 # carry real per-tensor scales (0.0197 / 0.0187) and the join has to drain them
@@ -149,8 +149,7 @@ def test_scaled_branch_is_still_reachable_for_int_targets():
 # keep out of the policy's reach.
 
 
-def _join(name, monkeypatch, einsum_general):
-    monkeypatch.setenv("GRAPHAX_EINSUM_GENERAL", einsum_general)
+def _join(name):
     a, b = _bd(key=11), _bd(key=12)
     qa = apply_quant(a, Quant(name))
     qb = apply_quant(b, Quant(name))
@@ -158,10 +157,9 @@ def _join(name, monkeypatch, einsum_general):
 
 
 @pytest.mark.parametrize("name", ["float32", "bfloat16"])
-@pytest.mark.parametrize("einsum_general", ["1", "0"])
-def test_join_introduces_no_rescale(name, einsum_general, monkeypatch):
+def test_join_introduces_no_rescale(name):
     """The property the policy actually depends on: no new or changed scale."""
-    a, b, qa, qb, s = _join(name, monkeypatch, einsum_general)
+    a, b, qa, qb, s = _join(name)
     for t in (qa, qb, s):
         assert float(np.asarray(t.scalar_mult, np.float64)) == 1.0
     assert s.fill_value is None
@@ -173,26 +171,16 @@ def test_join_introduces_no_rescale(name, einsum_general, monkeypatch):
     assert rel < 1e-2, rel
 
 
-def test_join_of_two_bf16_quants_promotes_under_the_planner(monkeypatch):
-    """Documented, not aspirational: with the planner on (the default) the
-    f32 scalar drain re-promotes both bf16 addends before the add."""
-    _, _, qa, qb, s = _join("bfloat16", monkeypatch, "1")
+def test_join_of_two_bf16_quants_promotes(monkeypatch):
+    """Documented, not aspirational: the f32 scalar drain re-promotes both
+    bf16 addends before the add."""
+    _, _, qa, qb, s = _join("bfloat16")
     assert jnp.dtype(qa.val.dtype) == BF16 and jnp.dtype(qb.val.dtype) == BF16
     assert jnp.dtype(s.val.dtype) == F32
 
 
-def test_join_of_two_bf16_quants_stays_bf16_without_the_planner(monkeypatch):
-    """With GRAPHAX_EINSUM_GENERAL=0 the keep-narrow read applies and the sum
-    is the BIT-EXACT bf16 elementwise sum -- proof that nothing was scaled."""
-    _, _, qa, qb, s = _join("bfloat16", monkeypatch, "0")
-    assert jnp.dtype(s.val.dtype) == BF16
-    np.testing.assert_array_equal(
-        np.asarray(s.val, np.float64),
-        np.asarray(qa.val + qb.val, np.float64))
-
-
 def test_join_of_two_f32_quants_is_bit_exact(monkeypatch):
-    _, _, qa, qb, s = _join("float32", monkeypatch, "1")
+    _, _, qa, qb, s = _join("float32")
     assert jnp.dtype(s.val.dtype) == F32
     np.testing.assert_array_equal(
         np.asarray(s.val, np.float64),
@@ -205,7 +193,7 @@ def test_scaled_int8_operands_do_carry_a_scale(monkeypatch):
     drain -- the failure mode POLICY_QUANT_DTYPES rules out."""
     if "int8" not in QUANT_DTYPES:
         pytest.skip("int8 not in the catalog")
-    _, _, qa, qb, s = _join("int8", monkeypatch, "1")
+    _, _, qa, qb, s = _join("int8")
     assert float(np.asarray(qa.scalar_mult, np.float64)) != 1.0
     assert float(np.asarray(qb.scalar_mult, np.float64)) != 1.0
     assert float(np.asarray(s.scalar_mult, np.float64)) == 1.0

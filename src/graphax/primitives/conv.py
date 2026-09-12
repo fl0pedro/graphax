@@ -7,12 +7,6 @@ from ..sparse.tensor import (
     SparseTensor,
     _swap_back_axes,
 )
-from ..sparse.indexes import (
-    ToeplitzIndex,
-    TOEPLITZ_OUT,
-    TOEPLITZ_IN,
-    TOEPLITZ_TAP,
-)
 from .base import elemental_rules, elemental_only_rules, get_ndim, get_shape
 
 
@@ -34,11 +28,33 @@ def _build_windowed_jacobian_1d(out_s, in_s, wd, ws, pad_lo, bd=1, wid=1):
     return J
 
 
+def _window_incidence(g):
+    """The dense windowed incidence ``M[p, q, k]`` of one spatial axis: 1 where
+    output position ``p`` reads input position ``q`` through kernel tap ``k``,
+    0 elsewhere. Shape ``(out_size, in_size, kernel_size)``.
+
+    Built from iota broadcasts and one equality, so XLA fuses it into the
+    einsum that consumes it. No gather, no scatter.
+    """
+    P, X, K = g["out_size"], g["in_size"], g["kernel_size"]
+    p = jnp.arange(P)[:, None, None]
+    q = jnp.arange(X)[None, :, None]
+    k = jnp.arange(K)[None, None, :]
+    dilated = p * g["stride"] + k * g["win_dilation"] - g["pad_lo"]
+    if g["base_dilation"] > 1:
+        col = dilated // g["base_dilation"]
+        valid = (dilated % g["base_dilation"]) == 0
+    else:
+        col = dilated
+        valid = True
+    return ((q == col) & (col >= 0) & (col < X) & valid).astype(jnp.float32)
+
+
 def conv_general_dilated_elemental_rule(primals, **params):
     """Exact sparse Jacobian of ``conv_general_dilated`` w.r.t. both operands.
 
     For each output spatial axis the (out-pos, in-pos, kernel-tap) incidence is
-    the windowed indicator ``M_s[p, q, k]`` (:meth:`ToeplitzIndex.indicator`).
+    the windowed indicator ``M_s[p, q, k]`` (:func:`_window_incidence`).
     Writing the conv as ``out[n,o,P] = sum_{i,K} lhs[n,i,Q(P,K)] * rhs[o,i,K]``:
 
       * d out / d lhs  has value ``W[o,P,i,Q] = sum_K (prod_s M_s) rhs[o,i,K]``
@@ -46,13 +62,14 @@ def conv_general_dilated_elemental_rule(primals, **params):
       * d out / d rhs  has value ``V[n,P,i,K] = sum_Q (prod_s M_s) lhs[n,i,Q]``
         with the out-feature axis a DiagonalIndex pair (o == o').
 
-    Rather than materialize those dense ``W`` / ``V`` blocks, each windowed
-    spatial axis is emitted as a :class:`ToeplitzIndex` PAIR and ``val`` stores
-    only the COMPRESSED operand — the kernel ``rhs`` for ``d out/d lhs``, the
-    activations ``lhs`` for ``d out/d rhs`` (up to ``K×`` / huge savings). The
-    dense band is rebuilt scatter-free by ``_densify_toeplitz`` at the op
-    boundary. Batch (lhs) and out-feature (rhs) stay DiagonalIndex pairs; a
-    pass-through (1x1 / pointwise) spatial axis is a DiagonalIndex pair too.
+    Each windowed spatial axis becomes a DENSE pair. The ``ToeplitzIndex`` pair
+    that used to store only the compressed operand is gone (ruling 2026-09-07:
+    ``SparseTensor`` has exactly two index classes), so the rule contracts the
+    incidence against the operand here, in one einsum per Jacobian, instead of
+    deferring that contraction to the op boundary. The values are identical;
+    only the storage grows. Batch (lhs) and out-feature (rhs) stay DiagonalIndex
+    pairs, and a pass-through (1x1 / pointwise) spatial axis stays a
+    DiagonalIndex pair too, so a pointwise conv still costs nothing extra.
     Validated to 0 error vs ``jax.jacfwd``/``jax.jacrev``.
     """
     val_out = lax.conv_general_dilated_p.bind(*primals, **params)
@@ -85,10 +102,7 @@ def conv_general_dilated_elemental_rule(primals, **params):
     # Per-spatial geometry + pass-through flag: a stride-1, kernel-1, undilated,
     # unpadded axis whose out/in sizes match is an IDENTITY block in the
     # activation Jacobian, so it stays a DiagonalIndex pair (the 1x1 /
-    # pointwise-conv win). Genuinely windowed axes become ToeplitzIndex pairs
-    # whose val stores the operand (kernel / activations) COMPRESSED; the dense
-    # P x Q band is rebuilt only at the op boundary, scatter-free, by
-    # _densify_toeplitz.
+    # pointwise-conv win). A genuinely windowed axis becomes a dense pair.
     geom, passthrough = [], []
     for s in range(nsp):
         P_s = out_shape[out_spec[2 + s]]
@@ -103,63 +117,106 @@ def conv_general_dilated_elemental_rule(primals, **params):
             and pad_lo == 0 and pad_hi == 0 and P_s == X_s)
 
     # Canonicalize operands to (feat-first, spatial-last), independent of the
-    # dimension_numbers permutation. These ARE the compressed vals.
+    # dimension_numbers permutation.
     rhs_c = jnp.transpose(rhs, [rhs_spec[0], rhs_spec[1], *(rhs_spec[2 + s] for s in range(nsp))])
     lhs_c = jnp.transpose(lhs, [lhs_spec[0], lhs_spec[1], *(lhs_spec[2 + s] for s in range(nsp))])
 
-    def _toe(out_id, prim_id, out_role, prim_role, out_size, prim_size, s, axis):
-        """A ToeplitzIndex pair: primary (out side) owns the contracted ``axis``
-        of val; the partner carries ``axis=None``. Both hold the full geometry."""
-        g = geom[s]
-        return (ToeplitzIndex(out_id, out_size, axis, prim_id, role=out_role,
-                              primary=True, **g),
-                ToeplitzIndex(prim_id, prim_size, None, out_id, role=prim_role,
-                              primary=False, **g))
+    def _contract(val, val_subs, m_subs, m_arrays, out_slots, primal_slots):
+        """One einsum: contract the per-axis incidences against ``val`` and lay
+        the result out in dim order.
+
+        ``out_slots`` / ``primal_slots`` are ``(list_position, id, size,
+        letter)`` for every dim that ends up with a physical axis. The output
+        axes follow that order, so each dim's ``axis`` is just its rank in the
+        concatenated list — the parameter layout every consumer expects.
+        """
+        subs = ",".join([val_subs] + m_subs)
+        order = list(out_slots) + list(primal_slots)
+        eq = subs + "->" + "".join(t[3] for t in order)
+        dense = jnp.einsum(eq, val, *m_arrays)
+        axis_of = {t[1]: i for i, t in enumerate(order)}
+        return dense, axis_of
+
+    letters = iter("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
     # --- d out / d rhs : out-feature DiagonalIndex pair; each spatial axis is a
-    #     ToeplitzIndex (OUT x TAP) contracting the input axis; val = lhs_c ---
+    #     dense (out-pos x kernel-tap) pair contracting the input positions ---
+    n_l, i_l = next(letters), next(letters)
+    q_l = [next(letters) for _ in range(nsp)]
+    p_l = [next(letters) for _ in range(nsp)]
+    k_l = [next(letters) for _ in range(nsp)]
+
+    f_out, f_prim = out_spec[1], out_ndim + rhs_spec[0]
     rhs_out = [None] * out_ndim
     rhs_primal = [None] * len(rhs_shape)
-    f_out, f_prim = out_spec[1], out_ndim + rhs_spec[0]
-    rhs_out[out_spec[0]] = DenseIndex(out_spec[0], N, 0)               # batch N (from lhs)
     rhs_out[out_spec[1]] = DiagonalIndex(out_spec[1], O, None, f_prim)
     rhs_primal[rhs_spec[0]] = DiagonalIndex(f_prim, O, None, f_out)
-    rhs_primal[rhs_spec[1]] = DenseIndex(out_ndim + rhs_spec[1], I, 1)  # in-feature I
-    for s in range(nsp):
-        oa, ra = out_spec[2 + s], rhs_spec[2 + s]
-        ot, pt = _toe(oa, out_ndim + ra, TOEPLITZ_OUT, TOEPLITZ_TAP,
-                      out_shape[oa], rhs_shape[ra], s, 2 + s)
-        rhs_out[oa], rhs_primal[ra] = ot, pt
-    # check_consistency=False: a ToeplitzIndex pair links axes of DIFFERENT
-    # sizes (P vs X/K), like BandedIndex — the size-equality invariant does not
-    # apply to compressed pairs (they are densified before any consumer).
-    rhs_tensor = SparseTensor(rhs_out, rhs_primal, lhs_c, check_consistency=False)
+
+    out_slots = [(out_spec[0], out_spec[0], N, n_l)]
+    out_slots += [(out_spec[2 + s], out_spec[2 + s], out_shape[out_spec[2 + s]], p_l[s])
+                  for s in range(nsp)]
+    out_slots.sort()
+    primal_slots = [(rhs_spec[1], out_ndim + rhs_spec[1], I, i_l)]
+    primal_slots += [(rhs_spec[2 + s], out_ndim + rhs_spec[2 + s],
+                      rhs_shape[rhs_spec[2 + s]], k_l[s]) for s in range(nsp)]
+    primal_slots.sort()
+
+    dense_rhs, axis_of = _contract(
+        lhs_c, n_l + i_l + "".join(q_l),
+        [p_l[s] + q_l[s] + k_l[s] for s in range(nsp)],
+        [_window_incidence(geom[s]) for s in range(nsp)],
+        out_slots, primal_slots,
+    )
+    for slot, did, size, _ in out_slots:
+        rhs_out[slot] = DenseIndex(did, size, axis_of[did])
+    for slot, did, size, _ in primal_slots:
+        rhs_primal[slot] = DenseIndex(did, size, axis_of[did])
+    rhs_tensor = SparseTensor(rhs_out, rhs_primal, dense_rhs)
 
     # --- d out / d lhs : batch DiagonalIndex pair; pass-through spatial axes are
-    #     DiagonalIndex (identity), windowed axes are ToeplitzIndex (OUT x IN)
-    #     contracting the kernel-tap axis; val = the (reduced) kernel rhs_c ---
+    #     DiagonalIndex (identity), windowed axes are a dense (out-pos x in-pos)
+    #     pair contracting the kernel taps ---
     win = [s for s in range(nsp) if not passthrough[s]]
     widx = {s: j for j, s in enumerate(win)}
     # Drop pass-through kernel axes (size 1) from the stored kernel.
     rhs_red = rhs_c[(slice(None), slice(None))
                     + tuple(0 if passthrough[s] else slice(None) for s in range(nsp))]
+    o_l, i2_l = next(letters), next(letters)
+    p2_l = [next(letters) for _ in range(nsp)]
+    q2_l = [next(letters) for _ in range(nsp)]
+    k2_l = [next(letters) for _ in range(nsp)]
+
+    b_out, b_prim = out_spec[0], out_ndim + lhs_spec[0]
     lhs_out = [None] * out_ndim
     lhs_primal = [None] * len(lhs_shape)
-    b_out, b_prim = out_spec[0], out_ndim + lhs_spec[0]
     lhs_out[out_spec[0]] = DiagonalIndex(out_spec[0], N, None, b_prim)
-    lhs_out[out_spec[1]] = DenseIndex(out_spec[1], O, 0)
     lhs_primal[lhs_spec[0]] = DiagonalIndex(b_prim, N, None, b_out)
-    lhs_primal[lhs_spec[1]] = DenseIndex(out_ndim + lhs_spec[1], I, 1)
     for s in range(nsp):
-        oa, la = out_spec[2 + s], lhs_spec[2 + s]
         if passthrough[s]:
+            oa, la = out_spec[2 + s], lhs_spec[2 + s]
             lhs_out[oa] = DiagonalIndex(oa, out_shape[oa], None, out_ndim + la)
             lhs_primal[la] = DiagonalIndex(out_ndim + la, lhs_shape[la], None, oa)
-        else:
-            ot, pt = _toe(oa, out_ndim + la, TOEPLITZ_OUT, TOEPLITZ_IN,
-                          out_shape[oa], lhs_shape[la], s, 2 + widx[s])
-            lhs_out[oa], lhs_primal[la] = ot, pt
-    lhs_tensor = SparseTensor(lhs_out, lhs_primal, rhs_red, check_consistency=False)
+
+    out_slots = [(out_spec[1], out_spec[1], O, o_l)]
+    out_slots += [(out_spec[2 + s], out_spec[2 + s], out_shape[out_spec[2 + s]], p2_l[s])
+                  for s in win]
+    out_slots.sort()
+    primal_slots = [(lhs_spec[1], out_ndim + lhs_spec[1], I, i2_l)]
+    primal_slots += [(lhs_spec[2 + s], out_ndim + lhs_spec[2 + s],
+                      lhs_shape[lhs_spec[2 + s]], q2_l[s]) for s in win]
+    primal_slots.sort()
+
+    dense_lhs, axis_of = _contract(
+        rhs_red, o_l + i2_l + "".join(k2_l[s] for s in win),
+        [p2_l[s] + q2_l[s] + k2_l[s] for s in win],
+        [_window_incidence(geom[s]) for s in win],
+        out_slots, primal_slots,
+    )
+    for slot, did, size, _ in out_slots:
+        lhs_out[slot] = DenseIndex(did, size, axis_of[did])
+    for slot, did, size, _ in primal_slots:
+        lhs_primal[slot] = DenseIndex(did, size, axis_of[did])
+    lhs_tensor = SparseTensor(lhs_out, lhs_primal, dense_lhs)
 
     return val_out, [lhs_tensor, rhs_tensor]
 

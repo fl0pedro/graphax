@@ -19,10 +19,14 @@ Sparsity assertions
 -------------------
 Beyond correctness, every union / intersection test also pins down the *structure*
 of the output: the elementwise output of two block-diagonal sources with LCM-block
-size ``L`` over an ``M``-meta-block grid must compress to a ``SetIndex`` pair (the
-combined per-side block buffer in ``val``) — *not* a fully dense ``(M*L_h, M*L_w)``
-buffer. That compressed structure is what lets every downstream sparse op stay on
-the block-diagonal fast path instead of touching M²-many zero meta-blocks.
+size ``L`` must be a meta-block-diagonal pair over the ``M``-meta grid — *not* a
+fully dense ``(M*L_h, M*L_w)`` buffer. That structure is what lets every
+downstream sparse op stay on the block-diagonal fast path instead of touching
+M-squared-many zero meta-blocks.
+
+The tighter ``SetIndex`` form these outputs used to take is gone (ruling
+2026-09-07: SparseTensor has exactly two index classes), so the meta grid IS the
+output now.
 
 Reference for every test: densify both operands and compute the dense expected value via
 ``jnp.matmul`` / the elementwise op. We assert agreement in both no-JIT and JIT modes.
@@ -96,27 +100,10 @@ class TestElementwiseUnionMisalignedBlocks(unittest.TestCase):
         When ``M == 1`` (the entire tensor is one LCM-block), the M axis is
         squeezed away and val carries shape ``(LCM_h, LCM_w)`` directly — that's
         an additional optimization, not a regression."""
-        from graphax.sparse.indexes import SetIndex
         M, lcm_h, lcm_w = self._expected_meta(a, b)
-        meta_size = M * lcm_h * lcm_w
         out, primal = got.out_dims[0], got.primal_dims[0]
 
-        # Phase 8.F: misaligned block-diagonal elementwise compresses to a
-        # ``SetIndex`` pair + a combined 1-D band buffer in ``val`` (storage
-        # strictly tighter than the eager M·LCM_h·LCM_w meta form). The dense
-        # round-trip is already asserted by the caller's ``_check``.
-        if any(isinstance(d, SetIndex) for d in got.dims):
-            self.assertTrue(all(isinstance(d, SetIndex) for d in got.dims))
-            self.assertEqual(out.size, M)
-            self.assertEqual(primal.size, M)
-            self.assertEqual(out.block_size, lcm_h)
-            self.assertEqual(primal.block_size, lcm_w)
-            self.assertEqual(got.shape, (M * lcm_h, M * lcm_w))
-            self.assertLess(int(got.val.size), meta_size,
-                            f"lazy form should be < eager: {int(got.val.size)} ≥ {meta_size}")
-            return
-
-        # Eager form: a meta-block-diagonal pair (DiagonalIndex factory builds
+        # The meta-block-diagonal pair (DiagonalIndex factory builds
         # an ``Index`` with other_id + block_size set) carrying the M meta-blocks.
         self.assertTrue(out.is_sparse and out.block_size is not None)
         self.assertTrue(primal.is_sparse and primal.block_size is not None)
@@ -227,29 +214,21 @@ class TestElementwiseIntersectionMisalignedBlocks(unittest.TestCase):
                 self._assert_intersection_block_diag_output(got, a, b)
 
     def _assert_intersection_block_diag_output(self, got, a, b):
-        """Phase 8.F: intersection ``mul`` on misaligned block-diagonals stores
-        the result at LCM-meta granularity as a ``SetIndex`` pair
-        (``semantic='intersection'``) + a combined band buffer in ``val`` — the
-        dense result is intersection-sparse (only cells where both sources have
-        data survive), but storage is the compact meta form. The dense
-        round-trip is asserted by the caller's ``_check``; here we pin the
-        compressed structure + storage bound when the band fires."""
-        from graphax.sparse.indexes import SetIndex
+        """Intersection ``mul`` on misaligned block-diagonals stores the result
+        at LCM-meta granularity as a meta-block-diagonal pair. The dense result
+        is intersection-sparse (only cells where both sources have data
+        survive), but storage is the meta form. The dense round-trip is
+        asserted by the caller's ``_check``; here we pin the structure.
+
+        The tighter ``SetIndex`` form this used to take is gone (ruling
+        2026-09-07), so the meta grid is the only outcome."""
         ao, ai = a.out_dims[0], a.primal_dims[0]
         bo, bi = b.out_dims[0], b.primal_dims[0]
         lcm_h = math.lcm(ao.block_size, bo.block_size)
         lcm_w = math.lcm(ai.block_size, bi.block_size)
         M = (ao.size * ao.block_size) // lcm_h
         out, primal = got.out_dims[0], got.primal_dims[0]
-        if any(isinstance(d, SetIndex) for d in got.dims):
-            self.assertTrue(all(isinstance(d, SetIndex) for d in got.dims))
-            self.assertEqual(out.semantic, "intersection")
-            self.assertEqual(out.block_size, lcm_h)
-            self.assertEqual(primal.block_size, lcm_w)
-            self.assertEqual(got.shape, (M * lcm_h, M * lcm_w))
-            self.assertLess(int(got.val.size), M * lcm_h * lcm_w)
-            return
-        # Eager / general-path output: a meta-block-diagonal pair.
+        # General-path output: a meta-block-diagonal pair.
         self.assertTrue(out.is_sparse and primal.is_sparse)
         self.assertEqual(got.shape, (M * lcm_h, M * lcm_w))
 
@@ -282,7 +261,19 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
     block(s) deliberately disagree. The contraction's logical size matches; the
     algorithm reconciles via per-axis LCM/GCD tiling."""
 
-    def _check(self, a, b, atol=1e-4):
+    def _check(self, a, b, atol=1e-4, stored=None, support=None, cover=None):
+        """``stored``, ``support`` and ``cover`` are HAND-WRITTEN, never read
+        off the result (ticket dsnn-3qm.28.5). ``support`` is the number of
+        structurally non-zero entries of the dense product. ``cover`` is the
+        element count of the least-common-multiple meta grid: per contracted
+        pair, LCM the two block sizes, divide the logical extent by it to get
+        the meta count, and multiply the per-pair grids together (times any
+        ride-through batch extents).
+
+        ``cover`` is the ceiling now. The BandedIndex form that used to store
+        the support exactly is gone (ruling 2026-09-07: SparseTensor has
+        exactly two index classes), so the meta grid is what a misaligned
+        contraction falls back to."""
         for use_jit in (False, True):
             with self.subTest(jit=use_jit):
                 fn = jax.jit(matmul) if use_jit else matmul
@@ -293,6 +284,38 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
                     f"matmul mismatch (jit={use_jit}): max diff "
                     f"{float(jnp.max(jnp.abs(got.dense() - expected)))}",
                 )
+                self._assert_storage(got, expected, stored, support, cover)
+
+    def _assert_storage(self, got, expected, stored, support, cover):
+        if stored is None:
+            return
+        got_stored = 0 if got.val is None else int(got.val.size)
+        self.assertEqual(
+            got_stored, stored,
+            f"stored {got_stored} != expected {stored}: the misaligned "
+            f"contraction changed how much it materialises")
+        ref_support = int(jnp.sum(jnp.abs(expected) > 1e-9))
+        self.assertEqual(
+            ref_support, support,
+            f"the hand-written support {support} is wrong, the dense product "
+            f"has {ref_support} non-zeros")
+        # The docstring's structure expectation: the output must stay a
+        # compressed pair over the LCM meta grid, never the full dense buffer.
+        logical = 1
+        for d in got.dims:
+            logical *= int(d.logical_size)
+        if support < logical:
+            self.assertLess(
+                got_stored, logical,
+                "the output densified: it stores the whole logical grid "
+                "although the product is structurally sparse")
+        # The least-common-multiple meta grid is the ceiling. The band form
+        # that used to reach the support exactly is gone (ruling 2026-09-07).
+        if cover is not None:
+            self.assertLessEqual(
+                got_stored, cover,
+                f"stored {got_stored} is above the {cover}-element LCM meta "
+                f"grid; the contraction materialised more than the grid holds")
 
     # --- 2D matmul: sparse-pair LHS, dense RHS, coprime contracting blocks ---
     def test_2d_coprime_2x3_contract(self):
@@ -303,7 +326,8 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
             (DenseIndex(0, 12, 0),), (DenseIndex(1, 6, 1),),
             _n((12, 6), 2),
         )
-        self._check(a, b)
+        # The rhs is dense, so the product is dense: 12 x 6 = 72.
+        self._check(a, b, stored=72, support=72, cover=72)
 
     def test_2d_coprime_3x5_contract(self):
         # Bigger coprime: LCM(3,5)=15 along the contracting axis
@@ -318,20 +342,29 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
             _n((6, 5, 5), 2),
         )
         # logical: a is 30x30, b is 30x30 → result 30x30
-        self._check(a, b)
+        # LCM(3, 5) = 15 along the contraction, so the 30-long axis holds
+        # 2 metas of 15 x 15 = 450. The band form that stored the 210-element
+        # support exactly is gone (ruling 2026-09-07), so the grid is what is
+        # left: 450 stored for 210 non-zeros, a ratio of 2.14.
+        self._check(a, b, stored=450, support=210, cover=450)
 
     def test_2d_divisor_2x4_contract(self):
         # LCM(2,4)=4 — many small blocks
         a = _sparse_pair_2d(N=8, B_o=2, B_i=2, key_idx=1)
         b = _sparse_pair_2d(N=4, B_o=4, B_i=4, key_idx=2)
         # both 16x16 → 16x16 result
-        self._check(a, b)
+        # LCM(2, 4) = 4, so the 16-long axis holds 4 metas of 4 x 4 = 64,
+        # which is also the support.
+        self._check(a, b, stored=64, support=64, cover=64)
 
     def test_2d_shared_factor_4x6_contract(self):
         a = _sparse_pair_2d(N=6, B_o=4, B_i=4, key_idx=1)
         b = _sparse_pair_2d(N=4, B_o=6, B_i=6, key_idx=2)
         # both 24x24 → 24x24
-        self._check(a, b)
+        # LCM(4, 6) = 12, so the 24-long axis holds 2 metas of 12 x 12 = 288.
+        # The band form stored the 192-element support exactly; it is gone
+        # (ruling 2026-09-07), so the grid stores 288, a ratio of 1.50.
+        self._check(a, b, stored=288, support=192, cover=288)
 
     # --- 3D matmul (one batch axis + sparse-pair contraction) ----------
     def test_3d_one_misalignment(self):
@@ -355,7 +388,9 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
             _n((s1, 4, 3, 3), 2),
         )
         # logical a: (s1, 12, 12), b: (s1, 12, 12)
-        self._check(a, b)
+        # Per batch LCM(2, 3) = 6, so the 12-long axis holds 2 metas of
+        # 6 x 6 = 72; times the 3 batch slices, 216.
+        self._check(a, b, stored=216, support=144, cover=216)
 
     # --- 4D matmul with one misalignment on the contraction axis -------
     def test_4d_one_misalignment(self):
@@ -380,7 +415,9 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
             _n((s1, s2, 4, 3, 3), 2),
         )
         # logical a: (s1, s2, 12, 12), b: (s1, s2, 12, 12)
-        self._check(a, b)
+        # Per batch LCM(2, 3) = 6 gives 2 metas of 6 x 6 = 72; times the
+        # 2 x 3 = 6 batch slices, 432.
+        self._check(a, b, stored=432, support=288, cover=432)
 
     # --- 4D matmul with TWO misalignments ------------------------------
     def test_4d_two_misalignments(self):
@@ -424,6 +461,10 @@ class TestMatmulMisalignedBlocks(unittest.TestCase):
                     f"matmul mismatch (jit={use_jit}): max diff "
                     f"{float(jnp.max(jnp.abs(got.dense() - expected)))}",
                 )
+                # Pair 1 LCM(2, 3) = 6 over 12 gives 2 metas of 6 x 6; pair 2
+                # LCM(2, 4) = 4 over 16 gives 4 metas of 4 x 4. The grid is
+                # 2 * 4 * 36 * 16 = 4608.
+                self._assert_storage(got, expected, 4608, 3072, 4608)
 
 
 if __name__ == "__main__":

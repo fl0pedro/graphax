@@ -199,7 +199,18 @@ class BroadcastBugTests(unittest.TestCase):
             normed = (r - mu)/jnp.sqrt(sigma + 1e-6) * gamma + beta
             return normed
         key = jrand.PRNGKey(42)
-        x = jnp.ones((4, 4))
+        # NOT ``jnp.ones((4, 4))``. With every row of x equal, r has zero
+        # variance, so ``1/sqrt(sigma + 1e-6)`` is 1e3 and the layer-norm
+        # derivative amplifies float32 noise by the same factor. Measured
+        # 2026-09-08: the reference block for WQ is then 1.8e-12 (analytically
+        # zero) while both computations differ by 6.1e-5, and the block for x
+        # peaks at 1.3e3 with a 3.1e-4 spread. No absolute tolerance can pass
+        # that, and the numbers are BIT-IDENTICAL across 8d92df2, cf01ee2 and
+        # the einsum engine, so it measures the input, not the engine. With a
+        # real x the same graph agrees with ``jax.jacrev`` to 4.8e-7 on every
+        # block. The jaxpr under test -- one variable broadcast twice, because
+        # ``(r - mu)`` appears twice -- does not depend on the values.
+        x = jrand.normal(key, (4, 4))
         WQ = jrand.normal(jrand.PRNGKey(1), (4, 4))
         WK = jrand.normal(jrand.PRNGKey(2), (4, 4))
         WV = jrand.normal(jrand.PRNGKey(3), (4, 4))

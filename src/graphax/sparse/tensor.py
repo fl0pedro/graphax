@@ -9,11 +9,12 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jax.tree_util import register_pytree_node_class
 from jax.typing import DTypeLike
 
-from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
+from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex, static_eye
 from graphax.sparse.dtype_compute import _scaled_mul
 from graphax.sparse.ops.dense import dense  # noqa: F401  (re-exported: callers do `from graphax.sparse.tensor import dense`)
 from graphax.sparse.ops.elementwise import elementwise
@@ -42,17 +43,13 @@ Transform = Callable[["SparseTensor", "SparseTensor", Array], "SparseTensor"]
 
 
 def _on_materialized(method):
-    """Decorator for value-semantic methods (reductions + non-linear unary ops)
-    that must NOT read a raw compressed ``val``: when the tensor has compressed
-    (``BandedIndex`` / ``SetIndex``) dims, run ``method`` on the materialized
-    ``{Diagonal, Dense}`` equivalent instead. No-op for non-compressed tensors.
-    A band buffer carries out-of-band padding and a set buffer the
-    pre-combination per-side blocks, so reducing either directly is wrong."""
+    """Historically re-ran value-semantic methods (reductions + non-linear unary
+    ops) on a materialized copy when the tensor carried a compressed dim. Those
+    index classes are gone (ruling 2026-09-07), so every ``val`` now holds
+    exactly the non-fill values and the method runs directly. Kept as an
+    identity decorator to mark the methods that read ``val`` by value."""
     @wraps(method)
     def wrapper(self, *args, **kwargs):
-        t = self._materialize_compressed()
-        if t is not self:
-            return getattr(t, method.__name__)(*args, **kwargs)
         return method(self, *args, **kwargs)
     return wrapper
 
@@ -466,16 +463,12 @@ class SparseTensor(SparseMathMixin):
         # ``dense_for_matmul`` is the single Array-producing densifier (fusion
         # fast paths, with a ``dense(hard=True)`` fallback for shapes they don't
         # cover) — see the densification map in ``ops/dense.py``. It consumes
-        # only Dense/Diagonal, so first strip any compressed (BandedIndex /
-        # SetIndex) dims (no-op when there are none).
         from graphax.sparse.ops.dense import dense_for_matmul
-        from graphax.sparse.ops.utils import _compressed_dims, _densify_compressed_dims
         # ``keep_quantization=False`` (default): promote to the full
         # mul-capable dtype and return full precision -- lossless.
         # ``True``: broadcast scalar_mult down and multiply in val's narrow
         # dtype, so the Quant survives (raises on concrete overflow).
-        t = _densify_compressed_dims(self) if _compressed_dims(self) else self
-        return dense_for_matmul(t, keep_quantization=keep_quantization)
+        return dense_for_matmul(self, keep_quantization=keep_quantization)
 
     @property
     def T(self) -> SparseTensor:
@@ -512,20 +505,6 @@ class SparseTensor(SparseMathMixin):
         fill_value=_KEEP,
     ):
         return _copy(self, val, scalar_mult, fill_value)
-
-    def _materialize_compressed(self) -> SparseTensor:
-        """Return an equivalent tensor with no compressed (``BandedIndex`` /
-        ``SetIndex``) dims — they are densified to their compact
-        ``DiagonalIndex`` / ``DenseIndex`` form so ``val`` again holds *exactly*
-        the non-fill values with ``size - val.size`` implicit fill cells. Any
-        value-semantic reduction / non-linear unary op below must route through
-        this first: a raw band / set buffer carries out-of-band padding slots
-        (banded) or pre-combination per-side blocks (set) whose element multiset
-        does NOT match the dense form, so reducing it directly is wrong. No-op
-        (returns ``self``) when the tensor has no compressed dims."""
-        from graphax.sparse.ops.utils import _compressed_dims, _materialize_for_op
-
-        return _materialize_for_op(self) if _compressed_dims(self) else self
 
     # Low priority TODO: axis, and other args
     @property
@@ -993,9 +972,15 @@ def _subdivide_coupled_blockdiag(
         # Both block axes materialised: split each into (k, bn) and keep the
         # meta-diagonal (ki == kj == g) sub-block via the eye-einsum.
         v = v.reshape([N, k, b1n, k, b2n] + rest_shape)  # (N, ki, b1n, kj, b2n, *rest)
-        eye = jnp.eye(k, dtype=v.dtype)
-        # sub[N, g, r, c, *rest] = sum_{ki,kj} eye[g,ki] eye[g,kj] v[N,ki,r,kj,c,*rest]
-        sub = jnp.einsum("gi,gj,nirjc...->ngrc...", eye, eye, v)  # (N, k, b1n, b2n, *rest)
+        # sub[N, g, r, c, *rest] = v[N, g, r, g, c, *rest]: SELECT the ki == kj
+        # sub-blocks. This used to contract two identity matrices against ``v``
+        # (``gi,gj,nirjc...->ngrc...``). An einsum lowers to a dot, and a dot on
+        # a GPU runs at the device's matmul precision -- MEASURED on an RTX 3090
+        # the selected values came back rounded to about 8 mantissa bits
+        # (-0.15441894 for -0.15443718), on a step that only moves numbers. A
+        # static index moves them exactly, and costs a gather instead of a dot.
+        _g = np.arange(k)
+        sub = jnp.moveaxis(v[:, _g, :, _g, :], 0, 1)  # (N, k, b1n, b2n, *rest)
         new_val = sub.reshape(out_lead + rest_shape)  # (factor, [b1n], [b2n], *rest)
     elif p1 or p2:
         # Exactly one block axis is materialised; its ``k`` split IS the new meta
@@ -1024,6 +1009,125 @@ def _subdivide_coupled_blockdiag(
         block_axis=((1 + (1 if keep1 else 0)) if keep2 else None),
     )
     return _rebuild(new_d1, new_d2, new_val, moved=moved, n_lead=n_lead)
+
+
+def squeeze_unit_axes(st):
+    """Drop every PHYSICAL ``val`` axis of extent 1 and mark its dim implicit.
+
+    The exact dual of :func:`materialize_uniform`. An axis of extent 1 stores
+    exactly one value along that role, which is precisely what an implicit axis
+    means, so the two forms hold the same data. Keeping it physical costs
+    nothing in bytes and everything in RANK.
+
+    Rank is not free. Every accumulation step unions the operands' dim ids, so
+    a Jacobian deep in a long elimination order carries a dim per id it has ever
+    touched, and nearly all of them are extent 1. MEASURED on TransformerLM at
+    the campaign shape (S=32, D=128, V=1024), minimum Markowitz order, before
+    this pass: reshape outputs reach rank 30 and carry 12 555 extent-1 axes for
+    38.9 GiB, transpose reaches rank 30 with 8 142 for 20.8 GiB, and 2 369
+    outputs are rank 6 or wider. A typical one is
+
+        (1,1,1,1,1,1,1,1,1,1,1, 32, 1, 128, 1,1,1,1,1,1,1,1,1,1,1,1,1, 128, 1, 128)
+
+    -- four real axes buried in twenty-six ones.
+
+    Making those dims implicit is not a heuristic: ``DenseIndex(id, N, None)``
+    is the engine's own encoding for "stored once", and the lazy elementwise
+    slot builder already keeps a role implicit when BOTH operands have it
+    implicit. So squeezing at the producer propagates: the next contraction
+    sees two compact operands and builds a compact result.
+    """
+    val = st.val
+    if val is None or getattr(val, "ndim", 0) == 0:
+        return st
+    shp = tuple(val.shape)
+    drop = set()
+    for d in st.dims:
+        if d.axis is not None and d.axis < len(shp) and shp[d.axis] == 1:
+            drop.add(d.axis)
+        if (d.is_sparse and d.block_axis is not None
+                and d.block_axis < len(shp) and shp[d.block_axis] == 1):
+            drop.add(d.block_axis)
+    if not drop:
+        return st
+
+    keep = [a for a in range(len(shp)) if a not in drop]
+    new_val = val.reshape(tuple(shp[a] for a in keep))
+    shift = {a: i for i, a in enumerate(keep)}
+
+    def _remap(d):
+        na = None if d.axis in drop else shift.get(d.axis, d.axis) \
+            if d.axis is not None else None
+        if d.is_sparse:
+            nb = None if d.block_axis in drop else (
+                shift.get(d.block_axis, d.block_axis)
+                if d.block_axis is not None else None)
+            return replace(d, axis=na, block_axis=nb)
+        return replace(d, axis=na)
+
+    return SparseTensor(
+        tuple(_remap(d) for d in st.out_dims),
+        tuple(_remap(d) for d in st.primal_dims),
+        new_val,
+        scalar_mult=st.scalar_mult,
+        fill_value=st.fill_value,
+        pre_transforms=st.pre_transforms,
+        post_transforms=st.post_transforms,
+        check_consistency=False,
+    )
+
+
+def materialize_uniform(st):
+    """Give a UNIFORM (``val is None``) tensor an explicit buffer, WITHOUT
+    densifying it.
+
+    A ``val is None`` tensor means "every logical cell equals ``scalar_mult``",
+    and it stores nothing: every dim is implicit. That is the leanest form, but
+    it is not a form every consumer can read. A face transform, in particular,
+    reshapes or slices ``val``, and there is no ``val`` to reshape.
+
+    This gives each dim a physical axis of its own extent -- the two members of
+    a coupled pair sharing one meta axis, as the layout requires -- and fills
+    the buffer with ones, leaving the value in ``scalar_mult``. The structural
+    class does not change and neither does the logical content, so this is the
+    block-diagonal storage, not the dense one: exactly the
+    ``_structural_val_size`` this tensor would occupy if materialized.
+    """
+    if st.val is not None:
+        return st
+    shape: list[int] = []
+    meta_of_pair: dict[int, int] = {}
+    new_by_id: dict[int, Index] = {}
+    for d in st.dims:
+        if d.is_sparse:
+            ax = meta_of_pair.get(d.id)
+            if ax is None:
+                ax = len(shape)
+                shape.append(int(d.size))
+                # Both members of the pair read the SAME meta axis.
+                meta_of_pair[d.id] = ax
+                meta_of_pair[d.other_id] = ax
+            b_ax = None
+            if d.block_size is not None and int(d.block_size) > 1:
+                b_ax = len(shape)
+                shape.append(int(d.block_size))
+            new_by_id[d.id] = replace(d, axis=ax, block_axis=b_ax)
+        else:
+            ax = len(shape)
+            shape.append(int(d.size))
+            new_by_id[d.id] = replace(d, axis=ax)
+    dt = getattr(st.scalar_mult, "dtype", None) or jnp.float32
+    val = jnp.ones(tuple(shape), dtype=dt)
+    return SparseTensor(
+        tuple(new_by_id[d.id] for d in st.out_dims),
+        tuple(new_by_id[d.id] for d in st.primal_dims),
+        val,
+        scalar_mult=st.scalar_mult,
+        fill_value=st.fill_value,
+        pre_transforms=st.pre_transforms,
+        post_transforms=st.post_transforms,
+        check_consistency=False,
+    )
 
 
 def _coarsen_coupled_blockdiag(st, is_out1, rel_i, d1, is_out2, rel_j, d2,
@@ -1109,9 +1213,12 @@ def _coarsen_coupled_blockdiag(st, is_out1, rel_i, d1, is_out2, rel_j, d2,
         # blocks must become explicit, so the pattern materializes (all OTHER
         # dims stay implicit -- a ``val is None`` tensor has no physical axes).
         dt = getattr(st.scalar_mult, "dtype", None) or jnp.float32
-        eye = jnp.eye(k, dtype=dt)
-        blk = jnp.einsum("ij,ab->iajb", eye, jnp.ones((b1, b2), dt))
-        new_val = jnp.broadcast_to(blk.reshape(B1, B2)[None], (G, B1, B2))
+        eye = static_eye(k, dt)
+        # Nothing here depends on traced data, so the whole block pattern is a
+        # compile-time constant.
+        blk = np.einsum("ij,ab->iajb", eye, np.ones((b1, b2), dt))
+        new_val = jnp.broadcast_to(
+            jnp.asarray(blk.reshape(B1, B2))[None], (G, B1, B2))
         return _rebuild(new_d1, new_d2, new_val)
 
     val = st.val
@@ -1141,9 +1248,17 @@ def _coarsen_coupled_blockdiag(st, is_out1, rel_i, d1, is_out2, rel_j, d2,
             v.reshape([N, 1, 1] + rest_shape), [N, b1, b2] + rest_shape)
 
     v = v.reshape([G, k, b1, b2] + rest_shape)
-    eye = jnp.eye(k, dtype=v.dtype)
-    # new[g, i, a, j, b, *rest] = eye[i, j] * v[g, i, a, b, *rest]
-    nv = jnp.einsum("ij,giab...->giajb...", eye, v)
+    eye = static_eye(k, v.dtype)
+    # new[g, i, a, j, b, *rest] = eye[i, j] * v[g, i, a, b, *rest]: PLACE each
+    # finer block on the sub-diagonal of its coarse block. Written as a
+    # broadcast multiply, not an einsum, for the same reason as the select
+    # above: an einsum lowers to a dot and a dot rounds to the device's matmul
+    # precision, while a multiply by exactly 1.0 or 0.0 keeps every bit. It is
+    # also the cheaper of the two -- one product per output element rather than
+    # a contraction over ``k``. Same shape as ``elemental/contract_B_B``'s
+    # block placement, which XLA fuses into the surrounding einsum.
+    nv = jnp.expand_dims(v, 3) * eye.reshape(
+        (1, k, 1, k, 1) + (1,) * len(rest_shape))
     new_val = nv.reshape([G, B1, B2] + rest_shape)
     return _rebuild(new_d1, new_d2, new_val, moved=moved, n_lead=3)
 

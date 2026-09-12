@@ -37,23 +37,19 @@ def test_deepcopy_with_val_none():
     assert cp.shape == st.shape
 
 
-def test_deepcopy_with_compressed_index():
-    """Smoke: deepcopy of a tensor carrying a compressed ``BandedIndex`` pair
-    (band buffer in ``val``) doesn't raise and preserves the compressed dims.
+def test_deepcopy_with_block_diagonal_index():
+    """Smoke: deepcopy of a tensor carrying a meta-block-diagonal pair does not
+    raise and preserves the pair. This used to exercise a ``BandedIndex`` pair;
+    that class is gone (ruling 2026-09-07), so the surviving structured form is
+    the DiagonalIndex pair.
     """
-    from graphax.sparse.indexes import BandedIndex
-
-    M, W, B = 2, 3, 3   # half-bandwidth = (W-1)/2 = 1 > 0
-    data = jnp.zeros((M, W, B, B), dtype=jnp.float32)
-    out = (BandedIndex(id=0, size=M, axis=0, other_id=1,
-                       block_size=B, block_axis=1, band_width=W, offset=(),
-                       primary=True, n_secondary=M, n_meta=1),)
-    primal = (BandedIndex(id=1, size=M, axis=0, other_id=0,
-                          block_size=B, block_axis=2, band_width=W, offset=(),
-                          primary=False, n_secondary=M, n_meta=1),)
-    st = SparseTensor(out, primal, data, check_consistency=False)
+    M, B = 2, 3
+    data = jnp.zeros((M, B, B), dtype=jnp.float32)
+    out = (DiagonalIndex(0, M, 0, 1, B, 1),)
+    primal = (DiagonalIndex(1, M, 0, 0, B, 2),)
+    st = SparseTensor(out, primal, data)
 
     cp = copy.deepcopy(st)
     assert isinstance(cp, SparseTensor)
-    assert cp.out_dims[0].is_compressed
+    assert cp.out_dims[0].is_sparse
     assert jnp.array_equal(cp.val, st.val)

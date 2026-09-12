@@ -4,12 +4,9 @@ THE DENSIFICATION MAP
 =====================
 Densification is one *ladder* from most-compressed to fully-materialized::
 
-    compressed (BandedIndex / SetIndex)
-        │  _densify_compressed_dims / Index.densify_axis
-        ▼
-    diagonal (DiagonalIndex block-diagonal pairs)   ← matmul / elementwise consume here
-        │  dense() / _densify_diagonal_select
-        ▼
+    diagonal (DiagonalIndex block-diagonal pairs)   <- matmul / elementwise consume here
+        |  dense() / _densify_diagonal_select
+        v
     dense grid (plain DenseIndex, NxN with fill off-block-diagonal)
 
 Two questions pick the entry point: (1) *how far down the ladder*, and (2)
@@ -22,41 +19,28 @@ Entry points (where they live -> what they return):
     The workhorse (~97 call sites). Materializes sparse pairs into dense axes.
     ``axes`` selects *which* logical dims (None = all); ``hard=True`` also
     materializes *implicit* dims (``axis is None``, i.e. not yet carried by
-    ``val``). Does NOT understand BandedIndex/SetIndex — densify those first.
+    ``val``).
 
 * ``dense_for_matmul(tensor)``  [this module]  -> ``Array``
     Fusion-friendly full densify for feeding ``jax.lax.dot_general``. Two fast
     paths — fully-dense (``val`` IS the answer, modulo a permutation) and a
     single sparse pair (one broadcast+select) — that XLA folds into the matmul
     kernel (stays in SMEM, no HBM spill). Everything else falls back to
-    ``dense(tensor, hard=True)`` then ``* scalar_mult`` — i.e. it is exactly
-    ``SparseTensor.dense()`` minus the compressed-dim handling, plus fast paths.
+    ``dense(tensor, hard=True)`` then ``* scalar_mult``.
 
 * ``SparseTensor.dense()``  [tensor.py]  -> ``Array``
     The public "give me the dense array" method, used everywhere (``flat``,
     ``__getitem__``, ``float()``, and as the test-suite's correctness oracle).
-    = ``_densify_compressed_dims`` (if any) -> ``dense(hard=True)`` -> ``* scalar_mult``.
-
-* ``_densify_compressed_dims(tensor, compact=False)``  [ops/utils.py]  -> ``SparseTensor``
-    Replaces BandedIndex/SetIndex dims with their expanded equivalents.
-    ``compact=True`` stops at the DiagonalIndex rung (M× less storage) when the
-    pair ``reduces_to_diagonal``; ``compact=False`` goes to the full dense grid.
-
-* ``_materialize_for_op(tensor)``  [ops/utils.py]  -> ``SparseTensor``
-    The matmul/elementwise boundary: strips compressed dims so those ops only
-    ever see Dense/Diagonal. == ``_densify_compressed_dims(compact=True)``.
-    Exposed as the ``SparseTensor._materialize_compressed()`` method (via the
-    ``@_on_materialized`` decorator) for reductions / non-linear unary ops,
-    which must run on the dense element multiset, not the raw band/set buffer.
+    = ``dense_for_matmul`` = ``dense(hard=True)`` -> ``* scalar_mult``.
 
 Internal kernels (not entry points): ``_apply_dense_scattering`` ->
 ``_densify_diagonal_select`` (broadcast + ``jnp.where`` over an eye-mask — *no*
 ``lax.scatter``, despite the surrounding "scatter" vocabulary, so XLA can fuse
-it); compressed expansion goes through ``Index.densify_axis`` -> the band
-kernels in ``ops/block_storage.py``.
+it).
 
-Architectural invariant: ops consume only {Dense, Diagonal}; {Banded, Set} are
-densified at every boundary except transpose-as-view.
+Architectural invariant: every dim is a DenseIndex or a DiagonalIndex. The
+compressed classes {Banded, Set, Toeplitz} are gone (ruling 2026-09-07), so
+there is no densify step above the diagonal rung any more.
 """
 
 from __future__ import annotations
@@ -70,7 +54,7 @@ import jax.lax as lax
 import jax.numpy as jnp
 from jax import Array
 
-from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex
+from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex, static_eye
 from graphax.sparse.dtype_compute import _scaled_mul
 
 if TYPE_CHECKING:
@@ -738,7 +722,7 @@ def _densify_diagonal_select(val: Array, fill_value: Array) -> Array:
     pairs into a single combined diagonal."""
     n_diag = val.shape[0]
     fv = jnp.asarray(fill_value, dtype=val.dtype)
-    eye_mask = jnp.eye(n_diag, dtype=jnp.bool_)
+    eye_mask = static_eye(n_diag, bool)
     eye_mask = eye_mask[(slice(None), slice(None)) + (None,) * (val.ndim - 1)]
     val_b = jnp.broadcast_to(val[:, None], (n_diag, n_diag) + val.shape[1:])
     return jnp.where(eye_mask, val_b, fv)
