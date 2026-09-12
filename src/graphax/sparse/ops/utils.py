@@ -401,9 +401,8 @@ def _swap_back_axes(st: "SparseTensor") -> "SparseTensor":
     # silently leave initial 0s in trailing slots when val carried physical
     # axes not described by any Index, producing a transpose that duplicated
     # axis 0.
-    assert sorted(permutation) == list(range(st.val.ndim)), (
-        f"_swap_back_axes produced invalid permutation {permutation}"
-    )
+    if not (sorted(permutation) == list(range(st.val.ndim))):
+        raise RuntimeError(f"_swap_back_axes produced invalid permutation {permutation}")
 
     new_val = st.val.transpose(permutation)
 

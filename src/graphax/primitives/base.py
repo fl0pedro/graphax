@@ -149,7 +149,8 @@ def _filter_params(fn, params):
 
 
 def standard_elemental(elementalrule, primitive, primals, **params):
-    assert elementalrule is not None, f"Elemental rule does exist for {primitive}!"
+    if elementalrule is None:
+        raise NotImplementedError(f"No elemental rule registered for {primitive}")
     val_out = primitive.bind(*primals, **params)
 
     elementals = elementalrule(*primals, **_filter_params(elementalrule, params))
@@ -177,14 +178,17 @@ def standard_elemental_only(elementalrule, primal_out, primals, **params):
 
 
 def defelemental(primitive, elementalrule):
-    assert isinstance(primitive, core.Primitive)
-    assert not primitive.multiple_results
+    if not isinstance(primitive, core.Primitive):
+        raise TypeError(f"defelemental expects a jax Primitive, got {type(primitive).__name__}")
+    if primitive.multiple_results:
+        raise NotImplementedError(f"defelemental does not support multiple-result primitive {primitive}")
     elemental_rules[primitive] = partial(standard_elemental, elementalrule, primitive)
     elemental_only_rules[primitive] = partial(standard_elemental_only, elementalrule)
 
 
 def standard_elemental2(elementalrule, primitive, primals, **params):
-    assert elementalrule is not None
+    if elementalrule is None:
+        raise NotImplementedError(f"No elemental rule registered for {primitive}")
 
     val_out = primitive.bind(*primals, **params)
     _filtered_params = _filter_params(elementalrule, params)
@@ -213,7 +217,9 @@ def standard_elemental2_only(elementalrule, primal_out, primals, **params):
 
 
 def defelemental2(primitive, elementalrule):
-    assert isinstance(primitive, core.Primitive)
-    assert not primitive.multiple_results
+    if not isinstance(primitive, core.Primitive):
+        raise TypeError(f"defelemental2 expects a jax Primitive, got {type(primitive).__name__}")
+    if primitive.multiple_results:
+        raise NotImplementedError(f"defelemental2 does not support multiple-result primitive {primitive}")
     elemental_rules[primitive] = partial(standard_elemental2, elementalrule, primitive)
     elemental_only_rules[primitive] = partial(standard_elemental2_only, elementalrule)

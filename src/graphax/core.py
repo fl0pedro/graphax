@@ -2397,12 +2397,10 @@ def _eliminate_vertex(
                         edge_shape = tuple(
                             list(out_edge.aval.shape) + list(in_edge.aval.shape)
                         )
-                        assert edge_shape == edge_outval.shape, (
-                            f"Computed edge shape {edge_outval.shape} does not match expected shape {edge_shape}!"
-                        )
-                        assert edge_shape == _edge.shape, (
-                            f"Existing edge shape {_edge.shape} does not match expected shape {edge_shape}!"
-                        )
+                        if not (edge_shape == edge_outval.shape):
+                            raise RuntimeError(f"Computed edge shape {edge_outval.shape} does not match expected shape {edge_shape}!")
+                        if not (edge_shape == _edge.shape):
+                            raise RuntimeError(f"Existing edge shape {_edge.shape} does not match expected shape {edge_shape}!")
                     if count_ops:
                         edge_outval, (_a, _m, _f) = add_w_counts(edge_outval, _edge)
                         adds += int(_a)

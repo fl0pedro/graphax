@@ -460,7 +460,8 @@ class _OutputSpec:
         shape = list(out.shape)
         # Merges are of adjacent (g, j) where j == g+1 by construction.
         for (ga, ja) in db_merges:
-            assert ja == ga + 1, "D_B (g, j) must be adjacent in physical layout"
+            if not (ja == ga + 1):
+                raise RuntimeError("D_B (g, j) must be adjacent in physical layout")
             merged = shape[ga] * shape[ja]
             out = out.reshape(tuple(shape[:ga] + [merged] + shape[ja + 1:]))
             shape = shape[:ga] + [merged] + shape[ja + 1:]
