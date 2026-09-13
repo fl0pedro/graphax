@@ -150,6 +150,12 @@ def _compute_dtype(*dtypes) -> Any:
     # exactly. Owner ruling: f32 and bf16 are the compute dtypes.
     if out == jnp.dtype(bool) or jnp.issubdtype(out, jnp.integer):
         return jnp.dtype(jnp.float32)
+    # Same rule for a NARROW FLOAT result: ``result_type(f8, f8)`` is f8 and
+    # does not raise, so two float8 operands would otherwise compute -- and
+    # write their result -- in float8 (measured 2026-09-13: standalone
+    # float8 x float8 contraction, result.val float8, NaN).
+    if out.name in _NARROW_PROMOTION_REP:
+        return jnp.dtype(_NARROW_PROMOTION_REP[out.name])
     return out
 
 
