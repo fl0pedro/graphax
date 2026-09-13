@@ -225,10 +225,16 @@ def _unify_operand_dtypes(lhs, rhs):
     """
     ldt = jnp.dtype(lhs.dtype)
     rdt = jnp.dtype(rhs.dtype)
-    if ldt == rdt:
-        # Same at-rest dtype on both sides -- no cross-operand promotion needed.
-        # (Two same-narrow operands also take the native path; the op runs in
-        # that narrow dtype, matching the stored precision.)
+    cdt = _compute_dtype(ldt, rdt)
+    if ldt == rdt == cdt:
+        # Same at-rest dtype on both sides AND it is a compute dtype: nothing
+        # to unify. Two same-NARROW operands (float8 x float8, int8 x int8) do
+        # NOT take this path any more: the contraction ran natively on the
+        # codes and wrote its result back in the code dtype, which saturated
+        # float8 to NaN and wrapped integer sums (measured 2026-09-13,
+        # standalone 16x64 @ 64x32: float8 result.val float8 -> NaN, int8 /
+        # int16 cosine 0.00 against exact). Codes are storage; arithmetic
+        # runs in the compute dtype, bf16 for narrow floats, f32 for ints.
         return lhs, rhs
     # DELIBERATE (2026-08-04): a {bf16, f32} MIXED pair UPCASTS to f32 --
     # quantizing one edge must never silently approximate its exact partner
@@ -236,7 +242,6 @@ def _unify_operand_dtypes(lhs, rhs):
     # path exists only when BOTH edges were made bf16: same-dtype pairs
     # return above unchanged, and the contraction then asks for f32
     # accumulation (matmul._emit_einsum).
-    cdt = _compute_dtype(ldt, rdt)
     return _cast_operand(lhs, cdt), _cast_operand(rhs, cdt)
 
 
