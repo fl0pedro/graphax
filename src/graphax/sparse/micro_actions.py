@@ -364,12 +364,16 @@ def quant_hardware_masks():
         # Unsigned types only become usable WITH a negate head (spec §quant);
         # until that head exists they are unrepresentable, not sampled-and-
         # sentinelled. GRAPHAX_QUANT_ALLOW_UNSIGNED=1 restores them.
-        # Default ALLOW (user-directed): the negate head (scale_sign arm
-        # select) + continuous scale head now travel the wire and are honored
-        # by apply_quant, so the policy can use unsigned ranges without
-        # zeroing all-negative blocks. GRAPHAX_QUANT_MASK_UNSIGNED=1 re-masks
-        # them (the pre-negate-head safety posture).
-        if _os.environ.get("GRAPHAX_QUANT_MASK_UNSIGNED", "0") == "1":
+        # The negate head folds ONE polarity per tensor into scalar_mult, which
+        # rescues an all-negative block but not a MIXED-sign one: the other
+        # sign is clamped to zero. Measured 2026-09-13 on a (16, 64) normal
+        # tensor: uint8 keeps 473 of 1024 entries, cosine 0.677; uint4 0.675;
+        # on TLM with every face slot uint8 the gradient cosine is 0.000. A
+        # SparseTensor has no zero point, so a mixed-sign tensor cannot be
+        # stored unsigned at all. Default MASK; GRAPHAX_QUANT_MASK_UNSIGNED=0
+        # restores the unsigned entries for a caller that knows its tensors
+        # are single-signed.
+        if _os.environ.get("GRAPHAX_QUANT_MASK_UNSIGNED", "1") == "1":
             import numpy as _np
             keep = _np.asarray(avail).copy()
             for _i, _name in enumerate(QUANT_DTYPES):
@@ -1059,6 +1063,13 @@ def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
     if st.val is None:
         return st
     target = jnp.dtype(action.dtype)
+    if target.kind == "u" and _os.environ.get("GRAPHAX_QUANT_MASK_UNSIGNED", "1") == "1":
+        raise ValueError(
+            f"Quant to unsigned {target.name!r}: a SparseTensor has no zero "
+            "point, so a mixed-sign tensor loses one sign (measured cosine "
+            "0.68 on a normal tensor, 0.00 on a fully quantized TLM). Set "
+            "GRAPHAX_QUANT_MASK_UNSIGNED=0 only for single-signed tensors."
+        )
     if _policy_quant_strict():
         check_policy_quant_dtype(target)
     if st.val.dtype == target:

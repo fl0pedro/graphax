@@ -50,6 +50,13 @@ _NARROW_PROMOTION_REP: dict[str, Any] = {
     "float8_e5m2fnuz": jnp.bfloat16,
     "float8_e8m0fnu": jnp.float32,
     "float4_e2m1fn": jnp.bfloat16,
+    # float16 is a STANDARD dtype for JAX, so result_type never raises on it;
+    # it is listed here so that `_compute_dtype` replaces a float16 RESULT by
+    # float32. float16 storage is fine (one quantized operand against f32
+    # partners: q = 1.000 on three measured edges), float16 ARITHMETIC is not
+    # (two float16 operands met, overflowed at 65504 and the TLM gradient was
+    # NaN). f32 rather than bf16: float16 carries 10 mantissa bits.
+    "float16": jnp.float32,
     "int2": jnp.int8,
     "int4": jnp.int8,
     "uint2": jnp.uint8,
@@ -251,13 +258,29 @@ def _unify_operand_dtypes(lhs, rhs):
     return _cast_operand(lhs, cdt), _cast_operand(rhs, cdt)
 
 
+def _cast_val(val, cdt):
+    """``val.astype(cdt)``, behind an optimization barrier when ``val`` is a
+    float8_e4m3 variant. XLA's GPU GEMM rewriter pattern-matches
+    ``convert(f8e4m3) -> dot`` into a cuBLAS FP8 GEMM and, on Blackwell with
+    jax 0.7 / XLA of 2026-09, builds a cyclic graph from it: "A cycle is
+    detected while visiting instruction get-tuple-element(cublas-gemm.clone)"
+    (TLM, every face slot float8_e4m3fn; float8_e5m2 compiles). The barrier
+    keeps the convert out of the pattern. No arithmetic changes.
+    """
+    out = val.astype(cdt)
+    if str(val.dtype).startswith("float8_e4m3"):
+        import jax
+        out = jax.lax.optimization_barrier(out)
+    return out
+
+
 def _cast_operand(t, cdt):
     """Return ``t`` with ``val`` / ``scalar_mult`` / ``fill_value`` cast to
     ``cdt``. ``val=None`` (pure structure) and ``fill_value=None`` (statically
     zero) markers are preserved; ``scalar_mult`` always exists. Avoids a rebuild
     when nothing changes."""
     new_val = (
-        t.val.astype(cdt)
+        _cast_val(t.val, cdt)
         if t.val is not None and jnp.dtype(t.val.dtype) != cdt
         else t.val
     )
