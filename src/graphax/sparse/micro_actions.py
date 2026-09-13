@@ -239,39 +239,40 @@ QUANT_DTYPES = _get_quant_dtypes()
 # all contract against an un-quantized float32 partner. The catalog is therefore
 # permissive again; GRAPHAX_QUANT_STRICT_PROMOTION=1 restores the conservative
 # scan (mask out anything that can't mix with float32) as an escape hatch.
-# Default STRICT: a dtype is only 'available' if it survives contraction and
-# arithmetic against float32 in BOTH operand orders. Set
-# GRAPHAX_QUANT_ALLOW_NARROW=1 to admit narrow dtypes anyway (only safe
-# once every contraction site force-casts the partner).
-_ALLOW_NARROW_QUANT = _os.environ.get("GRAPHAX_QUANT_ALLOW_NARROW", "0") == "1"
+# The scan asks the question the ENGINE asks. Every contraction and every
+# elementwise op casts both operands to ``dtype_compute._compute_dtype`` of the
+# pair first (elemental/dispatch.py -> ``_unify_operand_dtypes``), so a dtype is
+# usable iff it can be STORED and its cast to the compute dtype can be
+# contracted. The former scan probed the raw JAX promotion table
+# (``jnp.dot(float8, float32)``), which the engine never performs; it blocked
+# every float8 member on a rule that does not apply. There is no escape hatch
+# any more: one rule, the engine's.
 
 
 def verify_hardware_compat():
-    """Dynamically verify jnp.dot compatibility across all QUANT_DTYPES."""
-    import jax
+    """Which :data:`QUANT_DTYPES` this backend can store and contract, THE WAY
+    THE ENGINE CONTRACTS THEM (through the compute-dtype rule)."""
     import jax.numpy as jnp
-    
-    avail_mask = []
+    from graphax.sparse.dtype_compute import _cast_val, _compute_dtype
+
     f32 = jnp.zeros((2, 2), dtype=jnp.float32)
+
+    def _probe_pair(x, y):
+        """Contract and combine ``x`` and ``y`` as the engine would: both cast
+        to the pair's compute dtype first, in BOTH operand orders."""
+        cdt = _compute_dtype(x.dtype, y.dtype)
+        xc, yc = _cast_val(x, cdt), _cast_val(y, cdt)
+        jnp.dot(xc, yc)
+        jnp.dot(yc, xc)
+        xc * yc
+        xc + yc
+
+    avail_mask = []
     for dt in QUANT_DTYPES:
         try:
             x = jnp.zeros((2, 2), dtype=dt)
-            # Self-dot: can the hardware contract this dtype with itself?
-            jnp.dot(x, x)
-            # BOTH ORDERS against float32. A quantized edge is contracted with
-            # edges that were NOT quantized (still float32), and its
-            # scalar_mult / fill_value are float32 — and JAX's promotion table
-            # is NOT symmetric in what it reports, so (dt, f32) passing tells
-            # you nothing about (f32, dt). Testing only one order is what let
-            # float4_e2m1fn through: it survived dot(x, f32) and then died at
-            # runtime on ('float32', 'float4_e2m1fn').
-            if not _ALLOW_NARROW_QUANT:
-                jnp.dot(x, f32)
-                jnp.dot(f32, x)
-                x * jnp.float32(2.0)
-                jnp.float32(2.0) * x
-                x + jnp.zeros((2, 2), dtype=jnp.float32)
-                jnp.zeros((2, 2), dtype=jnp.float32) + x
+            _probe_pair(x, x)          # storable, and self-contractible
+            _probe_pair(x, f32)        # against an un-quantized partner
             avail_mask.append(1.0)
         except Exception:
             avail_mask.append(0.0)
@@ -283,15 +284,8 @@ def verify_hardware_compat():
             if not avail_mask[i] or not avail_mask[j]:
                 continue
             try:
-                x = jnp.zeros((2, 2), dtype=dt1)
-                y = jnp.zeros((2, 2), dtype=dt2)
-                # BOTH orders: a contraction can present the pair either way
-                # round depending on which edge is pre and which is post, and
-                # JAX's promotion rules are not guaranteed symmetric. Admitting
-                # (a,b) on the strength of (a,b) alone leaves (b,a) to fail at
-                # runtime inside the measurement callback.
-                jnp.dot(x, y)
-                jnp.dot(y, x)
+                _probe_pair(jnp.zeros((2, 2), dtype=dt1),
+                            jnp.zeros((2, 2), dtype=dt2))
                 compat_matrix = compat_matrix.at[i, j].set(1.0)
             except Exception:
                 pass
@@ -981,14 +975,16 @@ def _is_narrow_float_target(target) -> bool:
 # it.
 #
 # What an RL POLICY can actually emit is a far smaller set: alphagrad's unified
-# face head draws a single Bernoulli over {float32, bfloat16} (its ``S_DTYPE``).
-# BOTH of those take the plain-``astype`` branch of :func:`apply_quant` -- no
-# scale is computed, ``scalar_mult`` is passed through untouched, and a
-# JOIN/ADD of two bf16 edges therefore introduces no rescale. This constant
-# pins that contract as a REGRESSION GUARD: widening it to an int / float8
-# target silently re-enables the scaled quantizer, which folds a per-tensor
-# scale into ``scalar_mult``.
-POLICY_QUANT_DTYPES: tuple = ("float32", "bfloat16")
+# face head draws a categorical over these (its ``S_DTYPE`` block; the
+# alphagrad side lists the same names as ``masks.FACE_QUANT_DTYPES``).
+# float32 / bfloat16 take the plain-``astype`` branch of :func:`apply_quant`;
+# the two float8 targets take the SCALED branch (a per-tensor absmax scale
+# folded into ``scalar_mult``, dequantized by the compute-dtype rule at the
+# next contraction). No integer target: int8 cost q 0.91 when used widely and
+# int16 saved no memory (sweep64), so neither is a reward the policy can
+# find. This constant pins the set as a REGRESSION GUARD.
+POLICY_QUANT_DTYPES: tuple = (
+    "float32", "bfloat16", "float8_e5m2", "float8_e4m3fn")
 
 
 def _policy_quant_strict() -> bool:
@@ -1007,9 +1003,7 @@ def check_policy_quant_dtype(dtype):
     if name not in POLICY_QUANT_DTYPES:
         raise ValueError(
             f"Quant dtype {name!r} is not policy-reachable: the policy head "
-            f"emits only {POLICY_QUANT_DTYPES}. Those two take the UNSCALED "
-            f"astype branch of apply_quant; anything else stores a per-tensor "
-            f"scale in scalar_mult. (GRAPHAX_QUANT_POLICY_STRICT=1)"
+            f"emits only {POLICY_QUANT_DTYPES}. (GRAPHAX_QUANT_POLICY_STRICT=1)"
         )
     return name
 
