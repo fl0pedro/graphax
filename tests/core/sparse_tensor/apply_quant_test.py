@@ -167,9 +167,13 @@ def _dequant(st: SparseTensor) -> np.ndarray:
         st.val.astype(np.float32) * np.float32(st.scalar_mult)).reshape(-1)
 
 
-def test_quant_uint_sign_flip_keeps_the_chosen_arm():
+def test_quant_uint_sign_flip_keeps_the_chosen_arm(monkeypatch):
     """``scale_sign`` picks which arm of a signed val fills the unsigned range;
     the other arm clips to 0. No zero-point offset is stored."""
+    # Unsigned targets are refused by default since 2026-09-13 (a
+    # mixed-sign tensor loses one sign). This test checks the unsigned
+    # quantizer's own mechanics on values it controls, so it opts in.
+    monkeypatch.setenv("GRAPHAX_QUANT_MASK_UNSIGNED", "0")
     st = _signed_st()
     pos = apply_quant(st, Quant("uint8", scale_sign=1))
     neg = apply_quant(st, Quant("uint8", scale_sign=-1))
@@ -179,9 +183,13 @@ def test_quant_uint_sign_flip_keeps_the_chosen_arm():
     np.testing.assert_allclose(_dequant(neg), [-4.0, -2.0, 0.0, 0.0], atol=0.05)
 
 
-def test_quant_scales_to_the_target_max_not_the_value_max():
+def test_quant_scales_to_the_target_max_not_the_value_max(monkeypatch):
     """The kept arm's largest magnitude maps onto the TARGET dtype's max code
     (uint8 -> 255), i.e. the full range of the new type is used."""
+    # Unsigned targets are refused by default since 2026-09-13 (a
+    # mixed-sign tensor loses one sign). This test checks the unsigned
+    # quantizer's own mechanics on values it controls, so it opts in.
+    monkeypatch.setenv("GRAPHAX_QUANT_MASK_UNSIGNED", "0")
     q = apply_quant(_signed_st(), Quant("uint8", scale_sign=1))
     assert int(np.asarray(q.val).max()) == 255            # 4 -> 255, scale 4/255
 
