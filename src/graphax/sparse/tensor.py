@@ -520,7 +520,7 @@ class SparseTensor(SparseMathMixin):
         fully-dense ``val is None`` tensor has no pairs ⇒ every cell is structure
         (all ones); a diagonal pair contributes its ``N·B_row·B_col`` blocks."""
         if self.val is not None:
-            return self.val.size
+            return self.val.size * self._implicit_block_factor
         n = self.size
         seen = set()
         for d in self.dims:
@@ -529,6 +529,22 @@ class SparseTensor(SparseMathMixin):
                 if key not in seen:
                     seen.add(key)
                     n //= d.size
+        return n
+
+    @property
+    def _implicit_block_factor(self) -> int:
+        """How many times each stored cell REPEATS because a dim's block is
+        implicit — a BLOCKED DENSE dim (``other_id is None`` with a
+        ``block_size``, ticket dsnn-3qm.62) stores one entry per block and the
+        value is uniform inside it.
+
+        Those positions are ON-STRUCTURE, not fill: without this factor
+        ``_n_fill_cells`` reports the whole block as implicit fill and every
+        reduction folds ``fill_value`` over cells that hold real values."""
+        n = 1
+        for d in self.dims:
+            if d.is_blocked_dense:
+                n *= int(d.block_size)
         return n
 
     @property
@@ -548,7 +564,8 @@ class SparseTensor(SparseMathMixin):
             return self.val
         return jnp.ones(self._structural_val_size, dtype=self.dtype)
 
-    def _reduce(self, reduce_fn, fold_fn, *, weighted: bool = False) -> Array:
+    def _reduce(self, reduce_fn, fold_fn, *, weighted: bool = False,
+                repeat_fn=None) -> Array:
         """Shared skeleton for all/any/sum/prod (NOT max/min — see ``_extremum``,
         which can't seed an identity without introducing ``-inf``).
 
@@ -563,6 +580,13 @@ class SparseTensor(SparseMathMixin):
         * otherwise (all/any): an idempotent fold applied only when fill cells
           exist; ``fold_fn`` maps the fill's truthiness itself."""
         val_part = reduce_fn(_scaled_mul(self._stored_val(), self.scalar_mult))
+        # An implicit block stores one cell per block and means the rest, so the
+        # reduction has to account for the repetitions ``val`` does not hold:
+        # ``repeat_fn`` is the op's own weighting (``* n`` for sum, ``** n`` for
+        # prod; all/any are idempotent and pass None).
+        rep = self._implicit_block_factor
+        if rep > 1 and repeat_fn is not None:
+            val_part = repeat_fn(val_part, rep)
         scaled_fill = _scaled_mul(self._eff_fill, self.scalar_mult)
         # weighted (sum/prod) always folds (branchless, vanishes when n_fill==0);
         # all/any fold only when fill cells exist.
@@ -580,11 +604,13 @@ class SparseTensor(SparseMathMixin):
 
     @_on_materialized
     def sum(self) -> Array:
-        return self._reduce(jnp.sum, lambda v, f, n: v + f * n, weighted=True)
+        return self._reduce(jnp.sum, lambda v, f, n: v + f * n, weighted=True,
+                            repeat_fn=lambda v, n: v * n)
 
     @_on_materialized
     def prod(self) -> Array:
-        return self._reduce(jnp.prod, lambda v, f, n: v * f ** n, weighted=True)
+        return self._reduce(jnp.prod, lambda v, f, n: v * f ** n, weighted=True,
+                            repeat_fn=lambda v, n: v ** n)
 
     def _extremum(self, reduce_fn, fold_fn) -> Array:
         """Shared skeleton for max()/min(): scale BEFORE the extremum (a negative
@@ -1294,6 +1320,26 @@ def _apply_block_diagonal(
     d1 = st.out_dims[idx1] if is_out1 else st.primal_dims[idx1]
     d2 = st.out_dims[idx2] if is_out2 else st.primal_dims[idx2]
 
+    # A dim whose BLOCK IS IMPLICIT (a blocked dense dim, ticket dsnn-3qm.62:
+    # ``other_id is None`` with a ``block_size``, one stored cell per block)
+    # stores fewer positions than the ``size x b`` split below re-cuts, so the
+    # reshape cannot reach them. Splitting those positions is what the caller
+    # ASKED for, and the mask cleared it, so PAY for the block here rather than
+    # refuse the action: expand it and carry on as a plain dense dim of the same
+    # logical extent. The rewrite is rank-preserving, so ``v1`` / ``v2`` and
+    # every other dim's ``axis`` still mean what they meant.
+    #
+    # The one case this over-pays for is ``factor == size`` -- there the stored
+    # axis IS the new meta and the block could stay implicit
+    # (``block_axis=None``) for free. Not worth a second code path until a
+    # target is measured spending time in it.
+    if any(d.is_blocked_dense for d in (d1, d2)):
+        from graphax.sparse.ops.dense import _expand_implicit_blocks
+
+        st = _expand_implicit_blocks(st, only_ids=frozenset((d1.id, d2.id)))
+        d1 = st.out_dims[idx1] if is_out1 else st.primal_dims[idx1]
+        d2 = st.out_dims[idx2] if is_out2 else st.primal_dims[idx2]
+
     # SILENT PATH #1 (was: `return st`) — PARTNER MISMATCH.
     #
     # d1 is already half of a sparse pair bonded to some dim OTHER than d2, so
@@ -1330,6 +1376,22 @@ def _apply_block_diagonal(
         v2 = None
 
     val = st.val
+    # The split has to fit the axis it re-cuts. The one-axis branch below has
+    # always checked this and its comment documents the contract: a ValueError,
+    # which is ALSO what ``action_is_legal`` reads, so the legality mask and the
+    # applier agree the action is unavailable instead of disagreeing in a crash.
+    # Hoisted here so the two-axis branch is covered too -- it reached
+    # ``jnp.reshape`` instead and took the whole trace down with a TypeError
+    # (TLM, job 65102: (16,64,4,16) into [16,64,1,4,64,1]). An implicit block
+    # cannot get here any more (it was expanded above); what remains is a rule
+    # that fits the NOMINAL axis but not THIS operand's stored extent.
+    for _v, _b, _d in ((v1, b1, d1), (v2, b2, d2)):
+        if _v is not None and int(val.shape[_v]) != size * _b:
+            raise ValueError(
+                f"block-diagonal split {size}x{_b} does not fit val axis {_v} "
+                f"of extent {val.shape[_v]} (dim id={_d.id}, "
+                f"logical_size={_d.logical_size})"
+            )
     new_K_axis: int | None = None
     new_b1_axis: int | None = None
     new_b2_axis: int | None = None

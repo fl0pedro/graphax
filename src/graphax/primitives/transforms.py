@@ -76,6 +76,24 @@ class JacobianTransform:
         return self.inverse_transform(tensor)
 
 
+def _reject_implicit_block(d, where: str) -> None:
+    """Raise on a BLOCKED DENSE dim (``other_id is None`` with a ``block_size``,
+    ticket dsnn-3qm.62) where the transform indexes its val axis with LOGICAL
+    offsets.
+
+    Concatenate and its inverse cut and pad at positions inside the dim, and the
+    dim's val axis holds one cell per block — a cut lands in the middle of a
+    block and there is no index form for "half a block". Project rule: raise
+    rather than cut at the wrong offset. Densify the edge before the concat."""
+    if d is not None and not d.is_sparse and getattr(d, "block_size", None):
+        raise ValueError(
+            f"{where}: dim id={d.id} carries an implicit block "
+            f"(size={d.size} block_size={d.block_size}); the transform indexes "
+            f"its val axis with logical offsets, which an implicit block cannot "
+            f"honour (ticket dsnn-3qm.62)."
+        )
+
+
 def _inverse_permutation(permutation):
     inverse = [0] * len(permutation)
     for i, p in enumerate(permutation):
@@ -343,11 +361,14 @@ def _reshape_elementals(primals, val_out, **params):
         # axis and carry no block factor (logical_size folds a block into the
         # axis — splitting it is unsafe). Reject if any sparse in-dim is dropped.
         for i, d in enumerate(in_dims):
-            if d.is_sparse:
-                if d.block_size is not None:
-                    return None
-                if i not in assigned_set:
-                    return None
+            # The block factor is unsafe to split for a BLOCKED DENSE in-dim
+            # (dsnn-3qm.62) for the same reason as for a pair: ``logical_size``
+            # folds the block into the extent the reshape is redistributing, and
+            # the buffer stores one cell per block. No ``is_sparse`` gate here.
+            if d.block_size is not None:
+                return None
+            if d.is_sparse and i not in assigned_set:
+                return None
 
         # ids: out_dims occupy [0, n_out); primal follow.
         if in_is_out:
@@ -517,7 +538,11 @@ def _slice_elementals(primals, val_out, **params):
         # DenseIndex (not sparse).
         preservable = True
         for ax, d in enumerate(pre.out_dims):
-            if _is_sliced(ax, d.logical_size) and d.is_sparse:
+            # A BLOCKED DENSE dim (dsnn-3qm.62) is not plain either: the slice
+            # bounds are LOGICAL positions while its val axis holds one cell per
+            # block, so slicing the axis would cut block counts.
+            if _is_sliced(ax, d.logical_size) and (
+                    d.is_sparse or d.block_size is not None):
                 preservable = False
                 break
 
@@ -605,7 +630,10 @@ def _slice_elementals(primals, val_out, **params):
         )
         if preservable:
             for d in post.primal_dims:
-                if d.is_sparse or d.axis is None:
+                # A BLOCKED DENSE dim (dsnn-3qm.62) stores one cell per block, so
+                # ``d.size`` is not the slice extent the pad config is computed
+                # from. Route it to the dense fallback like a pair.
+                if d.is_sparse or d.axis is None or d.block_size is not None:
                     preservable = False
                     break
 
@@ -769,8 +797,11 @@ def _squeeze_elementals(primals, val_out, **params):
                     0
                 ]
                 other_dim = new_primal_dims[other_idx]
+                # ``logical_size``, not ``size``: a BLOCKED DENSE partner
+                # (dsnn-3qm.62) spans size*block_size positions and the rebuilt
+                # dim carries no block fields (dsnn-3qm.62).
                 new_primal_dims[other_idx] = DenseIndex(
-                    other_dim.id, other_dim.size, None
+                    other_dim.id, other_dim.logical_size, None
                 )
 
             del new_out_dims[idx]
@@ -915,6 +946,7 @@ def _concatenate_elementals(primals, val_out, **params):
         new_primal_dims = list(copy.deepcopy(pre.primal_dims))
         d = new_out_dims[dim]
         idx, _idx = slices[primal_idx]
+        _reject_implicit_block(d, "concatenate_transform")
 
         if not d.is_sparse:
             if d.axis is not None:
@@ -1037,6 +1069,7 @@ def _concatenate_elementals(primals, val_out, **params):
                 fill_value=post.fill_value,
             )
 
+        _reject_implicit_block(d, "inverse_concatenate_transform")
         if not d.is_sparse:
             if d.axis is not None:
                 new_val = lax.slice_in_dim(post.val, *slices[primal_idx], axis=d.axis)

@@ -442,7 +442,23 @@ def next_projection_rule(src, target):
     slot_of = _slot_of_dim(src)
     for tid, td in sorted(t_by.items()):
         sd = s_by.get(tid)
-        if sd is None or td.axis is not None or sd.axis is None:
+        if sd is None:
+            continue
+        # A BLOCKED DENSE target (dsnn-3qm.62) stores one cell per block while
+        # ``src`` may spell every position out. Folding src onto that support is
+        # a per-block mean -- COARSER than the dim, finer than the whole slot --
+        # and no micro-action says that: Compress of the slot folds the dim
+        # whole. Raise rather than report "nothing left to do" and hand back a
+        # tensor outside the target's support (project rule: no silent pass).
+        if (sd.block_size or 1) != (td.block_size or 1) and not td.is_sparse:
+            raise ValueError(
+                f"join: no micro-action projects dim id={tid} onto the target's "
+                f"block grid (src block {sd.block_size or 1}, target block "
+                f"{td.block_size or 1}); an implicit-block target needs a "
+                f"per-block fold, which Compress cannot express "
+                f"(ticket dsnn-3qm.62)."
+            )
+        if td.axis is not None or sd.axis is None:
             continue
         if int(sd.size) <= 1:
             continue                      # already one slice: nothing to fold

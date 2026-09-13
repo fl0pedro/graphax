@@ -90,7 +90,9 @@ def _is_approx(st) -> bool:
     dense edge both return False, so the cleanly-contractible fast path is
     preserved and the no-approximation EXACT-AD edge is never touched."""
     for d in (*st.out_dims, *st.primal_dims):
-        if d.is_sparse and (getattr(d, "block_size", None) or 1) > 1:
+        if (getattr(d, "block_size", None) or 1) > 1:
+            # A sparse pair's Diag block, or a BLOCKED DENSE dim's implicit
+            # block (dsnn-3qm.62) -- which is a Diag AND a Compress in one dim.
             return True
         if (not d.is_sparse) and d.axis is None and int(d.logical_size) > 1:
             return True
