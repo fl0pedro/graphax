@@ -135,10 +135,22 @@ def _compute_dtype(*dtypes) -> Any:
     """
     dts = [jnp.dtype(d) for d in dtypes]
     try:
-        return jnp.result_type(*dts)
+        out = jnp.result_type(*dts)
     except Exception:
         reps = [_NARROW_PROMOTION_REP.get(d.name, d) for d in dts]
-        return jnp.result_type(*reps)
+        out = jnp.result_type(*reps)
+    # An integer Quant stores CODES: ``val`` is ``round(x / s)`` with ``s``
+    # folded into ``scalar_mult``. Two integer operands meeting (both slots of a
+    # face quantized) must not multiply as integers: the product of two codes
+    # overflows the code type and the reduction sums wrapped values. Measured
+    # 2026-09-13 (TLM, Markowitz order, every face slot int8 / int16): the
+    # gradient came back with cosine 0.000 against exact, and an int4 grid
+    # could not even be summed. Codes are storage; arithmetic on them is
+    # float32, which holds every int16 code and every int8 x int8 product
+    # exactly. Owner ruling: f32 and bf16 are the compute dtypes.
+    if out == jnp.dtype(bool) or jnp.issubdtype(out, jnp.integer):
+        return jnp.dtype(jnp.float32)
+    return out
 
 
 def _scaled_mul(value, scalar_mult, *, keep_narrow: bool = False):
