@@ -29,7 +29,7 @@ import pytest
 
 from graphax import SKIP_FACE, IncrementalPathTokenizer, faces_of
 from graphax.jaxpr import SLOT_SEPARATOR, get_vocab
-from graphax.sparse.micro_actions import Diag, Quant
+from graphax.sparse.micro_actions import Compress, Diag, Quant
 from graphax.sparse.tracer import FACE_SLOT_NAMES, N_FACE_SLOTS, face_slot_index
 
 _M = jnp.asarray(np.arange(16, dtype=np.float32).reshape(4, 4) / 15.0 + 0.1)
@@ -258,3 +258,122 @@ def test_the_slot_separator_is_its_own_token_appended_at_the_end():
     assert full[-1] == SLOT_SEPARATOR
     assert vocab[SLOT_SEPARATOR] == len(vocab) - 1
     assert n_vocab[vocab[SLOT_SEPARATOR]] == SLOT_SEPARATOR
+
+
+# ---------------------------------------------------------------------------
+# a CHOOSER'S action is recorded exactly as a literal one is
+# ---------------------------------------------------------------------------
+#
+# A slot callable has two meanings. It may return a TENSOR, which the engine
+# takes as the new operand and records for nobody, or it may return the
+# micro-action it PICKED, which the engine applies through ``_apply_micro`` and
+# records through ``_record_micro``. Only the second reaches the token stream.
+# Every policy has to be the second kind: its operands are join intermediates,
+# so it cannot know their index structure before this moment, and a decision it
+# takes without leaving a block is a decision the encoder never sees.
+
+
+class _Chooser:
+    """A slot chooser that always picks ``action`` and remembers the outcome."""
+
+    def __init__(self, action):
+        self.action = action
+        self.outcomes = []
+
+    def __call__(self, st):
+        return self.action
+
+    def chosen_applied(self, action, applied):
+        self.outcomes.append((action, bool(applied)))
+
+
+_COMPRESS = Compress(axes=(0,), kind="mean")
+
+_CHOOSER_CASES = [
+    (_DIAG, "approxDIAG012^^"),
+    (_COMPRESS, "approxCOMPRESSk#mean0^^"),
+    (_QUANT, "approxQUANTd#bfloat16^^"),
+]
+
+
+@pytest.mark.parametrize("action,head", _CHOOSER_CASES,
+                         ids=["diag", "compress", "quant"])
+def test_a_chooser_that_returns_an_action_emits_the_block_a_literal_emits(
+        action, head):
+    """TYPE, ARGS and the output jaxpr, byte for byte the literal's block.
+
+    The chooser is the only form a policy can use, so if its block differed
+    from a literal's in any way the stream would carry two grammars for one
+    decision.
+    """
+    ch = _Chooser(action)
+    tk_c, tok_c, segs_c = _tokenize({0: _slots(pre=ch)})
+    tk_l, tok_l, segs_l = _tokenize({0: _slots(pre=action)})
+
+    assert _head(tk_c, _approx_part(tk_c, tok_c, segs_c[0])) == head
+    assert _approx_part(tk_c, tok_c, segs_c[0]) == \
+        _approx_part(tk_l, tok_l, segs_l[0])
+    assert tuple(tok_c) == tuple(tok_l)
+
+
+@pytest.mark.parametrize("action,_head_unused", _CHOOSER_CASES,
+                         ids=["diag", "compress", "quant"])
+def test_a_chosen_actions_block_carries_the_equations_it_emitted(
+        action, _head_unused):
+    """THE OUTPUT TOKENIZED JAXPR. A block is ``approx <TYPE> <args>`` followed
+    by the three slots' equation blocks, and the approximated slot's block is
+    the jaxpr the application itself wrote -- a ``convert_element_type`` for
+    QUANT, a ``reduce_sum`` and a divide for COMPRESS, the reshape / transpose /
+    slice chain for DIAG. The record's equation RANGE is what carves those
+    equations out of the face's contraction block, so a non-empty range is the
+    same statement as a non-empty block.
+    """
+    ch = _Chooser(action)
+    tk, tok, segs = _tokenize({0: _slots(pre=ch)})
+    recs = tk.ij.step_faces(0)[0].approx
+
+    assert [r.slot for r in recs] == ["lhs"]
+    assert recs[0].end > recs[0].start, (
+        "the approximation emitted no equations, so its block carries no "
+        "output jaxpr at all")
+    _start, split, end = segs[0]
+    part = tok[split:end]
+    assert part.count(tk.vocab["{"]) == 3, "three slot blocks, always"
+    # The approximated slot's block is the FIRST of the three and it is not
+    # empty; the two declining slots emit `{}`.
+    first = part.index(tk.vocab["{"])
+    assert part[first + 1] != tk.vocab["}"]
+
+
+def test_the_chooser_is_told_whether_its_action_changed_the_tensor():
+    """A chooser decides BEFORE the action runs, so it cannot know by itself
+    whether the action was a no-op -- and a no-op emits no block. The callback
+    is what lets a caller's ``applied`` counter agree with the stream."""
+    ch = _Chooser(_QUANT)
+    tk, _tok, _segs = _tokenize({0: _slots(pre=ch)})
+    assert ch.outcomes == [(_QUANT, True)]
+    assert [r.atype for r in tk.ij.step_faces(0)[0].approx] == ["QUANT"]
+
+    # THE INVARIANT the callback exists for: as many blocks as outcomes the
+    # engine reported applied, on every face, whatever the slots hold.
+    again = _Chooser(_QUANT)
+    tk2, _t2, _segs2 = _tokenize({0: _slots(pre=again, post=again, new=again)})
+    assert len(again.outcomes) == 3
+    n_blocks = len(tk2.ij.step_faces(0)[0].approx)
+    assert n_blocks == sum(1 for _a, applied in again.outcomes if applied)
+
+
+def test_a_chooser_that_declines_emits_no_block_at_all():
+    """``None`` is the one legal way to decline, and a decline is silence in
+    the stream: nothing was applied, so there is nothing to mark."""
+    tk, tok, segs = _tokenize({0: _slots(pre=lambda st: None)})
+    _start, split, end = segs[0]
+    assert split == end
+    assert tk.ij.step_faces(0)[0].approx == []
+
+
+def test_a_chooser_that_returns_several_actions_raises():
+    """graphax applies ONE action per chooser result. Taking the first would
+    drop the rest of what the caller asked for, silently."""
+    with pytest.raises(TypeError, match="returns exactly ONE"):
+        _tokenize({0: _slots(pre=lambda st: (_DIAG, _QUANT))})
