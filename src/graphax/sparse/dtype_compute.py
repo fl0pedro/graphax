@@ -2,9 +2,8 @@
 
 A :class:`~graphax.sparse.micro_actions.Quant` stores ``SparseTensor.val`` in a
 chosen (possibly narrow) dtype while ``scalar_mult`` / ``fill_value`` keep their
-native dtype. JAX deliberately gives the narrow dtypes — every ``float8_*``,
-``float4_e2m1fn``, and the sub-byte ints ``int2``/``int4``/``uint2``/``uint4`` —
-NO promotion-lattice entry: not just the implicit binary-op promotion but the
+native dtype. JAX deliberately gives the narrow dtypes — every ``float8_*``
+(the catalog is byte-sized and up since 2026-09-13) — NO promotion-lattice entry: not just the implicit binary-op promotion but the
 explicit ``jnp.promote_types`` / ``jnp.result_type`` queries themselves raise
 ``TypePromotionError`` for them (verified against the pinned JAX). So a bare
 ``val * scalar_mult`` fails whenever ``val`` was quantized to one of these, and
