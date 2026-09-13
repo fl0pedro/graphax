@@ -22,6 +22,8 @@ operand of the NEXT contraction.
 """
 import unittest
 
+import pytest
+
 import jax.numpy as jnp
 import jax.random as jr
 
@@ -180,6 +182,45 @@ class TestBlockedDenseSurvivor(unittest.TestCase):
                          "an implicit block is structure, not fill")
         self.assertAlmostEqual(float(t.sum()), 3.0 * BLK_PRI, places=2)
         self.assertAlmostEqual(float(t.max()), 2.0, places=5)
+
+    @pytest.mark.xfail(
+        strict=True, raises=ValueError,
+        reason="a blocked dense dim as a BATCH dim of the next contraction is "
+               "not implemented: matmul raises on batch pairings (race lane B, "
+               "2026-09-13). Lane A carried it through; this is its test, kept "
+               "so the raise is a recorded gap and not a silent one.")
+    def test_blocked_batch_dim_rides_through_both_operands(self):
+        """A blocked dense dim both operands carry (the same id on both out
+        sides, the same (size, block) factoring) is a ``batch_out`` pair. It
+        should ride through: the frame batches over the 2 stored entries and
+        the survivor keeps the 3 implicit, so neither side is materialized."""
+        N, BLK, K, Q = 2, 3, 5, 7
+        lhs = SparseTensor(
+            (Index(0, N, 0, None, BLK, None),),
+            (DenseIndex(1, K, 1),),
+            _n((N, K), 10),
+        )
+        rhs = SparseTensor(
+            (Index(0, N, 0, None, BLK, None), DenseIndex(1, K, 1)),
+            (DenseIndex(2, Q, 2),),
+            _n((N, K, Q), 11),
+        )
+        res = lhs @ rhs
+
+        self.assertEqual(res.shape, (N * BLK, Q))
+        self.assertEqual(tuple(res.val.shape), (N, Q))
+        d = res.out_dims[0]
+        self.assertTrue(d.is_blocked_dense)
+        self.assertEqual((d.size, d.block_size, d.block_axis, d.other_id),
+                         (N, BLK, None, None))
+
+        oracle = jnp.einsum("bk,bkq->bq", lhs.dense(), rhs.dense())
+        self.assertTrue(
+            jnp.allclose(res.dense(), oracle, atol=1e-5),
+            f"max diff {float(jnp.max(jnp.abs(res.dense() - oracle)))}",
+        )
+        self.assertEqual(growing_broadcasts(lhs, rhs), (0, 0))
+
 
 
 if __name__ == "__main__":
