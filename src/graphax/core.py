@@ -1421,6 +1421,15 @@ def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
     :func:`~graphax.sparse.micro_actions.action_is_legal` answers the same
     question without applying anything.
 
+    THE CHOOSER PROTOCOL, in full. A chooser is handed the live operand and
+    returns exactly ONE of: a ``Diag`` / ``Compress`` / ``Quant`` (applied and
+    recorded here), a ``SparseTensor`` (taken as the new operand and recorded by
+    nobody — the historical opaque form), or ``None`` (decline; the operand is
+    returned untouched). A sequence of actions RAISES. A chooser that also
+    carries a ``chosen_applied(action, applied)`` attribute is called back with
+    the outcome, so a caller keeping applied / skipped counters reads the same
+    ``_micro_applied`` verdict that decides whether a block is emitted.
+
     ``slot`` is the FaceSink's positional tag; ``log_slot`` (default: ``slot``)
     the transform log's finer one — see :func:`_record_micro`.
     """
@@ -1450,6 +1459,31 @@ def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
                 out = _apply_micro(val, _chosen)
                 _record_micro(_chosen, val, out, vertex, slot, in_edge,
                               out_edge, _as, _face_sink, _xlog, log_slot)
+                # THE OUTCOME, back to the chooser that asked for it. A chooser
+                # decides BEFORE the action runs, so it cannot know by itself
+                # whether the action changed the tensor -- and "changed" is the
+                # only truthful reading of "applied" while tracing
+                # (:func:`_micro_applied`), the same reading that decides
+                # whether a block is recorded at all. A chooser that keeps
+                # applied / skipped counters would otherwise have to guess, and
+                # a guess is how a counter and the token stream drift apart.
+                # OPTIONAL: a chooser without the attribute is not told.
+                _notify = getattr(_t, "chosen_applied", None)
+                if _notify is not None:
+                    _notify(_chosen, _micro_applied(val, out))
+            elif isinstance(_chosen, (tuple, list)):
+                # ONE action per chooser call. graphax applies and records what
+                # the chooser hands back, and a sequence would have to be
+                # legality-checked against the INTERMEDIATE tensors this call
+                # never sees. Raising names the caller; silently taking the
+                # first would drop the rest of what the caller asked for.
+                raise TypeError(
+                    f"The chooser in slot {slot!r} at vertex {vertex} returned "
+                    f"{len(_chosen)} actions; a chooser returns exactly ONE "
+                    "micro-action, a SparseTensor, or None to decline. A "
+                    "caller with several actions for one operand must install "
+                    "them as separate slots or as per-vertex transforms."
+                )
             else:
                 out = _chosen
         else:
