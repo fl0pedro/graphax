@@ -1829,6 +1829,11 @@ def _pair_output_dims(ctx, rhs_dims, res):
     return out_dims, primal_dims, shape, squeeze, summed, expands
 
 
+def _narrow_output() -> bool:
+    import os
+    return os.environ.get("GRAPHAX_NARROW_OUTPUT", "0") == "1"
+
+
 def _build_output_tensor(ctx, rhs_dims, res):
     from graphax.sparse.tensor import SparseTensor
 
@@ -1935,6 +1940,18 @@ def _build_output_tensor(ctx, rhs_dims, res):
     if not has_val and values is not None and values.size == 1:
         final_mult = _sm_promote(final_mult, jnp.squeeze(values))
         values = None
+    # EXPERIMENT KNOB (2026-09-13, owner question "are we staying in bf16?"):
+    # the dot accumulates in f32 and its result is stored in f32, so every
+    # contraction of two bf16 operands produces an f32 intermediate and the
+    # program is mostly f32 (885 f32 against 389 bf16 values in the all-bf16
+    # TLM executable). GRAPHAX_NARROW_OUTPUT=1 stores the result in the
+    # operands' shared narrow dtype instead. Accumulation stays f32. A knob,
+    # not a policy: it exists to measure the trade before the owner rules.
+    if (values is not None and _narrow_output()
+            and jnp.dtype(ctx.lhs.dtype) == jnp.dtype(ctx.rhs.dtype)
+            and jnp.dtype(ctx.lhs.dtype) == jnp.dtype(jnp.bfloat16)
+            and values.dtype != jnp.dtype(jnp.bfloat16)):
+        values = values.astype(jnp.bfloat16)
     out_dtype = values.dtype if values is not None else jnp.asarray(final_mult).dtype
     # transforms intentionally not propagated through matmul; callers in
     # core.py unload pre/post transforms before the matmul and reattach
