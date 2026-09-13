@@ -31,21 +31,25 @@ import jax.numpy as jnp
 import numpy as _np
 
 
-# Each narrow dtype JAX won't promote -> the smallest STANDARD dtype that
-# contains its range/precision. float8 (≤5 exponent bits) and float4 fit in
-# float16; ``float8_e8m0fnu`` carries 8 exponent bits (float32-range, no
-# mantissa) so it needs float32; sub-byte ints fit in int8/uint8. Used only to
-# resolve the promotion target when a narrow operand makes ``result_type`` raise.
+# Each narrow dtype JAX won't promote -> the STANDARD dtype arithmetic runs in
+# when a narrow operand makes ``result_type`` raise. Narrow FLOATS go to
+# bfloat16, not float16: the quantized value is a scaled code, and the
+# contraction it enters has the exponent range of the f32 Jacobians it meets.
+# Measured 2026-09-13 (TLM, Markowitz order, every face slot float8_e4m3fn or
+# float8_e5m2): with float16 as the rep the gradient came back NaN, and so did
+# a float16 Quant itself. bfloat16 keeps float32's 8 exponent bits (the owner
+# ruling: f32 and bf16 are the only compute dtypes). Sub-byte ints fit in
+# int8 / uint8.
 _NARROW_PROMOTION_REP: dict[str, Any] = {
-    "float8_e3m4": jnp.float16,
-    "float8_e4m3": jnp.float16,
-    "float8_e4m3b11fnuz": jnp.float16,
-    "float8_e4m3fn": jnp.float16,
-    "float8_e4m3fnuz": jnp.float16,
-    "float8_e5m2": jnp.float16,
-    "float8_e5m2fnuz": jnp.float16,
+    "float8_e3m4": jnp.bfloat16,
+    "float8_e4m3": jnp.bfloat16,
+    "float8_e4m3b11fnuz": jnp.bfloat16,
+    "float8_e4m3fn": jnp.bfloat16,
+    "float8_e4m3fnuz": jnp.bfloat16,
+    "float8_e5m2": jnp.bfloat16,
+    "float8_e5m2fnuz": jnp.bfloat16,
     "float8_e8m0fnu": jnp.float32,
-    "float4_e2m1fn": jnp.float16,
+    "float4_e2m1fn": jnp.bfloat16,
     "int2": jnp.int8,
     "int4": jnp.int8,
     "uint2": jnp.uint8,
