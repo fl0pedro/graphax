@@ -49,7 +49,6 @@ _NARROW_PROMOTION_REP: dict[str, Any] = {
     "float8_e5m2": jnp.bfloat16,
     "float8_e5m2fnuz": jnp.bfloat16,
     "float8_e8m0fnu": jnp.float32,
-    "float4_e2m1fn": jnp.bfloat16,
     # float16 is a STANDARD dtype for JAX, so result_type never raises on it;
     # it is listed here so that `_compute_dtype` replaces a float16 RESULT by
     # float32. float16 storage is fine (one quantized operand against f32
@@ -57,10 +56,6 @@ _NARROW_PROMOTION_REP: dict[str, Any] = {
     # (two float16 operands met, overflowed at 65504 and the TLM gradient was
     # NaN). f32 rather than bf16: float16 carries 10 mantissa bits.
     "float16": jnp.float32,
-    "int2": jnp.int8,
-    "int4": jnp.int8,
-    "uint2": jnp.uint8,
-    "uint4": jnp.uint8,
 }
 
 

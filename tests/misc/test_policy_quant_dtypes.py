@@ -72,7 +72,7 @@ def test_catalog_is_not_trimmed():
 def test_check_policy_quant_dtype_accepts_and_rejects():
     for name in POLICY_QUANT_DTYPES:
         assert check_policy_quant_dtype(name) == name
-    for bad in ("int8", "uint8", "float16", "float4_e2m1fn"):
+    for bad in ("int8", "uint8", "float16", "int16"):
         if bad not in QUANT_DTYPES and bad != "float16":
             continue
         with pytest.raises(ValueError):

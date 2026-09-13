@@ -229,7 +229,7 @@ def test_dtype_attributes_known_values():
         "float8_e5m2": (0, 8, 5, 2, 15, 0, 0),
         "float8_e5m2fnuz": (0, 8, 5, 2, 16, 1, 1),
         "int8": (1, 8, 0, 0, 0, 1, 0),
-        "uint4": (2, 4, 0, 0, 0, 1, 0),
+        "uint8": (2, 8, 0, 0, 0, 1, 0),
     }
     for n, v in expect.items():
         if n in idx:

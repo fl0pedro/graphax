@@ -167,15 +167,22 @@ class Compress:
 # env-side translator (looks the int up to construct a ``Quant``) — same
 # convention as :data:`COMPRESS_KINDS`.
 def _get_quant_dtypes():
-    """The candidate dtype catalog — ENUMERATED, not hand-picked.
+    """The candidate dtype catalog — ENUMERATED, byte-sized and up.
 
-    Every low-precision float ``ml_dtypes`` ships (``float4`` / ``float6`` /
-    ``float8_*``) plus the standard float/int ladder is listed here as a
-    *candidate*. Which candidates this backend can actually store and contract
-    is decided by the runtime scan (:func:`verify_hardware_compat` /
-    :func:`quant_hardware_masks`), never curated in this list — so a new
-    ml_dtypes release widens the catalog for free and an unsupported type is
-    masked out by the scan rather than silently omitted.
+    Every 8-bit float ``ml_dtypes`` ships (``float8_*``) plus the standard
+    float/int ladder is listed here as a *candidate*. Which candidates this
+    backend can actually store and contract is decided by the runtime scan
+    (:func:`verify_hardware_compat` / :func:`quant_hardware_masks`), never
+    curated in this list — so a new ml_dtypes release widens the catalog for
+    free and an unsupported type is masked out by the scan rather than
+    silently omitted.
+
+    NO SUB-BYTE TYPES (owner ruling 2026-09-13): ``float4_*``, ``float6_*``,
+    ``int4`` / ``uint4`` / ``int2`` / ``uint2`` are out of the catalog. XLA
+    stores them in 8-bit containers on the GPU, so they save no memory over
+    int8 / float8, and ``int4`` crashed the XLA compiler with SIGFPE on
+    reverse-order TLM programs on Blackwell (sweep64, probe job 65258).
+    :func:`apply_quant` refuses them by name (:func:`refuse_sub_byte_target`).
     """
     import jax
     import jax.numpy as jnp
@@ -194,22 +201,16 @@ def _get_quant_dtypes():
         jnp.float32, jnp.float16, jnp.bfloat16,
         jnp.int32, jnp.uint32, jnp.int16, jnp.uint16, jnp.int8, jnp.uint8,
     ]
-    # EVERY sub-8-bit / 8-bit float ml_dtypes exposes.
+    # EVERY 8-bit float ml_dtypes exposes. Nothing narrower (see docstring).
     if ml_dtypes is not None:
         for name in sorted(dir(ml_dtypes)):
             if name.startswith("_"):
                 continue
-            if not name.startswith(("float8", "float6", "float4")):
+            if not name.startswith("float8"):
                 continue
             obj = getattr(ml_dtypes, name)
             if isinstance(obj, type):
                 candidates.append(obj)
-    # Sub-byte integers (stored in an int8/uint8 container).
-    for name in ("int4", "uint4", "int2", "uint2"):
-        obj = getattr(ml_dtypes, name, None) if ml_dtypes is not None else None
-        obj = obj if obj is not None else getattr(jnp, name, None)
-        if obj is not None:
-            candidates.append(obj)
 
     # Keep name-resolvable dtypes only, de-duplicated by canonical name in
     # first-seen order (this order is the index space the quant head selects).
@@ -226,7 +227,29 @@ def _get_quant_dtypes():
 
 QUANT_DTYPES = _get_quant_dtypes()
 
-# Narrow dtypes (int4/uint4, float4/6/8, int2) pass a same-dtype ``dot`` but
+#: The sub-byte dtype names the catalog excludes, by prefix / exact name.
+SUB_BYTE_PREFIXES = ("float4", "float6")
+SUB_BYTE_NAMES = ("int4", "uint4", "int2", "uint2")
+
+
+def is_sub_byte_name(name: str) -> bool:
+    n = str(name)
+    return n.startswith(SUB_BYTE_PREFIXES) or n in SUB_BYTE_NAMES
+
+
+def refuse_sub_byte_target(target) -> None:
+    """Raise ``ValueError`` for a sub-byte Quant target. Invalid usage, not a
+    silent skip: the catalog has no such entry and the engine does not
+    quantize below one byte."""
+    name = jnp.dtype(target).name
+    if is_sub_byte_name(name):
+        raise ValueError(
+            f"Quant dtype {name!r} is sub-byte and not supported: the catalog "
+            f"is byte-sized and up (owner ruling 2026-09-13; XLA stores "
+            f"sub-byte types in 8-bit containers, and int4 crashed the XLA "
+            f"compiler on Blackwell). Use int8 / uint8 / a float8 member.")
+
+# Narrow dtypes (float8, int8/uint8 through the scaler) pass a same-dtype ``dot`` but
 # cannot implicitly promote against float32 — and a quantized edge is contracted
 # against edges that were NOT quantized, whose scalar_mult is float32. That used
 # to kill a run inside the measurement callback with "no available implicit
@@ -410,8 +433,8 @@ def _dtype_attributes(name: str) -> tuple[int, int, int, int, int, int, int]:
 
     * ``kind`` ∈ ``{QK_FLOAT, QK_INT, QK_UINT}``.
     * ``bits`` — the LOGICAL width, i.e. the numeric token in the name
-      (``float8`` → 8, ``int4`` → 4, ``bfloat16`` → 16), not the storage
-      container's size (``int4`` is stored in an int8).
+      (``float8`` → 8, ``bfloat16`` → 16, ``float32`` → 32). Every catalog
+      entry is byte-sized, so this equals the storage size.
     * For floats: ``exp`` / ``mantissa`` from ``ml_dtypes.finfo`` and
       ``bias = 1 - finfo.minexp`` (recovers 7 for e4m3fn, 11 for e4m3b11fnuz,
       16 for e5m2fnuz, 127 for float32/bfloat16 — the smallest-normal exponent
@@ -722,10 +745,9 @@ def _reduce_along_axes(val: jnp.ndarray, axes: tuple[int, ...], kind: str):
         moved = jnp.transpose(val, perm)
         flat_shape = moved.shape[: len(keep)] + (-1,)
         flat = moved.reshape(flat_shape)
-        # jaxlib >= 0.11 forbids ``abs`` on sub-byte ints (int4/int2/uint4/...),
-        # which a quantized edge can be. The abs is only used to pick the
-        # arg-extremum, so widen to float32 for the comparison; ``take_along_axis``
-        # against the original ``flat`` keeps the value's dtype and sign.
+        # The abs is only used to pick the arg-extremum, so widen to float32
+        # for the comparison; ``take_along_axis`` against the original ``flat``
+        # keeps the value's dtype and sign.
         abs_flat = jnp.abs(flat.astype(jnp.float32))
         if jnp.issubdtype(flat.dtype, jnp.inexact):
             # GATHER-FREE (#52, 2026-08-04): argmin/argmax + take_along_axis
@@ -741,8 +763,7 @@ def _reduce_along_axes(val: jnp.ndarray, axes: tuple[int, ...], kind: str):
             first = jnp.logical_and(hit, jnp.cumsum(hit, axis=-1) == 1)
             return jnp.sum(jnp.where(first, flat, jnp.zeros((), flat.dtype)),
                            axis=-1)
-        # Integer (incl. sub-byte Quant) vals: ``sum`` is unsupported for
-        # int4-class dtypes — keep the legacy gather-based pick.
+        # Integer vals: keep the gather-based pick (exact for integer codes).
         if kind == "abs_min":
             idx = jnp.argmin(abs_flat, axis=-1, keepdims=True)
         else:
@@ -954,7 +975,7 @@ def _is_scaled_quant_target(target) -> bool:
 
 
 def _is_narrow_float_target(target) -> bool:
-    """Sub-byte-container float targets (float8_* / float6_* / float4_*).
+    """One-byte float targets (float8_*).
 
     Their representable range is tiny (float4_e2m1fn max 6, most float8 max
     448) and their smallest normal is large, so a bare ``astype`` SATURATES a
@@ -1066,6 +1087,7 @@ def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
         )
     if _policy_quant_strict():
         check_policy_quant_dtype(target)
+    refuse_sub_byte_target(target)
     if st.val.dtype == target:
         return st
 

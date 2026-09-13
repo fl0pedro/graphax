@@ -128,7 +128,7 @@ def test_the_2026_09_13_rules_by_example():
     assert _compute_dtype("float16", "float16") == f32    # NaN at 65504 before
     assert _compute_dtype("float16", "float32") == f32
     assert _compute_dtype("bfloat16", "bfloat16") == bf16 # the compute dtype itself
-    for n in ("float8_e4m3fn", "float8_e5m2", "float4_e2m1fn"):
+    for n in ("float8_e4m3fn", "float8_e5m2"):
         if n in NARROW:
             assert _compute_dtype(n, n) == bf16, n        # float8 result, NaN before
             assert _compute_dtype(n, "float32") == f32, n
