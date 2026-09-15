@@ -72,7 +72,21 @@ def ADALIF_SNN(S_in, S_target, U1, U2, U3, a1, a2, a3, W1, W2, W3, alpha, beta, 
     U3, a3, s3 = ada_lif(U3, a3, i3, alpha, beta, rho, thresh)
     return .5*(s3 - S_target)**2, U1, U2, U3, a1, a2, a3
 
-import os as _os
+#: The ``jax.named_scope`` prefix every unrolled time step of a temporal model
+#: in this module carries. One step copy ``t`` of the elimination graph is
+#: exactly the equations whose ``source_info.name_stack`` is ``"snn_step_<t>"``,
+#: and everything outside such a scope is the BASE (the readout that closes the
+#: loss). alphagrad's ``common/temporal_order.py`` reads this name to give every
+#: vertex its step index; the two sides must never spell it differently, so the
+#: name lives here, next to the loop that emits it, and is imported there.
+SNN_STEP_SCOPE = "snn_step"
+
+
+def snn_step_scope(t: int):
+    """The named scope of time step ``t``. Wrap ONE unrolled step body in it."""
+    return jax.named_scope(f"{SNN_STEP_SCOPE}_{int(t)}")
+
+
 def ADALIF_SNN_SEQ(S_in_seq, S_target, U1, U2, U3, a1, a2, a3,
                    W1, W2, W3, alpha, beta, rho, thresh):
     """Temporal 3-layer ADAPTIVE LIF over a spike window ``S_in_seq`` (N, n_in).
@@ -90,31 +104,22 @@ def ADALIF_SNN_SEQ(S_in_seq, S_target, U1, U2, U3, a1, a2, a3,
     N = int(S_in_seq.shape[0])
     loss = 0.0
     for t in range(N):
-        i1 = W1 @ S_in_seq[t]
-        U1, a1, s1 = ada_lif(U1, a1, i1, alpha, beta, rho, thresh)
-        i2 = W2 @ s1
-        U2, a2, s2 = ada_lif(U2, a2, i2, alpha, beta, rho, thresh)
-        i3 = W3 @ s2
-        U3, a3, s3 = ada_lif(U3, a3, i3, alpha, beta, rho, thresh)
-        loss = loss + jnp.mean(0.5 * (s3 - S_target) ** 2)
+        with snn_step_scope(t):
+            i1 = W1 @ S_in_seq[t]
+            U1, a1, s1 = ada_lif(U1, a1, i1, alpha, beta, rho, thresh)
+            i2 = W2 @ s1
+            U2, a2, s2 = ada_lif(U2, a2, i2, alpha, beta, rho, thresh)
+            i3 = W3 @ s2
+            U3, a3, s3 = ada_lif(U3, a3, i3, alpha, beta, rho, thresh)
+            loss = loss + jnp.mean(0.5 * (s3 - S_target) ** 2)
     return loss / N
-
-
-def _snn_trunc():
-    """ALPHAGRAD_SNN_TRUNC: unset->None (full BPTT unroll over all T);
-    0 (or <0)->online (single step in the graph, recurrent carry is a leaf);
-    N>0->truncated window of N steps unrolled into the grad/Jacobian graph."""
-    v = _os.environ.get("ALPHAGRAD_SNN_TRUNC", None)
-    if v is None or v == "":
-        return None
-    return int(v)
 
 
 def LIF_SNN_SHD(S_in_seq, S_target, U1, U2, U3, I1, I2, I3,
                 W1, W2, W3, alpha, beta, thresh):
     """Temporal 3-layer LIF over a spike WINDOW ``S_in_seq`` of shape (N, n_in).
-    N is the REVERSE/Jacobian truncation window (set by the args builder from
-    ALPHAGRAD_SNN_TRUNC). The recurrent carry ENTERING the window (U*, I*) is
+    N is the GRADIENT WINDOW (set by the args builder from alphagrad's
+    ``--target-grad-window``). The recurrent carry ENTERING the window (U*, I*) is
     precomputed by a FULL forward pass over the earlier T-N timesteps (detached),
     so forward activations reflect the whole sequence while ONLY these N steps are
     differentiated. The elimination graph graphax sees is therefore a constant
@@ -123,11 +128,46 @@ def LIF_SNN_SHD(S_in_seq, S_target, U1, U2, U3, I1, I2, I3,
     N = int(S_in_seq.shape[0])
     loss = 0.0
     for t in range(N):
-        i1 = W1 @ S_in_seq[t]
-        U1, I1, s1 = lif_cb(U1, I1, i1, alpha, beta, thresh)
-        i2 = W2 @ s1
-        U2, I2, s2 = lif_cb(U2, I2, i2, alpha, beta, thresh)
-        i3 = W3 @ s2
-        U3, I3, s3 = lif_cb(U3, I3, i3, alpha, beta, thresh)
-        loss = loss + jnp.mean(0.5 * (s3 - S_target) ** 2)
+        with snn_step_scope(t):
+            i1 = W1 @ S_in_seq[t]
+            U1, I1, s1 = lif_cb(U1, I1, i1, alpha, beta, thresh)
+            i2 = W2 @ s1
+            U2, I2, s2 = lif_cb(U2, I2, i2, alpha, beta, thresh)
+            i3 = W3 @ s2
+            U3, I3, s3 = lif_cb(U3, I3, i3, alpha, beta, thresh)
+            loss = loss + jnp.mean(0.5 * (s3 - S_target) ** 2)
+    return loss / N
+
+
+def ADALIF_SNN_SHD(S_in_seq, S_target, U1, U2, U3, a1, a2, a3,
+                   W1, W2, W3, alpha, beta, rho, thresh):
+    """The ADAPTIVE-LIF twin of :func:`LIF_SNN_SHD`, same contract.
+
+    Temporal 3-layer adaptive LIF over a spike WINDOW ``S_in_seq`` of shape
+    ``(N, n_in)``. ``N`` is the GRADIENT WINDOW: the steps BEFORE it are run by
+    the args builder as a detached forward pass and reach this function only as
+    the carry ``(U*, a*)``, so the elimination graph is a constant BASE plus
+    ``N`` per-step blocks -- exactly the truncated-BPTT shape LIF_SNN_SHD has.
+
+    The cell is :func:`ada_lif` (Bellec et al. e-prop), the same cell
+    :func:`ADALIF_SNN` and :func:`ADALIF_SNN_SEQ` use, so the adaptation state
+    ``a*`` replaces LIF's synaptic current ``I*`` and one extra decay ``rho``
+    joins the signature. The WEIGHTS STAY AT ARGS 8/9/10, so ``--argnums
+    8,9,10`` is the same on every member of this family.
+
+    Every step body sits in its own :func:`snn_step_scope`, so the elimination
+    graph's vertices carry their step index and the temporal order constraint
+    can read it. Returns the scalar mean readout loss.
+    """
+    N = int(S_in_seq.shape[0])
+    loss = 0.0
+    for t in range(N):
+        with snn_step_scope(t):
+            i1 = W1 @ S_in_seq[t]
+            U1, a1, s1 = ada_lif(U1, a1, i1, alpha, beta, rho, thresh)
+            i2 = W2 @ s1
+            U2, a2, s2 = ada_lif(U2, a2, i2, alpha, beta, rho, thresh)
+            i3 = W3 @ s2
+            U3, a3, s3 = ada_lif(U3, a3, i3, alpha, beta, rho, thresh)
+            loss = loss + jnp.mean(0.5 * (s3 - S_target) ** 2)
     return loss / N
