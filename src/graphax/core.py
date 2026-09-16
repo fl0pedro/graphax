@@ -486,6 +486,22 @@ def jacve(
             dense edges under ``dense_edges=True``; ``None`` takes
             :data:`graphax.dense_edges.DEFAULT_MAX_BYTES` (2 GiB). Over the
             ceiling raises instead of letting the job be killed.
+        face_transforms (dict, optional): PER-FACE approximations, as a
+            mapping with TWO levels::
+
+                {vertex: {face_key: (lhs, rhs, res)}}
+
+            The outer key is the 1-based vertex; the inner key is the pair
+            :func:`faces_of` returns for that vertex, enumerated on the graph
+            state IMMEDIATELY before that vertex is eliminated. A flat
+            ``{face_key: slots}`` dict is the natural mistake -- it is what
+            ``faces_of`` hands you -- and it matches no vertex, so it RAISES
+            here rather than dropping every approximation in silence. A
+            request that matches no face raises as well, after the
+            elimination. The per-vertex ``transforms`` argument also accepts a
+            dict per vertex, but that one is keyed by the ELIMINATOR's own
+            ``(in_eqn_id, out_eqn_id)`` pair, which is a different index;
+            ``faces_of``'s keys belong to ``face_transforms``.
 
     Returns:
         Callable: The function that returns the Jacobian of `fun`.
@@ -1144,6 +1160,133 @@ class _SkipFace:
 
 
 SKIP_FACE = _SkipFace()
+
+
+class FaceRequest(dict):
+    """ONE vertex's ``{face_key: slots}`` request, with a HIT RECORD.
+
+    :func:`vertex_elimination_jaxpr` wraps every inner dict of a
+    ``face_transforms`` mapping in this class before the elimination runs, and
+    checks the hit record afterwards. The wrapper exists for one reason: an
+    approximation that is REQUESTED and never APPLIED must not pass in
+    silence. See :func:`check_face_transforms`.
+    """
+
+    __slots__ = ("hit",)
+
+    def __init__(self, mapping=()):
+        super().__init__(mapping)
+        self.hit = set()
+
+    def get(self, key, default=None):
+        if dict.__contains__(self, key):
+            self.hit.add(key)
+            return dict.__getitem__(self, key)
+        return default
+
+
+def _is_face_key(key) -> bool:
+    """Is ``key`` an INNER (face) key -- a ``(in_vidx, out_vidx)`` pair?"""
+    return (isinstance(key, (tuple, list)) and len(key) == 2
+            and all(isinstance(_x, (int, np.integer)) or _x is None
+                    for _x in key))
+
+
+def check_face_transforms(face_transforms, *, site: str = "jacve"):
+    """Validate the SHAPE of a ``face_transforms`` argument, or raise.
+
+    THE NESTING IS THE TRAP, and it used to be a silent one.
+    ``face_transforms`` is ``{vertex: {face_key: slots}}`` -- TWO levels. But
+    the thing a caller has in hand is :func:`faces_of`'s output, which is the
+    list of INNER keys, so the natural mistake is to build the FLAT
+    ``{face_key: slots}`` dict and hand that to :func:`jacve`. Every lookup in
+    the elimination is then ``face_transforms.get(vertex)``, no vertex is ever
+    a pair, and the whole request evaporates: measured on 2026-09-16
+    (job 65975) twelve requested ``Diag`` hooks produced ZERO hook calls and a
+    bit-identical gradient. An approximation asked for and not applied is
+    exactly what "nothing skips silently" forbids, so the flat form raises
+    here instead.
+
+    Returns the mapping with every inner dict wrapped in :class:`FaceRequest`,
+    or ``None`` / the original falsy value unchanged.
+    """
+    if not face_transforms:
+        return face_transforms
+    if not isinstance(face_transforms, dict):
+        raise TypeError(
+            f"{site}: face_transforms must be a dict "
+            f"{{vertex: {{face_key: slots}}}}, got "
+            f"{type(face_transforms).__name__}.")
+    out = {}
+    for _v, _faces in face_transforms.items():
+        if _is_face_key(_v):
+            raise ValueError(
+                f"{site}: face_transforms is keyed by a FACE KEY {_v!r}, not "
+                f"by a vertex. The mapping has TWO levels -- "
+                f"{{vertex: {{face_key: slots}}}} -- and `faces_of` returns "
+                f"the INNER keys only. A flat {{face_key: slots}} dict "
+                f"matches no vertex, so every approximation in it would be "
+                f"dropped in silence. Group the keys by the vertex they were "
+                f"enumerated on.")
+        if not (isinstance(_v, (int, np.integer)) and not isinstance(_v, bool)):
+            raise ValueError(
+                f"{site}: face_transforms key {_v!r} "
+                f"({type(_v).__name__}) is not a vertex id. The outer key is "
+                f"the 1-based vertex the faces belong to.")
+        if _faces is None:
+            continue
+        if _faces is SKIP_FACE or not isinstance(_faces, dict):
+            raise ValueError(
+                f"{site}: face_transforms[{int(_v)}] is {_faces!r}, not a "
+                f"{{face_key: slots}} dict. A vertex maps to its FACES; the "
+                f"slots triple sits one level further in. Pass "
+                f"{{{int(_v)}: {{face_key: slots}}}}, or use the per-vertex "
+                f"`transforms` argument for a whole-vertex transform.")
+        for _k in _faces:
+            if not _is_face_key(_k):
+                raise ValueError(
+                    f"{site}: face_transforms[{int(_v)}] has key {_k!r}, "
+                    f"which is not a face key. A face key is the pair "
+                    f"`(vidx[in_edge], vidx[out_edge])` that `faces_of` "
+                    f"returns for this vertex, on the graph state "
+                    f"IMMEDIATELY before it is eliminated.")
+        out[int(_v)] = FaceRequest(_faces)
+    return out
+
+
+def report_unapplied_face_transforms(face_transforms, *, site: str = "jacve"):
+    """Raise when a whole vertex's face request matched NOTHING.
+
+    Called after the elimination, on the mapping :func:`check_face_transforms`
+    returned. A vertex whose request is non-empty and whose hit record is
+    empty was never looked up at all: either it is not in the order, or its
+    keys were enumerated on a different graph state (``faces_of`` must be
+    called immediately before that vertex's own elimination, because every
+    elimination rewires the graph).
+
+    PARTIAL misses are NOT an error. :func:`faces_of` is a documented SUPERSET
+    of the faces the elimination visits -- an unevaluated ``LazyEdge`` is
+    listed optimistically and may force to ``None`` -- so a request that lands
+    on some of a vertex's faces and not all of them is legitimate.
+    """
+    if not face_transforms:
+        return
+    dead = [int(_v) for _v, _faces in face_transforms.items()
+            if isinstance(_faces, FaceRequest) and _faces and not _faces.hit]
+    if not dead:
+        return
+    _v0 = dead[0]
+    raise ValueError(
+        f"{site}: the face transforms requested for "
+        f"{'vertices' if len(dead) > 1 else 'vertex'} {dead} were never "
+        f"applied -- the elimination looked up none of their face keys. "
+        f"Vertex {_v0} asked for "
+        f"{sorted(face_transforms[_v0].keys())[:8]}. Either the vertex is "
+        f"not in the elimination order, or the keys come from a different "
+        f"graph state: `faces_of` has to be called on the graph the vertex "
+        f"is about to be eliminated on, because every elimination rewires "
+        f"the graph. Nothing is applied in silence here (owner rule).")
+
 
 
 def _record_micro(_t, before, after, vertex, slot, in_edge, out_edge,
@@ -3230,8 +3373,20 @@ class VertexEliminator:
         # dict is the face-like per-path spec (kept as-is); a sequence is the
         # legacy per-vertex transform list.
         t_dict: Dict[int, object] = {}
+        _t_requests: Dict[int, object] = {}
         for v, ts in (transforms or ()):
-            t_dict[int(v)] = ts if isinstance(ts, dict) else tuple(ts)
+            if isinstance(ts, dict):
+                # THE PER-VERTEX DICT FORM IS KEYED DIFFERENTLY FROM
+                # ``face_transforms``. Its keys are
+                # ``(var_vid[in_edge], var_vid[out_edge])`` -- the eqn-position
+                # ids built just below, with a graph input at
+                # ``-(invar_index + 1)`` -- NOT the stable-var-index pair
+                # ``faces_of`` returns. Handing it ``faces_of``'s keys matches
+                # nothing. Wrapped so a request that matches nothing raises
+                # instead of running exact in silence.
+                t_dict[int(v)] = _t_requests[int(v)] = FaceRequest(ts)
+            else:
+                t_dict[int(v)] = tuple(ts)
 
         # Var -> integer vertex-id map so per-path dicts keyed by
         # (primal_vertex_id, out_vertex_id) resolve during elimination: a
@@ -3351,6 +3506,8 @@ class VertexEliminator:
 
         graph = m_graph.finish()
         transpose_graph = m_transpose_graph.finish()
+        report_unapplied_face_transforms(
+            _t_requests, site="transforms (the per-vertex dict form)")
         return graph, transpose_graph, adds, muls, fmas, mem, counts
 
 
@@ -3445,6 +3602,11 @@ def vertex_elimination_jaxpr(
     # not a flag threaded through ``_eliminate_vertex``. Nothing below runs, and
     # no line below changed, so ``dense_edges=False`` is bit-identical by
     # construction.
+    # THE NESTING, CHECKED BEFORE ANYTHING RUNS. A flat {face_key: slots}
+    # dict matches no vertex and used to evaporate in silence (job 65975).
+    face_transforms = check_face_transforms(
+        face_transforms, site="vertex_elimination_jaxpr")
+
     if dense_edges:
         if sparse_representation:
             raise ValueError(
@@ -3453,7 +3615,7 @@ def vertex_elimination_jaxpr(
                 "array. Drop sparse_representation.")
         from .dense_edges import dense_vertex_elimination
 
-        return dense_vertex_elimination(
+        _dense_out = dense_vertex_elimination(
             jaxpr,
             order,
             consts,
@@ -3465,6 +3627,9 @@ def vertex_elimination_jaxpr(
             face_transforms=face_transforms,
             max_bytes=dense_max_bytes,
         )
+        report_unapplied_face_transforms(
+            face_transforms, site="vertex_elimination_jaxpr(dense_edges=True)")
+        return _dense_out
 
     jaxpr_invars = [invar for i, invar in enumerate(jaxpr.invars) if i in argnums]
     env, _, _, vo_vertices = _build_graph(jaxpr, args, consts)
@@ -3484,6 +3649,11 @@ def vertex_elimination_jaxpr(
         order, jaxpr, transforms, vo_vertices, count_ops,
         face_transforms=face_transforms,
     )
+    # EVERY REQUEST IS ACCOUNTED FOR. A vertex whose faces were never looked
+    # up asked for an approximation that did not happen, and that must not
+    # pass for a clean run.
+    report_unapplied_face_transforms(
+        face_transforms, site="vertex_elimination_jaxpr")
 
     # Offloading all remaining Jacobian transforms to the output variables
     # before densification! Mutate via a single .mutate() proxy on the outer
