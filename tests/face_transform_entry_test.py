@@ -159,3 +159,69 @@ def test_the_exact_path_is_untouched():
                     jax.tree_util.tree_leaves(ref)):
         np.testing.assert_allclose(np.asarray(a), np.asarray(e),
                                    rtol=1e-6, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# A TOTAL DEAD-EDGE MISS IS NOT A WRONG KEY (defect found 2026-09-16)
+#
+# The guard used to read the HIT record, which counts the faces the
+# elimination CONTRACTED. A face whose edge Jacobian forces to None is walked
+# to and skipped before any lookup, so a vertex whose only face is such a one
+# looked exactly like a caller with a wrong key. The measured live-face
+# occupancy of this project is about 1.24 faces per vertex, so a one-face
+# vertex is the normal case and the guard fired on real plans: job 66101, a
+# three-episode run on the recurrent SHD target, refused EVERY plan the
+# policy emitted and measured nothing. The guard reads the ENUMERATED record
+# now, which is the question it was always asking.
+# ---------------------------------------------------------------------------
+
+def _dead_fun(a, b):
+    """``b``'s path into the product is blocked, so one edge forces to None."""
+    c = jnp.sin(a) * jax.lax.stop_gradient(jnp.tanh(b))
+    return jnp.sum(jnp.cos(c) + b)
+
+
+def _dead_order_and_keys():
+    cj = jax.make_jaxpr(_dead_fun)(A, B)
+    jx, consts = _inline_call_primitives(cj.jaxpr, cj.literals)
+    valid = [i for i, e in enumerate(jx.eqns, 1)
+             if e.outvars[0] not in jx.outvars]
+    order = sorted(valid, reverse=True)
+    ij = IncrementalJaxpr(jx, (0, 1), list(consts), [A, B], track_faces=False)
+    keys = {}
+    for v in order:
+        keys[v] = list(faces_of(ij.graph, ij.tgraph, int(v), jx))
+        ij.eliminate(v, (), None)
+    return order, keys
+
+
+def test_a_request_on_a_face_the_elimination_finds_dead_does_not_raise():
+    """`faces_of` lists an unevaluated LazyEdge optimistically and cannot
+    force it, so the caller cannot know. Asking for every face of every
+    vertex is what a per-face policy does, and it must not raise."""
+    order, keys = _dead_order_and_keys()
+    fired: list = []
+    ft = {v: {k: (_counting_hook(fired, (v, k)), None, None)
+              for k in ks}
+          for v, ks in keys.items() if ks}
+    assert ft, "the probe function has no faces to ask for"
+    jacve(_dead_fun, order, argnums=(0, 1), face_transforms=ft)(A, B)
+
+
+def test_every_vertex_asked_for_one_face_only_still_does_not_raise():
+    """The one-face vertex is the case the HIT record got wrong."""
+    order, keys = _dead_order_and_keys()
+    fired: list = []
+    ft = {v: {ks[0]: (_counting_hook(fired, v), None, None)}
+          for v, ks in keys.items() if ks}
+    jacve(_dead_fun, order, argnums=(0, 1), face_transforms=ft)(A, B)
+
+
+def test_a_key_that_was_never_enumerated_still_raises():
+    """The fault the guard exists for is untouched: a key from another graph
+    state, or a vertex that is not in the order."""
+    order, keys = _dead_order_and_keys()
+    v = next(v for v, ks in keys.items() if ks)
+    with pytest.raises(ValueError, match="were never applied"):
+        jacve(_dead_fun, order, argnums=(0, 1),
+              face_transforms={v: {(4242, 4343): (None, None, None)}})(A, B)

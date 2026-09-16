@@ -1170,19 +1170,52 @@ class FaceRequest(dict):
     checks the hit record afterwards. The wrapper exists for one reason: an
     approximation that is REQUESTED and never APPLIED must not pass in
     silence. See :func:`check_face_transforms`.
+
+    TWO RECORDS, AND THEY ANSWER DIFFERENT QUESTIONS.
+
+    ``hit``  the keys the elimination LOOKED UP, which is the subset of the
+             faces it actually contracted.
+    ``seen`` the keys the elimination ENUMERATED, which also covers a face it
+             walked to and then SKIPPED because one of its two edge Jacobians
+             forced to ``None``.
+
+    The guard reads ``seen``. A face whose edge is dead is not a wrong key and
+    not a silent drop: there is no contraction there to approximate, and
+    ``faces_of`` lists it anyway because an unevaluated ``LazyEdge`` cannot be
+    forced during enumeration. A key that was never ENUMERATED is the real
+    fault -- the vertex is not in the order, or the keys come from another
+    graph state -- and that is what raises.
     """
 
-    __slots__ = ("hit",)
+    __slots__ = ("hit", "seen")
 
     def __init__(self, mapping=()):
         super().__init__(mapping)
         self.hit = set()
+        self.seen = set()
 
     def get(self, key, default=None):
         if dict.__contains__(self, key):
             self.hit.add(key)
+            self.seen.add(key)
             return dict.__getitem__(self, key)
         return default
+
+    def note_enumerated(self, key) -> None:
+        """This face was walked to, whether or not it was contracted."""
+        if dict.__contains__(self, key):
+            self.seen.add(key)
+
+    def note_dead_out_edge(self, out_idx) -> None:
+        """Every face of this out edge was walked to and found dead.
+
+        The elimination leaves the out-edge loop before it forms a single
+        ``(in, out)`` pair there, so the pairs are marked from the request's
+        own keys rather than from a second walk of the graph.
+        """
+        for _k in self:
+            if _k[1] == out_idx:
+                self.seen.add(_k)
 
 
 def _is_face_key(key) -> bool:
@@ -1255,12 +1288,12 @@ def check_face_transforms(face_transforms, *, site: str = "jacve"):
 
 
 def report_unapplied_face_transforms(face_transforms, *, site: str = "jacve"):
-    """Raise when a whole vertex's face request matched NOTHING.
+    """Raise when a whole vertex's face request was never ENUMERATED.
 
     Called after the elimination, on the mapping :func:`check_face_transforms`
-    returned. A vertex whose request is non-empty and whose hit record is
-    empty was never looked up at all: either it is not in the order, or its
-    keys were enumerated on a different graph state (``faces_of`` must be
+    returned. A vertex none of whose requested keys the elimination even
+    walked to was never addressed at all: either it is not in the order, or
+    its keys were enumerated on a different graph state (``faces_of`` must be
     called immediately before that vertex's own elimination, because every
     elimination rewires the graph).
 
@@ -1268,18 +1301,31 @@ def report_unapplied_face_transforms(face_transforms, *, site: str = "jacve"):
     of the faces the elimination visits -- an unevaluated ``LazyEdge`` is
     listed optimistically and may force to ``None`` -- so a request that lands
     on some of a vertex's faces and not all of them is legitimate.
+
+    A TOTAL DEAD-EDGE MISS IS NOT AN ERROR EITHER, and reading ``hit`` rather
+    than ``seen`` made it one. The measured live-face occupancy of this
+    project is about 1.24 faces per vertex, so a vertex with ONE listed face
+    is the normal case; when that one face's edge Jacobian forces to ``None``
+    the elimination walks to it, skips it, looks up nothing, and the guard
+    fired on a caller that had done nothing wrong. MEASURED 2026-09-16, job
+    66101: a three-episode run on the recurrent SHD target had every real
+    policy plan refused with "the face transforms requested for vertices
+    [...] were never applied", on arms with no carry container at all, so no
+    plan was ever measured. The request is now checked against the keys the
+    elimination ENUMERATED, which is the question the guard was always asking.
     """
     if not face_transforms:
         return
     dead = [int(_v) for _v, _faces in face_transforms.items()
-            if isinstance(_faces, FaceRequest) and _faces and not _faces.hit]
+            if isinstance(_faces, FaceRequest) and _faces
+            and not (set(_faces) & _faces.seen)]
     if not dead:
         return
     _v0 = dead[0]
     raise ValueError(
         f"{site}: the face transforms requested for "
         f"{'vertices' if len(dead) > 1 else 'vertex'} {dead} were never "
-        f"applied -- the elimination looked up none of their face keys. "
+        f"applied -- the elimination ENUMERATED none of their face keys. "
         f"Vertex {_v0} asked for "
         f"{sorted(face_transforms[_v0].keys())[:8]}. Either the vertex is "
         f"not in the elimination order, or the keys come from a different "
@@ -2313,6 +2359,13 @@ def _eliminate_vertex(
             return keys
         return sorted(keys, key=lambda v: _vidx.get(v, 1 << 30))
 
+    # THE REQUEST RECORDS WHAT WAS ENUMERATED, NOT ONLY WHAT WAS CONTRACTED.
+    # A face whose edge Jacobian forces to ``None`` is walked to and skipped
+    # below, before any lookup, and a vertex whose only face is such a one
+    # would otherwise look to the after-the-fact guard exactly like a caller
+    # with a wrong key. See :class:`FaceRequest`.
+    _req = face_transforms if isinstance(face_transforms, FaceRequest) else None
+
     for central_var in eqn.outvars:
         if central_var not in graph:
             continue  # dead or already-eliminated vertex
@@ -2320,6 +2373,8 @@ def _eliminate_vertex(
         for out_edge in _ordered(graph[central_var].keys()):
             _post_raw = _force(graph[central_var][out_edge])
             if _post_raw is None:
+                if _req is not None:
+                    _req.note_dead_out_edge(_vidx.get(out_edge))
                 continue  # no Jacobian for this out-edge; skip
             # ``_post_raw`` / ``_pre_raw`` come straight from the memoized
             # ``_force`` cache; ``post_val`` / ``pre_val`` only READ them (their
@@ -2332,6 +2387,9 @@ def _eliminate_vertex(
             for in_edge in _ordered(transpose_graph[central_var].keys()):
                 _pre_raw = _force(transpose_graph[central_var][in_edge])
                 if _pre_raw is None:
+                    if _req is not None:
+                        _req.note_enumerated(
+                            (_vidx.get(in_edge), _vidx.get(out_edge)))
                     continue  # no Jacobian (e.g. stop_gradient blocks grad); skip
                 pre_val = _pre_raw
                 if _face_sink is not None:
