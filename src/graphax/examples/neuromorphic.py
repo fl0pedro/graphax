@@ -117,106 +117,6 @@ class snn_carry_scope:
         return self._outer.__exit__(*exc)
 
 
-#: WHICH CARRIED JACOBIAN BLOCKS A THREE-LAYER SHD TARGET TAKES, in the order
-#: the varargs of :func:`LIF_SNN_SHD` / :func:`ADALIF_SNN_SHD` carry them.
-#:
-#: Each entry is ``(state slot, weight slot)``. The state slot indexes the SIX
-#: carried states in the order the signature lists them -- ``U1, U2, U3`` then
-#: ``a1, a2, a3`` (``I1, I2, I3`` for the LIF twin) -- and the weight slot
-#: indexes ``W1, W2, W3``. Block ``(s, w)`` holds ``d state_s / d W_w`` at the
-#: step the window starts, so its shape is ``state_shape + W_w.shape``.
-#:
-#: WHY TWELVE AND NOT EIGHTEEN. The three layers are feed-forward in space, so
-#: ``W2`` and ``W3`` cannot reach layer 1 and ``W3`` cannot reach layer 2: six
-#: of the eighteen blocks are STRUCTURALLY zero and are not carried. The other
-#: twelve are the exact influence matrix of one RTRL step, so a plan built on
-#: them reproduces the gradient through the WHOLE prefix, not a truncation.
-#:
-#: THE BLOCK DIAGONAL of this set -- ``(U1,W1) (a1,W1) (U2,W2) (a2,W2)
-#: (U3,W3) (a3,W3)`` -- is what e-prop keeps; the other six are the
-#: cross-layer coupling Zenke and Neftci's block-diagonal approximation drops.
-SHD_CARRY_BLOCKS: tuple[tuple[int, int], ...] = (
-    (0, 0),                  # U1 <- W1
-    (1, 0), (1, 1),          # U2 <- W1, W2
-    (2, 0), (2, 1), (2, 2),  # U3 <- W1, W2, W3
-    (3, 0),                  # a1 (I1) <- W1
-    (4, 0), (4, 1),          # a2 (I2) <- W1, W2
-    (5, 0), (5, 1), (5, 2),  # a3 (I3) <- W1, W2, W3
-)
-
-#: The block-diagonal subset of :data:`SHD_CARRY_BLOCKS`: the within-layer
-#: blocks, which is exactly what an e-prop eligibility trace carries.
-SHD_CARRY_DIAGONAL_BLOCKS: tuple[tuple[int, int], ...] = (
-    (0, 0), (1, 1), (2, 2), (3, 0), (4, 1), (5, 2),
-)
-
-
-def attach_carried_jacobians(states, weights, carried):
-    """Give every carried state an EDGE to the weights, valued by ``carried``.
-
-    ``states`` are the six carried states in signature order and ``weights``
-    are ``(W1, W2, W3)``. ``carried`` is either empty -- backpropagation
-    through time, nothing is emitted and the graph is the one this module
-    always built -- or the FIFTEEN entries
-
-        ``(W1_ref, W2_ref, W3_ref, J_0, ..., J_11)``
-
-    where ``W*_ref`` is a bit-for-bit copy of the matching weight that is NOT
-    differentiated, and ``J_k`` is the block :data:`SHD_CARRY_BLOCKS` names at
-    position ``k``.
-
-    The returned states have the SAME VALUES, bit for bit, and a Jacobian with
-    respect to the weights that is exactly the carried one.
-
-    HOW, and why this shape. The attachment is
-
-        ``dW_w   = W_w - W_w_ref``
-        ``state_s <- state_s + tensordot(J_sw, dW_w)``
-
-    ``W_w - W_w_ref`` is EXACTLY zero, so no forward value moves and a
-    backpropagation-through-time run and a real-time-recurrent-learning run of
-    the same recording see the same loss to the last bit. What it does move is
-    the GRAPH: the subtraction is a vertex whose edge from ``W_w`` is the
-    identity, the contraction is a vertex whose edge from it is ``J_sw``, and
-    the addition is the carried state the window's first step reads.
-    Eliminating the contraction vertex is ONE RTRL STEP -- it multiplies the
-    carried Jacobian by the state-to-state Jacobian the step body supplies --
-    and that face is where an e-prop-like approximation lives.
-
-    WHY A REFERENCE ARGUMENT AND NOT ``stop_gradient``. Both give an exactly
-    zero delta. ``stop_gradient`` would add three equations that carry no edge
-    at all, and an edge-free equation is still a VERTEX the policy has to
-    choose and eliminate for nothing. The reference weights sit outside
-    ``argnums``, so graphax's forward pruning gives them no edge and they add
-    no vertex.
-    """
-    if not carried:
-        return tuple(states)
-    n = len(SHD_CARRY_BLOCKS)
-    if len(carried) != 3 + n:
-        raise ValueError(
-            f"a carried-Jacobian attachment needs three reference weights and "
-            f"then exactly {n} blocks, in the order of "
-            f"graphax.examples.neuromorphic.SHD_CARRY_BLOCKS, so {3 + n} "
-            f"entries; got {len(carried)}. Six of the eighteen (state, weight) "
-            f"pairs are structurally zero and are the ones left out, so a "
-            f"shorter tuple is an approximation, not a saving.")
-    refs, blocks = carried[:3], carried[3:]
-    out = list(states)
-    with snn_carry_scope():
-        # One delta per weight, shared by every block that reads it. The value
-        # is exactly 0.0 and the edge to the weight is the identity.
-        deltas = [W - R for W, R in zip(weights, refs)]
-        for (s, w), J in zip(SHD_CARRY_BLOCKS, blocks):
-            want = tuple(out[s].shape) + tuple(weights[w].shape)
-            if tuple(J.shape) != want:
-                raise ValueError(
-                    f"carried block (state {s}, weight {w}) has shape "
-                    f"{tuple(J.shape)}; d state / d W is {want}")
-            out[s] = out[s] + jnp.tensordot(J, deltas[w], 2)
-    return tuple(out)
-
-
 def ADALIF_SNN_SEQ(S_in_seq, S_target, U1, U2, U3, a1, a2, a3,
                    W1, W2, W3, alpha, beta, rho, thresh):
     """Temporal 3-layer ADAPTIVE LIF over a spike window ``S_in_seq`` (N, n_in).
@@ -246,7 +146,7 @@ def ADALIF_SNN_SEQ(S_in_seq, S_target, U1, U2, U3, a1, a2, a3,
 
 
 def LIF_SNN_SHD(S_in_seq, S_target, U1, U2, U3, I1, I2, I3,
-                W1, W2, W3, alpha, beta, thresh, *carried):
+                W1, W2, W3, alpha, beta, thresh):
     """Temporal 3-layer LIF over a spike WINDOW ``S_in_seq`` of shape (N, n_in).
     N is the GRADIENT WINDOW (set by the args builder from alphagrad's
     ``--target-grad-window``). The recurrent carry ENTERING the window (U*, I*) is
@@ -256,12 +156,8 @@ def LIF_SNN_SHD(S_in_seq, S_target, U1, U2, U3, I1, I2, I3,
     base + N * per-step block (truncated BPTT): online (N=1) is smallest, full
     (N=T) largest. Returns the scalar mean readout loss (differentiate W @ 8,9,10).
 
-    ``carried`` is EMPTY for backpropagation through time and holds the twelve
-    :data:`SHD_CARRY_BLOCKS` for real-time recurrent learning; see
-    :func:`attach_carried_jacobians`."""
+"""
     N = int(S_in_seq.shape[0])
-    U1, U2, U3, I1, I2, I3 = attach_carried_jacobians(
-        (U1, U2, U3, I1, I2, I3), (W1, W2, W3), carried)
     loss = 0.0
     for t in range(N):
         with snn_step_scope(t):
@@ -276,7 +172,7 @@ def LIF_SNN_SHD(S_in_seq, S_target, U1, U2, U3, I1, I2, I3,
 
 
 def ADALIF_SNN_SHD(S_in_seq, S_target, U1, U2, U3, a1, a2, a3,
-                   W1, W2, W3, alpha, beta, rho, thresh, *carried):
+                   W1, W2, W3, alpha, beta, rho, thresh):
     """The ADAPTIVE-LIF twin of :func:`LIF_SNN_SHD`, same contract.
 
     Temporal 3-layer adaptive LIF over a spike WINDOW ``S_in_seq`` of shape
@@ -294,18 +190,8 @@ def ADALIF_SNN_SHD(S_in_seq, S_target, U1, U2, U3, a1, a2, a3,
     Every step body sits in its own :func:`snn_step_scope`, so the elimination
     graph's vertices carry their step index and the temporal order constraint
     can read it. Returns the scalar mean readout loss.
-
-    ``carried`` SELECTS THE TEMPORAL RULE. Empty (the default) is
-    backpropagation through time: the carry enters as a constant and the
-    gradient is the truncated one. The twelve :data:`SHD_CARRY_BLOCKS` make it
-    real-time recurrent learning: the carried influence matrix enters as a
-    given edge from the weights to the carried state, so eliminating that
-    vertex is one RTRL step and the gradient is exact through the WHOLE
-    prefix. See :func:`attach_carried_jacobians`.
     """
     N = int(S_in_seq.shape[0])
-    U1, U2, U3, a1, a2, a3 = attach_carried_jacobians(
-        (U1, U2, U3, a1, a2, a3), (W1, W2, W3), carried)
     loss = 0.0
     for t in range(N):
         with snn_step_scope(t):
@@ -317,3 +203,214 @@ def ADALIF_SNN_SHD(S_in_seq, S_target, U1, U2, U3, a1, a2, a3,
             U3, a3, s3 = ada_lif(U3, a3, i3, alpha, beta, rho, thresh)
             loss = loss + jnp.mean(0.5 * (s3 - S_target) ** 2)
     return loss / N
+
+
+# ===========================================================================
+# THE RECURRENT SHD STEP (owner ruling 2026-09-16)
+#
+# ONE recurrent step is the whole elimination graph. Its inputs are the
+# weights, the carried state ``s_(t-1)`` and the input frame ``x_t``; its
+# outputs are ``s_t`` and the step loss. Temporal credit does NOT enter as
+# more step copies. It enters as EDGES WITH GIVEN VALUES, computed numerically
+# outside the graph over the whole untouched recording:
+#
+#   tbptt  no temporal edge. ``s_(t-1)`` is a constant. Truncated, spatial
+#          only. The baseline.
+#   bptt   the FUTURE feeds in. An edge from ``s_t`` to the loss carries the
+#          adjoint ``lambda_(t+1) = dL_(>t)/ds_t`` from a detached backward
+#          pass over the suffix. The graph's gradient is the exact per-step
+#          contribution of full backpropagation through time.
+#   rtrl   the PAST feeds in. An edge ``W -> s_(t-1)`` carries
+#          ``J_(t-1) = ds_(t-1)/dW`` from a detached pass over the prefix.
+#          Eliminating that vertex multiplies ``J_(t-1)`` through
+#          ``A_t = ds_t/ds_(t-1)``, which is one step of real-time recurrent
+#          learning, and the gradient is exact through the whole prefix.
+#
+# THE MODEL is the recurrent spiking network of Zenke and Neftci (arXiv
+# 2010.11931). Its architecture, surrogate and weight init are the ones of
+# Zenke's public SpyTorch tutorial 4, which is the SHD network of that paper
+# (github.com/fzenke/spytorch, notebooks/SpyTorchTutorial4.ipynb):
+# 700 inputs, a RECURRENTLY connected hidden layer, 20 outputs, a leaky
+# non-spiking readout, ``SurrGradSpike.scale = 100``, and
+# ``std = 0.2 / sqrt(fan_in)``. The threshold adaptation is Bellec et al.'s
+# ALIF, which is the adaptive unit Zenke and Neftci write their e-prop-like
+# rule for. The decay constants belong to the caller, because the time step
+# here is the SHD loader's 10 ms bin and not Zenke's 1 ms.
+#
+# WHY THE RECURRENT WEIGHTS MATTER. With ``V`` present, ``A_t`` has
+# off-diagonal terms: hidden unit i at step t sees hidden unit j at step t-1.
+# So the carried Jacobian is NOT block diagonal, and e-prop's drop of that
+# coupling is a real approximation the policy can find. Without ``V`` the
+# block diagonal is exact and there is nothing to learn.
+# ===========================================================================
+
+#: The five carried state components, in the order the signature lists them.
+RSNN_STATE_NAMES: tuple[str, ...] = ("S", "I", "U", "a", "Uo")
+
+#: The three weight matrices, in the order the signature lists them.
+RSNN_WEIGHT_NAMES: tuple[str, ...] = ("W", "V", "Wo")
+
+#: Which ``(state, weight)`` blocks of the carried Jacobian are carried, in
+#: the order the varargs hold them. The readout weight ``Wo`` feeds NOTHING
+#: back, so the four blocks ``(S, Wo) (I, Wo) (U, Wo) (a, Wo)`` are
+#: structurally zero and are not carried. The other eleven are the whole
+#: influence matrix of one RTRL step.
+RSNN_CARRY_BLOCKS: tuple[tuple[int, int], ...] = (
+    (0, 0), (0, 1),          # S  <- W, V
+    (1, 0), (1, 1),          # I  <- W, V
+    (2, 0), (2, 1),          # U  <- W, V
+    (3, 0), (3, 1),          # a  <- W, V
+    (4, 0), (4, 1), (4, 2),  # Uo <- W, V, Wo
+)
+
+#: The four blocks that cannot be non-zero. A builder asserts they are zero
+#: rather than assuming it.
+RSNN_ZERO_BLOCKS: tuple[tuple[int, int], ...] = (
+    (0, 2), (1, 2), (2, 2), (3, 2),
+)
+
+#: Zenke's surrogate slope (``SurrGradSpike.scale`` in SpyTorch tutorial 4).
+RSNN_SURROGATE_SCALE = 100.0
+
+
+def superspike_sq_surrogate(scale: float = RSNN_SURROGATE_SCALE):
+    """Zenke's SuperSpike surrogate: ``1 / (scale |x| + 1)^2`` on the backward.
+
+    This is the one SpyTorch uses (``SurrGradSpike``), squared denominator and
+    ``scale = 100``. :func:`superspike_surrogate` above is the UNSQUARED form
+    with ``beta = 10`` and is kept for the targets that already use it.
+    """
+    @jax.custom_jvp
+    def theta(x):
+        return jnp.heaviside(x, 1.0)
+
+    @theta.defjvp
+    def theta_jvp(primals, tangents):
+        x, = primals
+        x_dot, = tangents
+        return theta(x), x_dot / (scale * jnp.abs(x) + 1.0) ** 2
+
+    return theta
+
+
+rsnn_surrogate = superspike_sq_surrogate()
+
+
+def rsnn_cell(x, S, I, U, a, Uo, W, V, Wo,
+              a_syn, a_mem, a_out, rho, beta_a, thresh):
+    """ONE step of the recurrent adaptive-LIF network. Returns ``s_t``.
+
+    ``S`` are the hidden spikes of the previous step, ``I`` the synaptic
+    current, ``U`` the membrane, ``a`` the adaptation variable and ``Uo`` the
+    readout membrane. The recurrent term is ``V @ S``: that is the coupling
+    that makes ``d s_t / d s_(t-1)`` dense, and it is the term e-prop drops.
+    """
+    I_n = a_syn * I + W @ x + V @ S
+    U_n = a_mem * U + (1.0 - a_mem) * I_n - thresh * S
+    A_th = thresh + beta_a * a
+    S_n = rsnn_surrogate(U_n - A_th)
+    a_n = rho * a + S_n
+    Uo_n = a_out * Uo + (1.0 - a_out) * (Wo @ S_n)
+    return S_n, I_n, U_n, a_n, Uo_n
+
+
+def attach_rsnn_past(states, weights, given):
+    """RTRL: give every carried state an edge to the weights, valued by ``J``.
+
+    ``given`` is ``(W_ref, V_ref, Wo_ref, J_0, ..., J_10)`` where ``J_k`` is
+    the block :data:`RSNN_CARRY_BLOCKS` names at position ``k``. Each reference
+    weight is a bit-for-bit copy of its weight and sits OUTSIDE ``argnums``, so
+    ``W - W_ref`` is exactly zero (no forward value moves, and a run under any
+    rule sees the same loss to the last bit) and its edge to the weight is the
+    identity. A `stop_gradient` would give the same zero delta but would add an
+    edge-free VERTEX the policy has to eliminate for nothing.
+    """
+    refs, blocks = given[:3], given[3:]
+    out = list(states)
+    with snn_carry_scope():
+        deltas = [W - R for W, R in zip(weights, refs)]
+        for (s, w), J in zip(RSNN_CARRY_BLOCKS, blocks):
+            want = tuple(out[s].shape) + tuple(weights[w].shape)
+            if tuple(J.shape) != want:
+                raise ValueError(
+                    f"carried block ({RSNN_STATE_NAMES[s]}, "
+                    f"{RSNN_WEIGHT_NAMES[w]}) has shape {tuple(J.shape)}; "
+                    f"d state / d W is {want}")
+            out[s] = out[s] + jnp.tensordot(J, deltas[w], 2)
+    return tuple(out)
+
+
+def attach_rsnn_future(loss, next_states, given):
+    """BPTT: give ``s_t`` an edge to the future loss, valued by the adjoint.
+
+    ``given`` is the five adjoints ``lambda_(t+1) = dL_(>t)/ds_t``, one per
+    component of :data:`RSNN_STATE_NAMES`, from a detached backward pass over
+    the suffix of the recording. The returned scalar is
+    ``L_t + <lambda_(t+1), s_t>``, whose gradient with respect to the weights
+    is EXACTLY the per-step contribution full backpropagation through time
+    makes at step ``t``.
+    """
+    if len(given) != len(RSNN_STATE_NAMES):
+        raise ValueError(
+            f"a future-adjoint attachment needs one adjoint per state "
+            f"component ({len(RSNN_STATE_NAMES)}), got {len(given)}")
+    with snn_carry_scope():
+        for lam, s in zip(given, next_states):
+            if tuple(lam.shape) != tuple(s.shape):
+                raise ValueError(
+                    f"adjoint shape {tuple(lam.shape)} does not match the "
+                    f"state it multiplies, {tuple(s.shape)}")
+            loss = loss + jnp.sum(lam * s)
+    return loss
+
+
+#: How many varargs each temporal rule passes. The length IS the selector, so
+#: the three are kept distinct by construction and a length outside this table
+#: raises rather than choosing a rule by accident.
+RSNN_GIVEN_LENGTHS: dict[int, str] = {
+    0: "tbptt",
+    len(RSNN_STATE_NAMES): "bptt",
+    3 + len(RSNN_CARRY_BLOCKS): "rtrl",
+}
+
+
+def RSNN_SHD(x, y, S, I, U, a, Uo, W, V, Wo,
+             a_syn, a_mem, a_out, rho, beta_a, thresh, *given):
+    """ONE recurrent step of the SHD network, plus its step loss.
+
+    Weights are args 7, 8 and 9 (``W``, ``V``, ``Wo``); ``V`` is among them,
+    so the recurrent coupling is learned and ``d s_t / d s_(t-1)`` has real
+    off-diagonal terms.
+
+    ``given`` selects the temporal rule by its LENGTH
+    (:data:`RSNN_GIVEN_LENGTHS`):
+
+      0 entries   tbptt. The carried state is a constant.
+      5 entries   bptt. The five future adjoints; see
+                  :func:`attach_rsnn_future`.
+      14 entries  rtrl. Three reference weights and the eleven carried
+                  Jacobian blocks; see :func:`attach_rsnn_past`.
+
+    The loss is the softmax cross entropy of the leaky readout membrane
+    against the one-hot label ``y``. It is a PER-STEP loss on purpose: the
+    whole point of this target is that the sequence loss decomposes as
+    ``sum_t L_t``, so one step is a complete object and the three rules
+    differ only in which given quantity meets it.
+    """
+    rule = RSNN_GIVEN_LENGTHS.get(len(given))
+    if rule is None:
+        raise ValueError(
+            f"RSNN_SHD got {len(given)} extra arguments; the temporal rule is "
+            f"selected by that count and the legal counts are "
+            f"{sorted(RSNN_GIVEN_LENGTHS)} "
+            f"({', '.join(RSNN_GIVEN_LENGTHS[k] for k in sorted(RSNN_GIVEN_LENGTHS))})")
+    weights = (W, V, Wo)
+    if rule == "rtrl":
+        S, I, U, a, Uo = attach_rsnn_past((S, I, U, a, Uo), weights, given)
+    with snn_step_scope(0):
+        nxt = rsnn_cell(x, S, I, U, a, Uo, W, V, Wo,
+                        a_syn, a_mem, a_out, rho, beta_a, thresh)
+        loss = jnp.sum(-y * jax.nn.log_softmax(nxt[4]))
+    if rule == "bptt":
+        loss = attach_rsnn_future(loss, nxt, given)
+    return loss

@@ -5,8 +5,12 @@ from .neuromorphic import (LIF_SNN, ADALIF_SNN, ADALIF_SNN_SEQ,
                            LIF_SNN_SHD, ADALIF_SNN_SHD,
                            SNN_STEP_SCOPE, snn_step_scope,
                            SNN_CARRY_SCOPE, snn_carry_scope,
-                           SHD_CARRY_BLOCKS, SHD_CARRY_DIAGONAL_BLOCKS,
-                           attach_carried_jacobians)
+                           RSNN_SHD, rsnn_cell, rsnn_surrogate,
+                           superspike_sq_surrogate,
+                           RSNN_STATE_NAMES, RSNN_WEIGHT_NAMES,
+                           RSNN_CARRY_BLOCKS, RSNN_ZERO_BLOCKS,
+                           RSNN_GIVEN_LENGTHS, RSNN_SURROGATE_SCALE,
+                           attach_rsnn_past, attach_rsnn_future)
 from .differential_kinematics import RobotArm_6DOF
 from .deep_learning import Perceptron, Encoder, EncoderDecoder
 from .roe import RoeFlux_1d, RoeFlux_3d
