@@ -10,6 +10,7 @@ from .neuromorphic import (LIF_SNN, ADALIF_SNN, ADALIF_SNN_SEQ,
                            RSNN_STATE_NAMES, RSNN_WEIGHT_NAMES,
                            RSNN_CARRY_BLOCKS, RSNN_ZERO_BLOCKS,
                            RSNN_GIVEN_LENGTHS, RSNN_SURROGATE_SCALE,
+                           RSNN_CARRY_CONTAINERS, rsnn_carry_container,
                            attach_rsnn_past, attach_rsnn_future)
 from .differential_kinematics import RobotArm_6DOF
 from .deep_learning import Perceptron, Encoder, EncoderDecoder

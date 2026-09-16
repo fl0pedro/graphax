@@ -314,6 +314,40 @@ def rsnn_cell(x, S, I, U, a, Uo, W, V, Wo,
     return S_n, I_n, U_n, a_n, Uo_n
 
 
+#: The two containers a carried-Jacobian block can arrive in.
+#:
+#: ``dense``    the full ``state x weight`` block, ``d s / d W`` entry for
+#:              entry. 225.74 MB over the eleven blocks.
+#: ``compact``  the block-diagonal form, stored at the shape of the WEIGHT it
+#:              differentiates. This is what the eligibility trace of e-prop
+#:              IS, and the whole reason the approximation is worth anything:
+#:              it is about the size of the weights (2.12 MB over the eleven
+#:              blocks) instead of a hundred times them.
+RSNN_CARRY_CONTAINERS: tuple[str, ...] = ("dense", "compact")
+
+
+def rsnn_carry_container(block, state_shape, weight_shape, given_shape):
+    """Which container a carried block arrived in, or raise.
+
+    The shape decides, and the two are never ambiguous: a dense block is
+    ``state_shape + weight_shape`` and a compact one is ``weight_shape``, and
+    a state axis is never empty.
+    """
+    dense = tuple(state_shape) + tuple(weight_shape)
+    if tuple(given_shape) == dense:
+        return "dense"
+    if tuple(given_shape) == tuple(weight_shape):
+        return "compact"
+    s, w = block
+    raise ValueError(
+        f"carried block ({RSNN_STATE_NAMES[s]}, {RSNN_WEIGHT_NAMES[w]}) has "
+        f"shape {tuple(given_shape)}. The dense container for it is {dense} "
+        f"(d state / d W entry for entry) and the compact one is "
+        f"{tuple(weight_shape)} (the block diagonal, one number per synapse "
+        f"-- the eligibility trace). Nothing else is a container this "
+        f"attachment can read.")
+
+
 def attach_rsnn_past(states, weights, given):
     """RTRL: give every carried state an edge to the weights, valued by ``J``.
 
@@ -324,19 +358,46 @@ def attach_rsnn_past(states, weights, given):
     rule sees the same loss to the last bit) and its edge to the weight is the
     identity. A `stop_gradient` would give the same zero delta but would add an
     edge-free VERTEX the policy has to eliminate for nothing.
+
+    EACH BLOCK ARRIVES IN ITS OWN CONTAINER (owner ruling 2026-09-16). The
+    carry is produced by the rule the plan describes, run over the whole
+    prefix, and it is stored in the container that rule implies. Two are
+    readable here (:data:`RSNN_CARRY_CONTAINERS`):
+
+    * ``dense`` -- the full ``state x weight`` block. The exact carry.
+    * ``compact`` -- the BLOCK DIAGONAL, at the shape of the weight. This is
+      the eligibility trace: for a hidden block, ``J[j', j, i]`` is
+      ``delta(j', j) * e[j, i]``, so one number per synapse instead of one per
+      (unit, synapse) pair, and the contraction with ``dW`` collapses from a
+      rank-2 tensordot to a row sum. For the two READOUT blocks against a
+      hidden weight the readout is not a recurrence at all but a leaky filter
+      of the hidden traces through a CONSTANT ``Wo``, so the exact block
+      factorises as ``J[m, j, i] = Wo_ref[m, j] * f[j, i]`` and the compact
+      form carries ``f`` -- exact, not approximated, and 128 times smaller.
+      ``Wo_ref`` is the REFERENCE weight, outside ``argnums``, so restoring
+      the factor adds no edge and the graph does not gain a vertex.
+
+    Mixed containers are legal: the plan decides per face.
     """
     refs, blocks = given[:3], given[3:]
     out = list(states)
     with snn_carry_scope():
         deltas = [W - R for W, R in zip(weights, refs)]
         for (s, w), J in zip(RSNN_CARRY_BLOCKS, blocks):
-            want = tuple(out[s].shape) + tuple(weights[w].shape)
-            if tuple(J.shape) != want:
-                raise ValueError(
-                    f"carried block ({RSNN_STATE_NAMES[s]}, "
-                    f"{RSNN_WEIGHT_NAMES[w]}) has shape {tuple(J.shape)}; "
-                    f"d state / d W is {want}")
-            out[s] = out[s] + jnp.tensordot(J, deltas[w], 2)
+            kind = rsnn_carry_container(
+                (s, w), out[s].shape, weights[w].shape, J.shape)
+            if kind == "dense":
+                out[s] = out[s] + jnp.tensordot(J, deltas[w], 2)
+                continue
+            # COMPACT. ``row[j] = sum_i J[j, i] * dW[j, i]``: the block
+            # diagonal's contraction, one row sum instead of a tensordot.
+            row = jnp.sum(J * deltas[w], axis=-1)
+            if out[s].shape[0] == weights[w].shape[0]:
+                out[s] = out[s] + row
+            else:
+                # The readout against a hidden weight: restore the constant
+                # ``Wo_ref`` factor the compact form left out.
+                out[s] = out[s] + refs[2] @ row
     return tuple(out)
 
 
