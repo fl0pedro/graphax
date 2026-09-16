@@ -351,6 +351,16 @@ def dense_for_matmul(tensor: SparseTensor, *,
                     expanded_shape.append(1 if d.axis is None else next(v_iter))
                 v = v.reshape(expanded_shape)
             v = jnp.broadcast_to(v, tensor.shape)
+        elif tuple(v.shape) != tuple(tensor.shape):
+            # Same RANK, different EXTENT: one or more axes are a SIZE-1
+            # BROADCAST STAND-IN -- physically present, stored once, declaring
+            # more. That form is legal (``_assert_sparse_tensor_consistency``
+            # admits it) and the scatter path already grows it in
+            # ``_calculate_target_shape``. Testing the rank alone returned the
+            # STORED shape as though it were the dense one, so a (128, 64)
+            # tensor densified to (1, 64) and every consumer read a silently
+            # wrong array. Ticket dsnn-lvm.
+            v = jnp.broadcast_to(v, tensor.shape)
         return v
 
     # Single-sparse-pair fast path: emit a where over a 1-fusion dense form.
@@ -380,6 +390,13 @@ def dense_for_matmul(tensor: SparseTensor, *,
             # v.shape: (N, B_o, B_i, *leftover_sizes). Collapse (N, B_o) → logical_outer
             # so that v_2d[i, k, *l] == v[i // B_o, i % B_o, k, *l].
             leftover_sizes = list(v.shape[3:])
+            # Any of the three may be a SIZE-1 BROADCAST STAND-IN: physically
+            # present, stored once, declaring more (ticket dsnn-lvm). Read the
+            # DECLARED extent, exactly as ``_calculate_target_shape`` does on
+            # the scatter path, or the collapse below reshapes a one-element
+            # buffer into the full grid and raises.
+            if tuple(v.shape[:3]) != (N, B_o, B_i):
+                v = jnp.broadcast_to(v, (N, B_o, B_i, *leftover_sizes))
             v_2d = v.reshape(logical_outer, B_i, *leftover_sizes)
             # Tile across the inner axis via broadcast+reshape (pure shape ops, fold into
             # the consuming kernel). gathered[i, j, *l] == v_2d[i, j % B_i, *l].

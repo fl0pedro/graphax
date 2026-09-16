@@ -146,7 +146,7 @@ class TestTicketReproduction(unittest.TestCase):
         want = np.einsum("ij,jk->ik",
                          np.asarray(lhs.dense()), np.asarray(rhs.dense()))
         self.assertEqual(got.shape, want.shape)
-        self.assertEqual(float(np.abs(got - want).max()), 0.0)
+        self.assertLessEqual(float(np.abs(got - want).max()), 1e-5)
 
 
 class TestStandInCoarsenExactness(unittest.TestCase):
@@ -234,8 +234,22 @@ class TestStandInCoarsenExactness(unittest.TestCase):
 
 
 class TestStandInMatmulExactness(unittest.TestCase):
-    """The contraction itself, against ``jnp.einsum`` on the densified
-    operands, over misaligned meta grids with stand-ins on either side."""
+    """The contraction itself, over misaligned meta grids with stand-ins on
+    either side, judged two ways.
+
+    Against ``jnp.einsum`` on the densified operands, to a tolerance: both
+    routes sum the same products, but the sparse route sums only the live ones
+    and in its own order, and float addition is not associative. The repo's own
+    misaligned-block tests use ``atol=1e-5`` for the same reason. MEASURED
+    here: the largest disagreement over the whole case set is about 5e-7 on
+    values of order 10, which is fp32 rounding.
+
+    Against the SAME logical operands stored WITHOUT the stand-in, bit for
+    bit. This is the exactness claim that belongs to this ticket: a size-1
+    physical axis says one copy is stored and every position reads it, so
+    reading it must give exactly what writing the copies out gives -- not
+    nearly.
+    """
 
     # (logical L, lhs meta, rhs meta). Both metas divide L, the gcd is above 1
     # and lhs meta * rhs meta > L, which is what makes ``matmul`` take the
@@ -261,6 +275,44 @@ class TestStandInMatmulExactness(unittest.TestCase):
             od = (DiagonalIndex(0, meta, 0, 1, None, None),)
             pd = (DiagonalIndex(1, meta, 0, 0, None, None),)
         return SparseTensor(od, pd, val)
+
+    def _pair(self, L, meta, key):
+        """One logical operand stored two ways: with a size-1 stand-in meta
+        axis, and with that axis written out. Same numbers either way."""
+        b = L // meta
+        if b > 1:
+            core = _n((1, b, b), key)
+            full = jnp.broadcast_to(core, (meta, b, b))
+            od = (DiagonalIndex(0, meta, 0, 1, b, 1),)
+            pd = (DiagonalIndex(1, meta, 0, 0, b, 2),)
+        else:
+            core = _n((1,), key)
+            full = jnp.broadcast_to(core, (meta,))
+            od = (DiagonalIndex(0, meta, 0, 1, None, None),)
+            pd = (DiagonalIndex(1, meta, 0, 0, None, None),)
+        return SparseTensor(od, pd, core), SparseTensor(od, pd, full)
+
+    def test_a_stand_in_reads_exactly_as_the_written_out_copies(self):
+        for i, (L, a, b) in enumerate(self.CASES):
+            l_in, l_out = self._pair(L, a, 60 + i)
+            r_in, r_out = self._pair(L, b, 80 + i)
+            ref = np.asarray(matmul(l_out, r_out).dense())
+            for use_l, use_r in itertools.product((False, True), repeat=2):
+                with self.subTest(L=L, lhs_meta=a, rhs_meta=b,
+                                  lhs_standin=use_l, rhs_standin=use_r):
+                    got = np.asarray(matmul(l_in if use_l else l_out,
+                                            r_in if use_r else r_out).dense())
+                    self.assertEqual(got.shape, ref.shape)
+                    self.assertEqual(float(np.abs(got - ref).max()), 0.0)
+
+    def test_dense_of_a_stand_in_equals_dense_of_the_written_out_copies(self):
+        for i, (L, a, _b) in enumerate(self.CASES):
+            t_in, t_out = self._pair(L, a, 100 + i)
+            with self.subTest(L=L, meta=a):
+                got = np.asarray(t_in.dense())
+                ref = np.asarray(t_out.dense())
+                self.assertEqual(got.shape, ref.shape)
+                self.assertEqual(float(np.abs(got - ref).max()), 0.0)
 
     def test_matmul_equals_the_dense_einsum(self):
         for i, (L, a, b) in enumerate(self.CASES):
