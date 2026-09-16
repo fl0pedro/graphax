@@ -1,3 +1,5 @@
+from typing import NamedTuple
+
 import jax
 import jax.nn as jnn
 import jax.numpy as jnp
@@ -314,38 +316,114 @@ def rsnn_cell(x, S, I, U, a, Uo, W, V, Wo,
     return S_n, I_n, U_n, a_n, Uo_n
 
 
-#: The two containers a carried-Jacobian block can arrive in.
-#:
-#: ``dense``    the full ``state x weight`` block, ``d s / d W`` entry for
-#:              entry. 225.74 MB over the eleven blocks.
-#: ``compact``  the block-diagonal form, stored at the shape of the WEIGHT it
-#:              differentiates. This is what the eligibility trace of e-prop
-#:              IS, and the whole reason the approximation is worth anything:
-#:              it is about the size of the weights (2.12 MB over the eleven
-#:              blocks) instead of a hundred times them.
-RSNN_CARRY_CONTAINERS: tuple[str, ...] = ("dense", "compact")
+#: The dtype a QUANTIZED carry is stored in. bfloat16 shares float32's
+#: exponent range, which is the reason CONTEXT.md gives for it being the only
+#: narrow dtype in this project.
+RSNN_CARRY_QUANT_DTYPE = jnp.bfloat16
 
 
-def rsnn_carry_container(block, state_shape, weight_shape, given_shape):
+class CarryContainer(NamedTuple):
+    """WHICH CONTAINER a carried-Jacobian block arrived in.
+
+    OWNER RULING, 2026-09-16. The container follows the PLAN's approximation
+    on the carried-Jacobian face, for all four action classes and every
+    combination of them. The three flags below are the three classes that
+    change how a block is STORED; ``Skip`` is not one of them, because a
+    skipped carry face carries no block at all (the rule becomes truncated
+    backpropagation through time and the given tuple is empty).
+
+    ``diag``    the state axis is diagonal, so the block is stored at the
+                shape of the WEIGHT it differentiates. This is the
+                eligibility trace of e-prop: one number per synapse instead
+                of one per (unit, synapse) pair.
+    ``reduce``  the LAST axis of the weight -- the presynaptic index -- is
+                IMPLICIT. One value is stored and read as a broadcast, and
+                the contraction expands it only where it has to (CONTEXT.md,
+                Reduce and Implicit axis). The stored axis has extent 1.
+    ``quant``   the block is stored in :data:`RSNN_CARRY_QUANT_DTYPE`.
+
+    ``name`` is the canonical spelling used in records, logs and tests:
+    ``exact`` for no flag at all, otherwise the set flags joined by ``+`` in
+    the order ``diag``, ``reduce``, ``quant``.
+    """
+
+    diag: bool = False
+    reduce: bool = False
+    quant: bool = False
+
+    @property
+    def name(self) -> str:
+        parts = [n for n, on in
+                 (("diag", self.diag), ("reduce", self.reduce),
+                  ("quant", self.quant)) if on]
+        return "+".join(parts) if parts else "exact"
+
+    def block_shape(self, state_shape, weight_shape) -> tuple:
+        """The shape a block of this container has for one (state, weight)."""
+        w = tuple(weight_shape)
+        if self.reduce:
+            w = w[:-1] + (1,)
+        return w if self.diag else tuple(state_shape) + w
+
+    def dtype(self, base_dtype):
+        return RSNN_CARRY_QUANT_DTYPE if self.quant else base_dtype
+
+
+#: Every container a carried block can arrive in, by canonical name. The
+#: ``compact`` and ``dense`` spellings of the first design are gone: a
+#: container is now a SET of classes, because the plan can request more than
+#: one on the same face.
+RSNN_CARRY_CONTAINERS: tuple[str, ...] = tuple(
+    CarryContainer(d, r, q).name
+    for d in (False, True) for r in (False, True) for q in (False, True))
+
+
+def carry_container_from_name(name) -> CarryContainer:
+    """``"diag+quant"`` -> :class:`CarryContainer`, or raise."""
+    text = str(name)
+    if text == "exact":
+        return CarryContainer()
+    parts = [p for p in text.split("+") if p]
+    known = ("diag", "reduce", "quant")
+    for p in parts:
+        if p not in known:
+            raise ValueError(
+                f"carry container {text!r} names {p!r}, which is not one of "
+                f"{list(known)}. The legal names are "
+                f"{list(RSNN_CARRY_CONTAINERS)}.")
+    if len(set(parts)) != len(parts):
+        raise ValueError(f"carry container {text!r} names a class twice")
+    return CarryContainer("diag" in parts, "reduce" in parts,
+                          "quant" in parts)
+
+
+def rsnn_carry_container(block, state_shape, weight_shape, given_shape,
+                         given_dtype=None) -> CarryContainer:
     """Which container a carried block arrived in, or raise.
 
-    The shape decides, and the two are never ambiguous: a dense block is
-    ``state_shape + weight_shape`` and a compact one is ``weight_shape``, and
-    a state axis is never empty.
+    The SHAPE decides ``diag`` and ``reduce`` and the DTYPE decides ``quant``,
+    and none of the four shapes is ambiguous: a state axis is never empty and
+    the presynaptic axis of this model is never 1 (it is 700, 128 or 128).
     """
-    dense = tuple(state_shape) + tuple(weight_shape)
-    if tuple(given_shape) == dense:
-        return "dense"
-    if tuple(given_shape) == tuple(weight_shape):
-        return "compact"
-    s, w = block
-    raise ValueError(
-        f"carried block ({RSNN_STATE_NAMES[s]}, {RSNN_WEIGHT_NAMES[w]}) has "
-        f"shape {tuple(given_shape)}. The dense container for it is {dense} "
-        f"(d state / d W entry for entry) and the compact one is "
-        f"{tuple(weight_shape)} (the block diagonal, one number per synapse "
-        f"-- the eligibility trace). Nothing else is a container this "
-        f"attachment can read.")
+    want = {}
+    for d in (False, True):
+        for r in (False, True):
+            c = CarryContainer(d, r, False)
+            want[c.block_shape(state_shape, weight_shape)] = c
+    got = tuple(given_shape)
+    c = want.get(got)
+    if c is None:
+        s, w = block
+        lines = ", ".join(
+            f"{k} = {v.name}" for k, v in want.items())
+        raise ValueError(
+            f"carried block ({RSNN_STATE_NAMES[s]}, {RSNN_WEIGHT_NAMES[w]}) "
+            f"has shape {got}. The containers this attachment can read are "
+            f"{lines}. Nothing else is a container: a block of another shape "
+            f"is a producer that disagrees with the plan that asked for it.")
+    quant = (given_dtype is not None
+             and jnp.dtype(given_dtype) == jnp.dtype(RSNN_CARRY_QUANT_DTYPE))
+    return CarryContainer(c.diag, c.reduce, quant)
 
 
 def attach_rsnn_past(states, weights, given):
@@ -361,12 +439,14 @@ def attach_rsnn_past(states, weights, given):
 
     EACH BLOCK ARRIVES IN ITS OWN CONTAINER (owner ruling 2026-09-16). The
     carry is produced by the rule the plan describes, run over the whole
-    prefix, and it is stored in the container that rule implies. Two are
-    readable here (:data:`RSNN_CARRY_CONTAINERS`):
+    prefix, and it is stored in the container that rule implies. The container
+    is a SET of the action classes the plan put on the carried-Jacobian face
+    (:class:`CarryContainer`), and every combination is readable here:
 
-    * ``dense`` -- the full ``state x weight`` block. The exact carry.
-    * ``compact`` -- the BLOCK DIAGONAL, at the shape of the weight. This is
-      the eligibility trace: for a hidden block, ``J[j', j, i]`` is
+    * no class -- the full ``state x weight`` block, ``d s / d W`` entry for
+      entry. The exact carry, 225.74 MB over the eleven blocks.
+    * ``diag`` -- the BLOCK DIAGONAL, at the shape of the weight. This is the
+      eligibility trace: for a hidden block, ``J[j', j, i]`` is
       ``delta(j', j) * e[j, i]``, so one number per synapse instead of one per
       (unit, synapse) pair, and the contraction with ``dW`` collapses from a
       rank-2 tensordot to a row sum. For the two READOUT blocks against a
@@ -376,22 +456,40 @@ def attach_rsnn_past(states, weights, given):
       form carries ``f`` -- exact, not approximated, and 128 times smaller.
       ``Wo_ref`` is the REFERENCE weight, outside ``argnums``, so restoring
       the factor adds no edge and the graph does not gain a vertex.
+    * ``reduce`` -- the presynaptic axis is IMPLICIT. One value is stored for
+      the whole axis and the contraction NEVER broadcasts it back into the
+      physical grid (CONTEXT.md, ruling D1): ``sum_i J[.., j, 0] * dW[j, i]``
+      is ``J[.., j, 0] * sum_i dW[j, i]``, so the expansion becomes a sum on
+      the OTHER operand and one axis of work disappears.
+    * ``quant`` -- the block is stored narrow. The contraction promotes back
+      to the weight's dtype, so the precision that was lost is the precision
+      the recursion carried, which is the point.
 
-    Mixed containers are legal: the plan decides per face.
+    Mixed containers are legal: the plan decides per face, and one block may
+    be diagonal while another is not.
     """
     refs, blocks = given[:3], given[3:]
     out = list(states)
     with snn_carry_scope():
         deltas = [W - R for W, R in zip(weights, refs)]
         for (s, w), J in zip(RSNN_CARRY_BLOCKS, blocks):
-            kind = rsnn_carry_container(
-                (s, w), out[s].shape, weights[w].shape, J.shape)
-            if kind == "dense":
-                out[s] = out[s] + jnp.tensordot(J, deltas[w], 2)
+            c = rsnn_carry_container(
+                (s, w), out[s].shape, weights[w].shape, J.shape, J.dtype)
+            dW = deltas[w]
+            if c.reduce:
+                # THE IMPLICIT AXIS IS NEVER BROADCAST. Move the sum over the
+                # presynaptic index onto ``dW``, which stores it, and drop the
+                # stored axis of extent 1 from ``J``.
+                dW = jnp.sum(dW, axis=-1)
+                J = J[..., 0]
+            if not c.diag:
+                out[s] = out[s] + jnp.tensordot(J, dW, dW.ndim)
                 continue
-            # COMPACT. ``row[j] = sum_i J[j, i] * dW[j, i]``: the block
+            # DIAG. ``row[j] = sum_i J[j, i] * dW[j, i]``: the block
             # diagonal's contraction, one row sum instead of a tensordot.
-            row = jnp.sum(J * deltas[w], axis=-1)
+            # Under ``reduce`` the presynaptic axis is already gone from both
+            # operands and the row sum degenerates to an elementwise product.
+            row = J * dW if c.reduce else jnp.sum(J * dW, axis=-1)
             if out[s].shape[0] == weights[w].shape[0]:
                 out[s] = out[s] + row
             else:
@@ -410,6 +508,20 @@ def attach_rsnn_future(loss, next_states, given):
     ``L_t + <lambda_(t+1), s_t>``, whose gradient with respect to the weights
     is EXACTLY the per-step contribution full backpropagation through time
     makes at step ``t``.
+
+    THE CONTAINER FOLLOWS THE PLAN HERE TOO (owner ruling 2026-09-16), and an
+    adjoint has only the two classes that a vector can express:
+
+    * ``reduce`` -- the state axis is IMPLICIT, so the adjoint arrives as one
+      number of extent 1 and the inner product becomes that number times the
+      SUM of the state. Nothing is broadcast back into the grid.
+    * ``quant`` -- the adjoint is stored narrow.
+
+    ``diag`` does not change the STORE of an adjoint, only its VALUE: on the
+    suffix it means the state-to-state Jacobian is replaced by its block
+    diagonal at every step, which is what the producer does before it hands
+    the five numbers over. ``Skip`` means no adjoint at all, and then the rule
+    is truncated backpropagation through time and ``given`` is empty.
     """
     if len(given) != len(RSNN_STATE_NAMES):
         raise ValueError(
@@ -417,11 +529,17 @@ def attach_rsnn_future(loss, next_states, given):
             f"component ({len(RSNN_STATE_NAMES)}), got {len(given)}")
     with snn_carry_scope():
         for lam, s in zip(given, next_states):
-            if tuple(lam.shape) != tuple(s.shape):
+            if tuple(lam.shape) == tuple(s.shape):
+                loss = loss + jnp.sum(lam * s)
+            elif tuple(lam.shape) == (1,):
+                # The implicit state axis: one stored value, and the sum that
+                # would have expanded it moves onto the state instead.
+                loss = loss + lam[0] * jnp.sum(s)
+            else:
                 raise ValueError(
-                    f"adjoint shape {tuple(lam.shape)} does not match the "
-                    f"state it multiplies, {tuple(s.shape)}")
-            loss = loss + jnp.sum(lam * s)
+                    f"adjoint shape {tuple(lam.shape)} is neither the state "
+                    f"it multiplies, {tuple(s.shape)}, nor the reduced "
+                    f"container (1,) that an implicit state axis stores.")
     return loss
 
 
@@ -474,4 +592,41 @@ def RSNN_SHD(x, y, S, I, U, a, Uo, W, V, Wo,
         loss = jnp.sum(-y * jax.nn.log_softmax(nxt[4]))
     if rule == "bptt":
         loss = attach_rsnn_future(loss, nxt, given)
+    return loss
+
+
+#: The number of step copies in the two-copy window arm.
+RSNN_W2_COPIES = 2
+
+
+def RSNN_SHD_W2(x0, x1, y, S, I, U, a, Uo, W, V, Wo,
+                a_syn, a_mem, a_out, rho, beta_a, thresh):
+    """TWO recurrent steps of the SHD network, joined by the temporal edge.
+
+    THE FOURTH SNN ARM (owner ruling 2026-09-16). There is no given edge and
+    no temporal rule here. The window holds two copies of the step body, the
+    state carried from the first copy to the second IS the temporal edge, and
+    it is an ordinary edge of the graph -- so the policy picks the direction
+    of the temporal credit itself by choosing where in the elimination order
+    the second copy's vertices go. Eliminating the later copy first is
+    backpropagation through time; eliminating the earlier copy first is real
+    time recurrent learning; and the policy may also interleave them, which is
+    neither and is the reason this arm exists.
+
+    ``x0`` and ``x1`` are the input frames of steps ``t`` and ``t+1`` and the
+    loss is ``L_t + L_(t+1)``, so the temporal edge carries real credit. The
+    label is one per recording, as it is everywhere else in this family.
+
+    The weights sit at slots 8, 9 and 10 (``W``, ``V``, ``Wo``); the
+    ``infer_argnums`` table names them. Each copy is wrapped in its own
+    :func:`snn_step_scope`, so ``--fixed-temporal-order`` can pin the order
+    across the copies -- but this arm runs it FREE, which is the point.
+    """
+    state = (S, I, U, a, Uo)
+    loss = 0.0
+    for u, x in enumerate((x0, x1)):
+        with snn_step_scope(u):
+            state = rsnn_cell(x, *state, W, V, Wo,
+                              a_syn, a_mem, a_out, rho, beta_a, thresh)
+            loss = loss + jnp.sum(-y * jax.nn.log_softmax(state[4]))
     return loss
