@@ -869,6 +869,40 @@ class SparseTensor(SparseMathMixin):
         return self._target_arr.on_device_size_in_bytes()
 
 
+def _expand_coupled_standins(v, want, rest_shape):
+    """Grow every SIZE-1 BROADCAST STAND-IN among the leading axes of ``v`` to
+    the extent its dim declares.
+
+    THE INVARIANT. A physical axis of a ``SparseTensor`` may carry extent 1
+    while its dim declares ``size`` (or ``block_size``) greater than 1. That is
+    a legal, stored form and it means exactly what an IMPLICIT axis means: one
+    copy is stored and every position along the axis reads it. The invariant is
+    the one ``_assert_sparse_tensor_consistency`` already states and admits at
+    construction ("a size-1 physical axis is allowed as a broadcast/implicit
+    stand-in") and the one ``dense()`` already implements, in
+    ``_calculate_target_shape``, by growing such an axis to ``dim.size`` before
+    it materialises anything. So the reader broadcasts; the builder is not
+    asked to pre-expand.
+
+    Any code that re-cuts the buffer -- the two coupled block-diagonal
+    re-factorings below -- must therefore read the DECLARED extent, not the
+    stored one, and one ``broadcast_to`` is all it takes. ``want`` is that
+    declared leading layout, in buffer order; ``rest_shape`` is everything
+    behind it, which this does not touch (a stand-in there stays a stand-in:
+    the re-factoring does not index it).
+
+    A no-op -- returns ``v`` itself, so the emitted jaxpr is byte-identical --
+    whenever every leading axis is already at its declared extent, which is
+    every case that worked before. A leading extent that is neither 1 nor the
+    declared one is metadata that disagrees with its buffer, and ``broadcast_to``
+    raises on it.
+    """
+    want = tuple(int(w) for w in want)
+    if tuple(v.shape[:len(want)]) == want:
+        return v
+    return jnp.broadcast_to(v, want + tuple(rest_shape))
+
+
 def _subdivide_coupled_blockdiag(
     st, is_out1, rel_i, d1, is_out2, rel_j, d2, factor,
 ):
@@ -986,6 +1020,13 @@ def _subdivide_coupled_blockdiag(
         # its original index (the synthetic meta axis is not one of them), so the
         # ``_shift`` bookkeeping over ``moved`` stays correct.
         v = jnp.broadcast_to(v[None, ...], (N,) + v.shape)
+    # A PRESENT axis may still be a SIZE-1 BROADCAST STAND-IN for its declared
+    # extent, which the splits below would read as real data. Grow it first,
+    # exactly as the implicit meta above is grown. An ABSENT side stays absent:
+    # the branches below already keep it implicit, which is the cheaper form.
+    # Same invariant as the coarsening dual; see ``_expand_coupled_standins``.
+    v = _expand_coupled_standins(
+        v, [N] + ([b1] if p1 else []) + ([b2] if p2 else []), rest_shape)
 
     # A block side occupies a NEW leading val axis iff it is present AND still
     # bigger than 1 after the split; otherwise it is implicit / collapses away.
@@ -1259,6 +1300,15 @@ def _coarsen_coupled_blockdiag(st, is_out1, rel_i, d1, is_out2, rel_j, d2,
     if not pm:
         # Implicit meta: N identical blocks -- materialize the meta axis.
         v = jnp.broadcast_to(v[None, ...], (N,) + v.shape)
+    # A PHYSICAL axis of extent 1 standing for a declared extent above 1 is the
+    # same statement as an implicit axis, and is read the same way: broadcast
+    # it. See ``_expand_coupled_standins`` for the invariant. Without this the
+    # branches below reshape a one-element buffer into the full block grid --
+    # the TransformerLM free-order crash of ticket dsnn-lvm, where a constant
+    # diagonal of length 128 is stored as a single value on a physical meta
+    # axis: "cannot reshape array of shape (1,) into [128, 1, 1]".
+    v = _expand_coupled_standins(
+        v, [N] + ([b1] if p1 else []) + ([b2] if p2 else []), rest_shape)
     # Materialize implicit block sides (constant over the block axis): the
     # coarsened block mixes block and meta indices, so both must be physical.
     if p1 and p2:
