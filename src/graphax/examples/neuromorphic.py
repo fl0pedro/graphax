@@ -87,6 +87,136 @@ def snn_step_scope(t: int):
     return jax.named_scope(f"{SNN_STEP_SCOPE}_{int(t)}")
 
 
+#: The ``jax.named_scope`` that wraps the CARRIED-JACOBIAN attachment block --
+#: the real-time-recurrent-learning (RTRL) boundary of the gradient window. It
+#: is entered INSIDE ``snn_step_scope(0)``, so a vertex of this block carries
+#: step 0 for the temporal order constraint (it is the earliest work there is)
+#: while still being findable by its own name for a probe or a test.
+SNN_CARRY_SCOPE = "snn_carry_jac"
+
+
+class snn_carry_scope:
+    """The named scope of the carried-Jacobian attachment block.
+
+    It enters ``snn_step_scope(0)`` FIRST and its own name second, so every
+    equation of the block reads ``snn_step_0/snn_carry_jac`` on its name stack:
+    alphagrad's step-tag reader gives it step 0 -- the earliest work in the
+    window, which is where real-time recurrent learning starts -- and a probe
+    can still pick the block out by its own name.
+    """
+
+    def __enter__(self):
+        self._outer = snn_step_scope(0)
+        self._outer.__enter__()
+        self._inner = jax.named_scope(SNN_CARRY_SCOPE)
+        self._inner.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        self._inner.__exit__(*exc)
+        return self._outer.__exit__(*exc)
+
+
+#: WHICH CARRIED JACOBIAN BLOCKS A THREE-LAYER SHD TARGET TAKES, in the order
+#: the varargs of :func:`LIF_SNN_SHD` / :func:`ADALIF_SNN_SHD` carry them.
+#:
+#: Each entry is ``(state slot, weight slot)``. The state slot indexes the SIX
+#: carried states in the order the signature lists them -- ``U1, U2, U3`` then
+#: ``a1, a2, a3`` (``I1, I2, I3`` for the LIF twin) -- and the weight slot
+#: indexes ``W1, W2, W3``. Block ``(s, w)`` holds ``d state_s / d W_w`` at the
+#: step the window starts, so its shape is ``state_shape + W_w.shape``.
+#:
+#: WHY TWELVE AND NOT EIGHTEEN. The three layers are feed-forward in space, so
+#: ``W2`` and ``W3`` cannot reach layer 1 and ``W3`` cannot reach layer 2: six
+#: of the eighteen blocks are STRUCTURALLY zero and are not carried. The other
+#: twelve are the exact influence matrix of one RTRL step, so a plan built on
+#: them reproduces the gradient through the WHOLE prefix, not a truncation.
+#:
+#: THE BLOCK DIAGONAL of this set -- ``(U1,W1) (a1,W1) (U2,W2) (a2,W2)
+#: (U3,W3) (a3,W3)`` -- is what e-prop keeps; the other six are the
+#: cross-layer coupling Zenke and Neftci's block-diagonal approximation drops.
+SHD_CARRY_BLOCKS: tuple[tuple[int, int], ...] = (
+    (0, 0),                  # U1 <- W1
+    (1, 0), (1, 1),          # U2 <- W1, W2
+    (2, 0), (2, 1), (2, 2),  # U3 <- W1, W2, W3
+    (3, 0),                  # a1 (I1) <- W1
+    (4, 0), (4, 1),          # a2 (I2) <- W1, W2
+    (5, 0), (5, 1), (5, 2),  # a3 (I3) <- W1, W2, W3
+)
+
+#: The block-diagonal subset of :data:`SHD_CARRY_BLOCKS`: the within-layer
+#: blocks, which is exactly what an e-prop eligibility trace carries.
+SHD_CARRY_DIAGONAL_BLOCKS: tuple[tuple[int, int], ...] = (
+    (0, 0), (1, 1), (2, 2), (3, 0), (4, 1), (5, 2),
+)
+
+
+def attach_carried_jacobians(states, weights, carried):
+    """Give every carried state an EDGE to the weights, valued by ``carried``.
+
+    ``states`` are the six carried states in signature order and ``weights``
+    are ``(W1, W2, W3)``. ``carried`` is either empty -- backpropagation
+    through time, nothing is emitted and the graph is the one this module
+    always built -- or the FIFTEEN entries
+
+        ``(W1_ref, W2_ref, W3_ref, J_0, ..., J_11)``
+
+    where ``W*_ref`` is a bit-for-bit copy of the matching weight that is NOT
+    differentiated, and ``J_k`` is the block :data:`SHD_CARRY_BLOCKS` names at
+    position ``k``.
+
+    The returned states have the SAME VALUES, bit for bit, and a Jacobian with
+    respect to the weights that is exactly the carried one.
+
+    HOW, and why this shape. The attachment is
+
+        ``dW_w   = W_w - W_w_ref``
+        ``state_s <- state_s + tensordot(J_sw, dW_w)``
+
+    ``W_w - W_w_ref`` is EXACTLY zero, so no forward value moves and a
+    backpropagation-through-time run and a real-time-recurrent-learning run of
+    the same recording see the same loss to the last bit. What it does move is
+    the GRAPH: the subtraction is a vertex whose edge from ``W_w`` is the
+    identity, the contraction is a vertex whose edge from it is ``J_sw``, and
+    the addition is the carried state the window's first step reads.
+    Eliminating the contraction vertex is ONE RTRL STEP -- it multiplies the
+    carried Jacobian by the state-to-state Jacobian the step body supplies --
+    and that face is where an e-prop-like approximation lives.
+
+    WHY A REFERENCE ARGUMENT AND NOT ``stop_gradient``. Both give an exactly
+    zero delta. ``stop_gradient`` would add three equations that carry no edge
+    at all, and an edge-free equation is still a VERTEX the policy has to
+    choose and eliminate for nothing. The reference weights sit outside
+    ``argnums``, so graphax's forward pruning gives them no edge and they add
+    no vertex.
+    """
+    if not carried:
+        return tuple(states)
+    n = len(SHD_CARRY_BLOCKS)
+    if len(carried) != 3 + n:
+        raise ValueError(
+            f"a carried-Jacobian attachment needs three reference weights and "
+            f"then exactly {n} blocks, in the order of "
+            f"graphax.examples.neuromorphic.SHD_CARRY_BLOCKS, so {3 + n} "
+            f"entries; got {len(carried)}. Six of the eighteen (state, weight) "
+            f"pairs are structurally zero and are the ones left out, so a "
+            f"shorter tuple is an approximation, not a saving.")
+    refs, blocks = carried[:3], carried[3:]
+    out = list(states)
+    with snn_carry_scope():
+        # One delta per weight, shared by every block that reads it. The value
+        # is exactly 0.0 and the edge to the weight is the identity.
+        deltas = [W - R for W, R in zip(weights, refs)]
+        for (s, w), J in zip(SHD_CARRY_BLOCKS, blocks):
+            want = tuple(out[s].shape) + tuple(weights[w].shape)
+            if tuple(J.shape) != want:
+                raise ValueError(
+                    f"carried block (state {s}, weight {w}) has shape "
+                    f"{tuple(J.shape)}; d state / d W is {want}")
+            out[s] = out[s] + jnp.tensordot(J, deltas[w], 2)
+    return tuple(out)
+
+
 def ADALIF_SNN_SEQ(S_in_seq, S_target, U1, U2, U3, a1, a2, a3,
                    W1, W2, W3, alpha, beta, rho, thresh):
     """Temporal 3-layer ADAPTIVE LIF over a spike window ``S_in_seq`` (N, n_in).
@@ -116,7 +246,7 @@ def ADALIF_SNN_SEQ(S_in_seq, S_target, U1, U2, U3, a1, a2, a3,
 
 
 def LIF_SNN_SHD(S_in_seq, S_target, U1, U2, U3, I1, I2, I3,
-                W1, W2, W3, alpha, beta, thresh):
+                W1, W2, W3, alpha, beta, thresh, *carried):
     """Temporal 3-layer LIF over a spike WINDOW ``S_in_seq`` of shape (N, n_in).
     N is the GRADIENT WINDOW (set by the args builder from alphagrad's
     ``--target-grad-window``). The recurrent carry ENTERING the window (U*, I*) is
@@ -124,8 +254,14 @@ def LIF_SNN_SHD(S_in_seq, S_target, U1, U2, U3, I1, I2, I3,
     so forward activations reflect the whole sequence while ONLY these N steps are
     differentiated. The elimination graph graphax sees is therefore a constant
     base + N * per-step block (truncated BPTT): online (N=1) is smallest, full
-    (N=T) largest. Returns the scalar mean readout loss (differentiate W @ 8,9,10)."""
+    (N=T) largest. Returns the scalar mean readout loss (differentiate W @ 8,9,10).
+
+    ``carried`` is EMPTY for backpropagation through time and holds the twelve
+    :data:`SHD_CARRY_BLOCKS` for real-time recurrent learning; see
+    :func:`attach_carried_jacobians`."""
     N = int(S_in_seq.shape[0])
+    U1, U2, U3, I1, I2, I3 = attach_carried_jacobians(
+        (U1, U2, U3, I1, I2, I3), (W1, W2, W3), carried)
     loss = 0.0
     for t in range(N):
         with snn_step_scope(t):
@@ -140,7 +276,7 @@ def LIF_SNN_SHD(S_in_seq, S_target, U1, U2, U3, I1, I2, I3,
 
 
 def ADALIF_SNN_SHD(S_in_seq, S_target, U1, U2, U3, a1, a2, a3,
-                   W1, W2, W3, alpha, beta, rho, thresh):
+                   W1, W2, W3, alpha, beta, rho, thresh, *carried):
     """The ADAPTIVE-LIF twin of :func:`LIF_SNN_SHD`, same contract.
 
     Temporal 3-layer adaptive LIF over a spike WINDOW ``S_in_seq`` of shape
@@ -158,8 +294,18 @@ def ADALIF_SNN_SHD(S_in_seq, S_target, U1, U2, U3, a1, a2, a3,
     Every step body sits in its own :func:`snn_step_scope`, so the elimination
     graph's vertices carry their step index and the temporal order constraint
     can read it. Returns the scalar mean readout loss.
+
+    ``carried`` SELECTS THE TEMPORAL RULE. Empty (the default) is
+    backpropagation through time: the carry enters as a constant and the
+    gradient is the truncated one. The twelve :data:`SHD_CARRY_BLOCKS` make it
+    real-time recurrent learning: the carried influence matrix enters as a
+    given edge from the weights to the carried state, so eliminating that
+    vertex is one RTRL step and the gradient is exact through the WHOLE
+    prefix. See :func:`attach_carried_jacobians`.
     """
     N = int(S_in_seq.shape[0])
+    U1, U2, U3, a1, a2, a3 = attach_carried_jacobians(
+        (U1, U2, U3, a1, a2, a3), (W1, W2, W3), carried)
     loss = 0.0
     for t in range(N):
         with snn_step_scope(t):

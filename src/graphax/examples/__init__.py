@@ -3,7 +3,10 @@ from .easy import (Simple, Lighthouse, Hole, KerrSenn_metric, Helmholtz,
 from .randoms import f, g
 from .neuromorphic import (LIF_SNN, ADALIF_SNN, ADALIF_SNN_SEQ,
                            LIF_SNN_SHD, ADALIF_SNN_SHD,
-                           SNN_STEP_SCOPE, snn_step_scope)
+                           SNN_STEP_SCOPE, snn_step_scope,
+                           SNN_CARRY_SCOPE, snn_carry_scope,
+                           SHD_CARRY_BLOCKS, SHD_CARRY_DIAGONAL_BLOCKS,
+                           attach_carried_jacobians)
 from .differential_kinematics import RobotArm_6DOF
 from .deep_learning import Perceptron, Encoder, EncoderDecoder
 from .roe import RoeFlux_1d, RoeFlux_3d
