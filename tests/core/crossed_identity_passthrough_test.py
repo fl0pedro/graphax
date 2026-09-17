@@ -259,9 +259,16 @@ def test_armed_free_order_matches_jax_on_a_transposed_model(seed):
     for v in _order_for(jaxpr, ij.vo, seed):
         ij.eliminate(v, (_identity_rule,))
     outs, _labels = ij.jacobian_outputs(dense=True)
+    # The builder holds a live trace, so its outputs are tracers: stage them
+    # out and evaluate, the idiom tests/misc/test_incremental_jaxpr.py uses.
+    res = ij.trace.to_jaxpr(list(outs), ij.dbg, ij.si)
+    got = [np.asarray(o)
+           for o in jax.core.eval_jaxpr(res[0], res[1], *args)]
     want = jax.jacrev(_transposed_model, argnums=argnums)(*args)
-    assert len(outs) == len(want)
-    for g, w in zip(outs, want):
-        g = np.asarray(g).reshape(np.asarray(w).shape)
-        assert np.allclose(g, np.asarray(w), rtol=1e-5, atol=1e-5), \
-            f"seed={seed} max|diff| = {np.max(np.abs(g - np.asarray(w)))}"
+    assert len(got) == len(want)
+    for g, w in zip(got, want):
+        w = np.asarray(w)
+        assert g.size == w.size, f"seed={seed} {g.shape} vs {w.shape}"
+        g = g.reshape(w.shape)
+        assert np.allclose(g, w, rtol=1e-5, atol=1e-5), \
+            f"seed={seed} max|diff| = {np.max(np.abs(g - w))}"
