@@ -1024,11 +1024,34 @@ def _acts_as_identity(t) -> bool:
       * a DENSE dim (``other_id is None``) is a BROADCAST over that axis — NOT
         the identity;
       * a DIAGONAL pair (``other_id`` set, linking out↔primal of equal size)
-        with ``block_size in {None, 1}`` is a PURE DIAGONAL = identity;
+        with ``block_size in {None, 1}`` is a PURE DIAGONAL, and it is the
+        identity only when the pair is POSITION-ALIGNED — ``out_dims[k]`` tied
+        to ``primal_dims[k]``. A CROSSED pair is a PERMUTATION (see below);
         ``block_size > 1`` is a block-local reduction — NOT the identity;
       * a non-zero ``fill_value`` (anything but the statically-zero ``None``)
         paints the off-structure cells, so it is not a pure identity;
       * a 0-rank scalar (no dims) is the identity up to ``scalar_mult``.
+
+    THE CROSSED PAIR (ticket dsnn-a9a). ``lax.transpose_p``'s elemental rule
+    returns a dim-less seed carrying the permutation as a queued
+    ``JacobianTransform``. Draining that queue — which ``_eliminate_vertex``
+    does at two sites, both armed only under an approximation config — writes
+    the relabel into the tensor: a ``val is None`` diagonal whose out dim 0 is
+    tied to primal dim 1 and whose out dim 1 is tied to primal dim 0. Every
+    partner exists and every partner has the right size, so the old test said
+    "identity" and ``prepare_face_operands`` set ``need_contract=False``. The
+    pass-through then returned the OTHER operand verbatim and the permutation
+    was GONE. On a rectangular transpose the dropped permutation also changed
+    the dim list and ``_set_inner`` raised ``StoredEdgeShapeMismatch``
+    (measured: stored ``(32, 128, 32, 128)`` against the nominal
+    ``(128, 32, 32, 128)`` on TransformerLM). On a SQUARE transpose nothing
+    raised and the Jacobian was simply wrong, which is why the test has to be
+    made honest here rather than at the store.
+
+    A crossed pair therefore falls into the bucket ``prepare_face_operands``
+    already documents: "a ``val is None`` operand that is NOT the identity"
+    goes through the real contraction, which is the one piece of code that
+    already composes a permutation with anything.
 
     ``scalar_mult`` is deliberately NOT inspected here — it can't be proven
     ``== 1`` inside ``jit`` (it is a tracer) — so the test is purely structural
@@ -1041,7 +1064,8 @@ def _acts_as_identity(t) -> bool:
     if len(t.out_dims) != len(t.primal_dims):
         return False
     primal_by_id = {d.id: d for d in t.primal_dims}
-    for d in t.out_dims:
+    primal_pos = {d.id: k for k, d in enumerate(t.primal_dims)}
+    for k, d in enumerate(t.out_dims):
         if d.other_id is None:  # dense dim => broadcast, not identity
             return False
         p = primal_by_id.get(d.other_id)
@@ -1049,6 +1073,8 @@ def _acts_as_identity(t) -> bool:
             return False
         if (d.block_size or 1) != 1 or (p.block_size or 1) != 1:
             return False  # block_size > 1 => block-local reduction, not identity
+        if primal_pos[d.other_id] != k:
+            return False  # crossed pair => a PERMUTATION, not the identity
     return True
 
 
