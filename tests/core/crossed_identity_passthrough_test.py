@@ -203,7 +203,7 @@ def test_randomised_shapes_around_the_failure(seed):
 # ---------------------------------------------------------------------------
 _W = jnp.asarray(np.arange(12, dtype=np.float32).reshape(4, 3) / 11.0 + 0.1)
 _X = jnp.asarray(np.arange(15, dtype=np.float32).reshape(3, 5) / 14.0 - 0.3)
-_Y = jnp.asarray(np.arange(20, dtype=np.float32).reshape(5, 4) / 19.0 + 0.2)
+_Y = jnp.asarray(np.arange(24, dtype=np.float32).reshape(4, 6) / 23.0 + 0.2)
 
 
 def _transposed_model(W, X):
@@ -222,3 +222,46 @@ def test_engine_matches_jax_on_a_transposed_model(order):
         assert np.allclose(np.asarray(g), np.asarray(w),
                            rtol=1e-5, atol=1e-5), \
             f"max|diff| = {np.max(np.abs(np.asarray(g) - np.asarray(w)))}"
+
+
+# ---------------------------------------------------------------------------
+# 6. the ARMED engine on a transposed model, against jax.jacrev
+# ---------------------------------------------------------------------------
+# An identity CALLABLE arms the approximation path (``face_config_is_approx``
+# and ``_is_approx_cfg``) without changing one number, so the expected answer
+# stays the exact Jacobian.  That isolates the defect from every real
+# approximation: the armed run drains the transpose seed's queued relabel into
+# the crossed diagonal, which is exactly the state this ticket is about.
+def _identity_rule(t):
+    return t
+
+
+def _order_for(jaxpr, vo, seed):
+    from graphax.core import _checkify_order
+    import random as _random
+    order = list(_checkify_order(list(range(1, len(jaxpr.eqns) + 1)),
+                                 jaxpr, vo))
+    _random.Random(seed).shuffle(order)
+    return order
+
+
+@pytest.mark.parametrize("seed", list(range(8)))
+def test_armed_free_order_matches_jax_on_a_transposed_model(seed):
+    from graphax import inline_call_primitives
+    from graphax.incremental import IncrementalJaxpr
+
+    args = (_W, _X)
+    argnums = (0, 1)
+    closed = jax.make_jaxpr(_transposed_model)(*args)
+    jaxpr, consts = inline_call_primitives(closed.jaxpr,
+                                           list(closed.literals))
+    ij = IncrementalJaxpr(jaxpr, argnums, consts, list(args))
+    for v in _order_for(jaxpr, ij.vo, seed):
+        ij.eliminate(v, (_identity_rule,))
+    outs, _labels = ij.jacobian_outputs(dense=True)
+    want = jax.jacrev(_transposed_model, argnums=argnums)(*args)
+    assert len(outs) == len(want)
+    for g, w in zip(outs, want):
+        g = np.asarray(g).reshape(np.asarray(w).shape)
+        assert np.allclose(g, np.asarray(w), rtol=1e-5, atol=1e-5), \
+            f"seed={seed} max|diff| = {np.max(np.abs(g - np.asarray(w)))}"
