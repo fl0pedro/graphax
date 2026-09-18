@@ -443,6 +443,8 @@ def jacve(
         ]
     ] = None,
     face_transforms: dict = None,
+    jaxpr: core.Jaxpr = None,
+    consts: Sequence = None,
 ) -> Callable:
     """
     Jacobian `fun` with respect to the `argnums` using the vertex elimination method.
@@ -503,9 +505,26 @@ def jacve(
             ``(in_eqn_id, out_eqn_id)`` pair, which is a different index;
             ``faces_of``'s keys belong to ``face_transforms``.
 
+        jaxpr (core.Jaxpr, optional): THE jaxpr to eliminate, with its
+            ``consts``. Given, ``fun`` is never traced here and this jaxpr is
+            walked as it stands -- it must already be inlined
+            (:func:`inline_call_primitives`). A caller that NUMBERS vertices
+            or face keys on a jaxpr of its own must pass that jaxpr, because a
+            fresh trace of the same function is not the same equation list: a
+            weak-typed scalar argument alone moves every
+            ``convert_element_type``, and then the order addresses the wrong
+            vertices and the face keys address the wrong edges (dsnn-dfw.24).
+        consts (Sequence, optional): the literals of ``jaxpr``. Required with
+            it, refused without it.
+
     Returns:
         Callable: The function that returns the Jacobian of `fun`.
     """
+    if (jaxpr is None) != (consts is None):
+        raise ValueError(
+            "jacve: `jaxpr` and `consts` come together -- a jaxpr without its "
+            "literals cannot be evaluated, and literals without a jaxpr "
+            "configure nothing.")
     if dense_edges and sparse_representation:
         raise ValueError(
             "dense_edges=True with sparse_representation=True: the dense mode "
@@ -517,15 +536,25 @@ def jacve(
     def jacfun(*args, **kwargs):
         # TODO Make repackaging work properly with one input value only
         flattened_args, in_tree = jtu.tree_flatten(args)
-        closed_jaxpr = jax.make_jaxpr(fun)(*flattened_args, **kwargs)
-        inlined_jaxpr, inlined_consts = _inline_call_primitives(
-            closed_jaxpr.jaxpr, closed_jaxpr.literals
-        )
-        # Bypass the id-keyed eliminator cache when the jaxpr is a fresh inlined
-        # object, OR contains a value-dependent macro-vertex (cond / named jit) —
-        # both are exposed to GC id-reuse staleness (see vertex_elimination_jaxpr).
-        was_inlined = (inlined_jaxpr is not closed_jaxpr.jaxpr
-                       or _has_recursive_macro_vertex(inlined_jaxpr))
+        if jaxpr is not None:
+            # THE CALLER'S JAXPR IS THE ONE GRAPH. It numbered the order and
+            # the face keys on it; re-tracing here would hand the elimination
+            # a different equation list for the same function.
+            inlined_jaxpr, inlined_consts = jaxpr, list(consts)
+            traced_jaxpr = jaxpr
+            was_inlined = _has_recursive_macro_vertex(inlined_jaxpr)
+        else:
+            closed_jaxpr = jax.make_jaxpr(fun)(*flattened_args, **kwargs)
+            inlined_jaxpr, inlined_consts = _inline_call_primitives(
+                closed_jaxpr.jaxpr, closed_jaxpr.literals
+            )
+            traced_jaxpr = closed_jaxpr.jaxpr
+            # Bypass the id-keyed eliminator cache when the jaxpr is a fresh
+            # inlined object, OR contains a value-dependent macro-vertex
+            # (cond / named jit) — both are exposed to GC id-reuse staleness
+            # (see vertex_elimination_jaxpr).
+            was_inlined = (inlined_jaxpr is not closed_jaxpr.jaxpr
+                           or _has_recursive_macro_vertex(inlined_jaxpr))
 
         out = vertex_elimination_jaxpr(
             inlined_jaxpr,
@@ -550,10 +579,10 @@ def jacve(
 
         if has_aux:
             primal_out, grads = out
-            out_tree = jtu.tree_structure(tuple(closed_jaxpr.jaxpr.outvars))
+            out_tree = jtu.tree_structure(tuple(traced_jaxpr.outvars))
             if (
-                len(closed_jaxpr.jaxpr.outvars) == 1
-                and len(closed_jaxpr.jaxpr.invars) > 1
+                len(traced_jaxpr.outvars) == 1
+                and len(traced_jaxpr.invars) > 1
             ):
                 res = (primal_out[0], grads[0])
             else:
@@ -562,10 +591,10 @@ def jacve(
                     jtu.tree_unflatten(out_tree, grads),
                 )
         else:
-            out_tree = jtu.tree_structure(tuple(closed_jaxpr.jaxpr.outvars))
+            out_tree = jtu.tree_structure(tuple(traced_jaxpr.outvars))
             if (
-                len(closed_jaxpr.jaxpr.outvars) == 1
-                and len(closed_jaxpr.jaxpr.invars) > 1
+                len(traced_jaxpr.outvars) == 1
+                and len(traced_jaxpr.invars) > 1
             ):
                 res = out[0]
             else:
