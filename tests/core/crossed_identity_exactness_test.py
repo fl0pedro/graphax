@@ -333,3 +333,67 @@ def test_aligned_identity_still_passes_through(mix, approx):
     want = np.asarray(pre.dense())
     assert got.shape == want.shape
     assert np.array_equal(got, want)
+
+
+# ---------------------------------------------------------------------------
+# 7. THE ENGINE, on a SQUARE transpose, under the armed free order
+#
+# Sections 2 to 4 measure the face contraction directly. This section asks the
+# same question of the whole builder. A SQUARE transpose is the silent half:
+# the dropped permutation changes no shape, so the elimination runs to the end
+# and the only evidence is the number. The approximation path is armed with an
+# IDENTITY callable, which turns on the drain that materialises the crossed
+# diagonal without changing one number, so the expected answer stays the exact
+# Jacobian.
+# ---------------------------------------------------------------------------
+import jax
+
+_SW = jnp.asarray(np.arange(12, dtype=np.float32).reshape(4, 3) / 11.0 + 0.1)
+_SX = jnp.asarray(np.arange(12, dtype=np.float32).reshape(3, 4) / 13.0 - 0.3)
+_SY = jnp.asarray(np.arange(24, dtype=np.float32).reshape(4, 6) / 23.0 + 0.2)
+
+
+def _square_transposed_model(W, X):
+    """``v`` is ``(4, 4)``, so ``v.T`` is ``(4, 4)`` -- a fixed point of the
+    permutation. Nothing downstream can catch a dropped transpose here."""
+    v = jnp.tanh(W @ X)
+    return jnp.sum((v.T @ _SY) ** 2)
+
+
+def _identity_rule(t):
+    return t
+
+
+def _order_for(jaxpr, vo, seed):
+    from graphax.core import _checkify_order
+    import random as _random
+    order = list(_checkify_order(list(range(1, len(jaxpr.eqns) + 1)),
+                                 jaxpr, vo))
+    _random.Random(seed).shuffle(order)
+    return order
+
+
+@pytest.mark.parametrize("seed", list(range(8)))
+def test_armed_free_order_on_a_SQUARE_transpose(seed):
+    from graphax import inline_call_primitives
+    from graphax.incremental import IncrementalJaxpr
+
+    args = (_SW, _SX)
+    argnums = (0, 1)
+    closed = jax.make_jaxpr(_square_transposed_model)(*args)
+    jaxpr, consts = inline_call_primitives(closed.jaxpr, list(closed.literals))
+    ij = IncrementalJaxpr(jaxpr, argnums, consts, list(args))
+    for v in _order_for(jaxpr, ij.vo, seed):
+        ij.eliminate(v, (_identity_rule,))
+    outs, _labels = ij.jacobian_outputs(dense=True)
+    res = ij.trace.to_jaxpr(list(outs), ij.dbg, ij.si)
+    got = [np.asarray(o) for o in jax.core.eval_jaxpr(res[0], res[1], *args)]
+    want = jax.jacrev(_square_transposed_model, argnums=argnums)(*args)
+    worst = 0.0
+    for g, w in zip(got, want):
+        w = np.asarray(w)
+        g = g.reshape(w.shape)
+        worst = max(worst, float(np.max(np.abs(g - w))))
+    print(f"A9A-ENGINE square seed={seed} max_abs_diff={worst:.6e}",
+          flush=True)
+    assert worst <= 1e-5, f"seed={seed} max|diff| = {worst}"
