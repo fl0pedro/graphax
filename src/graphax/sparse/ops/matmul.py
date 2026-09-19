@@ -2812,6 +2812,10 @@ def matmul(lhs, rhs, count: bool = False):
     # exact + approx) reaches that fallback any more.
     # Misaligned meta grids: meet at the gcd, which IS the result's own frame,
     # instead of at the lcm, which the tiled path has to fold back afterwards.
+    _bx = _expand_blocked_against_meta(lhs, rhs)
+    if _bx is not None:
+        _record_path("expand_blocked_meta")
+        lhs, rhs = _bx
     _rf = _reframe_misaligned_contraction(lhs, rhs)
     if _rf is not None:
         _record_path("reframe_gcd")
@@ -2850,6 +2854,66 @@ def _coarsen_pair_to(t, dim_id, other_id, meta):
         return t
     return _coarsen_coupled_blockdiag(
         t, l1[0], l1[1], l1[2], l2[0], l2[1], l2[2], meta)
+
+
+def _materialize_blocked_dim(t, dim):
+    # Write out a blocked dense dim's implicit block as dense() would: size
+    # blocks of block_size uniform positions, in that order, rank preserved.
+    n = int(dim.size) * int(dim.block_size)
+    new = DenseIndex(dim.id, n, dim.axis)
+
+    def swap(dims):
+        return tuple(new if d.id == dim.id else d for d in dims)
+
+    if dim.axis is None:
+        return _copy(t, out_dims=swap(t.out_dims), primal_dims=swap(t.primal_dims))
+    for d in t.dims:
+        if d.id == dim.id:
+            continue
+        if d.axis == dim.axis or getattr(d, "block_axis", None) == dim.axis:
+            raise ValueError(
+                f"matmul: blocked dense dim id={dim.id} shares val axis "
+                f"{dim.axis} with dim id={d.id}; its implicit block cannot be "
+                f"materialized without moving the other dim's storage."
+            )
+    shape = list(t.val.shape)
+    val, _ = _apply_expands(
+        t.val, shape,
+        [_Expand(dim.axis, int(dim.size), 1, int(dim.size), int(dim.block_size))],
+    )
+    return _copy(t, val=val, out_dims=swap(t.out_dims),
+                 primal_dims=swap(t.primal_dims))
+
+
+def _expand_blocked_against_meta(lhs, rhs):
+    # dsnn-tsl. A blocked dense contracted dim gives the pair its meta (the
+    # block COUNT); a diagonal partner on the other side gives the pair the
+    # SURVIVOR's whole extent as its meta; shared_factors takes the gcd, so the
+    # block count is divided out of the survivor and _build_pair_dims can name
+    # only the quotient. The diagonal varies inside the block, so the block has
+    # to be written out here; every other blocked dense contraction keeps meta
+    # 1 or no survivor and is left alone.
+    lhs_out = {d.id: d for d in lhs.out_dims}
+    rhs_primal = {d.id: d for d in rhs.primal_dims}
+    l_hit, r_hit = None, None
+    for lp, ro in _align_contract_dims(lhs.primal_dims, rhs.out_dims, embed=False):
+        lo = lhs_out.get(getattr(lp, "other_id", -1)) if lp.is_sparse else None
+        rp = rhs_primal.get(getattr(ro, "other_id", -1)) if ro.is_sparse else None
+        l_outer = int(lp.size) if _is_blocked_dense(lp) else _dim_vals(lo, True)[0]
+        r_outer = int(ro.size) if _is_blocked_dense(ro) else _dim_vals(rp, True)[0]
+        if math.gcd(int(l_outer), int(r_outer)) == 1:
+            continue
+        if _is_blocked_dense(lp) and rp is not None:
+            l_hit = lp
+        if _is_blocked_dense(ro) and lo is not None:
+            r_hit = ro
+    if l_hit is None and r_hit is None:
+        return None
+    if l_hit is not None:
+        lhs = _materialize_blocked_dim(lhs, l_hit)
+    if r_hit is not None:
+        rhs = _materialize_blocked_dim(rhs, r_hit)
+    return lhs, rhs
 
 
 def _reframe_misaligned_contraction(lhs, rhs):
