@@ -33,7 +33,7 @@ _get_aval = getattr(jcore, "get_aval", None) or jcore.typeof
 
 from .core import (
     _build_graph, _prune_graph, _eliminate_vertex, _drain_transforms, _force,
-    faces_of,
+    faces_of, prune_enabled,
 )
 from .sparse.tracer import TransformLog
 
@@ -91,7 +91,12 @@ class IncrementalJaxpr:
             self.env, self.graph, self.tgraph, self.vo = _build_graph(
                 jaxpr, self.in_tracers, self.consts, self.argnums,
                 eqn_provenance=_base_prov, n_eqns_fn=self._n_eqns)
-            _prune_graph(self.graph, self.tgraph, jaxpr, self.argnums)
+            # The SAME gate the eliminator uses (`core._get_eliminator`,
+            # `dense_edges`, `elimrl.symmetry`). Pruning here while the
+            # eliminator keeps the full graph made the enumerated face keys
+            # describe a graph nobody eliminates.
+            if prune_enabled():
+                _prune_graph(self.graph, self.tgraph, jaxpr, self.argnums)
 
         self.n_base = self._n_eqns()
         # traced base equation index -> vertex (1-based), densified from
