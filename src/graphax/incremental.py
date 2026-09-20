@@ -35,7 +35,6 @@ from .core import (
     _build_graph, _prune_graph, _eliminate_vertex, _drain_transforms, _force,
     faces_of, prune_enabled,
 )
-from .core import _ES3, _ES3_DIR
 from .sparse.tracer import TransformLog
 
 
@@ -181,12 +180,6 @@ class IncrementalJaxpr:
         x0 = len(self.xlog.records)
         sink_cm = (self.face_sink if self.face_sink is not None
                    else contextlib.nullcontext())
-        if _ES3_DIR:
-            if _ES3["ij"] is not self:
-                _ES3["faces"] = []
-                _ES3["stores"] = []
-            _ES3["ij"] = self
-            _ES3["step"] = len(self.steps)
         with jcore.set_current_trace(self.trace), sink_cm, self.xlog:
             _eliminate_vertex(int(vertex), self.jaxpr, self.graph,
                               self.tgraph, self.vo, False,
