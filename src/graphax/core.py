@@ -2094,6 +2094,22 @@ def prepare_face_operands(post_val, pre_val, *, approx: bool = False,
             or (_pre_val.val is None
                 and not _acts_as_identity(_pre_val))
         )
+    # THE RE-ATTACH IN ``contract_face_operands`` IS THE ONLY CARRIER of these
+    # two queues, so the operands must not still hold them. ``sparse_matmul``
+    # and ``unload_*`` rebuild the tensor and drop the queue, which is why the
+    # re-attach restores it exactly once; a branch that COPIES its operand
+    # instead -- ``scale_by_scalar`` against a rank-0 partner, the identity
+    # pass-through -- keeps the queue and the re-attach then adds the same
+    # transform a SECOND time. A transpose relabel drained twice is the
+    # identity, so the edge is stored transposed against its nominal shape
+    # (tickets dsnn-dfw.10 and dsnn-dfw.70). Clearing here gives every
+    # contraction branch the same postcondition instead of one fix per branch.
+    if _pre_val.pre_transforms:
+        _pre_val = _pre_val.copy()
+        _pre_val.pre_transforms = ()
+    if _post_val.post_transforms:
+        _post_val = _post_val.copy()
+        _post_val.post_transforms = ()
     return FaceOperands(_post_val, _pre_val, _need_contract,
                         _pre_reattach, _post_reattach,
                         approx=bool(approx), stored_pre=pre_val)
