@@ -121,6 +121,16 @@ def _expand_implicit_blocks(tensor: "SparseTensor", only_ids=None) -> "SparseTen
         val,
         scalar_mult=tensor.scalar_mult,
         fill_value=tensor.fill_value,
+        # Forward the deferred-transform queues (the bare constructor defaults
+        # them to ()). The rewrite is rank-preserving and logical-shape-
+        # preserving, so a queued relabel still addresses the same dims and
+        # must ride along; dropping it leaves the edge in its pre-drain dim
+        # ORDER with nothing left to restore it, and the next merge reports
+        # "Computed edge shape ... does not match expected shape" (ticket
+        # dsnn-dfw.79). ``apply_quant``, ``apply_compress`` and
+        # ``_apply_block_diagonal`` all state the same postcondition.
+        pre_transforms=tensor.pre_transforms,
+        post_transforms=tensor.post_transforms,
         check_consistency=False,
     )
 
