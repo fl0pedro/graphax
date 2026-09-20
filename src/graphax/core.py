@@ -48,6 +48,99 @@ EliminationOrder = Union[Sequence[int], str]
 ComputationalGraph = Dict[core.Var, Dict[core.Var, jnp.ndarray]]
 
 
+# ---------------------------------------------------------------------------
+# DIAGNOSTIC (ticket dsnn-dfw.79). Inert unless GRAPHAX_ES3_DIR is set; the
+# whole block is removed once the defect is found.
+_ES3_DIR = os.environ.get("GRAPHAX_ES3_DIR")
+_ES3 = {"faces": [], "stores": [], "step": -1, "ij": None, "dumps": 0}
+
+
+def _es3_names(ts):
+    return tuple(type(t).__name__ for t in ts)
+
+
+def _es3_ids(ts):
+    return tuple(id(t) for t in ts)
+
+
+def _es3_short(t):
+    if t is None:
+        return None
+    try:
+        return {
+            "shape": tuple(int(s) for s in t.shape),
+            "val": (None if getattr(t, "val", None) is None
+                    else tuple(int(s) for s in t.val.shape)),
+            "pre": _es3_names(t.pre_transforms),
+            "post": _es3_names(t.post_transforms),
+            "pre_id": _es3_ids(t.pre_transforms),
+            "post_id": _es3_ids(t.post_transforms),
+        }
+    except Exception as _exc:
+        return {"error": repr(_exc)}
+
+
+def _es3_full(t):
+    d = _es3_short(t)
+    if t is None or "error" in d:
+        return d
+    try:
+        d["out_dims"] = repr(t.out_dims)
+        d["primal_dims"] = repr(t.primal_dims)
+        d["scalar_mult"] = repr(getattr(t, "scalar_mult", None))
+    except Exception as _exc:
+        d["dims_error"] = repr(_exc)
+    try:
+        d["drained_shape"] = tuple(
+            int(s) for s in _drain_transforms(t.copy()).shape)
+    except Exception as _exc:
+        d["drained_shape"] = repr(_exc)
+    return d
+
+
+def _es3_push(key, rec):
+    _l = _ES3[key]
+    _l.append(rec)
+    if len(_l) > 3000:
+        del _l[:1500]
+
+
+def _es3_dump(tag, payload):
+    if not _ES3_DIR or _ES3["dumps"] >= 3:
+        return
+    import json as _json
+    import sys as _sys
+    _ES3["dumps"] += 1
+    _ij = _ES3["ij"]
+    order = []
+    if _ij is not None:
+        for _s in getattr(_ij, "steps", []):
+            order.append({
+                "vertex": int(_s[0]),
+                "rules": repr(_s[1]),
+                "faces": (None if _s[6] is None
+                          else {repr(_k): repr(_v) for _k, _v in _s[6].items()}),
+            })
+    out = {
+        "tag": tag,
+        "pid": os.getpid(),
+        "step": _ES3["step"],
+        "order": order,
+        "payload": payload,
+        "faces": _ES3["faces"][-60:],
+        "stores": _ES3["stores"][-400:],
+    }
+    try:
+        os.makedirs(_ES3_DIR, exist_ok=True)
+        _p = os.path.join(
+            _ES3_DIR, "es3_%d_%d.json" % (os.getpid(), _ES3["dumps"]))
+        with open(_p, "w") as _f:
+            _json.dump(out, _f, indent=1, default=repr)
+        print("[es3] wrote %s" % _p, file=_sys.stderr, flush=True)
+    except Exception as _exc:
+        print("[es3] dump failed: %r" % (_exc,), file=_sys.stderr, flush=True)
+
+
 # Toggle caching of jaxpr-derived structures (e.g. computational graph). Set
 # GX_ENABLE_CACHE=0 to disable caching when iterating on tracing logic or
 # diagnosing graph-state corruption.
@@ -2602,6 +2695,28 @@ def _eliminate_vertex(
                 # exactly what the first produced.
                 _fc = contract_face_operands(_ops, count_ops=count_ops)
                 edge_outval = _fc.val
+                if _ES3_DIR:
+                    _es3_push("faces", {
+                        "step": _ES3["step"],
+                        "vertex": int(vertex),
+                        "in": _vidx.get(in_edge) if _vidx else None,
+                        "out": _vidx.get(out_edge) if _vidx else None,
+                        "in_aval": tuple(int(s) for s in in_edge.aval.shape),
+                        "out_aval": tuple(int(s) for s in out_edge.aval.shape),
+                        "slots": repr(_slots) if face_transforms is not None else None,
+                        "rules": repr(transforms),
+                        "approx_cfg": bool(_perpath or _is_approx_cfg),
+                        "need_contract": bool(_need_contract),
+                        "stored_post": _es3_short(post_val),
+                        "stored_pre": _es3_short(pre_val),
+                        "op_post": _es3_short(_ops.post),
+                        "op_pre": _es3_short(_ops.pre),
+                        "reattach_pre": _es3_names(_pre_reattach),
+                        "reattach_pre_id": _es3_ids(_pre_reattach),
+                        "reattach_post": _es3_names(_post_reattach),
+                        "reattach_post_id": _es3_ids(_post_reattach),
+                        "result": _es3_short(edge_outval),
+                    })
                 if count_ops:
                     adds += _fc.adds
                     muls += _fc.muls
@@ -2703,6 +2818,33 @@ def _eliminate_vertex(
                         edge_shape = tuple(
                             list(out_edge.aval.shape) + list(in_edge.aval.shape)
                         )
+                        if not (edge_shape == edge_outval.shape) or not (
+                                edge_shape == _edge.shape):
+                            if _ES3_DIR:
+                                _es3_dump("merge-shape", {
+                                    "expected": edge_shape,
+                                    "computed": tuple(int(s) for s in edge_outval.shape),
+                                    "existing": tuple(int(s) for s in _edge.shape),
+                                    "vertex": int(vertex),
+                                    "in": _vidx.get(in_edge) if _vidx else None,
+                                    "out": _vidx.get(out_edge) if _vidx else None,
+                                    "in_aval": tuple(int(s) for s in in_edge.aval.shape),
+                                    "out_aval": tuple(int(s) for s in out_edge.aval.shape),
+                                    "slots": (repr(_slots)
+                                              if face_transforms is not None else None),
+                                    "rules": repr(transforms),
+                                    "need_contract": bool(_need_contract),
+                                    "stored_post": _es3_full(post_val),
+                                    "stored_pre": _es3_full(pre_val),
+                                    "op_post": _es3_full(_ops.post),
+                                    "op_pre": _es3_full(_ops.pre),
+                                    "reattach_pre": _es3_names(_pre_reattach),
+                                    "reattach_pre_id": _es3_ids(_pre_reattach),
+                                    "reattach_post": _es3_names(_post_reattach),
+                                    "reattach_post_id": _es3_ids(_post_reattach),
+                                    "computed_edge": _es3_full(edge_outval),
+                                    "existing_edge": _es3_full(_edge),
+                                })
                         if not (edge_shape == edge_outval.shape):
                             raise RuntimeError(f"Computed edge shape {edge_outval.shape} does not match expected shape {edge_shape}!")
                         if not (edge_shape == _edge.shape):
@@ -2880,6 +3022,16 @@ def _eliminate_vertex(
                 if os.environ.get("GX_NO_SQUEEZE", "0") != "1":
                     edge_outval = _squeeze_unreferenced_val_axes(edge_outval)
 
+                if _ES3_DIR:
+                    _es3_push("stores", {
+                        "step": _ES3["step"],
+                        "vertex": int(vertex),
+                        "in": _vidx.get(in_edge) if _vidx else None,
+                        "out": _vidx.get(out_edge) if _vidx else None,
+                        "nominal": (tuple(int(s) for s in out_edge.aval.shape)
+                                    + tuple(int(s) for s in in_edge.aval.shape)),
+                        "edge": _es3_short(edge_outval),
+                    })
                 _record_edge_store(edge_outval)
                 _set_inner(graph, in_edge, out_edge, edge_outval)
                 _set_inner(transpose_graph, out_edge, in_edge, edge_outval, is_transpose=True)
