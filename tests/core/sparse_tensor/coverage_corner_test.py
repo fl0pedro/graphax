@@ -22,6 +22,7 @@ import jax.random as jr
 from graphax.sparse.tensor import SparseTensor
 from graphax.sparse.indexes import DenseIndex, DiagonalIndex
 from graphax.sparse.ops.matmul import matmul
+from graphax.sparse.ops._path_tracking import track_paths
 
 
 def _n(shape, key_idx, dtype=jnp.float32):
@@ -158,10 +159,10 @@ class TestZeroFillFlagSurvivesJit(unittest.TestCase):
     1. ``fill_value is None`` for default-construction zero fills.
     2. The None marker round-trips through ``jit(identity)`` (``tree_unflatten``
        restores it from the treedef).
-    3. A jit'd ``matmul`` of two zero-fill operands compiles to small HLO
-       (proxy for "stayed on the tiled path, didn't materialize a dense
-       intermediate") — the densify fallback would balloon the HLO with a
-       dense ``dot_general`` over densified operands.
+    3. A jit'd ``matmul`` of two zero-fill operands stays on the tiled path:
+       the dispatcher records ``tiled`` and the compiled HLO carries no
+       ``dot``. The densify fallback would contract densified operands and
+       emit one.
     """
 
     def _zero_fill_tensor(self, shape, key_idx, fill_value=None):
@@ -194,10 +195,21 @@ class TestZeroFillFlagSurvivesJit(unittest.TestCase):
         self.assertIsNone(t2.fill_value)
 
     def test_jitted_matmul_uses_tiled_path(self):
-        """If the densify fallback fires, HLO carries a full ``dot`` over
-        ``densify(lhs) × densify(rhs)`` and grows by an order of magnitude.
-        The tiled path keeps it tight. We assert the HLO is well under the
-        densify-fallback footprint as a coarse but reliable signal."""
+        """If the densify fallback fires, it contracts ``densify(lhs)`` with
+        ``densify(rhs)`` and the compiled HLO carries a ``dot``. The tiled path
+        emits none — for these operands it is a single ``multiply`` fusion.
+        Assert both the dispatcher's own path record and the emitted program.
+
+        This assertion used to be ``len(compile().as_text()) < 8000``. That
+        text opens with XLA's FileNames / FunctionNames / StackFrameIndex
+        tables, whose size follows the Python call stack that traced the
+        program, so the number measured the TEST RUNNER and not the lowering.
+        MEASURED 2026-09-20 (dsnn-dfw.72): the byte-identical program reads
+        7525 chars under plain pytest and 8312 under a pytest-xdist worker,
+        which adds ``execnet`` and ``xdist.remote`` frames; the two texts
+        differ only inside those metadata tables, and the entry computation is
+        the same single ``multiply`` fusion in both. A plain script, with a
+        shallower stack still, reads 3522."""
         a = self._zero_fill_tensor((4, 6), 1)
         b = self._zero_fill_tensor((4, 6), 2)
 
@@ -205,13 +217,18 @@ class TestZeroFillFlagSurvivesJit(unittest.TestCase):
         def f(x, y):
             return matmul(x, y).val
 
-        hlo = f.lower(a, b).compile().as_text()
-        # Densify fallback for these sizes lands at ~10–11k chars of HLO; the
-        # tiled path lands well under 6k. The 8k cutoff is a safe middle.
-        self.assertLess(
-            len(hlo), 8000,
-            f"HLO is {len(hlo)} chars — densify fallback likely fired again. "
-            f"Check that ``_is_zero_fill`` reads the cached static flag.",
+        with track_paths() as paths:
+            hlo = f.lower(a, b).compile().as_text()
+
+        self.assertEqual(
+            paths, ["tiled"],
+            f"matmul dispatched to {paths}, not the tiled path — check that "
+            f"``_is_zero_fill`` still reads the static ``fill_value is None`` "
+            f"marker through jit.",
+        )
+        self.assertNotIn(
+            "dot(", hlo,
+            "the compiled HLO carries a dot — the densify fallback fired.",
         )
 
 
