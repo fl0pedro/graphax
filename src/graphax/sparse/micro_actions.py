@@ -726,9 +726,17 @@ def _reduce_along_axes(val: jnp.ndarray, axes: tuple[int, ...], kind: str):
     after merging the reduction axes into a single trailing one — this keeps
     the reduction to a single XLA op even for multi-axis Compress and avoids
     a Python-level fold over the axes.
+
+    ``mean`` accumulates in float32 and casts back to the operand dtype when
+    that dtype is narrower than 32 bits (every float8 member, float16,
+    bfloat16). A sum of a few hundred entries in a narrow float format can
+    overflow into NaN or underflow to zero before the divide; float32 has the
+    range and precision to keep the accumulation correct.
     """
     axes = tuple(sorted(set(axes)))
     if kind == "mean":
+        if jnp.issubdtype(val.dtype, jnp.floating) and val.dtype.itemsize < 4:
+            return jnp.mean(val.astype(jnp.float32), axis=axes).astype(val.dtype)
         return jnp.mean(val, axis=axes)
     if kind == "min":
         return jnp.min(val, axis=axes)
