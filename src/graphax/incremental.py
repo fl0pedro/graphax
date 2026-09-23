@@ -135,8 +135,7 @@ class IncrementalJaxpr:
         return len(self.trace.frame.tracing_eqns)
 
     def _sync_eqns(self):
-        # jax's frame only appends; alphagrad also truncates the tail. The kept
-        # prefix ends at the last entry that is still the same object.
+        # jax appends and alphagrad cuts the tail, so the kept prefix ends at the last identical entry.
         teq = self.trace.frame.tracing_eqns
         if teq is not self._teq:
             self._teq, self._raw, self._eqns = teq, [], []
