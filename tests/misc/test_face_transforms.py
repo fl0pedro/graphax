@@ -377,14 +377,14 @@ def test_every_slot_is_recorded_on_the_open_face():
     the FaceSink trace stays a truthful description of what was applied."""
     def _ft(ij, jaxpr):
         keys = faces_of(ij.graph, ij.tgraph, 1, jaxpr)
-        return {keys[0]: (Quant("bfloat16"), Quant("float16"),
-                          Quant("bfloat16"))}
+        return {keys[0]: (Quant("bfloat16"), Quant("bfloat16"),
+                          Quant("float16"))}
 
     _, ij, step = _run(_fanout, (_X3,), (0,), _ft, vertex=1)
     approx = [fr.approx for fr in ij.step_faces(step)]
 
     assert [r.params["dtype"] for r in approx[0]] == [
-        "bfloat16", "float16", "bfloat16"]
+        "bfloat16", "bfloat16", "float16"]
     assert [r.slot for r in approx[0]] == ["lhs", "rhs", "res"], (
         "each slot records WHICH operand it approximated")
     assert approx[1] == []

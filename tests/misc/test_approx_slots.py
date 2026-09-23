@@ -29,7 +29,7 @@ import pytest
 
 from graphax import SKIP_FACE, IncrementalPathTokenizer, faces_of
 from graphax.jaxpr import SLOT_SEPARATOR, get_vocab
-from graphax.sparse.micro_actions import Compress, Diag, Quant
+from graphax.sparse.micro_actions import QUANT_DTYPE_INDEX, Compress, Diag, Quant
 from graphax.sparse.tracer import FACE_SLOT_NAMES, N_FACE_SLOTS, face_slot_index
 
 _M = jnp.asarray(np.arange(16, dtype=np.float32).reshape(4, 4) / 15.0 + 0.1)
@@ -125,7 +125,7 @@ def test_two_slots_and_three_slots_keep_the_positions():
 
     tk, delta, segs = _tokenize({0: (_QUANT, _QUANT, _QUANT)})
     assert _head(tk, _approx_part(tk, delta, segs[0])) == (
-        "approxQUANTd#bfloat16^QUANTd#bfloat16^QUANTd#bfloat16")
+        f"approx~{QUANT_DTYPE_INDEX['bfloat16']}^^QUANTd#bfloat16")
 
 
 def test_the_separator_count_is_invariant_and_three_blocks_follow():
@@ -227,8 +227,8 @@ def test_face_headers_are_stable_slot_for_slot_under_a_skip():
 def test_the_record_carries_the_slot_not_the_position():
     """What makes the head possible: the sink TAGS every approximation with the
     operand it hit, so a declining middle slot cannot shift the others."""
-    _tk, _delta, _segs = _tokenize({0: _slots(post=_QUANT)})
-    tk, _d, _s = _tokenize({0: _slots(pre=_QUANT, new=_QUANT)})
+    _tk, _delta, _segs = _tokenize({0: _slots(post=_DIAG)})
+    tk, _d, _s = _tokenize({0: _slots(pre=_DIAG, new=_QUANT)})
     recs = tk.ij.step_faces(0)[0].approx
     assert [r.slot for r in recs] == ["lhs", "res"]
     assert [face_slot_index(r.slot) for r in recs] == [0, 2]
@@ -289,17 +289,20 @@ class _Chooser:
 
 _COMPRESS = Compress(axes=(0,), kind="mean")
 
+# A Quant is two-sided (owner ruling 2026-09-23), so its chooser sits on both
+# contraction slots and its head is the face's ``~ <dtype index>``.
 _CHOOSER_CASES = [
-    (_DIAG, "approxDIAG012^^"),
-    (_COMPRESS, "approxCOMPRESSk#mean0^^"),
-    (_QUANT, "approxQUANTd#bfloat16^^"),
+    (_DIAG, ("pre",), "approxDIAG012^^", ["lhs"]),
+    (_COMPRESS, ("pre",), "approxCOMPRESSk#mean0^^", ["lhs"]),
+    (_QUANT, ("pre", "post"), f"approx~{QUANT_DTYPE_INDEX['bfloat16']}^^",
+     ["lhs", "rhs"]),
 ]
 
 
-@pytest.mark.parametrize("action,head", _CHOOSER_CASES,
+@pytest.mark.parametrize("action,where,head,_slots_unused", _CHOOSER_CASES,
                          ids=["diag", "compress", "quant"])
 def test_a_chooser_that_returns_an_action_emits_the_block_a_literal_emits(
-        action, head):
+        action, where, head, _slots_unused):
     """TYPE, ARGS and the output jaxpr, byte for byte the literal's block.
 
     The chooser is the only form a policy can use, so if its block differed
@@ -307,8 +310,8 @@ def test_a_chooser_that_returns_an_action_emits_the_block_a_literal_emits(
     decision.
     """
     ch = _Chooser(action)
-    tk_c, tok_c, segs_c = _tokenize({0: _slots(pre=ch)})
-    tk_l, tok_l, segs_l = _tokenize({0: _slots(pre=action)})
+    tk_c, tok_c, segs_c = _tokenize({0: _slots(**{w: ch for w in where})})
+    tk_l, tok_l, segs_l = _tokenize({0: _slots(**{w: action for w in where})})
 
     assert _head(tk_c, _approx_part(tk_c, tok_c, segs_c[0])) == head
     assert _approx_part(tk_c, tok_c, segs_c[0]) == \
@@ -316,10 +319,10 @@ def test_a_chooser_that_returns_an_action_emits_the_block_a_literal_emits(
     assert tuple(tok_c) == tuple(tok_l)
 
 
-@pytest.mark.parametrize("action,_head_unused", _CHOOSER_CASES,
+@pytest.mark.parametrize("action,where,_head_unused,rec_slots", _CHOOSER_CASES,
                          ids=["diag", "compress", "quant"])
 def test_a_chosen_actions_block_carries_the_equations_it_emitted(
-        action, _head_unused):
+        action, where, _head_unused, rec_slots):
     """THE OUTPUT TOKENIZED JAXPR. A block is ``approx <TYPE> <args>`` followed
     by the three slots' equation blocks, and the approximated slot's block is
     the jaxpr the application itself wrote -- a ``convert_element_type`` for
@@ -329,10 +332,10 @@ def test_a_chosen_actions_block_carries_the_equations_it_emitted(
     same statement as a non-empty block.
     """
     ch = _Chooser(action)
-    tk, tok, segs = _tokenize({0: _slots(pre=ch)})
+    tk, tok, segs = _tokenize({0: _slots(**{w: ch for w in where})})
     recs = tk.ij.step_faces(0)[0].approx
 
-    assert [r.slot for r in recs] == ["lhs"]
+    assert [r.slot for r in recs] == rec_slots
     assert recs[0].end > recs[0].start, (
         "the approximation emitted no equations, so its block carries no "
         "output jaxpr at all")
@@ -350,9 +353,9 @@ def test_the_chooser_is_told_whether_its_action_changed_the_tensor():
     whether the action was a no-op -- and a no-op emits no block. The callback
     is what lets a caller's ``applied`` counter agree with the stream."""
     ch = _Chooser(_QUANT)
-    tk, _tok, _segs = _tokenize({0: _slots(pre=ch)})
-    assert ch.outcomes == [(_QUANT, True)]
-    assert [r.atype for r in tk.ij.step_faces(0)[0].approx] == ["QUANT"]
+    tk, _tok, _segs = _tokenize({0: _slots(pre=ch, post=ch)})
+    assert ch.outcomes == [(_QUANT, True), (_QUANT, True)]
+    assert [r.atype for r in tk.ij.step_faces(0)[0].approx] == ["QUANT", "QUANT"]
 
     # THE INVARIANT the callback exists for: as many blocks as outcomes the
     # engine reported applied, on every face, whatever the slots hold.

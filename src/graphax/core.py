@@ -1639,8 +1639,30 @@ class FaceTransformIllegal(ValueError):
     """
 
 
+def _check_face_quant(lhs_action, rhs_action, vertex, face_key):
+    lq = lhs_action if isinstance(lhs_action, Quant) else None
+    rq = rhs_action if isinstance(rhs_action, Quant) else None
+    if lq is None and rq is None:
+        return
+    if lq is None or rq is None:
+        raise FaceTransformIllegal(
+            f"Face {face_key} at vertex {vertex} carries a Quant on its "
+            f"{'lhs' if rq is None else 'rhs'} contraction slot only. A Quant "
+            "narrows BOTH contraction operands of a face (owner ruling "
+            "2026-09-23: no one-sided Quant); put the same Quant on lhs and "
+            "rhs, or on neither. The new slot is unaffected.")
+    if lq.dtype != rq.dtype:
+        raise FaceTransformIllegal(
+            f"Face {face_key} at vertex {vertex} carries Quant({lq.dtype!r}) "
+            f"on lhs and Quant({rq.dtype!r}) on rhs. A face Quant is ONE "
+            "dtype on both contraction operands (owner ruling 2026-09-23); a "
+            "mixed pair would be upcast to their common dtype, which is the "
+            "one-sided full-width copy the ruling forbids.")
+
+
 def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
-                          out_edge=None, _xlog=None, log_slot=None):
+                          out_edge=None, _xlog=None, log_slot=None,
+                          chosen=None):
     """Apply ONE per-face slot transform to ONE Jacobian operand.
 
     Mirrors the per-vertex ``transforms`` dispatch in :func:`_eliminate_vertex`
@@ -1681,6 +1703,8 @@ def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
         return val
     try:
         if isinstance(_t, (Diag, Compress, Quant)):
+            if chosen is not None:
+                chosen.append(_t)
             _as = _eqn_count(_face_sink, _xlog)
             out = _apply_micro(val, _t)
             _record_micro(_t, val, out, vertex, slot, in_edge, out_edge,
@@ -1696,6 +1720,9 @@ def _apply_face_transform(val, _t, slot, vertex, _face_sink, in_edge=None,
             # transform log as a literal one, which a plain tensor-returning
             # callable is NOT.
             _chosen = _t(val)
+            if chosen is not None:
+                chosen.append(_chosen if isinstance(
+                    _chosen, (Diag, Compress, Quant)) else None)
             if _chosen is None:
                 return val
             if isinstance(_chosen, (Diag, Compress, Quant)):
@@ -2512,12 +2539,18 @@ def _eliminate_vertex(
                          _face_join_t) = _unpack_face_slots(_slots, vertex)
                         if _is_two_op_slots(_slots):
                             _face_res_log = "res:jres"
+                        _lhs_chosen, _rhs_chosen = [], []
                         pre_val = _apply_face_transform(
                             pre_val, _lhs_t, "lhs", vertex, _face_sink,
-                            in_edge, out_edge, _xlog)
+                            in_edge, out_edge, _xlog, chosen=_lhs_chosen)
                         post_val = _apply_face_transform(
                             post_val, _rhs_t, "rhs", vertex, _face_sink,
-                            in_edge, out_edge, _xlog)
+                            in_edge, out_edge, _xlog, chosen=_rhs_chosen)
+                        _check_face_quant(
+                            _lhs_chosen[0] if _lhs_chosen else None,
+                            _rhs_chosen[0] if _rhs_chosen else None,
+                            vertex,
+                            (_vidx.get(in_edge), _vidx.get(out_edge)))
 
                 # Resolve this path's per-op hooks. The path (in_edge -> vertex ->
                 # out_edge) is keyed by its neighbour vertex ids; ``_h_*`` default

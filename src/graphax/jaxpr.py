@@ -71,6 +71,7 @@ STRUCTURE_TOKENS = ["inputs", "outputs", "jac", "fns", "elim", "approx",
 # One special token per approximation TYPE (Diag / Compress / Quant) ...
 from graphax.sparse.micro_actions import (  # noqa: E402
     COMPRESS_KINDS as _COMPRESS_KINDS,
+    QUANT_DTYPE_INDEX as _QUANT_DTYPE_INDEX,
     QUANT_DTYPES as _QUANT_DTYPES,
 )
 # The per-face approximation slots are DEFINED by the sink that records them
@@ -989,6 +990,21 @@ def _op_fn_key(prim: str, params: Dict[str, Any]):
     return tuple((k, repr(v)) for k, v in _significant_params(params))
 
 
+def _split_face_quant(slots):
+    # A QUANT on a contraction slot is the face's two-sided Quant (core.py
+    # refuses the one-sided form), so it is rendered once, before the slots.
+    dtypes = {rec[1]["dtype"] for recs in slots[:2] for rec in recs
+              if rec[0] == "QUANT"}
+    if not dtypes:
+        return None, slots
+    if len(dtypes) > 1:
+        raise ValueError(
+            f"A face recorded Quants of {sorted(dtypes)} on its contraction "
+            "slots; a face Quant is one dtype on both (owner ruling 2026-09-23).")
+    rest = [[rec for rec in recs if rec[0] != "QUANT"] for recs in slots[:2]]
+    return dtypes.pop(), rest + list(slots[2:])
+
+
 class IncrementalPathTokenizer:
     """Renders the incremental Jacobian as an append-only token stream.
 
@@ -1359,7 +1375,11 @@ class IncrementalPathTokenizer:
         whole point: ``approx DIAG 1 2 4 ^ ^`` (pre), ``approx ^ DIAG 1 2 4 ^``
         (post) and ``approx ^ ^ DIAG 1 2 4`` (new) are three DIFFERENT streams,
         where the old one-header-per-record form made all three IDENTICAL."""
+        face_q, slots = _split_face_quant(slots)
         self._emit_word("approx", out)
+        if face_q is not None:
+            out.append(self.vocab["~"])
+            self._emit_int(_QUANT_DTYPE_INDEX[face_q], out)
         for i, recs in enumerate(slots):
             if i:
                 out.append(self.vocab[SLOT_SEPARATOR])
@@ -1616,9 +1636,11 @@ class IncrementalPathTokenizer:
             if any(slots):
                 # Same shape as the token stream: ONE head, three ``^``-
                 # separated slots (pre/post/new), then the three eqn blocks.
-                L.append("  approx " + " ^ ".join(
+                face_q, head = _split_face_quant(slots)
+                L.append("  approx " + ("" if face_q is None else f"~{face_q} ")
+                         + " ^ ".join(
                     " ".join(f"{t} {self._pp_approx_args(t, p)}".strip()
-                             for t, p, _sub in recs) for recs in slots))
+                             for t, p, _sub in recs) for recs in head))
                 for name, recs in zip(_FACE_SLOT_NAMES, slots):
                     L.append(f"    [{name}]")
                     self._pp_eqns([e for _t, _p, sub in recs for e in sub],
