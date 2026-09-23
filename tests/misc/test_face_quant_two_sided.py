@@ -29,8 +29,12 @@ def _fanout(x):
     return _W2 @ e, _W3 @ e
 
 
+_W1T = jnp.asarray(np.asarray(_W1).T)
+_W2T = jnp.asarray(np.asarray(_W2).T)
+
+
 def _batched(x):
-    return (x @ _W1.T) @ _W2.T
+    return (x @ _W1T) @ _W2T
 
 
 def _eliminate_all(fn, args, vertex, slots, faces=None):
@@ -94,6 +98,8 @@ def test_a_two_sided_quant_face_is_a_bf16_dot_with_f32_sums_and_a_bf16_result():
 
 def test_a_two_sided_quant_face_with_a_batch_axis_is_a_bf16_dot():
     ij = _eliminate_all(_batched, (_XB,), 1, (_Q, _Q, None))
+    recs = [r for fr in ij.step_faces(0) for r in fr.approx]
+    assert [(r.atype, r.slot) for r in recs] == [("QUANT", "lhs"), ("QUANT", "rhs")]
     _assert_narrow_gemm(_lowered(ij, (_XB,)))
     got = _jacobian(ij, (_XB,))
     assert jnp.dtype(got.dtype) == jnp.dtype(jnp.bfloat16)
@@ -164,9 +170,19 @@ def test_the_stream_carries_the_face_quant_once_before_the_slots():
 
 
 def test_the_face_quant_sits_beside_the_other_slot_decisions():
+    tk, delta, segs = _tokenize(_chain, (_X6,), 1, (_Q, _Q, Quant("float16")))
+    _start, split, end = segs[0]
+    assert _head(tk, delta[split:end]) == f"approx~{_QI}^^QUANTd#float16"
+
+
+def test_a_new_slot_quant_to_the_result_dtype_is_a_no_op():
+    # The two-sided face already stores its result bf16, so a bf16 Quant on
+    # the new slot changes nothing and records nothing.
     tk, delta, segs = _tokenize(_chain, (_X6,), 1, (_Q, _Q, _Q))
     _start, split, end = segs[0]
-    assert _head(tk, delta[split:end]) == f"approx~{_QI}^^QUANTd#bfloat16"
+    assert _head(tk, delta[split:end]) == f"approx~{_QI}^^"
+    recs = tk.ij.step_faces(0)[0].approx
+    assert [r.slot for r in recs] == ["lhs", "rhs"]
 
 
 def test_an_exact_face_carries_no_tilde():

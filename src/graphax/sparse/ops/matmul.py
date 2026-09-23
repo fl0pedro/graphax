@@ -2082,9 +2082,23 @@ def _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub):
     """
     if (jnp.dtype(a.dtype) == jnp.dtype(jnp.bfloat16)
             and jnp.dtype(b.dtype) == jnp.dtype(jnp.bfloat16)):
+        # jnp.einsum sums a private label in the preferred dtype, which widens
+        # a bf16 operand to f32 before the dot; a unit private axis is dropped
+        # here instead, so both operands reach the dot narrow.
+        a, lhs_sub = _drop_unit_private_axes(a, lhs_sub, rhs_sub, out_sub)
+        b, rhs_sub = _drop_unit_private_axes(b, rhs_sub, lhs_sub, out_sub)
         return jnp.einsum(a, lhs_sub, b, rhs_sub, out_sub,
                           preferred_element_type=jnp.float32)
     return jnp.einsum(a, lhs_sub, b, rhs_sub, out_sub)
+
+
+def _drop_unit_private_axes(x, sub, other_sub, out_sub):
+    drop = [i for i, lbl in enumerate(sub)
+            if x.shape[i] == 1 and lbl not in other_sub and lbl not in out_sub]
+    if not drop:
+        return x, sub
+    return (jnp.squeeze(x, drop),
+            [lbl for i, lbl in enumerate(sub) if i not in drop])
 
 
 def _gx_einsum(a, b, dims):

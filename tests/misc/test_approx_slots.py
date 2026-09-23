@@ -123,9 +123,14 @@ def test_two_slots_and_three_slots_keep_the_positions():
     assert _head(tk, _approx_part(tk, delta, segs[0])) == \
         "approxDIAG012^^DIAG012"
 
+    # The two-sided face stores its result bf16 already, so the bf16 Quant on
+    # the new slot is a no-op and records nothing.
     tk, delta, segs = _tokenize({0: (_QUANT, _QUANT, _QUANT)})
     assert _head(tk, _approx_part(tk, delta, segs[0])) == (
-        f"approx~{QUANT_DTYPE_INDEX['bfloat16']}^^QUANTd#bfloat16")
+        f"approx~{QUANT_DTYPE_INDEX['bfloat16']}^^")
+    tk, delta, segs = _tokenize({0: (_QUANT, _QUANT, Quant("float16"))})
+    assert _head(tk, _approx_part(tk, delta, segs[0])) == (
+        f"approx~{QUANT_DTYPE_INDEX['bfloat16']}^^QUANTd#float16")
 
 
 def test_the_separator_count_is_invariant_and_three_blocks_follow():
