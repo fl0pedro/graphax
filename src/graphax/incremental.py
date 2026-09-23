@@ -23,6 +23,7 @@ backward-compatible alias.
 from __future__ import annotations
 
 import contextlib
+from weakref import ReferenceType, ref
 
 from jax._src.interpreters import partial_eval as pe
 from jax._src import core as jcore, source_info_util
@@ -77,6 +78,9 @@ class IncrementalJaxpr:
         # the PERSISTENT trace — kept alive for the whole search, extended in
         # place by every eliminate() call.
         self.trace = pe.DynamicJaxprTrace(self.dbg, parent_trace=None)
+        self._teq = self.trace.frame.tracing_eqns
+        self._raw = []
+        self._eqns = []
 
         with jcore.set_current_trace(self.trace):
             self.in_tracers = [self.trace.new_arg(_get_aval(a), self.si)
@@ -130,8 +134,43 @@ class IncrementalJaxpr:
         # must not be used just to count; the face sink calls this O(faces) times.)
         return len(self.trace.frame.tracing_eqns)
 
+    def _sync_eqns(self):
+        # jax's frame only appends; alphagrad also truncates the tail. The kept
+        # prefix ends at the last entry that is still the same object.
+        teq = self.trace.frame.tracing_eqns
+        if teq is not self._teq:
+            self._teq, self._raw, self._eqns = teq, [], []
+        raw, eqns = self._raw, self._eqns
+        n = min(len(raw), len(teq))
+        while n:
+            k = raw[n - 1]
+            if teq[n - 1] is (k() if type(k) is ReferenceType else k):
+                break
+            n -= 1
+        if n < len(raw):
+            del raw[n:]
+            del eqns[n:]
+        for i in range(n, len(teq)):
+            e = teq[i]
+            if isinstance(e, ReferenceType):
+                raise RuntimeError(
+                    f"traced equation {i} is a weak reference; the incremental "
+                    f"equation list needs a trace without auto_dce")
+            if isinstance(e, pe.TracingEqn):
+                raw.append(ref(e))
+                e = jcore.JaxprEqn(
+                    [t.val for t in e.in_tracers], e.outvars, e.primitive,
+                    e.params, e.effects, e.source_info, e.ctx)
+            else:
+                raw.append(e)
+            eqns.append(e)
+        return eqns
+
+    def all_eqns_rebuilt(self):
+        return self.trace.frame.get_eqns()
+
     def base_eqns(self):
-        return list(self.trace.frame.get_eqns()[:self.n_base])
+        return self._sync_eqns()[:self.n_base]
 
     def base_owner_of_eqn(self, i: int) -> int:
         """Vertex (1-based) that produced base equation ``i``; 0 if none.
@@ -150,7 +189,7 @@ class IncrementalJaxpr:
 
     def step_eqns(self, i):
         s, e = self.steps[i][2:4]
-        return list(self.trace.frame.get_eqns()[s:e])
+        return self._sync_eqns()[s:e]
 
     # ---- incremental elimination -------------------------------------
     def faces(self, vertex):
@@ -193,7 +232,7 @@ class IncrementalJaxpr:
             None if face_transforms is None else dict(face_transforms),
             x0, x1,
         ))
-        return self.trace.frame.get_eqns()[s:e]
+        return self._sync_eqns()[s:e]
 
     def step_faces(self, i):
         """FaceRecords for step ``i`` (empty if faces aren't tracked)."""
@@ -227,7 +266,7 @@ class IncrementalJaxpr:
         return self.xlog.drains()
 
     def all_eqns(self):
-        return self.trace.frame.get_eqns()
+        return list(self._sync_eqns())
 
     def all_faces(self):
         """All FaceRecords across every step, in elimination order."""
