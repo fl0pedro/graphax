@@ -314,7 +314,7 @@ def test_a_rank_zero_edge_keeps_rank_zero_through_the_adapter():
 def test_sparse_representation_false_is_only_the_output_packing(order_name):
     """Bit-identical to ``sparse_representation=True`` on an APPROXIMATED plan:
     the same contractions packed two ways. This is why the dense mode exists."""
-    ft = _plan(CATALOG[order_name], {0: Quant("bfloat16")})
+    ft = _plan(CATALOG[order_name], {0: Quant("bfloat16"), 1: Quant("bfloat16")})
     sp = _np(_run(ORDERS[order_name], ft, dense=False, sparse=True))
     pk = _np(_run(ORDERS[order_name], ft, dense=False, sparse=False))
     for a, b in zip(sp, pk):
