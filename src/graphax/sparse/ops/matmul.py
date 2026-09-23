@@ -1829,9 +1829,15 @@ def _pair_output_dims(ctx, rhs_dims, res):
     return out_dims, primal_dims, shape, squeeze, summed, expands
 
 
-def _narrow_output() -> bool:
-    import os
-    return os.environ.get("GRAPHAX_NARROW_OUTPUT", "0") == "1"
+def _store_narrow(values, lhs_dtype, rhs_dtype):
+    # A bf16 x bf16 contraction sums in f32 (_emit_einsum) and stores its
+    # result bf16 (owner ruling 2026-09-23: the face Quant is two-sided).
+    if (values is not None
+            and jnp.dtype(lhs_dtype) == jnp.dtype(jnp.bfloat16)
+            and jnp.dtype(rhs_dtype) == jnp.dtype(jnp.bfloat16)
+            and values.dtype != jnp.dtype(jnp.bfloat16)):
+        return values.astype(jnp.bfloat16)
+    return values
 
 
 def _build_output_tensor(ctx, rhs_dims, res):
@@ -1940,18 +1946,7 @@ def _build_output_tensor(ctx, rhs_dims, res):
     if not has_val and values is not None and values.size == 1:
         final_mult = _sm_promote(final_mult, jnp.squeeze(values))
         values = None
-    # EXPERIMENT KNOB (2026-09-13, owner question "are we staying in bf16?"):
-    # the dot accumulates in f32 and its result is stored in f32, so every
-    # contraction of two bf16 operands produces an f32 intermediate and the
-    # program is mostly f32 (885 f32 against 389 bf16 values in the all-bf16
-    # TLM executable). GRAPHAX_NARROW_OUTPUT=1 stores the result in the
-    # operands' shared narrow dtype instead. Accumulation stays f32. A knob,
-    # not a policy: it exists to measure the trade before the owner rules.
-    if (values is not None and _narrow_output()
-            and jnp.dtype(ctx.lhs.dtype) == jnp.dtype(ctx.rhs.dtype)
-            and jnp.dtype(ctx.lhs.dtype) == jnp.dtype(jnp.bfloat16)
-            and values.dtype != jnp.dtype(jnp.bfloat16)):
-        values = values.astype(jnp.bfloat16)
+    values = _store_narrow(values, ctx.lhs.dtype, ctx.rhs.dtype)
     out_dtype = values.dtype if values is not None else jnp.asarray(final_mult).dtype
     # transforms intentionally not propagated through matmul; callers in
     # core.py unload pre/post transforms before the matmul and reattach
@@ -2087,9 +2082,23 @@ def _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub):
     """
     if (jnp.dtype(a.dtype) == jnp.dtype(jnp.bfloat16)
             and jnp.dtype(b.dtype) == jnp.dtype(jnp.bfloat16)):
+        # jnp.einsum sums a private label in the preferred dtype, which widens
+        # a bf16 operand to f32 before the dot; a unit private axis is dropped
+        # here instead, so both operands reach the dot narrow.
+        a, lhs_sub = _drop_unit_private_axes(a, lhs_sub, rhs_sub, out_sub)
+        b, rhs_sub = _drop_unit_private_axes(b, rhs_sub, lhs_sub, out_sub)
         return jnp.einsum(a, lhs_sub, b, rhs_sub, out_sub,
                           preferred_element_type=jnp.float32)
     return jnp.einsum(a, lhs_sub, b, rhs_sub, out_sub)
+
+
+def _drop_unit_private_axes(x, sub, other_sub, out_sub):
+    drop = [i for i, lbl in enumerate(sub)
+            if x.shape[i] == 1 and lbl not in other_sub and lbl not in out_sub]
+    if not drop:
+        return x, sub
+    return (jnp.squeeze(x, drop),
+            [lbl for i, lbl in enumerate(sub) if i not in drop])
 
 
 def _gx_einsum(a, b, dims):
@@ -2316,7 +2325,8 @@ def _matmul_via_densify(lhs, rhs):
         (tuple(lhs_contract), tuple(rhs_contract)),
         (tuple(lhs_batch), tuple(rhs_batch)),
     )
-    result = _gx_einsum(lhs_dense, rhs_dense, _dn)
+    result = _store_narrow(_gx_einsum(lhs_dense, rhs_dense, _dn),
+                           lhs_dense.dtype, rhs_dense.dtype)
 
     # The result axes are laid out as: batch, then lhs's kept (in order), then rhs's
     # kept (in order). Build the output sizes/slot tags in that same order.

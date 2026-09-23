@@ -467,7 +467,10 @@ def test_value_and_jacobian_accessor_labels_cover_both_lists():
 # 5. TRUTHFUL, ALWAYS-ON LOGGING
 # ---------------------------------------------------------------------------
 def _quant_at(vertex, slot, dtype):
-    idx = {"lhs": 0, "rhs": 1, "res": 2}[slot]
+    # A Quant on a contraction slot is two-sided (owner ruling 2026-09-23), so
+    # ``slot`` may name several slots: ``("lhs", "rhs")``.
+    names = (slot,) if isinstance(slot, str) else tuple(slot)
+    idxs = [{"lhs": 0, "rhs": 1, "res": 2}[s] for s in names]
 
     def _build(ij, v):
         if v != vertex:
@@ -475,7 +478,8 @@ def _quant_at(vertex, slot, dtype):
         ft = {}
         for k in ij.faces(v):
             slots = [None, None, None]
-            slots[idx] = Quant(dtype=dtype)
+            for idx in idxs:
+                slots[idx] = Quant(dtype=dtype)
             ft[k] = tuple(slots)
         return ft
     return _build
@@ -510,18 +514,21 @@ def test_noop_quant_on_structural_edge_is_not_recorded_as_applied(track_faces):
     ``_structural``'s vertex 1 under the FORWARD order has the broadcast/matmul
     structural Jacobian in its ``rhs`` slot -- a ``val is None`` tensor."""
     ij = _drive(_structural, (_X4,), (0,), "fwd",
-                face_transforms=_quant_at(1, "rhs", "int8"),
+                face_transforms=_quant_at(1, ("lhs", "rhs"), "bfloat16"),
                 track_faces=track_faces)
     recs = [r for r in ij.transform_records() if r.kind == "transform"]
-    assert len(recs) == 1, "the micro-action was dispatched exactly once"
-    assert recs[0].atype == "QUANT"
-    assert recs[0].applied is False, "a val-is-None quant changes nothing"
-    assert recs[0].start == recs[0].end, "and it emits no equations"
+    assert [r.slot for r in recs] == ["lhs", "rhs"], (
+        "the micro-action was dispatched exactly once per contraction slot")
+    lhs, rhs = recs
+    assert lhs.atype == rhs.atype == "QUANT"
+    assert lhs.applied is True
+    assert rhs.applied is False, "a val-is-None quant changes nothing"
+    assert rhs.start == rhs.end, "and it emits no equations"
     # applied_only filtering hides it, which is the point of the flag
-    assert ij.xlog.transforms(applied_only=True) == []
+    assert [r.slot for r in ij.xlog.transforms(applied_only=True)] == ["lhs"]
     if track_faces:
         # ... and no empty ``approx`` block is rendered for it
-        assert sum(len(f.approx) for f in ij.all_faces()) == 0
+        assert [r.slot for f in ij.all_faces() for r in f.approx] == ["lhs"]
 
 
 @pytest.mark.parametrize("track_faces", [False, True])
@@ -543,7 +550,9 @@ def test_noop_transform_does_not_change_the_jacobian():
     byte-identical to the un-approximated one."""
     plain = _drive(_structural, (_X4,), (0,), "fwd")
     noop = _drive(_structural, (_X4,), (0,), "fwd",
-                  face_transforms=_quant_at(1, "rhs", "int8"))
+                  face_transforms=_quant_at(1, ("lhs", "rhs"), "float32"))
+    recs = [r for r in noop.transform_records() if r.kind == "transform"]
+    assert [r.applied for r in recs] == [False, False]
     a, _ = _recover(plain, (_X4,))
     b, _ = _recover(noop, (_X4,))
     assert len(a) == len(b)
