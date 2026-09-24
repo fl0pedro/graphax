@@ -108,6 +108,64 @@ def test_a_two_sided_quant_face_with_a_batch_axis_is_a_bf16_dot():
     assert err < 2e-2, err
 
 
+_WC = jnp.asarray(np.arange(120, dtype=np.float32).reshape(5, 4, 6) / 119.0 - 0.4)
+_WA = jnp.asarray(np.arange(12, dtype=np.float32).reshape(3, 4) / 11.0 - 0.3)
+
+
+def _summed(x):
+    return _WA @ jnp.sum(jnp.einsum("chn,n->ch", _WC, x), axis=0)
+
+
+def _spread(s):
+    return _W1 @ jnp.broadcast_to(s, (6,))
+
+
+def _eliminate_in_order(fn, args, order, vertex, slots):
+    closed = jax.make_jaxpr(fn)(*args)
+    ij = IncrementalJacobian(closed.jaxpr, (0,), list(closed.literals),
+                             list(args), track_faces=True)
+    for v in order:
+        if v != vertex:
+            ij.eliminate(v)
+            continue
+        keys = faces_of(ij.graph, ij.tgraph, v, closed.jaxpr)
+        ij.eliminate(v, (), {k: slots for k in keys})
+    return ij
+
+
+_DOT_OPERANDS = re.compile(r"(%[\w#]+) = stablehlo\.dot_general (%[\w#]+), (%[\w#]+)")
+_CONVERT_RESULT = re.compile(r"(%[\w#]+) = stablehlo\.convert ")
+
+
+@pytest.mark.parametrize("fn, args, order, n", [
+    (_summed, (_X6,), (2, 1, 3), 5),
+    (_spread, (jnp.float32(0.3),), (1, 2), 6),
+], ids=["in-edge-uniform", "out-edge-uniform"])
+def test_a_two_sided_quant_face_with_a_real_private_sum_is_one_bf16_dot(fn, args, order, n):
+    # The reduce is eliminated first (or the broadcast is the in-edge), so the
+    # face's contracted axis sits at extent 1 on one side against n on the
+    # other: a real sum over the storing side, not a squeeze.
+    ij = _eliminate_in_order(fn, args, order, 1, (_Q, _Q, None))
+    hlo = _lowered(ij, args)
+    dots = _DOT.findall(hlo)
+    narrow = [d for d in dots if d[0].endswith("xbf16>") and d[1].endswith("xbf16>")]
+    assert len(narrow) == 1, f"expected one bf16 x bf16 dot, got {dots}\n{hlo}"
+    assert narrow[0][2].endswith("xf32>"), narrow
+    assert not [d for d in dots if ("bf16" in d[0]) != ("bf16" in d[1])], dots
+    widened = [c for c in _CONVERT.findall(hlo)
+               if c[0].endswith("xbf16>") and c[1].endswith("xf32>")]
+    assert len(widened) == 1, f"only the private sum widens, before the dot: {widened}\n{hlo}"
+    assert f"x{n}x" in widened[0][0], widened
+    converted = {m.group(1) for m in _CONVERT_RESULT.finditer(hlo)}
+    for _res, lhs, rhs in _DOT_OPERANDS.findall(hlo):
+        assert lhs not in converted and rhs not in converted, hlo
+    got = _jacobian(ij, args)
+    assert jnp.dtype(got.dtype) == jnp.dtype(jnp.bfloat16)
+    want = np.asarray(jax.jacrev(fn)(*args), np.float64)
+    err = np.abs(np.asarray(got, np.float64).reshape(want.shape) - want).max() / np.abs(want).max()
+    assert err < 2e-2, err
+
+
 @pytest.mark.parametrize("slots", [
     (_Q, None, None),
     (None, _Q, None),
