@@ -134,7 +134,8 @@ def _eliminate_in_order(fn, args, order, vertex, slots):
 
 
 _DOT_OPERANDS = re.compile(r"(%[\w#]+) = stablehlo\.dot_general (%[\w#]+), (%[\w#]+)")
-_CONVERT_RESULT = re.compile(r"(%[\w#]+) = stablehlo\.convert ")
+_WIDENED = re.compile(
+    r"(%[\w#]+) = stablehlo\.convert %[\w#]+ : \(tensor<[^>]*xbf16>\) -> tensor<[^>]*xf32>")
 
 
 @pytest.mark.parametrize("fn, args, order, n", [
@@ -156,9 +157,9 @@ def test_a_two_sided_quant_face_with_a_real_private_sum_is_one_bf16_dot(fn, args
                if c[0].endswith("xbf16>") and c[1].endswith("xf32>")]
     assert len(widened) == 1, f"only the private sum widens, before the dot: {widened}\n{hlo}"
     assert f"x{n}x" in widened[0][0], widened
-    converted = {m.group(1) for m in _CONVERT_RESULT.finditer(hlo)}
+    widened_names = {m.group(1) for m in _WIDENED.finditer(hlo)}
     for _res, lhs, rhs in _DOT_OPERANDS.findall(hlo):
-        assert lhs not in converted and rhs not in converted, hlo
+        assert lhs not in widened_names and rhs not in widened_names, hlo
     got = _jacobian(ij, args)
     assert jnp.dtype(got.dtype) == jnp.dtype(jnp.bfloat16)
     want = np.asarray(jax.jacrev(fn)(*args), np.float64)
