@@ -451,6 +451,88 @@ def rsnn_carry_container(block, state_shape, weight_shape, given_shape,
     return CarryContainer(c.diag, c.reduce, quant)
 
 
+def _dense_row(row, shape):
+    from graphax.sparse.tensor import SparseTensor
+    if row is None:
+        return jnp.zeros(shape)
+    if isinstance(row, SparseTensor):
+        row = row.dense()
+    return row
+
+
+def _project_block(J, weight, c: CarryContainer):
+    n_lead = J.ndim - 3
+    if c.diag:
+        if int(J.shape[n_lead]) == int(weight.shape[0]):
+            # THE BLOCK DIAGONAL: the state index against the weight's row.
+            D = jnp.diagonal(J, axis1=n_lead, axis2=n_lead + 1)
+            J = jnp.moveaxis(D, -1, -2)
+        else:
+            # The readout against a hidden weight: the compact form is the
+            # factor ``f`` of ``J[m, j, i] = Wo[m, j] f[j, i]``, and the
+            # projection onto that class is per (j, i) least squares in ``m``.
+            Wo = jax.lax.stop_gradient(weight)
+            J = (jnp.einsum("...mji,mj->...ji", J, Wo)
+                 / jnp.sum(Wo * Wo, axis=0)[:, None])
+    if c.reduce:
+        J = jnp.mean(J, axis=-1, keepdims=True)
+    if c.quant:
+        J = J.astype(RSNN_CARRY_QUANT_DTYPE)
+    return J
+
+
+def project_rsnn_carry(rows, container, weights, state_shapes=None):
+    """The five stacked tensors of ``RSNN_CARRY_STACKS`` in ``container``,
+    projected from the state rows a plan's program emits (owner ruling
+    2026-09-24, Q28a).
+
+    ``rows[s][w]`` is ``d s_t^s / d W_w`` as the program returns it: dense,
+    ``lead + state_shape + weight_shape`` (``lead`` is a batch axis or
+    nothing), a ``SparseTensor`` or ``None`` for a path the plan deleted.
+    dense keeps the rows, diag keeps the block diagonal, reduce takes the
+    presynaptic axis to its mean, quant casts to the narrow dtype; the
+    result reads back through :func:`rsnn_carry_container` as ``container``.
+    """
+    c = (container if isinstance(container, CarryContainer)
+         else carry_container_from_name(container))
+    out = []
+    for ss, w in RSNN_CARRY_STACKS:
+        blocks = []
+        for s in ss:
+            J = rows[s][w]
+            if J is None and state_shapes is None:
+                raise ValueError(
+                    f"the plan's program has no row for ({RSNN_STATE_NAMES[s]}, "
+                    f"{RSNN_WEIGHT_NAMES[w]}) and no state_shapes were given "
+                    f"to size its zero")
+            shape = (None if state_shapes is None
+                     else tuple(state_shapes[s]) + tuple(weights[w].shape))
+            blocks.append(_project_block(_dense_row(J, shape), weights[w], c))
+        if len(ss) == 1:
+            out.append(blocks[0])
+        else:
+            out.append(jnp.stack(blocks,
+                                 axis=blocks[0].ndim - (2 if c.diag else 3)))
+    return tuple(out)
+
+
+def rsnn_zero_carry(container, weights, lead=(), dtype=jnp.float32):
+    """The carry a recording starts from: the five stacked tensors of
+    ``RSNN_CARRY_STACKS`` at zero, in ``container``'s shapes and dtype."""
+    c = (container if isinstance(container, CarryContainer)
+         else carry_container_from_name(container))
+    W, V, Wo = weights
+    state_shape = {0: (W.shape[0],), 1: (W.shape[0],), 2: (W.shape[0],),
+                   3: (W.shape[0],), 4: (Wo.shape[0],)}
+    out = []
+    for ss, w in RSNN_CARRY_STACKS:
+        stack = (len(ss),) if len(ss) > 1 else ()
+        shape = (tuple(lead) + stack
+                 + c.block_shape(state_shape[ss[0]], weights[w].shape))
+        out.append(jnp.zeros(shape, c.dtype(dtype)))
+    return tuple(out)
+
+
 def attach_rsnn_past(states, weights, given):
     """RTRL: give every carried state an edge to the weights, valued by ``J``.
 
@@ -641,6 +723,11 @@ def RSNN_SHD(x, y, S, I, U, a, Uo, W, V, Wo,
     whole point of this target is that the sequence loss decomposes as
     ``sum_t L_t``, so one step is a complete object and the three rules
     differ only in which given quantity meets it.
+
+    Under ``rtrl`` the return is ``(loss, S, I, U, a, Uo)``: the first output
+    is the scalar loss, the rest is the carried state, whose Jacobian rows
+    with respect to the weights ARE the next carry ``J_t = A_t J_(t-1) + F_t``
+    (owner ruling 2026-09-24, Q27b). ``tbptt`` and ``bptt`` return the loss.
     """
     rule = rsnn_given_rule(given)
     weights = (W, V, Wo)
@@ -652,6 +739,10 @@ def RSNN_SHD(x, y, S, I, U, a, Uo, W, V, Wo,
         loss = jnp.sum(-y * jax.nn.log_softmax(nxt[4]))
     if rule == "bptt":
         loss = attach_rsnn_future(loss, nxt, given)
+    if rule == "rtrl":
+        # THE PLAN PRODUCES ITS OWN CARRY (owner ruling 2026-09-24, Q27b):
+        # the Jacobian rows of s_t are the next carried value.
+        return (loss,) + tuple(nxt)
     return loss
 
 
