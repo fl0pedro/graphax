@@ -50,15 +50,13 @@ def _rsnn_head():
 
 
 def _rsnn_carry():
-    """The eleven carried blocks of the rtrl rule, plus the three reference
-    weights, at the exact container's shapes."""
-    refs = (_arr(_H, _N_IN), _arr(_H, _H), _arr(_N_OUT, _H))
-    hidden = tuple(
-        b for _ in range(4)
-        for b in (_arr(_H, _H, _N_IN), _arr(_H, _H, _H)))
+    """The eleven carried blocks of the rtrl rule at the exact container's
+    shapes, stacked per weight: the four hidden blocks of ``W`` and of ``V``
+    as one ``(4, ..)`` tensor each, then the three readout blocks."""
+    hidden = (_arr(4, _H, _H, _N_IN), _arr(4, _H, _H, _H))
     readout = (_arr(_N_OUT, _H, _N_IN), _arr(_N_OUT, _H, _H),
                _arr(_N_OUT, _N_OUT, _H))
-    return refs + hidden + readout
+    return hidden + readout
 
 
 def _rsnn_adjoints():

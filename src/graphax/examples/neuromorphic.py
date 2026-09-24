@@ -252,17 +252,31 @@ RSNN_STATE_NAMES: tuple[str, ...] = ("S", "I", "U", "a", "Uo")
 #: The three weight matrices, in the order the signature lists them.
 RSNN_WEIGHT_NAMES: tuple[str, ...] = ("W", "V", "Wo")
 
-#: Which ``(state, weight)`` blocks of the carried Jacobian are carried, in
-#: the order the varargs hold them. The readout weight ``Wo`` feeds NOTHING
-#: back, so the four blocks ``(S, Wo) (I, Wo) (U, Wo) (a, Wo)`` are
-#: structurally zero and are not carried. The other eleven are the whole
-#: influence matrix of one RTRL step.
+#: Which ``(state, weight)`` blocks of the carried Jacobian are carried. The
+#: readout weight ``Wo`` feeds NOTHING back, so the four blocks ``(S, Wo)
+#: (I, Wo) (U, Wo) (a, Wo)`` are structurally zero and are not carried. The
+#: other eleven are the whole influence matrix of one RTRL step. The varargs
+#: hold them STACKED per weight, see :data:`RSNN_CARRY_STACKS`.
 RSNN_CARRY_BLOCKS: tuple[tuple[int, int], ...] = (
     (0, 0), (0, 1),          # S  <- W, V
     (1, 0), (1, 1),          # I  <- W, V
     (2, 0), (2, 1),          # U  <- W, V
     (3, 0), (3, 1),          # a  <- W, V
     (4, 0), (4, 1), (4, 2),  # Uo <- W, V, Wo
+)
+
+#: The four hidden state components, the ones a hidden weight reaches.
+RSNN_HIDDEN_STATES: tuple[int, ...] = (0, 1, 2, 3)
+
+#: How the varargs hold the eleven blocks (owner ruling 2026-09-24, Q31a):
+#: ``((states, weight), ...)``, one entry per stacked tensor. The four hidden
+#: blocks of one weight are ONE tensor with a leading stack axis of extent 4,
+#: in the state order ``S, I, U, a``; the three readout blocks stay single.
+#: Five entries, so the attachment contracts five tensors instead of eleven.
+RSNN_CARRY_STACKS: tuple[tuple[tuple[int, ...], int], ...] = (
+    (RSNN_HIDDEN_STATES, 0),   # (4, h, .., n_in)  S, I, U, a <- W
+    (RSNN_HIDDEN_STATES, 1),   # (4, h, .., h)     S, I, U, a <- V
+    ((4,), 0), ((4,), 1), ((4,), 2),   # Uo <- W, V, Wo
 )
 
 #: The four blocks that cannot be non-zero. A builder asserts they are zero
@@ -398,22 +412,33 @@ def carry_container_from_name(name) -> CarryContainer:
 
 
 def rsnn_carry_container(block, state_shape, weight_shape, given_shape,
-                         given_dtype=None) -> CarryContainer:
+                         given_dtype=None, n_stacked: int = 1) -> CarryContainer:
     """Which container a carried block arrived in, or raise.
 
     The SHAPE decides ``diag`` and ``reduce`` and the DTYPE decides ``quant``,
     and none of the four shapes is ambiguous: a state axis is never empty and
     the presynaptic axis of this model is never 1 (it is 700, 128 or 128).
+
+    ``n_stacked > 1`` means ``given_shape`` is a STACK of that many same-shaped
+    blocks (:data:`RSNN_CARRY_STACKS`): the leading axis is the stack axis,
+    not a state axis, and the container is read off the shape behind it.
     """
+    s, w = block
+    got = tuple(given_shape)
+    if n_stacked > 1:
+        if not got or got[0] != n_stacked:
+            raise ValueError(
+                f"carried stack ({RSNN_STATE_NAMES[s]}.., "
+                f"{RSNN_WEIGHT_NAMES[w]}) has shape {got}; a stack of "
+                f"{n_stacked} blocks leads with an axis of extent {n_stacked}.")
+        got = got[1:]
     want = {}
     for d in (False, True):
         for r in (False, True):
             c = CarryContainer(d, r, False)
             want[c.block_shape(state_shape, weight_shape)] = c
-    got = tuple(given_shape)
     c = want.get(got)
     if c is None:
-        s, w = block
         lines = ", ".join(
             f"{k} = {v.name}" for k, v in want.items())
         raise ValueError(
@@ -429,13 +454,19 @@ def rsnn_carry_container(block, state_shape, weight_shape, given_shape,
 def attach_rsnn_past(states, weights, given):
     """RTRL: give every carried state an edge to the weights, valued by ``J``.
 
-    ``given`` is ``(W_ref, V_ref, Wo_ref, J_0, ..., J_10)`` where ``J_k`` is
-    the block :data:`RSNN_CARRY_BLOCKS` names at position ``k``. Each reference
-    weight is a bit-for-bit copy of its weight and sits OUTSIDE ``argnums``, so
-    ``W - W_ref`` is exactly zero (no forward value moves, and a run under any
-    rule sees the same loss to the last bit) and its edge to the weight is the
-    identity. A `stop_gradient` would give the same zero delta but would add an
-    edge-free VERTEX the policy has to eliminate for nothing.
+    ``given`` is the five stacked tensors :data:`RSNN_CARRY_STACKS` names, in
+    that order: the four hidden blocks against ``W`` as one ``(4, ..)`` tensor,
+    the four against ``V`` likewise, then the three readout blocks. The delta
+    each stack is contracted with is ``W - stop_gradient(W)``: exactly zero in
+    value (no forward value moves, and a run under any rule sees the same loss
+    to the last bit) and the identity as an edge to the weight. The
+    ``stop_gradient`` is one edge-free vertex per weight; that price replaces
+    the three reference weights the tuple used to lead with (owner ruling
+    2026-09-24, Q31a: 434 kB of arguments per program).
+
+    ONE CONTRACTION PER STACK. The stacked hidden contraction gives the
+    ``(4, h)`` rows of the four states at once and is split back into the
+    four states inside this scope; eleven contraction chains become five.
 
     EACH BLOCK ARRIVES IN ITS OWN CONTAINER (owner ruling 2026-09-16). The
     carry is produced by the rule the plan describes, run over the whole
@@ -452,10 +483,10 @@ def attach_rsnn_past(states, weights, given):
       rank-2 tensordot to a row sum. For the two READOUT blocks against a
       hidden weight the readout is not a recurrence at all but a leaky filter
       of the hidden traces through a CONSTANT ``Wo``, so the exact block
-      factorises as ``J[m, j, i] = Wo_ref[m, j] * f[j, i]`` and the compact
+      factorises as ``J[m, j, i] = Wo[m, j] * f[j, i]`` and the compact
       form carries ``f`` -- exact, not approximated, and 128 times smaller.
-      ``Wo_ref`` is the REFERENCE weight, outside ``argnums``, so restoring
-      the factor adds no edge and the graph does not gain a vertex.
+      The factor is restored from ``stop_gradient(Wo)``, so it adds no edge
+      to ``Wo``.
     * ``reduce`` -- the presynaptic axis is IMPLICIT. One value is stored for
       the whole axis and the contraction NEVER broadcasts it back into the
       physical grid (CONTEXT.md, ruling D1): ``sum_i J[.., j, 0] * dW[j, i]``
@@ -468,13 +499,18 @@ def attach_rsnn_past(states, weights, given):
     Mixed containers are legal: the plan decides per face, and one block may
     be diagonal while another is not.
     """
-    refs, blocks = given[:3], given[3:]
+    if len(given) != len(RSNN_CARRY_STACKS):
+        raise ValueError(
+            f"a carried-Jacobian attachment needs one tensor per stack "
+            f"({len(RSNN_CARRY_STACKS)}), got {len(given)}")
     out = list(states)
     with snn_carry_scope():
-        deltas = [W - R for W, R in zip(weights, refs)]
-        for (s, w), J in zip(RSNN_CARRY_BLOCKS, blocks):
+        held = [jax.lax.stop_gradient(W) for W in weights]
+        deltas = [W - H for W, H in zip(weights, held)]
+        for (ss, w), J in zip(RSNN_CARRY_STACKS, given):
             c = rsnn_carry_container(
-                (s, w), out[s].shape, weights[w].shape, J.shape, J.dtype)
+                (ss[0], w), out[ss[0]].shape, weights[w].shape, J.shape,
+                J.dtype, n_stacked=len(ss))
             dW = deltas[w]
             if c.reduce:
                 # THE IMPLICIT AXIS IS NEVER BROADCAST. Move the sum over the
@@ -483,19 +519,23 @@ def attach_rsnn_past(states, weights, given):
                 dW = jnp.sum(dW, axis=-1)
                 J = J[..., 0]
             if not c.diag:
-                out[s] = out[s] + jnp.tensordot(J, dW, dW.ndim)
-                continue
-            # DIAG. ``row[j] = sum_i J[j, i] * dW[j, i]``: the block
-            # diagonal's contraction, one row sum instead of a tensordot.
-            # Under ``reduce`` the presynaptic axis is already gone from both
-            # operands and the row sum degenerates to an elementwise product.
-            row = J * dW if c.reduce else jnp.sum(J * dW, axis=-1)
-            if out[s].shape[0] == weights[w].shape[0]:
-                out[s] = out[s] + row
+                rows = jnp.tensordot(J, dW, dW.ndim)
             else:
-                # The readout against a hidden weight: restore the constant
-                # ``Wo_ref`` factor the compact form left out.
-                out[s] = out[s] + refs[2] @ row
+                # DIAG. ``row[j] = sum_i J[.., j, i] * dW[j, i]``: the block
+                # diagonal's contraction, one row sum over the whole stack
+                # instead of a tensordot. Under ``reduce`` the presynaptic
+                # axis is already gone from both operands and the row sum
+                # degenerates to an elementwise product.
+                rows = J * dW if c.reduce else jnp.sum(J * dW, axis=-1)
+                if out[ss[0]].shape[0] != weights[w].shape[0]:
+                    # The readout against a hidden weight: restore the
+                    # constant ``Wo`` factor the compact form left out.
+                    rows = held[2] @ rows
+            if len(ss) == 1:
+                out[ss[0]] = out[ss[0]] + rows
+                continue
+            for k, s in enumerate(ss):
+                out[s] = out[s] + jax.lax.index_in_dim(rows, k, 0, False)
     return tuple(out)
 
 
@@ -543,14 +583,40 @@ def attach_rsnn_future(loss, next_states, given):
     return loss
 
 
-#: How many varargs each temporal rule passes. The length IS the selector, so
-#: the three are kept distinct by construction and a length outside this table
-#: raises rather than choosing a rule by accident.
-RSNN_GIVEN_LENGTHS: dict[int, str] = {
-    0: "tbptt",
-    len(RSNN_STATE_NAMES): "bptt",
-    3 + len(RSNN_CARRY_BLOCKS): "rtrl",
+#: How many varargs each temporal rule passes. ``bptt`` passes one adjoint per
+#: state component and ``rtrl`` one tensor per carried stack, five each, so
+#: the count alone no longer tells them apart: :func:`rsnn_given_rule` reads
+#: the RANK behind the count. An adjoint is a vector (or the ``(1,)`` of an
+#: implicit state axis); a carried block is at least rank 2 in every
+#: container. A count outside this table raises rather than choosing a rule
+#: by accident.
+RSNN_GIVEN_COUNTS: dict[str, int] = {
+    "tbptt": 0,
+    "bptt": len(RSNN_STATE_NAMES),
+    "rtrl": len(RSNN_CARRY_STACKS),
 }
+
+
+def rsnn_given_rule(given) -> str:
+    """The temporal rule ``given`` selects, or raise."""
+    n = len(given)
+    if n == 0:
+        return "tbptt"
+    if n != len(RSNN_STATE_NAMES):
+        raise ValueError(
+            f"RSNN_SHD got {n} extra arguments; the temporal rule is selected "
+            f"by that count and the legal counts are "
+            f"{sorted(set(RSNN_GIVEN_COUNTS.values()))} "
+            f"({', '.join(f'{k}: {v}' for k, v in RSNN_GIVEN_COUNTS.items())})")
+    ranks = {int(jnp.ndim(g)) for g in given}
+    if ranks == {1}:
+        return "bptt"
+    if min(ranks) >= 2:
+        return "rtrl"
+    raise ValueError(
+        f"RSNN_SHD got {n} extra arguments of ranks {sorted(ranks)}; the five "
+        f"future adjoints are all vectors and the five carried stacks are all "
+        f"of rank 2 or more, and this tuple is neither.")
 
 
 def RSNN_SHD(x, y, S, I, U, a, Uo, W, V, Wo,
@@ -561,14 +627,14 @@ def RSNN_SHD(x, y, S, I, U, a, Uo, W, V, Wo,
     so the recurrent coupling is learned and ``d s_t / d s_(t-1)`` has real
     off-diagonal terms.
 
-    ``given`` selects the temporal rule by its LENGTH
-    (:data:`RSNN_GIVEN_LENGTHS`):
+    ``given`` selects the temporal rule by its LENGTH and, at five, by the
+    rank of what it holds (:func:`rsnn_given_rule`):
 
       0 entries   tbptt. The carried state is a constant.
-      5 entries   bptt. The five future adjoints; see
+      5 vectors   bptt. The five future adjoints; see
                   :func:`attach_rsnn_future`.
-      14 entries  rtrl. Three reference weights and the eleven carried
-                  Jacobian blocks; see :func:`attach_rsnn_past`.
+      5 tensors   rtrl. The eleven carried Jacobian blocks, stacked per
+                  weight; see :func:`attach_rsnn_past`.
 
     The loss is the softmax cross entropy of the leaky readout membrane
     against the one-hot label ``y``. It is a PER-STEP loss on purpose: the
@@ -576,13 +642,7 @@ def RSNN_SHD(x, y, S, I, U, a, Uo, W, V, Wo,
     ``sum_t L_t``, so one step is a complete object and the three rules
     differ only in which given quantity meets it.
     """
-    rule = RSNN_GIVEN_LENGTHS.get(len(given))
-    if rule is None:
-        raise ValueError(
-            f"RSNN_SHD got {len(given)} extra arguments; the temporal rule is "
-            f"selected by that count and the legal counts are "
-            f"{sorted(RSNN_GIVEN_LENGTHS)} "
-            f"({', '.join(RSNN_GIVEN_LENGTHS[k] for k in sorted(RSNN_GIVEN_LENGTHS))})")
+    rule = rsnn_given_rule(given)
     weights = (W, V, Wo)
     if rule == "rtrl":
         S, I, U, a, Uo = attach_rsnn_past((S, I, U, a, Uo), weights, given)
