@@ -652,6 +652,27 @@ def project_rsnn_carry(rows, container, weights, state_shapes=None):
     return tuple(out)
 
 
+def rsnn_given_container(states, weights, given) -> CarryContainer:
+    # The one container the five given stacks arrived in, read by shape and
+    # dtype; a leading batch axis is the one the states carry.
+    if len(given) != len(RSNN_CARRY_STACKS):
+        raise ValueError(
+            f"a carried-Jacobian tuple has one tensor per stack "
+            f"({len(RSNN_CARRY_STACKS)}), got {len(given)}")
+    found = set()
+    for (ss, w), J in zip(RSNN_CARRY_STACKS, given):
+        s = states[ss[0]]
+        lead = len(jnp.shape(s)) - 1
+        found.add(rsnn_carry_container(
+            (ss[0], w), jnp.shape(s)[lead:], jnp.shape(weights[w]),
+            jnp.shape(J)[lead:], J.dtype, n_stacked=len(ss)))
+    if len(found) != 1:
+        raise ValueError(
+            f"the given stacks arrived in {sorted(c.name for c in found)}; a "
+            f"plan's carry is one container")
+    return found.pop()
+
+
 def rsnn_zero_carry(container, weights, lead=(), dtype=jnp.float32):
     # The carry a recording starts from, in the container's shapes and dtype.
     c = (container if isinstance(container, CarryContainer)

@@ -16,6 +16,7 @@ from .neuromorphic import (LIF_SNN, ADALIF_SNN, ADALIF_SNN_SEQ,
                            RSNN_CARRY_QUANT_DTYPE, CarryContainer,
                            carry_container_from_name,
                            project_rsnn_carry, rsnn_zero_carry,
+                           rsnn_given_container,
                            RSNN_SHD_W2, RSNN_W2_COPIES,
                            attach_rsnn_past, attach_rsnn_future)
 from .differential_kinematics import RobotArm_6DOF
