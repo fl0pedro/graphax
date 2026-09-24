@@ -2084,21 +2084,36 @@ def _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub):
             and jnp.dtype(b.dtype) == jnp.dtype(jnp.bfloat16)):
         # jnp.einsum sums a private label in the preferred dtype, which widens
         # a bf16 operand to f32 before the dot; a unit private axis is dropped
-        # here instead, so both operands reach the dot narrow.
+        # here and a real private sum is taken in f32 and stored back narrow
+        # (owner ruling 2026-09-23), so both operands reach the dot narrow.
         a, lhs_sub = _drop_unit_private_axes(a, lhs_sub, rhs_sub, out_sub)
         b, rhs_sub = _drop_unit_private_axes(b, rhs_sub, lhs_sub, out_sub)
+        a, lhs_sub = _sum_private_axes_narrow(a, lhs_sub, rhs_sub, out_sub)
+        b, rhs_sub = _sum_private_axes_narrow(b, rhs_sub, lhs_sub, out_sub)
         return jnp.einsum(a, lhs_sub, b, rhs_sub, out_sub,
                           preferred_element_type=jnp.float32)
     return jnp.einsum(a, lhs_sub, b, rhs_sub, out_sub)
 
 
+def _private_axes(sub, other_sub, out_sub):
+    return [i for i, lbl in enumerate(sub)
+            if lbl not in other_sub and lbl not in out_sub]
+
+
 def _drop_unit_private_axes(x, sub, other_sub, out_sub):
-    drop = [i for i, lbl in enumerate(sub)
-            if x.shape[i] == 1 and lbl not in other_sub and lbl not in out_sub]
+    drop = [i for i in _private_axes(sub, other_sub, out_sub) if x.shape[i] == 1]
     if not drop:
         return x, sub
     return (jnp.squeeze(x, drop),
             [lbl for i, lbl in enumerate(sub) if i not in drop])
+
+
+def _sum_private_axes_narrow(x, sub, other_sub, out_sub):
+    axes = _private_axes(sub, other_sub, out_sub)
+    if not axes:
+        return x, sub
+    summed = jnp.sum(x.astype(jnp.float32), axis=tuple(axes)).astype(x.dtype)
+    return summed, [lbl for i, lbl in enumerate(sub) if i not in axes]
 
 
 def _gx_einsum(a, b, dims):
