@@ -451,26 +451,135 @@ def rsnn_carry_container(block, state_shape, weight_shape, given_shape,
     return CarryContainer(c.diag, c.reduce, quant)
 
 
-def _dense_row(row, shape):
+def _is_sparse_tensor(x) -> bool:
     from graphax.sparse.tensor import SparseTensor
-    if row is None:
-        return jnp.zeros(shape)
-    if isinstance(row, SparseTensor):
-        row = row.dense()
-    return row
+    return isinstance(x, SparseTensor)
 
 
-def _project_block(J, weight, readout, c: CarryContainer):
+def _pure_pair(a, b) -> bool:
+    return (a.is_sparse and b.is_sparse and a.other_id == b.id
+            and b.other_id == a.id and a.block_size is None
+            and b.block_size is None and a.axis is not None
+            and a.axis == b.axis)
+
+
+def _scaled_val(st):
+    from graphax.sparse.dtype_compute import _scaled_mul
+    v = jnp.asarray(1.0, st.dtype) if st.val is None else st.val
+    return _scaled_mul(v, st.scalar_mult)
+
+
+def _arrange(w, phys, sizes):
+    # ``w`` with axis ``phys[k]`` (or a broadcast when None) as output axis k.
+    if w.ndim == 0:
+        phys = [None] * len(phys)
+    used = [a for a in phys if a is not None]
+    if len(set(used)) != len(used):
+        raise ValueError(f"a stored axis is read twice: {phys}")
+    extra = [a for a in range(w.ndim) if a not in used]
+    if any(int(w.shape[a]) != 1 for a in extra):
+        raise ValueError(
+            f"the stored row has axes {extra} of shape {w.shape} that no "
+            f"dim of the container reads")
+    w = jnp.transpose(w, used + extra).reshape([w.shape[a] for a in used])
+    it = iter(range(len(used)))
+    w = w.reshape([w.shape[next(it)] if a is not None else 1 for a in phys])
+    return jnp.broadcast_to(w, tuple(sizes))
+
+
+def _refuse(st, why):
+    raise ValueError(
+        f"the state row's stored class {tuple(st.dims)} (val "
+        f"{None if st.val is None else tuple(st.val.shape)}) is not one the "
+        f"container reads without expansion: {why}")
+
+
+def _block_diagonal(st, m_size):
+    # lead + (n, m): the entries s == r of the logical lead + (n,) + (r, m)
+    # row, read off the stored class. A pure pair (s, r) stores the diagonal
+    # on its shared axis; dense s and r hold it on their diagonal; an
+    # implicit s or r is uniform along it, so the stored value is the
+    # diagonal. ``m_size`` 1 keeps an implicit m unexpanded (the reduce class).
+    from graphax.sparse.ops.dense import _expand_implicit_blocks
+    st = _expand_implicit_blocks(st)
+    lead, ds = st.out_dims[:-1], st.out_dims[-1]
+    dr, dm = st.primal_dims
+    if any(d.is_sparse for d in lead) or dm.is_sparse:
+        _refuse(st, "a batch or presynaptic dim is paired")
+    v = _scaled_val(st)
+    sizes = [d.logical_size for d in lead] + [ds.logical_size, m_size]
+    if _pure_pair(ds, dr):
+        phys = [d.axis for d in lead] + [ds.axis, dm.axis]
+    elif not ds.is_sparse and not dr.is_sparse:
+        if ds.axis is not None and dr.axis is not None and v.ndim:
+            a, b = int(ds.axis), int(dr.axis)
+            v = jnp.diagonal(v, axis1=a, axis2=b)
+            rest = [ax for ax in range(v.ndim + 1) if ax not in (a, b)]
+
+            def new(ax):
+                return None if ax is None else rest.index(int(ax))
+            phys = [new(d.axis) for d in lead] + [len(rest), new(dm.axis)]
+        else:
+            s_axis = ds.axis if ds.axis is not None else dr.axis
+            phys = [d.axis for d in lead] + [s_axis, dm.axis]
+    else:
+        _refuse(st, "the state and row dims are paired in another form")
+    if m_size == 1 and dm.axis is not None:
+        # the reduce class: the mean over a stored presynaptic axis
+        v = jnp.mean(v, axis=phys[-1], keepdims=True)
+    return _arrange(v, phys, sizes)
+
+
+def _dense_rows(st, i_size):
+    # The logical lead + (n,) + (r, m) row with every dim spelled out, for
+    # rows with no pair: the readout against a hidden weight and the exact
+    # container of a dense row. ``i_size`` 1 keeps an implicit m unexpanded.
+    from graphax.sparse.ops.dense import _expand_implicit_blocks
+    st = _expand_implicit_blocks(st)
+    if any(d.is_sparse for d in st.dims):
+        return None
+    dm = st.primal_dims[-1]
+    v = _scaled_val(st)
+    phys = [d.axis for d in st.dims]
+    sizes = [d.logical_size for d in st.dims[:-1]] + [i_size]
+    if i_size == 1 and dm.axis is not None:
+        v = jnp.mean(v, axis=phys[-1], keepdims=True)
+    return _arrange(v, phys, sizes)
+
+
+def _project_sparse(st, weight, readout, c: CarryContainer):
+    m = st.primal_dims[-1].logical_size
+    m_size = 1 if c.reduce else m
+    if c.diag:
+        if int(st.out_dims[-1].logical_size) == int(weight.shape[0]):
+            J = _block_diagonal(st, m_size)
+        else:
+            J = _dense_rows(st, m_size)
+            if J is None:
+                _refuse(st, "a readout row against a hidden weight is paired")
+            Wo = jax.lax.stop_gradient(readout)
+            J = (jnp.einsum("...mji,mj->...ji", J, Wo)
+                 / jnp.sum(Wo * Wo, axis=0)[:, None])
+    else:
+        J = _dense_rows(st, m_size)
+        if J is None:
+            # THE DENSE CONTAINER of a paired row: the store is dense by
+            # definition, so this is the one place a pair is expanded.
+            J = st.dense()
+            if c.reduce:
+                J = jnp.mean(J, axis=-1, keepdims=True)
+    if c.quant:
+        J = J.astype(RSNN_CARRY_QUANT_DTYPE)
+    return J
+
+
+def _project_dense(J, weight, readout, c: CarryContainer):
     n_lead = J.ndim - 3
     if c.diag:
         if int(J.shape[n_lead]) == int(weight.shape[0]):
-            # THE BLOCK DIAGONAL: the state index against the weight's row.
             D = jnp.diagonal(J, axis1=n_lead, axis2=n_lead + 1)
             J = jnp.moveaxis(D, -1, -2)
         else:
-            # The readout against a hidden weight: the compact form is the
-            # factor ``f`` of ``J[m, j, i] = Wo[m, j] f[j, i]``, and the
-            # projection onto that class is per (j, i) least squares in ``m``.
             Wo = jax.lax.stop_gradient(readout)
             J = (jnp.einsum("...mji,mj->...ji", J, Wo)
                  / jnp.sum(Wo * Wo, axis=0)[:, None])
@@ -482,17 +591,10 @@ def _project_block(J, weight, readout, c: CarryContainer):
 
 
 def project_rsnn_carry(rows, container, weights, state_shapes=None):
-    """The five stacked tensors of ``RSNN_CARRY_STACKS`` in ``container``,
-    projected from the state rows a plan's program emits (owner ruling
-    2026-09-24, Q28a).
-
-    ``rows[s][w]`` is ``d s_t^s / d W_w`` as the program returns it: dense,
-    ``lead + state_shape + weight_shape`` (``lead`` is a batch axis or
-    nothing), a ``SparseTensor`` or ``None`` for a path the plan deleted.
-    dense keeps the rows, diag keeps the block diagonal, reduce takes the
-    presynaptic axis to its mean, quant casts to the narrow dtype; the
-    result reads back through :func:`rsnn_carry_container` as ``container``.
-    """
+    # THE CONTAINER'S PROJECTION OF A PLAN'S STATE ROWS (owner ruling
+    # 2026-09-24, Q28a), applied on the STORED class of a SparseTensor row
+    # (the two-Diag plan stores (h, n_in) per hidden row) and on a dense row
+    # as it is; a None row is a path the plan deleted.
     c = (container if isinstance(container, CarryContainer)
          else carry_container_from_name(container))
     out = []
@@ -500,15 +602,17 @@ def project_rsnn_carry(rows, container, weights, state_shapes=None):
         blocks = []
         for s in ss:
             J = rows[s][w]
-            if J is None and state_shapes is None:
-                raise ValueError(
-                    f"the plan's program has no row for ({RSNN_STATE_NAMES[s]}, "
-                    f"{RSNN_WEIGHT_NAMES[w]}) and no state_shapes were given "
-                    f"to size its zero")
-            shape = (None if state_shapes is None
-                     else tuple(state_shapes[s]) + tuple(weights[w].shape))
-            blocks.append(_project_block(_dense_row(J, shape), weights[w],
-                                         weights[2], c))
+            if J is None:
+                if state_shapes is None:
+                    raise ValueError(
+                        f"the plan's program has no row for "
+                        f"({RSNN_STATE_NAMES[s]}, {RSNN_WEIGHT_NAMES[w]}) and "
+                        f"no state_shapes were given to size its zero")
+                J = jnp.zeros(tuple(state_shapes[s]) + tuple(weights[w].shape))
+            if _is_sparse_tensor(J):
+                blocks.append(_project_sparse(J, weights[w], weights[2], c))
+            else:
+                blocks.append(_project_dense(J, weights[w], weights[2], c))
         if len(ss) == 1:
             out.append(blocks[0])
         else:
@@ -518,8 +622,7 @@ def project_rsnn_carry(rows, container, weights, state_shapes=None):
 
 
 def rsnn_zero_carry(container, weights, lead=(), dtype=jnp.float32):
-    """The carry a recording starts from: the five stacked tensors of
-    ``RSNN_CARRY_STACKS`` at zero, in ``container``'s shapes and dtype."""
+    # The carry a recording starts from, in the container's shapes and dtype.
     c = (container if isinstance(container, CarryContainer)
          else carry_container_from_name(container))
     W, V, Wo = weights
