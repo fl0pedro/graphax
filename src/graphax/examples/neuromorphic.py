@@ -510,6 +510,37 @@ def _block_diagonal(st, m_size):
     sizes = [d.logical_size for d in lead] + [ds.logical_size, m_size]
     if _pure_pair(ds, dr):
         phys = [d.axis for d in lead] + [ds.axis, dm.axis]
+    elif (ds.is_sparse and dr.is_sparse and ds.other_id == dr.id
+          and dr.other_id == ds.id and ds.block_size is not None
+          and ds.block_size == dr.block_size and ds.axis == dr.axis
+          and ds.block_axis is not None and dr.block_axis is not None
+          and v.ndim):
+        # A BLOCKED PAIR: N blocks of B x B on the block axes, the block
+        # index on the shared outer axis (implicit when N is 1). The diagonal
+        # of every block, then the block index merged in front of it.
+        a, b = int(ds.block_axis), int(dr.block_axis)
+        N, B = int(ds.size), int(ds.block_size)
+        v = jnp.diagonal(v, axis1=a, axis2=b)
+        rest = [ax for ax in range(v.ndim + 1) if ax not in (a, b)]
+
+        def new(ax):
+            return None if ax is None else rest.index(int(ax))
+        diag = len(rest)
+        if ds.axis is None:
+            v = jnp.broadcast_to(v[..., None, :], v.shape[:-1] + (N, B))
+            outer = diag
+            diag = diag + 1
+        else:
+            outer = new(ds.axis)
+        keep = [k for k in range(v.ndim) if k not in (outer, diag)]
+        perm = keep + [outer, diag]
+        shp = [int(v.shape[k]) for k in perm]
+        v = jnp.transpose(v, perm).reshape(shp[:-2] + [shp[-2] * shp[-1]])
+
+        def moved(ax):
+            return None if ax is None else keep.index(ax)
+        phys = ([moved(new(d.axis)) for d in lead]
+                + [len(keep), moved(new(dm.axis))])
     elif not ds.is_sparse and not dr.is_sparse:
         if ds.axis is not None and dr.axis is not None and v.ndim:
             a, b = int(ds.axis), int(dr.axis)
