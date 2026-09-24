@@ -460,7 +460,7 @@ def _dense_row(row, shape):
     return row
 
 
-def _project_block(J, weight, c: CarryContainer):
+def _project_block(J, weight, readout, c: CarryContainer):
     n_lead = J.ndim - 3
     if c.diag:
         if int(J.shape[n_lead]) == int(weight.shape[0]):
@@ -471,7 +471,7 @@ def _project_block(J, weight, c: CarryContainer):
             # The readout against a hidden weight: the compact form is the
             # factor ``f`` of ``J[m, j, i] = Wo[m, j] f[j, i]``, and the
             # projection onto that class is per (j, i) least squares in ``m``.
-            Wo = jax.lax.stop_gradient(weight)
+            Wo = jax.lax.stop_gradient(readout)
             J = (jnp.einsum("...mji,mj->...ji", J, Wo)
                  / jnp.sum(Wo * Wo, axis=0)[:, None])
     if c.reduce:
@@ -507,7 +507,8 @@ def project_rsnn_carry(rows, container, weights, state_shapes=None):
                     f"to size its zero")
             shape = (None if state_shapes is None
                      else tuple(state_shapes[s]) + tuple(weights[w].shape))
-            blocks.append(_project_block(_dense_row(J, shape), weights[w], c))
+            blocks.append(_project_block(_dense_row(J, shape), weights[w],
+                                         weights[2], c))
         if len(ss) == 1:
             out.append(blocks[0])
         else:
