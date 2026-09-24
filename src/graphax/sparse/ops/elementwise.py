@@ -1122,6 +1122,47 @@ def elementwise(
     return out
 
 
+def _conflicting_pairs(a, b) -> set:
+    """The diagonal pairs of ``a`` that ``b`` couples differently: ``b`` pairs
+    one of the two ids with a THIRD id. A pair ``b`` holds identically, or
+    holds as two unpaired dims, is not a conflict (the union algebra already
+    meets those)."""
+    pa = {int(d.id): (int(d.other_id) if d.is_sparse else None) for d in a.dims}
+    pb = {int(d.id): (int(d.other_id) if d.is_sparse else None) for d in b.dims}
+    out = set()
+    for i, o in pa.items():
+        if o is None:
+            continue
+        if pb.get(i) not in (None, o) or pb.get(o) not in (None, i):
+            out.add((min(i, o), max(i, o)))
+    return out
+
+
+def _free_conflicting_pairs(lhs, rhs):
+    """``(lhs', rhs')`` with every conflicting pair (see
+    :func:`_conflicting_pairs`) freed into two dense dims on the side that
+    holds it, every other pair kept; ``None`` when there is no conflict to
+    free or a side cannot be freed (a non-zero fill), so the caller keeps its
+    dense fallback. Freeing is coarsening the pair to ONE full block, which is
+    lossless, then dropping the trivial coupling."""
+    from graphax.sparse.ops.join import decouple_trivial_pairs
+    from graphax.sparse.ops.matmul import _coarsen_pair_to
+
+    todo = (_conflicting_pairs(lhs, rhs), _conflicting_pairs(rhs, lhs))
+    if not todo[0] and not todo[1]:
+        return None
+    outs = []
+    for t, pairs in zip((lhs, rhs), todo):
+        if pairs and t.fill_value is not None:
+            return None
+        for i, o in sorted(pairs):
+            t = _coarsen_pair_to(t, i, o, 1)
+            if t is None:
+                return None
+        outs.append(decouple_trivial_pairs(t))
+    return outs[0], outs[1]
+
+
 def _materializing_general(lhs, rhs, op, is_intersection, n):
     """The incumbent general path: align, promote to the least-common-multiple
     meta grid, apply ``op``, demote, rebuild. It materializes -- an implicit
@@ -1145,6 +1186,18 @@ def _materializing_general(lhs, rhs, op, is_intersection, n):
         # them in, so densify both to a common dense representation and combine
         # there (the architectural boundary fallback). Correct, just not
         # compressed for this op.
+        #
+        # Free only the pairs the two sides couple DIFFERENTLY first. A pair
+        # both operands hold identically -- the vmapped batch axis on every
+        # merge of a batched graph (dsnn-dfw.140) -- has a union container that
+        # keeps it; densifying it along with the conflicting pairs stored a
+        # B x B block of which only the diagonal is nonzero.
+        _fr = _free_conflicting_pairs(lhs, rhs)
+        if _fr is not None:
+            out = elementwise(_fr[0], _fr[1], op, is_intersection=is_intersection)
+            if count:
+                return out, n
+            return out
         from .dense import dense as _dense
         out = elementwise(
             _dense(lhs, hard=True), _dense(rhs, hard=True), op,
