@@ -2273,10 +2273,9 @@ def _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub):
         elif b.one and not rhs_sub:
             res = a
         else:
-            x, y = a.materialize(), b.materialize()
-            if narrow:
-                x, y = x.astype(jnp.float32), y.astype(jnp.float32)
-            res = _View(jax.lax.mul(x, y))
+            # A narrow pair multiplies narrow: the product of two bf16 values
+            # is exact in f32, so its bf16 rounding is the dot's stored result.
+            res = _View(jax.lax.mul(a.materialize(), b.materialize()))
         return res.insert_units(len(out_sub), unit_out)
     res = jnp.einsum(a.materialize(), lhs_sub, b.materialize(), rhs_sub, out_core, **kw)
     return _View(res).insert_units(len(out_sub), unit_out)

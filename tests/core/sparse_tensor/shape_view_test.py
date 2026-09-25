@@ -173,12 +173,16 @@ def test_a_real_contraction_matches_the_dense_reference():
         assert 1 not in tuple(v.aval.shape), v.aval.shape
 
 
-def test_a_narrow_pair_multiplies_in_f32_and_stores_narrow():
+def test_a_narrow_pair_multiplies_narrow_and_matches_the_f32_product_rounded():
     a, b = A.astype(jnp.bfloat16), B.astype(jnp.bfloat16)
     res = _diag(a) @ _diag(b)
     assert jnp.dtype(res.val.dtype) == jnp.dtype(jnp.bfloat16)
     want = (a.astype(jnp.float32) * b.astype(jnp.float32)).astype(jnp.bfloat16)
     np.testing.assert_array_equal(np.asarray(res.val, np.float32), np.asarray(want, np.float32))
+    jaxpr = jax.make_jaxpr(lambda x, y: (_diag(x) @ _diag(y)).val)(a, b)
+    assert "convert_element_type" not in _prims(jaxpr), _prims(jaxpr)
+    muls = _eqns(jaxpr, "mul")
+    assert any(set(e.invars) == set(jaxpr.jaxpr.invars) for e in muls), _prims(jaxpr)
 
 
 def test_an_operand_that_stores_nothing_is_not_multiplied():

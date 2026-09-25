@@ -133,33 +133,30 @@ def _eliminate_in_order(fn, args, order, vertex, slots):
     return ij
 
 
-_DOT_OPERANDS = re.compile(r"(%[\w#]+) = stablehlo\.dot_general (%[\w#]+), (%[\w#]+)")
-_WIDENED = re.compile(
-    r"(%[\w#]+) = stablehlo\.convert %[\w#]+ : \(tensor<[^>]*xbf16>\) -> tensor<[^>]*xf32>")
+_MUL = re.compile(r"stablehlo\.multiply\b[^\n]*?:\s*(tensor<[^>]+>)")
 
 
 @pytest.mark.parametrize("fn, args, order, n", [
     (_summed, (_X6,), (2, 1, 3), 5),
     (_spread, (jnp.float32(0.3),), (1, 2), 6),
 ], ids=["in-edge-uniform", "out-edge-uniform"])
-def test_a_two_sided_quant_face_with_a_real_private_sum_is_one_bf16_dot(fn, args, order, n):
+def test_a_two_sided_quant_face_with_a_real_private_sum_is_one_narrow_product(fn, args, order, n):
     # The reduce is eliminated first (or the broadcast is the in-edge), so the
     # face's contracted axis sits at extent 1 on one side against n on the
-    # other: a real sum over the storing side, not a squeeze.
+    # other: a real sum over the storing side, not a squeeze. Nothing is summed
+    # between the operands after it, so the face is one narrow multiply, not a
+    # dot (dsnn-dfw.250): the product of two bf16 values is exact in f32 and its
+    # bf16 rounding is what the dot stored.
     ij = _eliminate_in_order(fn, args, order, 1, (_Q, _Q, None))
     hlo = _lowered(ij, args)
     dots = _DOT.findall(hlo)
-    narrow = [d for d in dots if d[0].endswith("xbf16>") and d[1].endswith("xbf16>")]
-    assert len(narrow) == 1, f"expected one bf16 x bf16 dot, got {dots}\n{hlo}"
-    assert narrow[0][2].endswith("xf32>"), narrow
-    assert not [d for d in dots if ("bf16" in d[0]) != ("bf16" in d[1])], dots
+    assert not [d for d in dots if "bf16" in d[0] or "bf16" in d[1]], f"{dots}\n{hlo}"
+    muls = _MUL.findall(hlo)
+    assert [m for m in muls if m.endswith("xbf16>")], f"no bf16 multiply:\n{hlo}"
     widened = [c for c in _CONVERT.findall(hlo)
                if c[0].endswith("xbf16>") and c[1].endswith("xf32>")]
-    assert len(widened) == 1, f"only the private sum widens, before the dot: {widened}\n{hlo}"
+    assert len(widened) == 1, f"only the private sum widens: {widened}\n{hlo}"
     assert f"x{n}x" in widened[0][0], widened
-    widened_names = {m.group(1) for m in _WIDENED.finditer(hlo)}
-    for _res, lhs, rhs in _DOT_OPERANDS.findall(hlo):
-        assert lhs not in widened_names and rhs not in widened_names, hlo
     got = _jacobian(ij, args)
     assert jnp.dtype(got.dtype) == jnp.dtype(jnp.bfloat16)
     want = np.asarray(jax.jacrev(fn)(*args), np.float64)
