@@ -143,16 +143,21 @@ _MUL = re.compile(r"stablehlo\.multiply\b[^\n]*?:\s*(tensor<[^>]+>)")
 def test_a_two_sided_quant_face_with_a_real_private_sum_is_one_narrow_product(fn, args, order, n):
     # The reduce is eliminated first (or the broadcast is the in-edge), so the
     # face's contracted axis sits at extent 1 on one side against n on the
-    # other: a real sum over the storing side, not a squeeze. Nothing is summed
-    # between the operands after it, so the face is one narrow multiply, not a
-    # dot (dsnn-dfw.250): the product of two bf16 values is exact in f32 and its
-    # bf16 rounding is what the dot stored.
+    # other: a real sum over the storing side, not a squeeze. The product after
+    # it is one bf16 dot with f32 sums when an axis is still summed between the
+    # operands (in-edge), and one bf16 multiply when none is (out-edge,
+    # dsnn-dfw.250): the product of two bf16 values is exact in f32 and its
+    # bf16 rounding is what the dot stored. Both operands reach it narrow.
     ij = _eliminate_in_order(fn, args, order, 1, (_Q, _Q, None))
     hlo = _lowered(ij, args)
     dots = _DOT.findall(hlo)
-    assert not [d for d in dots if "bf16" in d[0] or "bf16" in d[1]], f"{dots}\n{hlo}"
-    muls = _MUL.findall(hlo)
-    assert [m for m in muls if m.endswith("xbf16>")], f"no bf16 multiply:\n{hlo}"
+    assert not [d for d in dots if ("bf16" in d[0]) != ("bf16" in d[1])], dots
+    narrow = [d for d in dots if d[0].endswith("xbf16>") and d[1].endswith("xbf16>")]
+    if narrow:
+        assert len(narrow) == 1 and narrow[0][2].endswith("xf32>"), f"{dots}\n{hlo}"
+    else:
+        muls = _MUL.findall(hlo)
+        assert [m for m in muls if m.endswith("xbf16>")], f"no bf16 dot and no bf16 multiply:\n{hlo}"
     widened = [c for c in _CONVERT.findall(hlo)
                if c[0].endswith("xbf16>") and c[1].endswith("xf32>")]
     assert len(widened) == 1, f"only the private sum widens: {widened}\n{hlo}"

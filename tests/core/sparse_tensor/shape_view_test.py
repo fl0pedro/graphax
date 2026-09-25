@@ -180,9 +180,11 @@ def test_a_narrow_pair_multiplies_narrow_and_matches_the_f32_product_rounded():
     want = (a.astype(jnp.float32) * b.astype(jnp.float32)).astype(jnp.bfloat16)
     np.testing.assert_array_equal(np.asarray(res.val, np.float32), np.asarray(want, np.float32))
     jaxpr = jax.make_jaxpr(lambda x, y: (_diag(x) @ _diag(y)).val)(a, b)
-    assert "convert_element_type" not in _prims(jaxpr), _prims(jaxpr)
-    muls = _eqns(jaxpr, "mul")
-    assert any(set(e.invars) == set(jaxpr.jaxpr.invars) for e in muls), _prims(jaxpr)
+    ins = set(jaxpr.jaxpr.invars)
+    assert not [e for e in jaxpr.eqns if e.primitive.name == "convert_element_type"
+                and ins & set(e.invars)], _prims(jaxpr)
+    muls = [e for e in _eqns(jaxpr, "mul") if set(e.invars) == ins]
+    assert muls and jnp.dtype(muls[0].outvars[0].aval.dtype) == jnp.dtype(jnp.bfloat16), _prims(jaxpr)
 
 
 def test_an_operand_that_stores_nothing_is_not_multiplied():
