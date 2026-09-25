@@ -3069,6 +3069,53 @@ def _eval_primal(eqn, invals):
     return eqn.primitive.bind(*invals, **eqn.params)
 
 
+#: Primitives whose output is zero whenever their data operand is.
+_ZERO_THROUGH_UNARY = frozenset((
+    "reduce_sum", "slice", "squeeze", "reshape", "broadcast_in_dim",
+    "transpose", "neg", "convert_element_type", "expand_dims", "copy",
+    "reduce_precision"))
+
+
+def _symbolic_zero(eqn, zero_vars, sg_source):
+    # ``x - stop_gradient(x)`` is zero to the last bit, and so is every
+    # product, sum and relabeling of it; ``y + 0`` is ``y``. A carried value
+    # attached through that zero keeps its edges and loses its forward.
+    name = eqn.primitive.name
+    ins = eqn.invars
+
+    def zero(v):
+        return isinstance(v, core.Var) and v in zero_vars
+    if name == "sub" and len(ins) == 2:
+        if isinstance(ins[1], core.Var) and sg_source.get(ins[1]) is ins[0]:
+            return ("zero", None)
+        if zero(ins[0]) and zero(ins[1]):
+            return ("zero", None)
+        if zero(ins[1]):
+            return ("alias", 0)
+        return None
+    if name in ("mul", "dot_general"):
+        return ("zero", None) if any(zero(v) for v in ins) else None
+    if name in _ZERO_THROUGH_UNARY:
+        return ("zero", None) if zero(ins[0]) else None
+    if name == "add" and len(ins) == 2:
+        if zero(ins[0]) and zero(ins[1]):
+            return ("zero", None)
+        if zero(ins[1]):
+            return ("alias", 0)
+        if zero(ins[0]):
+            return ("alias", 1)
+    return None
+
+
+def _primal_of(eqn, invals, sz):
+    if sz is None:
+        return _eval_primal(eqn, invals)
+    if sz[0] == "alias":
+        return invals[sz[1]]
+    ov = eqn.outvars[0]
+    return jnp.zeros(ov.aval.shape, ov.aval.dtype)
+
+
 def _build_graph(
     jaxpr: core.Jaxpr,
     args: Sequence[jnp.ndarray],
@@ -3141,6 +3188,8 @@ def _build_graph(
 
     safe_map(write, jaxpr.invars, args)
     safe_map(write, jaxpr.constvars, consts)
+    sg_source: Dict[core.Var, core.Var] = {}
+    zero_vars: Set[core.Var] = set()
 
     # NOTE: this is essentially the tracing part. Probably should write a proper
     # tracing system with lift etc. for better compatibility with JAX
@@ -3172,6 +3221,11 @@ def _build_graph(
             )
 
         invals_snapshot = list(invals)
+        if eqn.primitive is lax.stop_gradient_p and eqn.outvars:
+            sg_source[eqn.outvars[0]] = eqn.invars[0]
+        _sz = _symbolic_zero(eqn, zero_vars, sg_source)
+        if _sz is not None and _sz[0] == "zero":
+            zero_vars.update(eqn.outvars)
         # Pairs of (eqn.invars position, Var) for differentiable inputs. The
         # elemental rules return one entry per primal (i.e. per eqn.invars
         # position); we only wire edges for Var positions, but must index into
@@ -3222,7 +3276,7 @@ def _build_graph(
         # entirely — but still bind the primitive so `env` carries the primal
         # for downstream use (output value selection, vo_vertices accounting).
         if active_vars is not None and not var_positions:
-            primal_outvals = _eval_primal(eqn, invals_snapshot)
+            primal_outvals = _primal_of(eqn, invals_snapshot, _sz)
             if eqn.primitive.multiple_results:
                 safe_map(write, eqn.outvars, primal_outvals)
             else:
@@ -3271,7 +3325,7 @@ def _build_graph(
             # Deferred dispatch path: bind primal eagerly, defer all elemental
             # JAX ops to lazy thunks that fire only when the edge is consumed.
             outvar = eqn.outvars[0]
-            primal_outvals = _eval_primal(eqn, invals_snapshot)
+            primal_outvals = _primal_of(eqn, invals_snapshot, _sz)
             if eqn.primitive.multiple_results:
                 safe_map(write, eqn.outvars, primal_outvals)
             else:

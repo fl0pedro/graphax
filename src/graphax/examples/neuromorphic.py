@@ -578,19 +578,14 @@ def _dense_rows(st, i_size):
     return _arrange(v, phys, sizes)
 
 
-def _project_sparse(st, weight, readout, c: CarryContainer):
+def _project_sparse(st, weight, c: CarryContainer):
     m = st.primal_dims[-1].logical_size
     m_size = 1 if c.reduce else m
     if c.diag:
-        if int(st.out_dims[-1].logical_size) == int(weight.shape[0]):
-            J = _block_diagonal(st, m_size)
-        else:
-            J = _dense_rows(st, m_size)
-            if J is None:
-                _refuse(st, "a readout row against a hidden weight is paired")
-            Wo = jax.lax.stop_gradient(readout)
-            J = (jnp.einsum("...mji,mj->...ji", J, Wo)
-                 / jnp.sum(Wo * Wo, axis=0)[:, None])
+        if int(st.out_dims[-1].logical_size) != int(weight.shape[0]):
+            _refuse(st, "the diag container's block diagonal pairs the state "
+                        "axis with the weight's first axis, and they differ")
+        J = _block_diagonal(st, m_size)
     else:
         J = _dense_rows(st, m_size)
         if J is None:
@@ -604,16 +599,16 @@ def _project_sparse(st, weight, readout, c: CarryContainer):
     return J
 
 
-def _project_dense(J, weight, readout, c: CarryContainer):
+def _project_dense(J, weight, c: CarryContainer):
     n_lead = J.ndim - 3
     if c.diag:
-        if int(J.shape[n_lead]) == int(weight.shape[0]):
-            D = jnp.diagonal(J, axis1=n_lead, axis2=n_lead + 1)
-            J = jnp.moveaxis(D, -1, -2)
-        else:
-            Wo = jax.lax.stop_gradient(readout)
-            J = (jnp.einsum("...mji,mj->...ji", J, Wo)
-                 / jnp.sum(Wo * Wo, axis=0)[:, None])
+        if int(J.shape[n_lead]) != int(weight.shape[0]):
+            raise ValueError(
+                f"the diag container's block diagonal pairs the state axis "
+                f"({J.shape[n_lead]}) with the weight's first axis "
+                f"({weight.shape[0]}), and they differ")
+        D = jnp.diagonal(J, axis1=n_lead, axis2=n_lead + 1)
+        J = jnp.moveaxis(D, -1, -2)
     if c.reduce:
         J = jnp.mean(J, axis=-1, keepdims=True)
     if c.quant:
@@ -621,17 +616,46 @@ def _project_dense(J, weight, readout, c: CarryContainer):
     return J
 
 
-def project_rsnn_carry(rows, container, weights, state_shapes=None):
+def _spike_trace(s_row, weight, c: CarryContainer, like):
+    # The block diagonal of the plan's row of the new spikes against
+    # ``weight``, before any narrowing: the hidden S block's own projection.
+    if s_row is None:
+        return jnp.zeros(jnp.shape(like), weight.dtype)
+    plain = CarryContainer(True, c.reduce, False)
+    if _is_sparse_tensor(s_row):
+        return _project_sparse(s_row, weight, plain)
+    return _project_dense(s_row, weight, plain)
+
+
+def project_rsnn_carry(rows, container, weights, state_shapes=None, *,
+                       given=None, a_out=None):
     # THE CONTAINER'S PROJECTION OF A PLAN'S STATE ROWS (owner ruling
     # 2026-09-24, Q28a), applied on the STORED class of a SparseTensor row
     # (the two-Diag plan stores (h, n_in) per hidden row) and on a dense row
     # as it is; a None row is a path the plan deleted.
+    # THE READOUT TRACE AGAINST A HIDDEN WEIGHT in the diag container is the
+    # leaky filter of the carried spike trace, f = a_out f + (1 - a_out) e_S,
+    # read off the given f and the plan's S row: the readout row itself
+    # (n_out, h, n_in) is never formed and never read.
     c = (container if isinstance(container, CarryContainer)
          else carry_container_from_name(container))
     out = []
-    for ss, w in RSNN_CARRY_STACKS:
+    for k, (ss, w) in enumerate(RSNN_CARRY_STACKS):
         blocks = []
         for s in ss:
+            if c.diag and len(ss) == 1 and w != 2:
+                if given is None or a_out is None:
+                    raise ValueError(
+                        "the diag container's readout trace against a hidden "
+                        "weight is the filter of the given trace and the "
+                        "plan's S row; pass given= and a_out=")
+                prev = given[k]
+                eS = _spike_trace(rows[0][w], weights[w], c, prev)
+                J = a_out * prev + (1.0 - a_out) * eS
+                if c.quant:
+                    J = J.astype(RSNN_CARRY_QUANT_DTYPE)
+                blocks.append(J)
+                continue
             J = rows[s][w]
             if J is None:
                 if state_shapes is None:
@@ -641,9 +665,9 @@ def project_rsnn_carry(rows, container, weights, state_shapes=None):
                         f"no state_shapes were given to size its zero")
                 J = jnp.zeros(tuple(state_shapes[s]) + tuple(weights[w].shape))
             if _is_sparse_tensor(J):
-                blocks.append(_project_sparse(J, weights[w], weights[2], c))
+                blocks.append(_project_sparse(J, weights[w], c))
             else:
-                blocks.append(_project_dense(J, weights[w], weights[2], c))
+                blocks.append(_project_dense(J, weights[w], c))
         if len(ss) == 1:
             out.append(blocks[0])
         else:
@@ -758,22 +782,31 @@ def attach_rsnn_past(states, weights, given):
                 J = J[..., 0]
             if not c.diag:
                 rows = jnp.tensordot(J, dW, dW.ndim)
-            else:
-                # DIAG. ``row[j] = sum_i J[.., j, i] * dW[j, i]``: the block
-                # diagonal's contraction, one row sum over the whole stack
-                # instead of a tensordot. Under ``reduce`` the presynaptic
-                # axis is already gone from both operands and the row sum
-                # degenerates to an elementwise product.
+                if len(ss) == 1:
+                    out[ss[0]] = out[ss[0]] + rows
+                    continue
+                for k, s in enumerate(ss):
+                    out[s] = out[s] + jax.lax.index_in_dim(rows, k, 0, False)
+                continue
+            # DIAG. ``row[j] = sum_i J[.., j, i] * dW[j, i]``: the block
+            # diagonal's contraction, one row sum per block. Under ``reduce``
+            # the presynaptic axis is already gone from both operands and
+            # the row sum degenerates to an elementwise product. Each block
+            # of a stack is read from its own slot, so the elimination sees
+            # one (h, n_in) trace per state and never a slice of a stacked
+            # row.
+            if len(ss) == 1:
                 rows = J * dW if c.reduce else jnp.sum(J * dW, axis=-1)
                 if out[ss[0]].shape[0] != weights[w].shape[0]:
                     # The readout against a hidden weight: restore the
                     # constant ``Wo`` factor the compact form left out.
                     rows = held[2] @ rows
-            if len(ss) == 1:
                 out[ss[0]] = out[ss[0]] + rows
                 continue
             for k, s in enumerate(ss):
-                out[s] = out[s] + jax.lax.index_in_dim(rows, k, 0, False)
+                Jk = J[k]
+                out[s] = out[s] + (Jk * dW if c.reduce
+                                   else jnp.sum(Jk * dW, axis=-1))
     return tuple(out)
 
 
