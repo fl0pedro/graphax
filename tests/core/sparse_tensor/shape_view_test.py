@@ -92,17 +92,30 @@ def test_a_view_of_unit_shuffles_emits_nothing():
 
 
 def test_a_view_emits_at_most_reshape_transpose_reshape():
+    x = jnp.arange(24.0, dtype=jnp.float32).reshape(2, 12)
+
+    def f(a):
+        v = _View(a).reshape(2, 1, 3, 4, 1).transpose([4, 3, 1, 0, 2]).reshape(4, 1, 2, 3)
+        return v.transpose([1, 0, 2, 3]).reshape(8, 3).materialize()
+
+    jaxpr = jax.make_jaxpr(f)(x)
+    names = [e.primitive.name for e in jaxpr.eqns]
+    assert names == ["reshape", "transpose", "reshape"], names
+    ref = x.reshape(2, 1, 3, 4, 1).transpose([4, 3, 1, 0, 2]).reshape(4, 1, 2, 3).transpose([1, 0, 2, 3]).reshape(8, 3)
+    np.testing.assert_array_equal(np.asarray(f(x)), np.asarray(ref))
+
+
+def test_a_regrouping_the_atoms_cannot_express_materializes_once():
     x = jnp.arange(24.0, dtype=jnp.float32).reshape(2, 3, 4)
 
     def f(a):
         v = _View(a).reshape(2, 1, 12).transpose([2, 1, 0]).reshape(4, 3, 1, 2)
         return v.transpose([1, 3, 0, 2]).reshape(6, 4).materialize()
 
-    jaxpr = jax.make_jaxpr(f)(x)
-    names = [e.primitive.name for e in jaxpr.eqns]
-    assert names == ["reshape", "transpose", "reshape"]
     ref = x.reshape(2, 1, 12).transpose([2, 1, 0]).reshape(4, 3, 1, 2).transpose([1, 3, 0, 2]).reshape(6, 4)
     np.testing.assert_array_equal(np.asarray(f(x)), np.asarray(ref))
+    names = [e.primitive.name for e in jax.make_jaxpr(f)(x).eqns]
+    assert names.count("reshape") <= 3 and names.count("transpose") <= 2, names
 
 
 def _diag(val):

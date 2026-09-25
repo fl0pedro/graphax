@@ -2001,9 +2001,11 @@ def _build_output_tensor(ctx, rhs_dims, res):
         grid_view = grid_view.reshape(shape)
     if expands:
         grid_view, shape = _apply_expands(grid_view, list(shape), expands)
-    if summed:
-        # keepdims so every axis index below still means what it meant.
-        grid_view = grid_view.sum_keepdims(summed)
+    # keepdims so every axis index below still means what it meant; a sum over
+    # one element is the identity and emits nothing.
+    real_sum = [ax for ax in set(summed) if grid_view.shape[ax] != 1]
+    if real_sum:
+        grid_view = grid_view.sum_keepdims(real_sum)
     squeeze = squeeze + summed
     if squeeze:
         unique_sq = tuple(sorted(set(squeeze)))
