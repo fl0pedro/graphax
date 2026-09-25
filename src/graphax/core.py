@@ -3110,9 +3110,13 @@ def _symbolic_zero(eqn, zero_vars, sg_source):
 def _primal_of(eqn, invals, sz):
     if sz is None:
         return _eval_primal(eqn, invals)
-    if sz[0] == "alias":
-        return invals[sz[1]]
     ov = eqn.outvars[0]
+    if sz[0] == "alias":
+        val = invals[sz[1]]
+        if (tuple(jnp.shape(val)) == tuple(ov.aval.shape)
+                and jnp.result_type(val) == ov.aval.dtype):
+            return val
+        return jnp.broadcast_to(jnp.asarray(val, ov.aval.dtype), ov.aval.shape)
     return jnp.zeros(ov.aval.shape, ov.aval.dtype)
 
 
