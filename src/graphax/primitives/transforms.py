@@ -519,9 +519,10 @@ def _slice_elementals(primals, val_out, **params):
     # Only when a sliced axis is a sparse/compressed dim (slicing breaks the
     # square Kronecker structure) do we fall back to densify-then-slice. The
     # inverse (transpose-of-slice = interior-pad embedding) is likewise
-    # structure-preserving when every slice-output primal dim is plain dense
-    # (pad its own axis in place, n -> L); a diagonal-partner / compressed /
-    # implicit primal dim falls back to densify-then-pad (_inverse_dense).
+    # structure-preserving when every sliced slice-output primal dim is plain
+    # dense (pad its own axis in place, n -> L); a diagonal-partner / compressed
+    # / implicit primal dim on a sliced axis falls back to densify-then-pad
+    # (_inverse_dense).
     start_indices = list(params["start_indices"])
     limit_indices = list(params["limit_indices"])
     _strides = params.get("strides")
@@ -615,12 +616,13 @@ def _slice_elementals(primals, val_out, **params):
 
         in_shape = primals[0].shape
 
-        # Structure-preserving fast path: each primal (slice-output) dim is a
-        # plain DenseIndex carried on a distinct physical val axis. The pad
+        # Structure-preserving fast path: each sliced primal (slice-output) dim is
+        # a plain DenseIndex carried on a distinct physical val axis. The pad
         # embedding grows that axis in place (n -> L); the out-side dims keep
         # their own distinct axes and structure verbatim, so no axis collides.
         # A sparse (DiagonalIndex partner) / compressed / implicit (axis is None)
-        # primal dim, or a primal-rank mismatch, routes to the dense fallback:
+        # primal dim on a sliced axis, or a primal-rank mismatch, routes to the
+        # dense fallback:
         # padding a diagonal partner's axis would break the equal-size pair
         # invariant (out size n != padded input size L), which the index
         # vocabulary cannot represent.
@@ -628,12 +630,26 @@ def _slice_elementals(primals, val_out, **params):
             post.val is not None
             and len(post.primal_dims) == len(in_shape)
         )
+
+        def _plain(d):
+            return not (d.is_sparse or d.axis is None
+                        or d.block_size is not None)
+
+        # An axis the slice does not cut is not padded, so its dim is carried
+        # as it is: the vmapped batch axis stays a pair (dsnn-dfw.192).
+        def _carried(ax, d):
+            return not _plain(d) and not _is_sliced(ax, in_shape[ax])
+
         if preservable:
-            for d in post.primal_dims:
+            for ax, d in enumerate(post.primal_dims):
+                if _carried(ax, d) and (post.fill_value is not None
+                                        or d.logical_size != in_shape[ax]):
+                    preservable = False
+                    break
                 # A BLOCKED DENSE dim (dsnn-3qm.62) stores one cell per block, so
                 # ``d.size`` is not the slice extent the pad config is computed
                 # from. Route it to the dense fallback like a pair.
-                if d.is_sparse or d.axis is None or d.block_size is not None:
+                if not _plain(d) and not _carried(ax, d):
                     preservable = False
                     break
 
@@ -663,6 +679,12 @@ def _slice_elementals(primals, val_out, **params):
         val = post.val
         new_primal_dims = []
         for ax, d in enumerate(post.primal_dims):
+            if _carried(ax, d):
+                nd = replace(d, id=K + ax)
+                if nd.is_sparse:
+                    nd = replace(nd, other_id=old_to_new[d.other_id])
+                new_primal_dims.append(nd)
+                continue
             L = in_shape[ax]
             n = d.size
             st, stride = start_indices[ax], strides[ax]
