@@ -13,6 +13,7 @@ from ..sparse.tensor import (
     SparseTensor,
     _materialize_indexes,
     _swap_back_axes,
+    materialize_uniform,
 )
 from ..sparse.ops.dense import dense as _dense_hard
 
@@ -626,30 +627,46 @@ def _slice_elementals(primals, val_out, **params):
         # padding a diagonal partner's axis would break the equal-size pair
         # invariant (out size n != padded input size L), which the index
         # vocabulary cannot represent.
-        preservable = (
-            post.val is not None
-            and len(post.primal_dims) == len(in_shape)
-        )
-
         def _plain(d):
             return not (d.is_sparse or d.axis is None
                         or d.block_size is not None)
 
         # An axis the slice does not cut is not padded, so its dim is carried
         # as it is: the vmapped batch axis stays a pair (dsnn-dfw.192).
-        def _carried(ax, d):
-            return not _plain(d) and not _is_sliced(ax, in_shape[ax])
+        def _carries(t):
+            if t.fill_value is not None or len(t.primal_dims) != len(in_shape):
+                return False
+            uniform, found = t.val is None, False
+            for ax, d in enumerate(t.primal_dims):
+                kept = d.is_sparse or d.block_size is not None
+                if _is_sliced(ax, in_shape[ax]):
+                    if kept or (d.axis is None and not uniform):
+                        return False
+                elif d.logical_size != in_shape[ax]:
+                    return False
+                elif kept or (d.axis is None and not uniform):
+                    found = True
+            return found
 
+        carry = _carries(post)
+        if carry and post.val is None:
+            post = materialize_uniform(post)
+
+        def _carried(ax, d):
+            return carry and not _plain(d) and not _is_sliced(ax, in_shape[ax])
+
+        preservable = (
+            post.val is not None
+            and len(post.primal_dims) == len(in_shape)
+        )
         if preservable:
             for ax, d in enumerate(post.primal_dims):
-                if _carried(ax, d) and (post.fill_value is not None
-                                        or d.logical_size != in_shape[ax]):
-                    preservable = False
-                    break
+                if _carried(ax, d):
+                    continue
                 # A BLOCKED DENSE dim (dsnn-3qm.62) stores one cell per block, so
                 # ``d.size`` is not the slice extent the pad config is computed
                 # from. Route it to the dense fallback like a pair.
-                if not _plain(d) and not _carried(ax, d):
+                if d.is_sparse or d.axis is None or d.block_size is not None:
                     preservable = False
                     break
 
