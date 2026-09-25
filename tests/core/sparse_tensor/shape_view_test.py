@@ -27,6 +27,15 @@ def _eqns(jaxpr, name):
     return [e for e in jaxpr.eqns if e.primitive.name == name]
 
 
+def _reads_an_input(e, jaxpr):
+    return any(v is x for v in e.invars for x in jaxpr.jaxpr.invars)
+
+
+def _reads_the_inputs(e, jaxpr):
+    ins = jaxpr.jaxpr.invars
+    return len(e.invars) == len(ins) and all(any(v is x for v in e.invars) for x in ins)
+
+
 def _factor(rng, n):
     out = []
     while n > 1:
@@ -143,8 +152,7 @@ def test_a_product_of_two_diagonal_partials_is_one_mul():
     jaxpr = jax.make_jaxpr(f)(A, B)
     names = _prims(jaxpr)
     assert not [n for n in names if n in SHAPE_PRIMS or n == "dot_general"], names
-    muls = _eqns(jaxpr, "mul")
-    assert any(set(e.invars) == set(jaxpr.jaxpr.invars) for e in muls), names
+    assert any(_reads_the_inputs(e, jaxpr) for e in _eqns(jaxpr, "mul")), names
     np.testing.assert_array_equal(np.asarray(f(A, B)), np.asarray(A * B))
     res = _diag(A) @ _diag(B)
     np.testing.assert_array_equal(np.asarray(res.dense()), np.asarray(_diag(A * B).dense()))
@@ -180,10 +188,9 @@ def test_a_narrow_pair_multiplies_narrow_and_matches_the_f32_product_rounded():
     want = (a.astype(jnp.float32) * b.astype(jnp.float32)).astype(jnp.bfloat16)
     np.testing.assert_array_equal(np.asarray(res.val, np.float32), np.asarray(want, np.float32))
     jaxpr = jax.make_jaxpr(lambda x, y: (_diag(x) @ _diag(y)).val)(a, b)
-    ins = set(jaxpr.jaxpr.invars)
     assert not [e for e in jaxpr.eqns if e.primitive.name == "convert_element_type"
-                and ins & set(e.invars)], _prims(jaxpr)
-    muls = [e for e in _eqns(jaxpr, "mul") if set(e.invars) == ins]
+                and _reads_an_input(e, jaxpr)], _prims(jaxpr)
+    muls = [e for e in _eqns(jaxpr, "mul") if _reads_the_inputs(e, jaxpr)]
     assert muls and jnp.dtype(muls[0].outvars[0].aval.dtype) == jnp.dtype(jnp.bfloat16), _prims(jaxpr)
 
 
@@ -197,7 +204,7 @@ def test_an_operand_that_stores_nothing_is_not_multiplied():
     jaxpr = jax.make_jaxpr(f)(A)
     names = _prims(jaxpr)
     assert not [n for n in names if n in SHAPE_PRIMS or n == "dot_general"], names
-    assert not any(jaxpr.jaxpr.invars[0] in e.invars for e in jaxpr.eqns), names
+    assert not any(_reads_an_input(e, jaxpr) for e in jaxpr.eqns), names
     res = ident @ _diag(A)
     np.testing.assert_array_equal(np.asarray(res.val), np.asarray(A))
     np.testing.assert_allclose(np.asarray(res.dense()), 3.0 * np.asarray(_diag(A).dense()), rtol=1e-6)

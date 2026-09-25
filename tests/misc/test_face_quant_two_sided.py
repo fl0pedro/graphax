@@ -161,7 +161,9 @@ def test_a_two_sided_quant_face_with_a_real_private_sum_is_one_narrow_product(fn
     widened = [c for c in _CONVERT.findall(hlo)
                if c[0].endswith("xbf16>") and c[1].endswith("xf32>")]
     assert len(widened) == 1, f"only the private sum widens: {widened}\n{hlo}"
-    assert f"x{n}x" in widened[0][0], widened
+    # The summed extent is a dimension of the widened operand; the operand
+    # carries no size-1 axes any more (dsnn-dfw.250), so it may lead.
+    assert str(n) in widened[0][0].split("<")[1].split("x")[:-1], widened
     got = _jacobian(ij, args)
     assert jnp.dtype(got.dtype) == jnp.dtype(jnp.bfloat16)
     want = np.asarray(jax.jacrev(fn)(*args), np.float64)
