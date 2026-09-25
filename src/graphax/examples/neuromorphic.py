@@ -643,7 +643,7 @@ def project_rsnn_carry(rows, container, weights, state_shapes=None, *,
     for k, (ss, w) in enumerate(RSNN_CARRY_STACKS):
         blocks = []
         for s in ss:
-            if c.diag and len(ss) == 1 and w != 2:
+            if c.diag and s not in RSNN_HIDDEN_STATES and w != 2:
                 if given is None or a_out is None:
                     raise ValueError(
                         "the diag container's readout trace against a hidden "
