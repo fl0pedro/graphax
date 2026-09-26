@@ -104,7 +104,7 @@ def test_eliminating_more_only_grows_the_stream():
 def _name_hungry():
     def big(x, y):
         v = x
-        for _ in range(12):
+        for _ in range(24):
             v = jnp.tanh(v * y) + jnp.sin(v)
         return jnp.sum(v), jnp.sum(v * y)
     return big, (jnp.ones((4,)) * 0.5, jnp.ones((4,)) * 0.3)

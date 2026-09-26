@@ -1747,7 +1747,9 @@ class IncrementalPathTokenizer:
         embeddings from this. (With the unbounded default it degrades to the
         running maximum, which is why callers should pass ``vocab_size``.)"""
         cap = self._L + self.digit_base + self._name_alphabet - 1
-        top = max((int(a, 16) for atoms in self._names.values() for a in atoms),
+        # Function names come from the same pool as variable names.
+        top = max((int(a, 16) for atoms in (*self._names.values(), *self._fns.values())
+                   for a in atoms),
                   default=self.digit_base - 1)
         return min(cap, self._L + top) if self._name_alphabet >= 400000 \
             else cap
