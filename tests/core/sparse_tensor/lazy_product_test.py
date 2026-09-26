@@ -70,3 +70,16 @@ def test_a_narrow_batch_only_product_is_a_plain_bf16_multiply():
     assert jnp.dtype(got.dtype) == jnp.dtype(jnp.bfloat16)
     want = (w.astype(jnp.float32)[None, :, :] * t.astype(jnp.float32)[:, None, :]).astype(jnp.bfloat16)
     np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(want, np.float32))
+
+
+def test_a_product_read_in_a_dot_generals_order_is_that_dot():
+    # The shared axis first, then each operand's own axes in its order: one
+    # dot_general makes exactly that, with no broadcast and no transpose.
+    x, y = _n((3, 4), 8), _n((3, 5), 9)                  # x[a, b], y[a, d]
+
+    def f(x, y):
+        return _emit_einsum(x, [0, 1], y, [0, 2], [0, 1, 2]).materialize()   # (a, b, d)
+
+    prims = _prims(f, x, y)
+    assert prims == ["dot_general"], prims
+    np.testing.assert_array_equal(np.asarray(f(x, y)), np.einsum("ab,ad->abd", np.asarray(x), np.asarray(y)))

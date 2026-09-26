@@ -26,7 +26,9 @@ class _LazyProduct:
     Axis ``k`` of the product is axis ``xa[k]`` of ``x`` and axis ``ya[k]`` of
     ``y``, or ``None`` where the operand does not carry it. ``emit`` writes the
     product with its axes in the order the reader asks for, so no transpose
-    follows the product."""
+    follows the product: as the ``dot_general`` that makes that order when one
+    does (the shared axes first, then each operand's own axes in its order),
+    else as a multiply of the two operands broadcast to it."""
 
     __slots__ = ("x", "y", "xa", "ya", "shape", "dtype", "_out")
 
@@ -43,14 +45,33 @@ class _LazyProduct:
     def emit(self, perm):
         perm = tuple(int(p) for p in perm)
         if perm not in self._out:
-            shape = tuple(self.shape[p] for p in perm)
-            self._out[perm] = jnp.multiply(_side(self.x, self.xa, perm, shape),
-                                           _side(self.y, self.ya, perm, shape))
+            out = self._dot(perm)
+            if out is None:
+                shape = tuple(self.shape[p] for p in perm)
+                out = jax.lax.mul(_side(self.x, self.xa, perm, shape),
+                                  _side(self.y, self.ya, perm, shape))
+            self._out[perm] = out
         return self._out[perm]
+
+    def _dot(self, perm):
+        both = [p for p in perm if self.xa[p] is not None and self.ya[p] is not None]
+        k = len(both)
+        if k == len(perm) or not self.x.ndim or not self.y.ndim or list(perm[:k]) != both:
+            return None
+        own_x = sorted((p for p in perm if self.ya[p] is None), key=lambda p: self.xa[p])
+        own_y = sorted((p for p in perm if self.xa[p] is None), key=lambda p: self.ya[p])
+        bx, by = tuple(self.xa[p] for p in both), tuple(self.ya[p] for p in both)
+        if list(perm[k:]) == own_x + own_y:
+            return jax.lax.dot_general(self.x, self.y, (((), ()), (bx, by)))
+        if list(perm[k:]) == own_y + own_x:
+            return jax.lax.dot_general(self.y, self.x, (((), ()), (by, bx)))
+        return None
 
 
 def _side(arr, axes, perm, shape):
     # One operand laid along the product's axes in ``perm`` order.
+    if not arr.ndim:
+        return arr
     carried = [(pos, axes[p]) for pos, p in enumerate(perm) if axes[p] is not None]
     src = [a for _, a in carried]
     if len(src) != arr.ndim:

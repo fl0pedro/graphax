@@ -148,6 +148,9 @@ def test_a_join_of_equal_structures_in_different_layouts_is_one_transpose():
 
 
 def test_a_contraction_transposes_at_most_once():
+    # The product is written in the order its result is stored (dsnn-dfw.272):
+    # no transpose, and the one broadcast lays the diagonal along the dense axis
+    # for the multiply.
     x = jax.random.normal(KEY, (4, 2, 8), jnp.float32)
     d = jax.random.normal(jax.random.fold_in(KEY, 1), (2, 8), jnp.float32)
     lhs = lambda p: SparseTensor((DenseIndex(0, 4, 0),), (DenseIndex(1, 2, 1), DenseIndex(2, 8, 2)), p)
@@ -155,6 +158,7 @@ def test_a_contraction_transposes_at_most_once():
                                  (DiagonalIndex(2, 2, 0, 0), DiagonalIndex(3, 8, 1, 1)), q)
     names = _prims(jax.make_jaxpr(lambda p, q: (lhs(p) @ rhs(q)).val)(x, d))
     assert names.count("transpose") <= 1, names
-    assert not [n for n in names if n in ("reshape", "broadcast_in_dim", "squeeze")], names
+    assert not [n for n in names if n in ("reshape", "squeeze")], names
+    assert names.count("broadcast_in_dim") <= 1 and names.count("mul") == 1, names
     want = np.asarray(x) * np.asarray(d)[None]
     np.testing.assert_allclose(np.asarray((lhs(x) @ rhs(d)).dense()), want, rtol=1e-6, atol=1e-6)
