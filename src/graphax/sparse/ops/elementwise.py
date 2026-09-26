@@ -28,7 +28,7 @@ from .utils import (
 from .layout import generate_block_permutation
 from .view import _View, _as_view, _bcast, _mat
 from graphax.sparse.dtype_compute import _unify_operand_dtypes, _compute_dtype
-from graphax.sparse.indexes import DiagonalIndex, DenseIndex
+from graphax.sparse.indexes import DiagonalIndex, DenseIndex, static_eye
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
@@ -374,36 +374,16 @@ def _promote_to_unified(value: Array, metrics, is_left: bool, fill: Array) -> Ar
     if value.shape != tuple(in_shape):
         value = value.reshape(in_shape)
     if needs_expansion:  # only the expansion reads ``fill`` (B3)
-        # Each expanding pair's ``exp`` sub-blocks go onto the diagonal of an
-        # ``(exp, exp)`` grid by interior padding: element ``k`` lands at
-        # ``k * (exp + 1)`` of an ``exp * exp`` axis, the grid's diagonal, and
-        # every other cell holds ``fill``. The same cells as the eye-mask
-        # select, written once into a buffer of the output's own size, with
-        # no mask and no broadcast. With several pairs expanding a cell holds
-        # the value only where every pair is on its diagonal, as the product
-        # mask had it. Off the diagonal the value is the fill (0 for every
-        # zero-fill op in ``_ZERO_PRESERVING_OPS``).
+        # A select on the eye, not a pad: XLA fuses it into its reader, so a reader of the diagonal alone never writes the grid (dsnn-dfw.299).
         fill = jnp.asarray(fill, value.dtype)
-        interior = [0] * len(in_shape)
-        grid = []
+        value = _mat(_as_view(value).reshape(exp_shape))
         for i, m in enumerate(metrics):
-            b1, b2 = (m["left_b1"], m["left_b2"]) if is_left else (m["right_b1"], m["right_b2"])
-            exp = m["common_b1"] // b1
-            interior[4 * i + 1] = exp if exp > 1 else 0
-            grid.extend([m["unified_size"], exp, exp, b1, b2])
-        # Only the axes that carry data enter the pad; the unit axes are put
-        # back on the view.
-        value = _as_view(value)
-        at = value.base_axes()
-        if at is not None:
-            slot_of = dict(at)
-            padded = jax.lax.pad(value.base, fill, [
-                (0, 0, interior[slot_of[k]] if k in slot_of else 0)
-                for k in range(value.base.ndim)])
-        else:
-            core, keep = value.drop_units(list(range(value.ndim)))
-            padded = jax.lax.pad(_mat(core), fill, [(0, 0, interior[k]) for k in keep])
-        value = _View(padded).reshape(grid + rem)
+            exp = m["common_b1"] // (m["left_b1"] if is_left else m["right_b1"])
+            if exp > 1:
+                shape = [1] * len(exp_shape)
+                shape[5 * i + 1] = shape[5 * i + 2] = exp
+                value = jnp.where(static_eye(exp, bool).reshape(shape), value, fill)
+        value = _View(value)
     else:
         value = value.reshape(exp_shape)
     perm = generate_block_permutation(len(metrics), 5, [0, 1, 3, 2, 4])
