@@ -2153,7 +2153,11 @@ def _sum_private_axes(v, sub, other_sub, out_sub):
     axes = _private_axes(sub, other_sub, out_sub)
     if not axes:
         return v, sub
-    x = jnp.sum(v.materialize(), axis=tuple(axes))
+    x = v.materialize()
+    if jnp.issubdtype(x.dtype, jnp.floating) and jnp.dtype(x.dtype).itemsize < 4:
+        # Without the barrier XLA drops the Quant cast and this upcast as a pair (dsnn-dfw.273).
+        x = jax.lax.optimization_barrier(x)
+    x = jnp.sum(x, axis=tuple(axes))
     return _View(x), [lbl for i, lbl in enumerate(sub) if i not in axes]
 
 
