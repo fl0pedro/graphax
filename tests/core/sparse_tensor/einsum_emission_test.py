@@ -8,7 +8,7 @@ dimension numbers the dot would have taken.
 
 The dot is no longer emitted anywhere in graphax, so ``_reference_dot`` below
 is the reference, written out here. It restates ``_emit_einsum``'s dtype rule:
-a bf16 x bf16 contraction accumulates in float32.
+a bf16 x bf16 contraction is a plain bf16 dot (owner ruling 2026-09-26).
 """
 from __future__ import annotations
 
@@ -24,11 +24,7 @@ from graphax.sparse.ops.matmul import (_dims_to_sublists, _frame_sublists,
 
 
 def _reference_dot(a, b, dims):
-    """``lax.dot_general`` with ``_emit_einsum``'s accumulation rule."""
-    if (jnp.dtype(a.dtype) == jnp.dtype(jnp.bfloat16)
-            and jnp.dtype(b.dtype) == jnp.dtype(jnp.bfloat16)):
-        return jax.lax.dot_general(a, b, dims,
-                                   preferred_element_type=jnp.float32)
+    """``lax.dot_general``, the form ``_emit_einsum`` states as an einsum."""
     return jax.lax.dot_general(a, b, dims)
 
 KEY = jax.random.PRNGKey(5)
@@ -91,16 +87,19 @@ def test_labels_are_integers_so_there_is_no_alphabet_cap():
     assert max(out_sub) >= 26
 
 
-def test_a_bf16_pair_accumulates_like_the_dot():
-    """Only Quant makes bf16 operands. The emission must not change the
-    accumulation, or a switch of emission would move a value."""
+def test_a_bf16_pair_is_a_plain_bf16_contraction():
+    """Only Quant makes bf16 operands. The pair is a plain bf16 operation: bf16
+    in, bf16 out, and XLA's own kernel forms the sums (owner ruling 2026-09-26,
+    dsnn-dfw.273). No f32 result is cast back by hand."""
     a = _n((8, 8), 4).astype(jnp.bfloat16)
     b = _n((8, 8), 5).astype(jnp.bfloat16)
     dims = (((1,), (0,)), ((), ()))
     got, want = _gx_einsum(a, b, dims), _reference_dot(a, b, dims)
-    assert jnp.dtype(got.dtype) == jnp.dtype(want.dtype)
-    np.testing.assert_allclose(np.asarray(got, np.float64),
-                               np.asarray(want, np.float64), rtol=2e-2, atol=2e-2)
+    assert jnp.dtype(got.dtype) == jnp.dtype(jnp.bfloat16)
+    jaxpr = jax.make_jaxpr(lambda x, y: _gx_einsum(x, y, dims))(a, b).jaxpr
+    for e in jaxpr.eqns:
+        assert all(jnp.dtype(v.aval.dtype) == jnp.dtype(jnp.bfloat16) for v in e.outvars), e
+    np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(want, np.float32))
 
 
 # --- The frame's own sublists (ticket dsnn-3qm.72) -------------------------

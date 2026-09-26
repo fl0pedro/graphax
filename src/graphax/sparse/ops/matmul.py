@@ -1831,14 +1831,14 @@ def _pair_output_dims(ctx, rhs_dims, res):
     return out_dims, primal_dims, shape, squeeze, summed, expands
 
 
-def _store_narrow(values, lhs_dtype, rhs_dtype):
-    # A bf16 x bf16 contraction sums in f32 (_emit_einsum) and stores its
-    # result bf16 (owner ruling 2026-09-23: the face Quant is two-sided).
+def _check_narrow(values, lhs_dtype, rhs_dtype):
+    # A bf16 x bf16 contraction is a plain bf16 operation (owner ruling
+    # 2026-09-26, dsnn-dfw.273), so its result is already bf16.
     if (values is not None
             and jnp.dtype(lhs_dtype) == jnp.dtype(jnp.bfloat16)
             and jnp.dtype(rhs_dtype) == jnp.dtype(jnp.bfloat16)
-            and values.dtype != jnp.dtype(jnp.bfloat16)):
-        return values.astype(jnp.bfloat16)
+            and jnp.dtype(values.dtype) != jnp.dtype(jnp.bfloat16)):
+        raise TypeError(f"a bf16 x bf16 contraction produced a {values.dtype} result")
     return values
 
 
@@ -1953,7 +1953,7 @@ def _build_output_tensor(ctx, rhs_dims, res):
     if not has_val and values is not None and values.size == 1:
         final_mult = _sm_promote(final_mult, jnp.squeeze(_mat(values)))
         values = None
-    values = _store_narrow(_mat(values), ctx.lhs.dtype, ctx.rhs.dtype)
+    values = _check_narrow(_mat(values), ctx.lhs.dtype, ctx.rhs.dtype)
     out_dtype = values.dtype if values is not None else _scalar_dtype_of(final_mult)
     final_mult = _cast_scalar(final_mult, out_dtype)
     # transforms intentionally not propagated through matmul; callers in
@@ -2071,24 +2071,23 @@ def _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub):
     else, per shape and per device. A ``dot_general`` pins one of those for
     every shape, and a hand-written multiply-then-reduce pins another.
 
-    DTYPE. A bf16 x bf16 contraction accumulates in float32 through
-    ``preferred_element_type``. Only ``Quant`` produces a bf16 operand, and a
-    mixed ``{bf16, f32}`` pair is upcast by ``dtype_compute`` before it reaches
-    here, so this fires exactly when both edges were quantized.
+    DTYPE. A bf16 x bf16 contraction is a plain bf16 operation: bf16 in, bf16
+    out. XLA's own kernels form the sums and fuse as they like; a bf16 GEMM
+    sums in f32 inside the kernel and rounds its output once (owner ruling
+    2026-09-26, dsnn-dfw.273). Only ``Quant`` produces a bf16 operand, and a
+    mixed ``{bf16, f32}`` pair is upcast by ``dtype_compute`` before it
+    reaches here.
 
-    Measured caveat, carried over from the deleted planner
-    (``lower.matmul._einsum_accum_dtype``, 2026-08): ``jnp.einsum`` honours
+    Measured, carried over from the deleted planner
+    (``lower.matmul._einsum_accum_dtype``, 2026-08): ``jnp.einsum`` honoured
     ``preferred_element_type`` as a genuine bf16-in / f32-out dot only for the
     plain ``ij,jk->ik`` form. For a form carrying batch labels or size-1 axes
-    it instead converts BOTH operands to f32 up front, which deletes the bf16
-    dot and adds converts (measured on mlp2 / mlp4 / attn: every bf16 dot gone,
-    about 50 percent more converts). The error against the exact f32 Jacobian
-    was unchanged either way (relerr 4.207e-3 on mlp2, 4.103e-3 on mlp4),
-    because XLA already accumulates a bf16 dot in f32 internally and only
-    rounds the output. So the kwarg costs Quant some speed and buys no
-    accuracy on the batched forms. It stays because dropping it changes the
-    STORED width of the result, and every downstream edge dtype with it.
-    Changing that is a deliberate precision decision, not a tidy-up.
+    it instead converted BOTH operands to f32 up front, which deleted the bf16
+    dot and added converts (measured on mlp2 / mlp4 / attn). The error against
+    the exact f32 Jacobian was unchanged either way (relerr 4.207e-3 on mlp2,
+    4.103e-3 on mlp4), because XLA already accumulates a bf16 dot in f32
+    internally and only rounds the output. The kwarg is gone since the ruling
+    of 2026-09-26.
     """
     # The operands enter without size-1 axes and in their bases' own axis
     # order, and the result leaves in the order the product makes it: the
@@ -2098,9 +2097,6 @@ def _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub):
     carried = set(lhs_sub) | set(rhs_sub)
     out_core = [lbl for lbl in out_sub if lbl in carried]
     unit_out = [i for i, lbl in enumerate(out_sub) if lbl not in carried]
-    narrow = (jnp.dtype(a.dtype) == jnp.dtype(jnp.bfloat16)
-              and jnp.dtype(b.dtype) == jnp.dtype(jnp.bfloat16))
-    kw = {"preferred_element_type": jnp.float32} if narrow else {}
 
     def done(res, labels):
         v = _as_view(res).transpose([labels.index(lbl) for lbl in out_core])
@@ -2115,33 +2111,24 @@ def _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub):
         # and sums in the same order; only the transpose after it moves onto
         # the result view.
         x, y = a.materialize(), b.materialize()
-        if narrow:
-            # jnp.einsum sums a private label in the preferred dtype, which
-            # widens a bf16 operand to f32 before the dot; the private sum is
-            # taken in f32 and stored back narrow (owner ruling 2026-09-23),
-            # so both operands reach the dot narrow.
-            x, lhs_sub = _sum_private_axes_narrow(x, lhs_sub, rhs_sub, out_core)
-            y, rhs_sub = _sum_private_axes_narrow(y, rhs_sub, lhs_sub, out_core)
         batch = [lbl for lbl in out_core if lbl in lhs_sub and lbl in rhs_sub]
         free_x = [lbl for lbl in lhs_sub if lbl in out_core and lbl not in rhs_sub]
         free_y = [lbl for lbl in rhs_sub if lbl in out_core and lbl not in lhs_sub]
         if batch + free_x + free_y == out_core:
-            return done(jnp.einsum(x, lhs_sub, y, rhs_sub, out_core, **kw), out_core)
+            return done(jnp.einsum(x, lhs_sub, y, rhs_sub, out_core), out_core)
         out = batch + free_y + free_x
-        return done(jnp.einsum(y, rhs_sub, x, lhs_sub, out, **kw), out)
+        return done(jnp.einsum(y, rhs_sub, x, lhs_sub, out), out)
     # Nothing is summed between the operands. A private label is a sum on its
     # own side, and what remains is a product: elementwise when both carry the
     # same axes or one is a scalar, an outer product otherwise.
-    a, lhs_sub = _sum_private_axes(a, lhs_sub, rhs_sub, out_core, narrow)
-    b, rhs_sub = _sum_private_axes(b, rhs_sub, lhs_sub, out_core, narrow)
+    a, lhs_sub = _sum_private_axes(a, lhs_sub, rhs_sub, out_core)
+    b, rhs_sub = _sum_private_axes(b, rhs_sub, lhs_sub, out_core)
     if a.one and not lhs_sub:
         return done(b, rhs_sub)
     if b.one and not rhs_sub:
         return done(a, lhs_sub)
     if set(lhs_sub) == set(rhs_sub) or not lhs_sub or not rhs_sub:
-        # One operand keeps its own axis order and the other follows it. A
-        # narrow pair multiplies narrow: the product of two bf16 values is
-        # exact in f32, so its bf16 rounding is the dot's stored result.
+        # One operand keeps its own axis order and the other follows it.
         if lhs_sub:
             x, labels = _natural(a, lhs_sub)
             y = (b.transpose([rhs_sub.index(lbl) for lbl in labels]).materialize()
@@ -2153,7 +2140,7 @@ def _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub):
     x, lhs_sub = _natural(a, lhs_sub)
     y, rhs_sub = _natural(b, rhs_sub)
     out = _dot_order(lhs_sub, rhs_sub, out_core)
-    return done(jnp.einsum(x, lhs_sub, y, rhs_sub, out, **kw), out)
+    return done(jnp.einsum(x, lhs_sub, y, rhs_sub, out), out)
 
 
 def _natural(v, labels):
@@ -2175,26 +2162,13 @@ def _private_axes(sub, other_sub, out_sub):
             if lbl not in other_sub and lbl not in out_sub]
 
 
-def _sum_private_axes_narrow(x, sub, other_sub, out_sub):
-    axes = _private_axes(sub, other_sub, out_sub)
-    if not axes:
-        return x, sub
-    summed = jnp.sum(x.astype(jnp.float32), axis=tuple(axes)).astype(x.dtype)
-    return summed, [lbl for i, lbl in enumerate(sub) if i not in axes]
-
-
-def _sum_private_axes(v, sub, other_sub, out_sub, narrow):
+def _sum_private_axes(v, sub, other_sub, out_sub):
     # A sum keeps the frame's layout, so it adds in the order it always did.
     axes = _private_axes(sub, other_sub, out_sub)
     if not axes:
         return v, sub
-    x = v.materialize()
-    if narrow:
-        x, sub = _sum_private_axes_narrow(x, sub, other_sub, out_sub)
-    else:
-        x = jnp.sum(x, axis=tuple(axes))
-        sub = [lbl for i, lbl in enumerate(sub) if i not in axes]
-    return _View(x), sub
+    x = jnp.sum(v.materialize(), axis=tuple(axes))
+    return _View(x), [lbl for i, lbl in enumerate(sub) if i not in axes]
 
 
 def _gx_einsum(a, b, dims):
@@ -2424,7 +2398,7 @@ def _matmul_via_densify(lhs, rhs):
         (tuple(lhs_contract), tuple(rhs_contract)),
         (tuple(lhs_batch), tuple(rhs_batch)),
     )
-    result = _store_narrow(_gx_einsum(lhs_dense, rhs_dense, _dn),
+    result = _check_narrow(_gx_einsum(lhs_dense, rhs_dense, _dn),
                            lhs_dense.dtype, rhs_dense.dtype)
 
     # The result axes are laid out as: batch, then lhs's kept (in order), then rhs's

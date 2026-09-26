@@ -71,12 +71,14 @@ _CONVERT = re.compile(
 
 
 def _assert_narrow_gemm(hlo):
+    # A two-sided Quant face is a plain bf16 dot: bf16 in, bf16 out; the
+    # kernel forms the sums (owner ruling 2026-09-26, dsnn-dfw.273).
     dots = _DOT.findall(hlo)
     assert dots, hlo
     narrow = [d for d in dots if d[0].endswith("xbf16>") and d[1].endswith("xbf16>")]
     assert narrow, f"no bf16 x bf16 dot:\n{hlo}"
     for lhs, rhs, out in narrow:
-        assert out.endswith("xf32>"), f"bf16 dot without f32 sums: {(lhs, rhs, out)}\n{hlo}"
+        assert out.endswith("xbf16>"), f"a bf16 dot with a wide result: {(lhs, rhs, out)}\n{hlo}"
     mixed = [d for d in dots if ("bf16" in d[0]) != ("bf16" in d[1])]
     assert not mixed, f"mixed-width dot: {mixed}\n{hlo}"
     widened = [c for c in _CONVERT.findall(hlo)
@@ -84,7 +86,7 @@ def _assert_narrow_gemm(hlo):
     assert not widened, f"a bf16 operand is widened to f32: {widened}\n{hlo}"
 
 
-def test_a_two_sided_quant_face_is_a_bf16_dot_with_f32_sums_and_a_bf16_result():
+def test_a_two_sided_quant_face_is_a_plain_bf16_dot_with_a_bf16_result():
     ij = _eliminate_all(_chain, (_X6,), 1, (_Q, _Q, None))
     _assert_narrow_gemm(_lowered(ij, (_X6,)))
     got = _jacobian(ij, (_X6,))
@@ -134,6 +136,7 @@ def _eliminate_in_order(fn, args, order, vertex, slots):
 
 
 _MUL = re.compile(r"stablehlo\.multiply\b[^\n]*?:\s*(tensor<[^>]+>)")
+_REDUCE = re.compile(r"stablehlo\.reduce\b[^\n]*?:\s*\((tensor<[^>]+>),")
 
 
 @pytest.mark.parametrize("fn, args, order, n", [
@@ -144,26 +147,23 @@ def test_a_two_sided_quant_face_with_a_real_private_sum_is_one_narrow_product(fn
     # The reduce is eliminated first (or the broadcast is the in-edge), so the
     # face's contracted axis sits at extent 1 on one side against n on the
     # other: a real sum over the storing side, not a squeeze. The product after
-    # it is one bf16 dot with f32 sums when an axis is still summed between the
+    # it is one plain bf16 dot when an axis is still summed between the
     # operands (in-edge), and one bf16 multiply when none is (out-edge,
-    # dsnn-dfw.250): the product of two bf16 values is exact in f32 and its
-    # bf16 rounding is what the dot stored. Both operands reach it narrow.
+    # dsnn-dfw.250). Both operands reach it narrow, and the result is bf16
+    # (owner ruling 2026-09-26, dsnn-dfw.273).
     ij = _eliminate_in_order(fn, args, order, 1, (_Q, _Q, None))
     hlo = _lowered(ij, args)
     dots = _DOT.findall(hlo)
     assert not [d for d in dots if ("bf16" in d[0]) != ("bf16" in d[1])], dots
     narrow = [d for d in dots if d[0].endswith("xbf16>") and d[1].endswith("xbf16>")]
     if narrow:
-        assert len(narrow) == 1 and narrow[0][2].endswith("xf32>"), f"{dots}\n{hlo}"
+        assert len(narrow) == 1 and narrow[0][2].endswith("xbf16>"), f"{dots}\n{hlo}"
     else:
         muls = _MUL.findall(hlo)
         assert [m for m in muls if m.endswith("xbf16>")], f"no bf16 dot and no bf16 multiply:\n{hlo}"
-    widened = [c for c in _CONVERT.findall(hlo)
-               if c[0].endswith("xbf16>") and c[1].endswith("xf32>")]
-    assert len(widened) == 1, f"only the private sum widens: {widened}\n{hlo}"
-    # The summed extent is a dimension of the widened operand; the operand
-    # carries no size-1 axes any more (dsnn-dfw.250), so it may lead.
-    assert str(n) in widened[0][0].split("<")[1].split("x")[:-1], widened
+    # The private sum is a real reduce over the extent the storing side holds.
+    reduced = _REDUCE.findall(hlo)
+    assert [r for r in reduced if str(n) in r.split("<")[1].split("x")[:-1]], f"{reduced}\n{hlo}"
     got = _jacobian(ij, args)
     assert jnp.dtype(got.dtype) == jnp.dtype(jnp.bfloat16)
     want = np.asarray(jax.jacrev(fn)(*args), np.float64)
