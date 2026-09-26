@@ -26,8 +26,9 @@ from .utils import (
     _apply_scalar_mult, _scaled_fill, _copy,
 )
 from .layout import generate_block_permutation
+from .view import _View, _as_view, _bcast, _mat
 from graphax.sparse.dtype_compute import _unify_operand_dtypes, _compute_dtype
-from graphax.sparse.indexes import DiagonalIndex, DenseIndex, static_eye
+from graphax.sparse.indexes import DiagonalIndex, DenseIndex
 
 if TYPE_CHECKING:
     from graphax.sparse.tensor import SparseTensor
@@ -323,14 +324,17 @@ def _value_axes_info(tensor, sp, dp, is_left):
 
 
 def _align_value(value, tensor, sp, dp, axes, broadcast_unused, is_left):
-    value = _apply_scalar_mult(value, tensor)
+    """The operand in the per-pair frame, as a ``_View``: the frame's reshapes
+    and transposes stay symbolic, and only a broadcast of a role the operand
+    stores once is emitted."""
+    value = _View(_apply_scalar_mult(value, tensor))
     target_shape = [s for _, s in _ew_pair_axes(sp, dp, is_left)]
     value = _prepare_physical_array(value, axes)
     pad = len(broadcast_unused) - (value.ndim - len(axes))
     if pad > 0:
         n = len(axes)
         value = value.reshape(value.shape[:n] + (1,) * pad + value.shape[n:])
-    return jnp.broadcast_to(value, tuple(target_shape) + tuple(broadcast_unused))
+    return _bcast(value, tuple(target_shape) + tuple(broadcast_unused))
 
 
 def _promote_to_unified(value: Array, metrics, is_left: bool, fill: Array) -> Array:
@@ -369,72 +373,35 @@ def _promote_to_unified(value: Array, metrics, is_left: bool, fill: Array) -> Ar
     in_shape += rem; exp_shape += rem; out_shape += rem
     if value.shape != tuple(in_shape):
         value = value.reshape(in_shape)
-    if needs_expansion:  # only the expansion branches read ``fill`` (B3)
+    if needs_expansion:  # only the expansion reads ``fill`` (B3)
+        # Each expanding pair's ``exp`` sub-blocks go onto the diagonal of an
+        # ``(exp, exp)`` grid by interior padding: element ``k`` lands at
+        # ``k * (exp + 1)`` of an ``exp * exp`` axis, the grid's diagonal, and
+        # every other cell holds ``fill``. The same cells as the eye-mask
+        # select, written once into a buffer of the output's own size, with
+        # no mask and no broadcast. With several pairs expanding a cell holds
+        # the value only where every pair is on its diagonal, as the product
+        # mask had it. Off the diagonal the value is the fill (0 for every
+        # zero-fill op in ``_ZERO_PRESERVING_OPS``).
         fill = jnp.asarray(fill, value.dtype)
-
-    # Single-pair expansion fast path: scatter the ``exp`` source sub-blocks
-    # directly into a zero-initialized ``(M, LCM_h, LCM_w)`` buffer instead of
-    # the broadcast+where dance below. The broadcast+where allocates an
-    # intermediate ``(M, exp, exp, B_h, B_w)`` (size ``exp²·M·B_h·B_w``) full
-    # of zeros except on the diagonal; the masked-where stays at peak
-    # ``M·LCM_h·LCM_w`` (the same as the final output buffer). That's the
-    # *divisor case*: one side already lives at LCM granularity, so only the
-    # smaller side goes through this expansion. ``test_03``'s peak-mem
-    # regression (16.69 → 4.17 MB targetted) sits on this path.
-    #
-    # Off-diagonal values are 0 (the same value the broadcast+where path
-    # produces); this is correct for all zero-fill ops we support — every op
-    # in ``_ZERO_PRESERVING_OPS`` returns the partner's value when one operand
-    # is 0 (sub/min on negatives is the only edge case worth flagging, but the
-    # existing path has the same semantics).
-    if needs_expansion and len(metrics) == 1:
-        m = metrics[0]
-        b1, b2 = (m["left_b1"], m["left_b2"]) if is_left else (m["right_b1"], m["right_b2"])
-        cb1, cb2 = m["common_b1"], m["common_b2"]
-        exp = cb1 // b1
-        if exp > 1:
-            M = m["unified_size"]
-            # Reshape source ``(M, exp, b1, b2)`` to a per-block-axis layout
-            # ``(M, exp, 1, b1, b2)`` so a single ``where(eye_mask, value, 0)``
-            # produces the diagonal-scattered ``(M, exp, exp, b1, b2)`` form,
-            # then reshape to ``(M, cb1, cb2)``. Avoids the per-``i`` Python
-            # loop over ``out.at[...].set(...)`` (one HLO op per slice).
-            v = value.reshape(M, exp, 1, b1, b2, *rem)
-            mask_shape = [1, exp, exp, 1, 1] + [1] * len(rem)
-            eye = static_eye(exp, bool).reshape(mask_shape)
-            v = jnp.where(eye, v, fill)
-            return v.transpose([0, 1, 3, 2, 4] + list(range(5, 5 + len(rem)))) \
-                    .reshape(M, cb1, cb2, *rem)
-
-    if value.shape != tuple(exp_shape):
-        value = value.reshape(exp_shape)
-    if needs_expansion:
-        mask = None
+        interior = [0] * len(in_shape)
+        grid = []
         for i, m in enumerate(metrics):
-            b1 = m["left_b1"] if is_left else m["right_b1"]
-            b2 = m["left_b2"] if is_left else m["right_b2"]
-            exp_h = m["common_b1"] // b1
-            exp_w = m["common_b2"] // b2
-            if exp_h > 1:
-                # Build the diagonal selector from independent per-axis eyes
-                # (``logical_and`` of the two), so the cross-axis structure is
-                # explicit even though the well-formed invariant pins
-                # ``exp_h == exp_w``.
-                ms_h = [1] * len(exp_shape); ms_h[5 * i + 1] = exp_h; ms_h[5 * i + 2] = exp_h
-                ms_w = [1] * len(exp_shape); ms_w[5 * i + 1] = exp_w; ms_w[5 * i + 2] = exp_w
-                eye_h = static_eye(exp_h, bool).reshape(ms_h)
-                eye_w = static_eye(exp_w, bool).reshape(ms_w)
-                em = jnp.logical_and(eye_h, eye_w)
-                mask = em if mask is None else mask & em
-        if mask is not None:
-            value = jnp.where(mask, value, fill)
+            b1, b2 = (m["left_b1"], m["left_b2"]) if is_left else (m["right_b1"], m["right_b2"])
+            exp = m["common_b1"] // b1
+            interior[4 * i + 1] = exp if exp > 1 else 0
+            grid.extend([m["unified_size"], exp, exp, b1, b2])
+        # Only the axes that carry data enter the pad; the unit axes are put
+        # back on the view.
+        value = _as_view(value)
+        core, keep = value.drop_units(list(range(value.ndim)))
+        padded = jax.lax.pad(_mat(core), fill, [(0, 0, interior[k]) for k in keep])
+        value = _View(padded).reshape(grid + rem)
+    else:
+        value = value.reshape(exp_shape)
     perm = generate_block_permutation(len(metrics), 5, [0, 1, 3, 2, 4])
     perm.extend(range(5 * len(metrics), len(exp_shape)))
-    if perm != list(range(len(perm))):
-        value = value.transpose(perm)
-    if value.shape != tuple(out_shape):
-        value = value.reshape(out_shape)
-    return value
+    return value.transpose(perm).reshape(out_shape)
 
 
 def _demote_intersection(value, metrics, is_intersection):
@@ -454,7 +421,8 @@ def _demote_intersection(value, metrics, is_intersection):
     rem = list(value.shape[3 * len(metrics):])
     in_shape += rem; out_shape += rem
     if sum_axes:
-        value = value.reshape(in_shape).sum(axis=tuple(sum_axes)).reshape(out_shape)
+        value = _mat(value.reshape(in_shape))
+        value = _View(value.sum(axis=tuple(sum_axes))).reshape(out_shape)
     return value, meta
 
 
@@ -480,8 +448,8 @@ def _reconstruct_result(value, lhs, sp, dp, output_meta, op, rhs):
     for pair in dp:
         rec[pair[0].id] = replace(pair[0], axis=info["axis"]); info["axis"] += 1
     if info["squeeze"]:
-        idx = tuple(0 if ax in info["squeeze"] else slice(None) for ax in range(value.ndim))
-        value = value[idx]
+        value = _as_view(value).drop_slots(info["squeeze"])
+    value = _mat(value)
     s_mult = _identity_scalar_mult(value.dtype)
     # Result fill: ``None`` (statically zero) when both inputs are statically
     # zero AND ``op(0, 0) == 0`` — so the output keeps fast-path eligibility.
@@ -664,6 +632,14 @@ def _side_axes_cover(t) -> bool:
         elif d.axis is not None:
             axes.append(d.axis)
     return sorted(axes) == list(range(t.val.ndim))
+
+
+def _op_operand(v):
+    """A view as an operand of a lax binary op: 0-d when it holds one value,
+    which the op broadcasts, else its slots materialized in order."""
+    if v.size == 1:
+        return _mat(v.drop_units(list(range(v.ndim)))[0])
+    return _mat(v)
 
 
 def _place_axes(val, srcs):
@@ -1004,8 +980,28 @@ def _lazy_pair(lhs, rhs, op, l_by_id, r_by_id):
             return _skip("phys_extent")
 
     # --- One physical op over the reconciled layouts. ---
-    la = _place_axes(_apply_scalar_mult(lhs.val, lhs), [s[0] for s in slots])
-    ra = _place_axes(_apply_scalar_mult(rhs.val, rhs), [s[1] for s in slots])
+    la = _place_axes(_View(_apply_scalar_mult(lhs.val, lhs)), [s[0] for s in slots])
+    ra = _place_axes(_View(_apply_scalar_mult(rhs.val, rhs)), [s[1] for s in slots])
+    # A slot of extent 1 is a size-1 dim that both sides store once. It stays
+    # out of the op and its dim comes back implicit, which is the form
+    # ``squeeze_unit_axes`` below gives it; the unit axis is never built.
+    unit = [k for k, s in enumerate(slots) if s[2] == 1]
+    la, ra = _op_operand(la.drop_slots(unit)), _op_operand(ra.drop_slots(unit))
+    if unit:
+        new_of = {}
+        for k in range(len(slots)):
+            new_of[k] = None if k in unit else k - sum(1 for u in unit if u < k)
+
+        def _remap(d):
+            kw = {}
+            if d.axis is not None:
+                kw["axis"] = new_of[d.axis]
+            if d.is_sparse and d.block_axis is not None:
+                kw["block_axis"] = new_of[d.block_axis]
+            return replace(d, **kw) if kw else d
+
+        rec = {i: _remap(d) for i, d in rec.items()}
+        slots = [s for k, s in enumerate(slots) if k not in unit]
     if la.dtype != ra.dtype:
         cdt = _compute_dtype(la.dtype, ra.dtype)
         la, ra = la.astype(cdt), ra.astype(cdt)
@@ -1216,15 +1212,20 @@ def _materializing_general(lhs, rhs, op, is_intersection, n):
     bus = list(jnp.broadcast_shapes(tuple(ul), tuple(ur)))
     vl = _align_value(vl, lhs, sp, dp, al, bus, True)
     vr = _align_value(vr, rhs, sp, dp, ar, bus, False)
-    _pl = _promote_to_unified(vl, metrics, True, _scaled_fill(lhs))
-    _pr = _promote_to_unified(vr, metrics, False, _scaled_fill(rhs))
+    _pl = _as_view(_promote_to_unified(vl, metrics, True, _scaled_fill(lhs)))
+    _pr = _as_view(_promote_to_unified(vr, metrics, False, _scaled_fill(rhs)))
+    # An axis of extent 1 on both sides carries nothing: it stays out of the
+    # op, and the result view puts it back without an equation.
+    unit = [k for k, (a, b) in enumerate(zip(_pl.shape, _pr.shape)) if a == 1 and b == 1]
+    ndim = _pl.ndim
+    _pl, _pr = _mat(_pl.drop_slots(unit)), _mat(_pr.drop_slots(unit))
     _pldt = getattr(_pl, "dtype", None)
     _prdt = getattr(_pr, "dtype", None)
     if _pldt is not None and _prdt is not None and _pldt != _prdt:
         _cdt = _compute_dtype(_pldt, _prdt)
         _pl = _pl.astype(_cdt)
         _pr = _pr.astype(_cdt)
-    res = op(_pl, _pr)
+    res = _View(op(_pl, _pr)).insert_units(ndim, unit)
     # The intersection demote SUMS over the LCM-expansion axis, which is only
     # valid when the off-intersection sub-blocks are zero — i.e. zero fill (for
     # a multiplicative op, fill·data vanishes only when a fill is 0). With a

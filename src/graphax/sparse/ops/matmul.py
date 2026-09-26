@@ -643,156 +643,8 @@ def _build_matmul_topology(lhs, rhs_out_dims, rhs_primal_dims, rhs_id_offset):
     return pairs
 
 
-# --- Symbolic shape views ---------------------------------------------------
-class _View:
-    # An array with its pending reshapes and transposes: a slot is the list of
-    # atoms (factors of base axes) it merges, an empty slot is a size-1 axis.
-    # ``one`` marks the placeholder of an operand that stores nothing.
-    __slots__ = ("base", "order", "extent", "slots", "one")
-
-    def __init__(self, base, *, order=None, extent=None, slots=None, one=False):
-        self.base = base
-        if order is None:
-            order, extent, slots = [], {}, []
-            for k, n in enumerate(base.shape):
-                n = int(n)
-                if n == 1:
-                    slots.append([])
-                else:
-                    order.append(k)
-                    extent[k] = n
-                    slots.append([k])
-        self.order, self.extent, self.slots, self.one = order, extent, slots, one
-
-    def _clone(self, slots, order=None, extent=None):
-        return _View(
-            self.base,
-            order=list(self.order) if order is None else order,
-            extent=dict(self.extent) if extent is None else extent,
-            slots=slots,
-            one=self.one,
-        )
-
-    @property
-    def shape(self):
-        return tuple(math.prod(self.extent[t] for t in s) for s in self.slots)
-
-    @property
-    def ndim(self):
-        return len(self.slots)
-
-    @property
-    def size(self):
-        return math.prod(self.shape)
-
-    @property
-    def dtype(self):
-        return self.base.dtype
-
-    def transpose(self, perm):
-        perm = list(perm)
-        if perm == list(range(len(self.slots))):
-            return self
-        return self._clone([self.slots[p] for p in perm])
-
-    def reshape(self, *shape):
-        if len(shape) == 1 and isinstance(shape[0], (list, tuple)):
-            shape = shape[0]
-        shape = tuple(int(d) for d in shape)
-        if shape == self.shape:
-            return self
-        if math.prod(shape) != self.size:
-            raise ValueError(f"cannot reshape a view of shape {self.shape} to {shape}")
-        seq = [t for s in self.slots for t in s]
-        order, extent = list(self.order), dict(self.extent)
-        nxt = max(extent, default=-1) + 1
-        slots, i = [], 0
-        for d in shape:
-            if d == 1:
-                slots.append([])
-                continue
-            run, group = 1, []
-            while run < d:
-                t = seq[i]
-                s = extent[t]
-                if d % (run * s) == 0:
-                    group.append(t)
-                    run *= s
-                    i += 1
-                elif d % run == 0 and s % (d // run) == 0:
-                    # Split the atom at the boundary; the minor part is a new
-                    # atom right after it in the base order.
-                    d1 = d // run
-                    t2 = nxt
-                    nxt += 1
-                    extent[t] = d1
-                    extent[t2] = s // d1
-                    order.insert(order.index(t) + 1, t2)
-                    seq.insert(i + 1, t2)
-                    group.append(t)
-                    run *= d1
-                    i += 1
-                else:
-                    # A regrouping the atoms cannot express: a real reshape of
-                    # the materialized buffer.
-                    return _View(self._materialize(shape), one=self.one)
-            slots.append(group)
-        return self._clone(slots, order, extent)
-
-    def _materialize(self, target=None):
-        arr = self.base
-        atoms = tuple(self.extent[t] for t in self.order)
-        if tuple(int(n) for n in arr.shape) != atoms:
-            arr = arr.reshape(atoms)
-        seq = [t for s in self.slots for t in s]
-        pos = {t: i for i, t in enumerate(self.order)}
-        perm = [pos[t] for t in seq]
-        if perm != list(range(len(perm))):
-            arr = arr.transpose(perm)
-        target = self.shape if target is None else tuple(int(d) for d in target)
-        if tuple(int(n) for n in arr.shape) != target:
-            arr = arr.reshape(target)
-        return arr
-
-    def materialize(self):
-        arr = self._materialize()
-        self.base = arr
-        self.order = [t for s in self.slots for t in s]
-        return arr
-
-    def broadcast_to(self, shape):
-        return _View(jnp.broadcast_to(self.materialize(), tuple(shape)))
-
-    def sum_keepdims(self, axes):
-        axes = tuple(sorted(set(int(a) for a in axes)))
-        out = _View(jnp.sum(self.materialize(), axis=axes))
-        return out.insert_units(self.ndim, axes)
-
-    def __getitem__(self, idx):
-        return _View(self.materialize()[idx])
-
-    def drop_units(self, labels):
-        keep = [i for i, s in enumerate(self.slots) if s]
-        return self._clone([self.slots[i] for i in keep]), [labels[i] for i in keep]
-
-    def insert_units(self, n_total, positions):
-        positions = set(positions)
-        rest = iter(self.slots)
-        return self._clone([[] if i in positions else next(rest) for i in range(n_total)])
-
-
-def _as_view(x):
-    return x if isinstance(x, _View) else _View(x)
-
-
-def _mat(x):
-    return x.materialize() if isinstance(x, _View) else x
-
-
-def _bcast(x, shape):
-    if isinstance(x, _View):
-        return x.broadcast_to(shape)
-    return jnp.broadcast_to(x, tuple(shape))
+# --- Symbolic shape views: see view.py -------------------------------------
+from .view import _View, _as_view, _bcast, _mat  # noqa: E402
 
 
 # --- Physical array preparation -------------------------------------------
@@ -2238,9 +2090,9 @@ def _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub):
     STORED width of the result, and every downstream edge dtype with it.
     Changing that is a deliberate precision decision, not a tidy-up.
     """
-    # The operands enter without size-1 axes: a unit axis carries nothing, and
-    # a label no operand carries is a unit axis of the output, put back on the
-    # result view without an equation.
+    # The operands enter without size-1 axes and in their bases' own axis
+    # order, and the result leaves in the order the product makes it: the
+    # permutation to ``out_sub`` and its unit axes stay on the result view.
     a, lhs_sub = _as_view(a).drop_units(list(lhs_sub))
     b, rhs_sub = _as_view(b).drop_units(list(rhs_sub))
     carried = set(lhs_sub) | set(rhs_sub)
@@ -2249,8 +2101,14 @@ def _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub):
     narrow = (jnp.dtype(a.dtype) == jnp.dtype(jnp.bfloat16)
               and jnp.dtype(b.dtype) == jnp.dtype(jnp.bfloat16))
     kw = {"preferred_element_type": jnp.float32} if narrow else {}
+
+    def done(res, labels):
+        v = _as_view(res).transpose([labels.index(lbl) for lbl in out_core])
+        return v.insert_units(len(out_sub), unit_out)
+
     if any(lbl in rhs_sub and lbl not in out_core for lbl in lhs_sub):
-        x, y = a.materialize(), b.materialize()
+        x, lhs_sub = _natural(a, lhs_sub)
+        y, rhs_sub = _natural(b, rhs_sub)
         if narrow:
             # jnp.einsum sums a private label in the preferred dtype, which
             # widens a bf16 operand to f32 before the dot; the private sum is
@@ -2258,29 +2116,47 @@ def _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub):
             # so both operands reach the dot narrow.
             x, lhs_sub = _sum_private_axes_narrow(x, lhs_sub, rhs_sub, out_core)
             y, rhs_sub = _sum_private_axes_narrow(y, rhs_sub, lhs_sub, out_core)
-        res = jnp.einsum(x, lhs_sub, y, rhs_sub, out_core, **kw)
-        return _View(res).insert_units(len(out_sub), unit_out)
+        out = _dot_order(lhs_sub, rhs_sub, out_core)
+        return done(jnp.einsum(x, lhs_sub, y, rhs_sub, out, **kw), out)
     # Nothing is summed between the operands. A private label is a sum on its
     # own side, and what remains is a product: elementwise when both carry the
     # same axes or one is a scalar, an outer product otherwise.
     a, lhs_sub = _sum_private_axes(a, lhs_sub, rhs_sub, out_core, narrow)
     b, rhs_sub = _sum_private_axes(b, rhs_sub, lhs_sub, out_core, narrow)
+    if a.one and not lhs_sub:
+        return done(b, rhs_sub)
+    if b.one and not rhs_sub:
+        return done(a, lhs_sub)
     if set(lhs_sub) == set(rhs_sub) or not lhs_sub or not rhs_sub:
+        # One operand keeps its own axis order and the other follows it. A
+        # narrow pair multiplies narrow: the product of two bf16 values is
+        # exact in f32, so its bf16 rounding is the dot's stored result.
         if lhs_sub:
-            a = a.transpose([lhs_sub.index(lbl) for lbl in out_core])
-        if rhs_sub:
-            b = b.transpose([rhs_sub.index(lbl) for lbl in out_core])
-        if a.one and not lhs_sub:
-            res = b
-        elif b.one and not rhs_sub:
-            res = a
+            x, labels = _natural(a, lhs_sub)
+            y = (b.transpose([rhs_sub.index(lbl) for lbl in labels]).materialize()
+                 if rhs_sub else _natural(b, rhs_sub)[0])
         else:
-            # A narrow pair multiplies narrow: the product of two bf16 values
-            # is exact in f32, so its bf16 rounding is the dot's stored result.
-            res = _View(jax.lax.mul(a.materialize(), b.materialize()))
-        return res.insert_units(len(out_sub), unit_out)
-    res = jnp.einsum(a.materialize(), lhs_sub, b.materialize(), rhs_sub, out_core, **kw)
-    return _View(res).insert_units(len(out_sub), unit_out)
+            y, labels = _natural(b, rhs_sub)
+            x = _natural(a, lhs_sub)[0]
+        return done(jax.lax.mul(x, y), labels)
+    x, lhs_sub = _natural(a, lhs_sub)
+    y, rhs_sub = _natural(b, rhs_sub)
+    out = _dot_order(lhs_sub, rhs_sub, out_core)
+    return done(jnp.einsum(x, lhs_sub, y, rhs_sub, out, **kw), out)
+
+
+def _natural(v, labels):
+    arr, rank = _as_view(v).natural()
+    return arr, [labels[i] for i in rank]
+
+
+def _dot_order(lhs_sub, rhs_sub, out_core):
+    """The order ``dot_general`` itself produces: the batch labels, then each
+    operand's free labels in its own order. Asked for this, the einsum emits no
+    transpose after the dot."""
+    batch = [lbl for lbl in lhs_sub if lbl in rhs_sub and lbl in out_core]
+    return (batch + [lbl for lbl in lhs_sub if lbl not in rhs_sub and lbl in out_core]
+            + [lbl for lbl in rhs_sub if lbl not in lhs_sub and lbl in out_core])
 
 
 def _private_axes(sub, other_sub, out_sub):
@@ -2297,13 +2173,13 @@ def _sum_private_axes_narrow(x, sub, other_sub, out_sub):
 
 
 def _sum_private_axes(v, sub, other_sub, out_sub, narrow):
-    axes = _private_axes(sub, other_sub, out_sub)
-    if not axes:
+    if not _private_axes(sub, other_sub, out_sub):
         return v, sub
-    x = v.materialize()
+    x, sub = _natural(v, sub)
     if narrow:
         x, sub = _sum_private_axes_narrow(x, sub, other_sub, out_sub)
     else:
+        axes = _private_axes(sub, other_sub, out_sub)
         x = jnp.sum(x, axis=tuple(axes))
         sub = [lbl for i, lbl in enumerate(sub) if i not in axes]
     return _View(x), sub
