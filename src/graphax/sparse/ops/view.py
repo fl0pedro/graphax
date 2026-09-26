@@ -20,6 +20,53 @@ import jax
 import jax.numpy as jnp
 
 
+class _LazyProduct:
+    """``x * y`` over the union of their axes, not emitted yet (dsnn-dfw.272).
+
+    Axis ``k`` of the product is axis ``xa[k]`` of ``x`` and axis ``ya[k]`` of
+    ``y``, or ``None`` where the operand does not carry it. ``emit`` writes the
+    product with its axes in the order the reader asks for, so no transpose
+    follows the product."""
+
+    __slots__ = ("x", "y", "xa", "ya", "shape", "dtype", "_out")
+
+    def __init__(self, x, xa, y, ya, shape):
+        self.x, self.y, self.xa, self.ya = x, y, list(xa), list(ya)
+        self.shape = tuple(int(d) for d in shape)
+        self.dtype = jnp.result_type(x, y)
+        self._out = {}
+
+    @property
+    def ndim(self):
+        return len(self.shape)
+
+    def emit(self, perm):
+        perm = tuple(int(p) for p in perm)
+        if perm not in self._out:
+            shape = tuple(self.shape[p] for p in perm)
+            self._out[perm] = jnp.multiply(_side(self.x, self.xa, perm, shape),
+                                           _side(self.y, self.ya, perm, shape))
+        return self._out[perm]
+
+
+def _side(arr, axes, perm, shape):
+    # One operand laid along the product's axes in ``perm`` order.
+    carried = [(pos, axes[p]) for pos, p in enumerate(perm) if axes[p] is not None]
+    src = [a for _, a in carried]
+    if len(src) != arr.ndim:
+        raise ValueError(f"an operand of rank {arr.ndim} carries {len(src)} product axes")
+    if src != list(range(len(src))):
+        arr = jax.lax.transpose(arr, src)
+    dims = tuple(pos for pos, _ in carried)
+    if dims == tuple(range(len(shape))):
+        return arr
+    return jax.lax.broadcast_in_dim(arr, shape, dims)
+
+
+def _force(base):
+    return base.emit(range(base.ndim)) if isinstance(base, _LazyProduct) else base
+
+
 class _View:
     __slots__ = ("base", "order", "extent", "slots", "one")
 
@@ -116,7 +163,7 @@ class _View:
         arr = self.base
         atoms = tuple(self.extent[t] for t in self.order)
         if tuple(int(n) for n in arr.shape) != atoms:
-            arr = arr.reshape(atoms)
+            arr = _force(arr).reshape(atoms)
         return arr
 
     def _materialize(self, target=None):
@@ -124,7 +171,9 @@ class _View:
         seq = [t for s in self.slots for t in s]
         pos = {t: i for i, t in enumerate(self.order)}
         perm = [pos[t] for t in seq]
-        if perm != list(range(len(perm))):
+        if isinstance(arr, _LazyProduct):
+            arr = arr.emit(perm)
+        elif perm != list(range(len(perm))):
             arr = arr.transpose(perm)
         target = self.shape if target is None else tuple(int(d) for d in target)
         if tuple(int(n) for n in arr.shape) != target:
@@ -143,6 +192,8 @@ class _View:
         ``k``. Falls back to the slot order when a slot's atoms are not one
         contiguous run of the base."""
         full = [i for i, s in enumerate(self.slots) if s]
+        if isinstance(self.base, _LazyProduct):
+            return self._clone([self.slots[j] for j in full])._materialize(), full
         pos = {t: i for i, t in enumerate(self.order)}
         first = {}
         for i in full:
@@ -178,6 +229,8 @@ class _View:
         """``{base axis: slot}`` when every non-unit slot is one whole base
         axis and the slots keep the base's order, else ``None``: then an op
         that maps axes can read the base as it is."""
+        if isinstance(self.base, _LazyProduct):
+            return None
         base = tuple(int(n) for n in self.base.shape)
         at = {}
         for p, s in enumerate(self.slots):

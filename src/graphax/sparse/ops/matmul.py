@@ -644,7 +644,7 @@ def _build_matmul_topology(lhs, rhs_out_dims, rhs_primal_dims, rhs_id_offset):
 
 
 # --- Symbolic shape views: see view.py -------------------------------------
-from .view import _View, _as_view, _bcast, _mat  # noqa: E402
+from .view import _LazyProduct, _View, _as_view, _bcast, _mat  # noqa: E402
 
 
 # --- Physical array preparation -------------------------------------------
@@ -2061,9 +2061,11 @@ def _dims_to_sublists(lhs_ndim, rhs_ndim, dims):
 
 
 def _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub):
-    """The contraction as ONE ``jnp.einsum`` over integer sublists, or ONE
-    ``mul`` when no label is summed between the operands (a product of two
+    """The contraction as ONE ``jnp.einsum`` over integer sublists, or a lazy
+    product when no label is summed between the operands (a product of two
     diagonal partials), on operands without size-1 axes. Returns a ``_View``.
+    A lazy product is emitted by the reader that materializes the view, in the
+    reader's own axis order, so no transpose follows it (dsnn-dfw.272).
 
     The sole emission of the contraction engine (owner ruling D1, revised
     2026-09-08). It states which axes meet and leaves the lowering to XLA,
@@ -2127,34 +2129,18 @@ def _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub):
         return done(b, rhs_sub)
     if b.one and not rhs_sub:
         return done(a, lhs_sub)
-    if set(lhs_sub) == set(rhs_sub) or not lhs_sub or not rhs_sub:
-        # One operand keeps its own axis order and the other follows it.
-        if lhs_sub:
-            x, labels = _natural(a, lhs_sub)
-            y = (b.transpose([rhs_sub.index(lbl) for lbl in labels]).materialize()
-                 if rhs_sub else _natural(b, rhs_sub)[0])
-        else:
-            y, labels = _natural(b, rhs_sub)
-            x = _natural(a, lhs_sub)[0]
-        return done(jax.lax.mul(x, y), labels)
-    x, lhs_sub = _natural(a, lhs_sub)
-    y, rhs_sub = _natural(b, rhs_sub)
-    out = _dot_order(lhs_sub, rhs_sub, out_core)
-    return done(jnp.einsum(x, lhs_sub, y, rhs_sub, out), out)
+    x, xl = _natural(a, lhs_sub)
+    y, yl = _natural(b, rhs_sub)
+    labels = xl + [lbl for lbl in yl if lbl not in xl]
+    shape = [x.shape[xl.index(lbl)] if lbl in xl else y.shape[yl.index(lbl)] for lbl in labels]
+    prod = _LazyProduct(x, [xl.index(lbl) if lbl in xl else None for lbl in labels],
+                        y, [yl.index(lbl) if lbl in yl else None for lbl in labels], shape)
+    return done(_View(prod), labels)
 
 
 def _natural(v, labels):
     arr, rank = _as_view(v).natural()
     return arr, [labels[i] for i in rank]
-
-
-def _dot_order(lhs_sub, rhs_sub, out_core):
-    """The order ``dot_general`` itself produces: the batch labels, then each
-    operand's free labels in its own order. Asked for this, the einsum emits no
-    transpose after the dot."""
-    batch = [lbl for lbl in lhs_sub if lbl in rhs_sub and lbl in out_core]
-    return (batch + [lbl for lbl in lhs_sub if lbl not in rhs_sub and lbl in out_core]
-            + [lbl for lbl in rhs_sub if lbl not in lhs_sub and lbl in out_core])
 
 
 def _private_axes(sub, other_sub, out_sub):
