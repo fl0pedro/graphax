@@ -1,4 +1,4 @@
-# The transpose relabel moves no data (dsnn-dfw.252).
+# The transpose and squeeze relabels move no data (dsnn-dfw.252).
 import itertools
 
 import jax
@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from graphax import jacve
-from graphax.primitives.transforms import _transpose_elementals
+from graphax.primitives.transforms import _squeeze_elementals, _transpose_elementals
 from graphax.sparse.indexes import DenseIndex, DiagonalIndex
 from graphax.sparse.tensor import SparseTensor
 
@@ -54,3 +54,16 @@ def test_a_function_with_transposes_and_squeezes_keeps_its_gradient():
     got = jacve(f, "rev", argnums=(0,))(x)
     want = np.asarray(jax.grad(f)(x))
     np.testing.assert_allclose(np.asarray(got).reshape(want.shape), want, rtol=1e-5, atol=1e-6)
+
+
+def test_the_squeeze_relabel_keeps_its_size_1_axis_physical_and_transposes_nothing():
+    x = jax.random.normal(KEY, (3, 1, 4), jnp.float32)
+    y = jnp.squeeze(x, axis=1)
+    t = _squeeze_elementals((x,), y, dimensions=(1,))[0].pre_transforms[0]
+    w = jax.random.normal(jax.random.fold_in(KEY, 3), (5, 3, 4), jnp.float32)
+    names = _names(jax.make_jaxpr(lambda v: t.inverse_transform(_dense_edge(v, 1)).val)(w))
+    assert "transpose" not in names, names
+    got = t.inverse_transform(_dense_edge(w, 1))
+    assert got.shape == (5, 3, 1, 4)
+    assert got.primal_dims[1].axis is not None
+    np.testing.assert_array_equal(np.asarray(got.dense()), np.asarray(w)[:, :, None, :])

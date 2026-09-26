@@ -922,7 +922,8 @@ def _squeeze_elementals(primals, val_out, **params):
         val = post.val
 
         # Each re-inserted size-1 primal axis gets a FRESH val axis appended at
-        # the end; _swap_back_axes then permutes val into canonical dim order.
+        # the end, and its dim points at it; the consumer's view takes the
+        # order, so val is not transposed into dim order (dsnn-dfw.252).
         # (Computing the exact insertion axis by hand is unsound because diagonal
         # pairs share a val axis, so a dim-count overshoots val.ndim.)
         for dim in new_dims:
@@ -939,10 +940,10 @@ def _squeeze_elementals(primals, val_out, **params):
             replace(d, other_id=old_to_new[d.other_id]) if d.is_sparse else d
             for d in out_dims
         ]
-        return _swap_back_axes(SparseTensor(
+        return SparseTensor(
             new_out, new_primal, val,
             scalar_mult=post.scalar_mult, fill_value=post.fill_value,
-        ))
+        )
 
     # Bijective size-1 relabel -> seed_drainable (chains like transpose).
     transform = JacobianTransform(squeeze_transform, inverse_squeeze_transform,
