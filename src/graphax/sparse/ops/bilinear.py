@@ -281,7 +281,7 @@ def _view_of_sparse(st, dtype) -> _View:
             f"{None if st.val is None else tuple(st.val.shape)}")
 
     # --- the stored values, in frame order ---------------------------------
-    sm = jnp.asarray(st.scalar_mult).astype(dtype)
+    sm = jnp.asarray(st.scalar_mult, dtype=dtype)
     G, uniform = None, True
     if st.val is not None:
         uniform = False

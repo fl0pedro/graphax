@@ -79,7 +79,7 @@ def _scale(k, log=None, tag=None):
         if log is not None:
             log.append((tag, tuple(st.shape)))
         return st.copy(
-            scalar_mult=st.scalar_mult * jnp.asarray(k, st.scalar_mult.dtype))
+            scalar_mult=st.scalar_mult * jnp.asarray(k, jnp.result_type(st.scalar_mult)))
     return _apply
 
 

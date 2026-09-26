@@ -130,7 +130,7 @@ def test_apply_quant_is_a_bare_astype(name):
     )
     # scalar_mult passed through untouched
     assert np.asarray(q.scalar_mult) == np.asarray(t.scalar_mult)
-    assert jnp.dtype(q.scalar_mult.dtype) == jnp.dtype(t.scalar_mult.dtype)
+    assert jnp.result_type(q.scalar_mult) == jnp.result_type(t.scalar_mult)
 
 
 def test_scaled_branch_is_still_reachable_for_int_targets():

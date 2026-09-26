@@ -129,7 +129,7 @@ def _scale(k):
     """
     def _apply(st):
         return st.copy(
-            scalar_mult=st.scalar_mult * jnp.asarray(k, st.scalar_mult.dtype))
+            scalar_mult=st.scalar_mult * jnp.asarray(k, jnp.result_type(st.scalar_mult)))
     return _apply
 
 

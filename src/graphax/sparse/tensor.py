@@ -15,7 +15,7 @@ from jax.tree_util import register_pytree_node_class
 from jax.typing import DTypeLike
 
 from graphax.sparse.indexes import DenseIndex, Index, DiagonalIndex, static_eye
-from graphax.sparse.dtype_compute import _scaled_mul
+from graphax.sparse.dtype_compute import _cast_scalar, _scalar_dtype_of, _scaled_mul
 from graphax.sparse.ops.dense import dense  # noqa: F401  (re-exported: callers do `from graphax.sparse.tensor import dense`)
 from graphax.sparse.ops.elementwise import elementwise
 from graphax.sparse.ops.matmul import matmul
@@ -176,16 +176,23 @@ class SparseMathMixin:
     def __pos__(self):
         return self.copy()
 
-    def _map_unary(self, g):
+    def _map_unary(self, g, g_scalar=None):
         """Apply a zero-preserving unary ``g`` to ``val`` / ``scalar_mult`` /
         ``fill_value`` (``g(0) == 0`` for cast / conj / real / imag / abs / round),
         keeping the ``None`` fill fast-path marker via ``_map_fill``. Callers wrap
         with ``@_on_materialized`` when ``g`` is non-linear in ``val``. NOT for
         ``__neg__`` (linear: scales scalar_mult only, leaves val lazy) or
         ``__invert__`` (maps val only)."""
+        sm = self.scalar_mult
+        if not isinstance(sm, (int, float)):
+            sm = g(sm)
+        elif g_scalar is not None:
+            sm = g_scalar(sm)
+        else:
+            sm = g(jnp.asarray(sm, _scalar_dtype_of(sm)))
         return self.copy(
             val=g(self.val) if self.val is not None else None,
-            scalar_mult=g(self.scalar_mult),
+            scalar_mult=sm,
             fill_value=_map_fill(self.fill_value, g),
         )
 
@@ -267,7 +274,9 @@ class SparseTensor(SparseMathMixin):
         _scalar_dtype = _scalar_store_dtype(dtype)
 
         if scalar_mult is None:
-            scalar_mult = jnp.array(1, dtype=_scalar_dtype)
+            # The identity is a Python float, so a product with it folds at trace time (dsnn-dfw.253).
+            scalar_mult = (1.0 if jnp.issubdtype(_scalar_dtype, jnp.floating)
+                           else jnp.array(1, dtype=_scalar_dtype))
         elif _is_narrow(getattr(scalar_mult, "dtype", None)):
             scalar_mult = jnp.asarray(scalar_mult).astype(_scalar_dtype)
 
@@ -478,7 +487,7 @@ class SparseTensor(SparseMathMixin):
     def _target_arr(self) -> Array:
         if self.val is not None:
             return self.val
-        return self.scalar_mult
+        return jnp.asarray(self.scalar_mult)
 
     def block_until_ready(self) -> SparseTensor:
         _ = self._target_arr.block_until_ready()
@@ -488,7 +497,7 @@ class SparseTensor(SparseMathMixin):
     def dtype(self) -> DTypeLike:
         if self.val is not None:
             return self.val.dtype
-        return self.scalar_mult.dtype
+        return _scalar_dtype_of(self.scalar_mult)
 
     @property
     def _eff_fill(self) -> Array:
@@ -696,7 +705,8 @@ class SparseTensor(SparseMathMixin):
     # zero-fill marker through — otherwise a cast/conj inside jit would drop
     # fast-path eligibility.
     def astype(self, dtype: DTypeLike, **kwargs) -> SparseTensor:
-        return self._map_unary(lambda v: v.astype(dtype, **kwargs))
+        return self._map_unary(lambda v: v.astype(dtype, **kwargs),
+                               g_scalar=lambda s: _cast_scalar(s, dtype))
 
     def conj(self) -> SparseTensor:
         return self._map_unary(jnp.conj)
@@ -1183,7 +1193,7 @@ def materialize_uniform(st):
             ax = len(shape)
             shape.append(int(d.size))
             new_by_id[d.id] = replace(d, axis=ax)
-    dt = getattr(st.scalar_mult, "dtype", None) or jnp.float32
+    dt = _scalar_dtype_of(st.scalar_mult)
     val = jnp.ones(tuple(shape), dtype=dt)
     return SparseTensor(
         tuple(new_by_id[d.id] for d in st.out_dims),
@@ -1279,7 +1289,7 @@ def _coarsen_coupled_blockdiag(st, is_out1, rel_i, d1, is_out2, rel_j, d2,
         # Uniform-ones structure: the off-sub-diagonal zeros inside the new
         # blocks must become explicit, so the pattern materializes (all OTHER
         # dims stay implicit -- a ``val is None`` tensor has no physical axes).
-        dt = getattr(st.scalar_mult, "dtype", None) or jnp.float32
+        dt = _scalar_dtype_of(st.scalar_mult)
         eye = static_eye(k, dt)
         # Nothing here depends on traced data, so the whole block pattern is a
         # compile-time constant.

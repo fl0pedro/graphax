@@ -283,7 +283,7 @@ def contract_dense_block_diagonal(
         return dense_op_fallback(lhs, rhs, jnp.matmul)
 
     out_dtype = _compute_dtype(lhs.dtype, rhs.dtype)
-    scalar = (lhs.scalar_mult * rhs.scalar_mult).astype(out_dtype)
+    scalar = jnp.asarray(lhs.scalar_mult * rhs.scalar_mult, dtype=out_dtype)
 
     if rhs_is_diag:
         # ---- D @ B -----------------------------------------------------------
@@ -701,7 +701,7 @@ def _multiB_einsum(
     # into ``dense_arr``; only the STRUCT operand's scalar_mult (it is read from
     # the raw ``val`` buffer below) still needs folding — applying both here
     # would double-count the dense side's scale.
-    scalar = struct_st.scalar_mult.astype(out_dtype)
+    scalar = jnp.asarray(struct_st.scalar_mult, dtype=out_dtype)
 
     # --- letter pools for einsum subscripts (distinct symbols) --------------- #
     pool = iter(string.ascii_letters)

@@ -1130,7 +1130,9 @@ def apply_quant(st: SparseTensor, action: Quant) -> SparseTensor:
         # 0) and ``sign`` folds into ``sm'`` so the kept arm dequantizes with its
         # original polarity — no zero-point / offset is ever stored.
         sm = 1.0 if st.scalar_mult is None else st.scalar_mult
-        logical = st.val.astype(jnp.float32) * jnp.asarray(sm, jnp.float32)
+        logical = st.val.astype(jnp.float32)
+        if not (isinstance(sm, (int, float)) and sm == 1):
+            logical = logical * jnp.asarray(sm, jnp.float32)
         sign = jnp.float32(action.scale_sign)
         absmax = jnp.max(jnp.abs(logical))
         dmax = _quant_dtype_max(target)              # target's max magnitude

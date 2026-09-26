@@ -135,12 +135,14 @@ def structural_ones(st, dtype=None):
     """
     from graphax.sparse.tensor import SparseTensor
 
+    from graphax.sparse.dtype_compute import _full_float_dtype
+
     dt = st.dtype if dtype is None else dtype
     one = jnp.ones((), dt)
     return SparseTensor(
         st.out_dims, st.primal_dims,
         None if st.val is None else jnp.ones(st.val.shape, dt),
-        scalar_mult=one,
+        scalar_mult=None if jnp.dtype(dt) == _full_float_dtype() else one,
         fill_value=None if st.fill_value is None else one,
         check_consistency=False)
 

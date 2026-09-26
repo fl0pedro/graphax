@@ -197,10 +197,11 @@ def lowrank_elementwise(lhs, rhs, op, is_intersection: bool = False,
         ru_val = rhs.u.val if name == "add" else -rhs.u.val
         # fold each side's scalar_mult into its own stored factor before the
         # concat — the concatenated buffer can only carry ONE multiplier.
-        lu = lhs.u.val * lhs.u.scalar_mult
-        lv = lhs.v.val * lhs.v.scalar_mult
-        ru = ru_val * rhs.u.scalar_mult
-        rv = rhs.v.val * rhs.v.scalar_mult
+        from graphax.sparse.dtype_compute import _scaled_mul
+        lu = _scaled_mul(lhs.u.val, lhs.u.scalar_mult)
+        lv = _scaled_mul(lhs.v.val, lhs.v.scalar_mult)
+        ru = _scaled_mul(ru_val, rhs.u.scalar_mult)
+        rv = _scaled_mul(rhs.v.val, rhs.v.scalar_mult)
         r_new = lhs.rank + rhs.rank
         u_dims = tuple(
             replace(d, size=r_new) if i == len(lhs.u.out_dims) else d

@@ -60,7 +60,11 @@ _ADDITIVE_IDENTITY_OPS = frozenset((
 def _identity_scalar_mult(dtype) -> Array:
     """Identity ``scalar_mult`` for a freshly-built result buffer: ``True`` for
     bool, else ``1.0`` in the result dtype (the values already carry the scale)."""
-    return jnp.array(True) if dtype == jnp.bool_ else jnp.array(1.0, dtype=dtype)
+    from graphax.sparse.dtype_compute import _full_float_dtype
+    if dtype == jnp.bool_:
+        return jnp.array(True)
+    # A Python float where the array would be the full float (dsnn-dfw.253).
+    return 1.0 if jnp.dtype(dtype) == _full_float_dtype() else jnp.array(1.0, dtype=dtype)
 
 
 def _reconcile_broadcast_dims(lhs, rhs):

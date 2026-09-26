@@ -60,7 +60,10 @@ def _apply_scalar_mult(value: Array, tensor) -> Array:
     mult) for bool tensors, multiply otherwise. The single definition of "apply
     this operand's scalar_mult to a buffer", shared by elementwise + matmul."""
     if tensor.dtype == jnp.bool_:
-        return value & tensor.scalar_mult.astype(jnp.bool_)
+        sm = tensor.scalar_mult
+        if isinstance(sm, (int, float)):
+            return value if sm else value & jnp.zeros((), jnp.bool_)
+        return value & sm.astype(jnp.bool_)
     # Highest-common-dtype multiply: a Quant'd narrow ``value`` (float8 /
     # sub-byte int / …) has no implicit promotion path with a float32
     # scalar_mult, so upcast both to their common dtype before the op.

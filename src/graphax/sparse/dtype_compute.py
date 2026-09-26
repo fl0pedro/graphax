@@ -28,6 +28,7 @@ from typing import Any
 
 import jax.numpy as jnp
 import numpy as _np
+from jax import lax
 
 
 # Each narrow dtype JAX won't promote -> the STANDARD dtype arithmetic runs in
@@ -160,6 +161,34 @@ def _compute_dtype(*dtypes) -> Any:
     return out
 
 
+def _is_one(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and x == 1
+
+
+def _scalar_dtype_of(scalar_mult):
+    dt = getattr(scalar_mult, "dtype", None)
+    return _full_float_dtype() if dt is None else jnp.dtype(dt)
+
+
+def _times_one(x, *, keep_narrow: bool = False):
+    dt = getattr(x, "dtype", None)
+    if dt is None:
+        return x * 1.0
+    if keep_narrow:
+        return x
+    cdt = _compute_dtype(dt, _full_float_dtype())
+    return x if jnp.dtype(dt) == cdt else x.astype(cdt)
+
+
+def _cast_scalar(scalar_mult, dtype):
+    """``scalar_mult`` in ``dtype``. A Python number stays one where its array
+    would be the full float, and becomes an array of ``dtype`` elsewhere."""
+    dt = jnp.dtype(dtype)
+    if isinstance(scalar_mult, (int, float)) and not isinstance(scalar_mult, bool):
+        return float(scalar_mult) if dt == _full_float_dtype() else jnp.asarray(scalar_mult, dt)
+    return lax.convert_element_type(scalar_mult, dt)
+
+
 def _scaled_mul(value, scalar_mult, *, keep_narrow: bool = False):
     """``value * scalar_mult``.
 
@@ -177,16 +206,26 @@ def _scaled_mul(value, scalar_mult, *, keep_narrow: bool = False):
     the native ``astype``), so a narrow (Quant'd) ``value`` never trips JAX's
     implicit-promotion guard. The result carries the common dtype.
 
-    A python-scalar operand (e.g. a ``SparseTensor`` built with a raw
-    ``fill_value=1`` / ``scalar_mult=2.0`` — the constructor wraps only
-    ``val`` in ``jnp.asarray``) has no ``.dtype`` and can never be a narrow
-    JAX dtype, so it can't hit the promotion guard: fall back to the plain
-    multiply, which also preserves JAX weak-typing for that operand.
+    A Python-number operand (the identity ``scalar_mult`` is the Python float
+    1.0, dsnn-dfw.253) is a full-precision scalar: it combines exactly like an
+    array of ``_full_float_dtype()``, and the literal one multiplies nothing,
+    so the product folds at trace time. Two Python numbers multiply as Python
+    numbers.
     """
+    if _is_one(scalar_mult):
+        return _times_one(value, keep_narrow=keep_narrow)
+    if _is_one(value):
+        return _times_one(scalar_mult)
     vdt = getattr(value, "dtype", None)
     sdt = getattr(scalar_mult, "dtype", None)
-    if vdt is None or sdt is None:
+    if vdt is None and sdt is None:
         return value * scalar_mult
+    if vdt is None:
+        value = jnp.asarray(value, _full_float_dtype())
+        vdt = value.dtype
+    if sdt is None:
+        scalar_mult = jnp.asarray(scalar_mult, _full_float_dtype())
+        sdt = scalar_mult.dtype
     # A mixed {bf16, f32} value / scalar_mult pair is UPCAST here, so a Quant'd
     # array is re-promoted to f32 by the densify read before the contraction
     # consumes it. Keeping it narrow instead was measured (2026-08, G3) and it
@@ -279,10 +318,9 @@ def _cast_operand(t, cdt):
         else t.val
     )
     new_sm = (
-        t.scalar_mult.astype(cdt)
-        if getattr(t.scalar_mult, "dtype", None) is not None
-        and jnp.dtype(t.scalar_mult.dtype) != cdt
-        else t.scalar_mult
+        t.scalar_mult
+        if jnp.dtype(_scalar_dtype_of(t.scalar_mult)) == cdt
+        else _cast_scalar(t.scalar_mult, cdt)
     )
     new_fill = (
         t.fill_value.astype(cdt)

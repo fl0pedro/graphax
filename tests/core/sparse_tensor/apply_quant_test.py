@@ -46,7 +46,7 @@ def test_quant_basic_cast_val_only():
     # (the default fill_value=None stays None — checked separately below).
     st, _ = _make_dense_pair_st(4, 4, fill_value=jnp.array(0.0, dtype=jnp.float32))
     assert st.val.dtype == jnp.float32
-    assert st.scalar_mult.dtype == jnp.float32
+    assert jnp.result_type(st.scalar_mult) == jnp.float32
     assert st.fill_value.dtype == jnp.float32
 
     new_st = apply_quant(st, Quant("float16"))
@@ -54,7 +54,7 @@ def test_quant_basic_cast_val_only():
     assert new_st.val.dtype == jnp.float16
     # The user's "cast val only" decision: scalar_mult / fill_value are
     # intentionally preserved in their native dtype.
-    assert new_st.scalar_mult.dtype == jnp.float32
+    assert jnp.result_type(new_st.scalar_mult) == jnp.float32
     assert new_st.fill_value.dtype == jnp.float32
 
     # The statically-zero (fill_value=None) default is likewise preserved.

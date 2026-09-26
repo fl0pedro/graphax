@@ -16,6 +16,7 @@ from ..sparse.tensor import (
     materialize_uniform,
 )
 from ..sparse.ops.dense import dense as _dense_hard
+from ..sparse.dtype_compute import _cast_scalar, _is_one
 
 from .base import (
     elemental_only_rules,
@@ -148,7 +149,7 @@ def _identity_post_over(post, out_shape, dtype=jnp.float32):
         n *= s
     eye = jnp.eye(n, dtype=dtype)
     scalar = post.scalar_mult
-    if scalar is not None:
+    if scalar is not None and not _is_one(scalar):
         eye = eye * scalar
     val = eye.reshape(out_shape + out_shape)
     counter = 0
@@ -1222,7 +1223,7 @@ def _convert_element_type_elementals(primals, val_out, **params):
             new_out_dims,
             new_primal_dims,
             new_pre_val,
-            scalar_mult=lax.convert_element_type(pre.scalar_mult, new_dtype),
+            scalar_mult=_cast_scalar(pre.scalar_mult, new_dtype),
             # None (statically-zero) fill stays None across a dtype convert.
             fill_value=(None if pre.fill_value is None
                         else lax.convert_element_type(pre.fill_value, new_dtype)),
@@ -1238,7 +1239,7 @@ def _convert_element_type_elementals(primals, val_out, **params):
             new_out_dims,
             new_primal_dims,
             new_post_val,
-            scalar_mult=lax.convert_element_type(post.scalar_mult, new_dtype),
+            scalar_mult=_cast_scalar(post.scalar_mult, new_dtype),
             # None (statically-zero) fill stays None across a dtype convert.
             fill_value=(None if post.fill_value is None
                         else lax.convert_element_type(post.fill_value, new_dtype)),

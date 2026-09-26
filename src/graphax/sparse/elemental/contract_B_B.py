@@ -240,7 +240,8 @@ def contract_B_B(
         C = jnp.einsum("gpk,gkq->gpq", Adiag, Bdiag)     # (G, ra*P, rb*Q)
         block_row, block_col = ra * P, rb * Q
 
-    scalar_mult = lhs.scalar_mult * rhs.scalar_mult
+    from graphax.sparse.dtype_compute import _scaled_mul
+    scalar_mult = _scaled_mul(lhs.scalar_mult, rhs.scalar_mult)
     return _wrap_result(C, G, block_row, block_col, scalar_mult)
 
 

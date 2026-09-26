@@ -2093,7 +2093,8 @@ def _build_output_tensor(ctx, rhs_dims, res):
     # here — the seed-vertex adjoint contraction reaches this tiled path with mixed
     # float8/float32 scalar_mults (the pre-op _unify only touches the operand val,
     # not this post-contraction 3-way scalar_mult product).
-    from graphax.sparse.dtype_compute import _scaled_mul as _sm_promote
+    from graphax.sparse.dtype_compute import (
+        _cast_scalar, _scalar_dtype_of, _scaled_mul as _sm_promote)
     final_mult = _sm_promote(
         _sm_promote(ctx.lhs.scalar_mult, ctx.rhs.scalar_mult), res.scalar_mult
     )
@@ -2101,7 +2102,8 @@ def _build_output_tensor(ctx, rhs_dims, res):
         final_mult = _sm_promote(final_mult, jnp.squeeze(_mat(values)))
         values = None
     values = _store_narrow(_mat(values), ctx.lhs.dtype, ctx.rhs.dtype)
-    out_dtype = values.dtype if values is not None else jnp.asarray(final_mult).dtype
+    out_dtype = values.dtype if values is not None else _scalar_dtype_of(final_mult)
+    final_mult = _cast_scalar(final_mult, out_dtype)
     # transforms intentionally not propagated through matmul; callers in
     # core.py unload pre/post transforms before the matmul and reattach
     # fresh ones to the result.
@@ -2109,7 +2111,7 @@ def _build_output_tensor(ctx, rhs_dims, res):
         final_out,
         final_primal,
         values,
-        scalar_mult=jnp.asarray(final_mult).astype(out_dtype),
+        scalar_mult=final_mult,
         fill_value=None,  # tiled path assumes zero fill → statically zero
     )
 
@@ -2427,8 +2429,11 @@ def _fold_both_implicit(lhs, rhs, count):
             out, cnt = res
         else:
             out = res
-    fac = jnp.asarray(factor, dtype=out.scalar_mult.dtype)
-    out = out.copy(scalar_mult=out.scalar_mult * fac)
+    sm = out.scalar_mult
+    if isinstance(sm, (int, float)):
+        out = out.copy(scalar_mult=float(sm * factor))
+    else:
+        out = out.copy(scalar_mult=sm * jnp.asarray(factor, dtype=sm.dtype))
     return (out, cnt) if count else out
 
 
@@ -2583,14 +2588,8 @@ def _matmul_via_densify(lhs, rhs):
         # tiled path's _build_output_tensor. Promote mixed scalar dtypes to
         # their common compute dtype first (a narrow-Quant sm has no implicit
         # promotion path against f32).
-        _sl, _sr = lhs.scalar_mult, rhs.scalar_mult
-        if isinstance(_sl, (int, float)) and isinstance(_sr, (int, float)):
-            _sm_out = _sl * _sr
-        else:
-            from graphax.sparse.dtype_compute import _compute_dtype
-            _a, _b = jnp.asarray(_sl), jnp.asarray(_sr)
-            _cdt = _compute_dtype(_a.dtype, _b.dtype)
-            _sm_out = _a.astype(_cdt) * _b.astype(_cdt)
+        from graphax.sparse.dtype_compute import _scaled_mul
+        _sm_out = _scaled_mul(lhs.scalar_mult, rhs.scalar_mult)
         return SparseTensor(
             out_dims,
             primal_dims,
@@ -2857,13 +2856,18 @@ def scale_by_scalar(tensor, scalar, count: bool = False):
     compounded to ``(1, 1)`` on a second scale in the same chain. A rank-0
     tensor's own ``val``, when present, is genuinely 0-d.
     """
-    from graphax.sparse.dtype_compute import _scaled_mul
+    from graphax.sparse.dtype_compute import (
+        _cast_scalar, _scalar_dtype_of, _scaled_mul)
 
-    sval = (scalar.val if scalar.val is not None
-            else jnp.ones((), dtype=scalar.scalar_mult.dtype))
+    sval = scalar.val if scalar.val is not None else 1.0
     factor = _scaled_mul(sval, scalar.scalar_mult)
-    factor = jnp.asarray(factor, dtype=tensor.scalar_mult.dtype)
-    out = tensor.copy(scalar_mult=_scaled_mul(tensor.scalar_mult, factor))
+    tsm = tensor.scalar_mult
+    if isinstance(tsm, (int, float)) and isinstance(factor, (int, float)):
+        new_sm = tsm * factor
+    else:
+        # The factor meets the tensor's scale in the scale's own dtype.
+        new_sm = _scaled_mul(tsm, _cast_scalar(factor, _scalar_dtype_of(tsm)))
+    out = tensor.copy(scalar_mult=new_sm)
     if count:
         return out, (0, out.size, 0)
     return out
