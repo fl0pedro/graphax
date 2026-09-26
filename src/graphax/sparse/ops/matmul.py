@@ -2116,6 +2116,42 @@ def _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub):
         batch = [lbl for lbl in out_core if lbl in lhs_sub and lbl in rhs_sub]
         free_x = [lbl for lbl in lhs_sub if lbl in out_core and lbl not in rhs_sub]
         free_y = [lbl for lbl in rhs_sub if lbl in out_core and lbl not in lhs_sub]
+        _diag_dot = _os.environ.get("GX_DIAG_DOT", "einsum")
+        _private = [lbl for lbl in lhs_sub if lbl not in rhs_sub and lbl not in out_core] + \
+                   [lbl for lbl in rhs_sub if lbl not in lhs_sub and lbl not in out_core]
+        if _diag_dot != "einsum" and not _private:
+            if batch + free_x + free_y == out_core:
+                p, psub, q, qsub, fp, fq = x, list(lhs_sub), y, list(rhs_sub), free_x, free_y
+            else:
+                p, psub, q, qsub, fp, fq = y, list(rhs_sub), x, list(lhs_sub), free_y, free_x
+            contr = [lbl for lbl in psub if lbl in qsub and lbl not in out_core]
+            size = {lbl: int(p.shape[i]) for i, lbl in enumerate(psub)}
+            size.update({lbl: int(q.shape[i]) for i, lbl in enumerate(qsub)})
+            nb = len(batch)
+            if _diag_dot == "unitbatch":
+                dims = (([psub.index(l) + 1 for l in contr], [qsub.index(l) + 1 for l in contr]),
+                        ([0] + [psub.index(l) + 1 for l in batch], [0] + [qsub.index(l) + 1 for l in batch]))
+                out = jax.lax.dot_general(p[None], q[None], dims)
+                out = out.reshape(out.shape[1:])
+                return done(out, batch + fp + fq)
+
+            def _canon(arr, sub, order, lead):
+                arr = jax.lax.transpose(arr, [sub.index(l) for l in order])
+                return arr.reshape([size[l] for l in batch] + lead)
+
+            mp, kk, nq = (math.prod(size[l] for l in fp), math.prod(size[l] for l in contr),
+                          math.prod(size[l] for l in fq))
+            big_q = q.size >= p.size
+            first_q = big_q if _diag_dot == "canon_big" else not big_q
+            if first_q:
+                q2 = _canon(q, qsub, batch + contr + fq, [kk, nq])
+                p2 = _canon(p, psub, batch + fp + contr, [mp, kk])
+            else:
+                p2 = _canon(p, psub, batch + fp + contr, [mp, kk])
+                q2 = _canon(q, qsub, batch + contr + fq, [kk, nq])
+            out = jax.lax.dot_general(p2, q2, (([nb + 1], [nb]), (list(range(nb)), list(range(nb)))))
+            out = out.reshape([size[l] for l in batch + fp + fq])
+            return done(out, batch + fp + fq)
         if batch + free_x + free_y == out_core:
             return done(jnp.einsum(x, lhs_sub, y, rhs_sub, out_core), out_core)
         out = batch + free_y + free_x
@@ -2154,7 +2190,9 @@ def _sum_private_axes(v, sub, other_sub, out_sub):
     if not axes:
         return v, sub
     x = v.materialize()
-    if jnp.issubdtype(x.dtype, jnp.floating) and jnp.dtype(x.dtype).itemsize < 4:
+    _diag_bar = _os.environ.get("GX_DIAG_BARRIER", "on")
+    _bar_ok = _diag_bar == "on" or (_diag_bar.startswith("min:") and x.size >= int(_diag_bar[4:]))
+    if _bar_ok and jnp.issubdtype(x.dtype, jnp.floating) and jnp.dtype(x.dtype).itemsize < 4:
         # The sum reads the stored bf16 edge. Without the barrier, XLA drops the Quant cast
         # and this upcast as a pair, and the sum reads the f32 product (dsnn-dfw.273).
         x = jax.lax.optimization_barrier(x)

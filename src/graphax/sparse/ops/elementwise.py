@@ -384,6 +384,27 @@ def _promote_to_unified(value: Array, metrics, is_left: bool, fill: Array) -> Ar
         # mask had it. Off the diagonal the value is the fill (0 for every
         # zero-fill op in ``_ZERO_PRESERVING_OPS``).
         fill = jnp.asarray(fill, value.dtype)
+        _diag_join = os.environ.get("GX_DIAG_JOIN", "pad")
+        if _diag_join in ("eye", "iota"):
+            from graphax.sparse.indexes import static_eye as _static_eye
+            value = _mat(_as_view(value).reshape(exp_shape))
+            for i, m in enumerate(metrics):
+                exp = m["common_b1"] // (m["left_b1"] if is_left else m["right_b1"])
+                if exp > 1:
+                    if _diag_join == "eye":
+                        shape = [1] * len(exp_shape)
+                        shape[5 * i + 1] = shape[5 * i + 2] = exp
+                        mask = _static_eye(exp, bool).reshape(shape)
+                    else:
+                        shape = list(value.shape)
+                        shape[5 * i + 2] = exp
+                        mask = (jax.lax.broadcasted_iota(jnp.int32, shape, 5 * i + 1)
+                                == jax.lax.broadcasted_iota(jnp.int32, shape, 5 * i + 2))
+                    value = jnp.where(mask, value, fill)
+            value = _View(value)
+            perm = generate_block_permutation(len(metrics), 5, [0, 1, 3, 2, 4])
+            perm.extend(range(5 * len(metrics), len(exp_shape)))
+            return value.transpose(perm).reshape(out_shape)
         interior = [0] * len(in_shape)
         grid = []
         for i, m in enumerate(metrics):
