@@ -1,4 +1,4 @@
-# The join on the shape view: the eye embedding and a diagonal meeting a dense edge (dsnn-dfw.252, dsnn-dfw.299).
+# The join on the shape view: the pad embedding and a diagonal meeting a dense edge (dsnn-dfw.252).
 import itertools
 import math
 
@@ -52,7 +52,7 @@ def _bits(x):
 
 
 @pytest.mark.parametrize("seed", range(40))
-def test_the_unified_promotion_writes_the_cells_of_the_eye_mask_select(seed):
+def test_the_pad_embedding_writes_the_cells_of_the_eye_mask_select(seed):
     rng = np.random.default_rng(seed)
     metrics, shape = [], []
     for _ in range(int(rng.integers(1, 3))):
@@ -127,13 +127,13 @@ def _prims(jaxpr):
     return out
 
 
-def test_a_diagonal_meeting_a_dense_edge_is_one_select_and_one_add():
+def test_a_diagonal_meeting_a_dense_edge_is_one_pad_and_one_add():
     v = jnp.arange(4.0, dtype=jnp.float32) + 1
     w = jnp.ones((4, 4), jnp.float32)
     names = _prims(jax.make_jaxpr(lambda x, y: (_dense(y) + _diag(x)).val)(v, w))
-    assert names.count("select_n") == 1 and names.count("add") == 1, names
-    assert "pad" not in names, names
-    assert sum(names.count(p) for p in SHAPE_PRIMS) <= 4, names
+    assert names.count("pad") == 1 and names.count("add") == 1, names
+    assert "select_n" not in names, names
+    assert sum(names.count(p) for p in SHAPE_PRIMS) <= 1, names
 
 
 def test_a_join_of_equal_structures_in_different_layouts_is_one_transpose():
