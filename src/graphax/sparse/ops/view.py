@@ -25,10 +25,12 @@ class _LazyProduct:
 
     Axis ``k`` of the product is axis ``xa[k]`` of ``x`` and axis ``ya[k]`` of
     ``y``, or ``None`` where the operand does not carry it. ``emit`` writes the
-    product with its axes in the order the reader asks for, so no transpose
-    follows the product: as the ``dot_general`` that makes that order when one
-    does (the shared axes first, then each operand's own axes in its order),
-    else as a multiply of the two operands broadcast to it."""
+    product with its axes in the order the reader asks for. When the reader
+    puts the shared axes first, the product is the ``dot_general`` over them,
+    and a transpose of the operands' own axes when the reader orders them
+    otherwise. When it does not, a dot would have to move its batch axes
+    behind the others, and the product is a multiply of the two operands
+    broadcast in the reader's order, with no transpose after it."""
 
     __slots__ = ("x", "y", "xa", "ya", "shape", "dtype", "_out")
 
@@ -61,11 +63,13 @@ class _LazyProduct:
         own_x = sorted((p for p in perm if self.ya[p] is None), key=lambda p: self.xa[p])
         own_y = sorted((p for p in perm if self.xa[p] is None), key=lambda p: self.ya[p])
         bx, by = tuple(self.xa[p] for p in both), tuple(self.ya[p] for p in both)
-        if list(perm[k:]) == own_x + own_y:
-            return jax.lax.dot_general(self.x, self.y, (((), ()), (bx, by)))
         if list(perm[k:]) == own_y + own_x:
             return jax.lax.dot_general(self.y, self.x, (((), ()), (by, bx)))
-        return None
+        out = jax.lax.dot_general(self.x, self.y, (((), ()), (bx, by)))
+        made = both + own_x + own_y
+        if list(perm) != made:
+            out = jax.lax.transpose(out, [made.index(p) for p in perm])
+        return out
 
 
 def _side(arr, axes, perm, shape):

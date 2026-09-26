@@ -83,3 +83,20 @@ def test_a_product_read_in_a_dot_generals_order_is_that_dot():
     prims = _prims(f, x, y)
     assert prims == ["dot_general"], prims
     np.testing.assert_array_equal(np.asarray(f(x, y)), np.einsum("ab,ad->abd", np.asarray(x), np.asarray(y)))
+
+
+def test_a_product_read_with_the_shared_axis_first_is_the_dot_and_one_transpose():
+    # The reader puts the shared axis first and interleaves the operands' own
+    # axes: the dot over the shared axis, then one transpose of the own axes.
+    # This is the form 50e3aed emitted. As two sibling multiplies, two such
+    # products of TLM free_w8_s2_exact were fused into one kernel and doubled
+    # its temp bytes (job 68372).
+    x, y = _n((3, 4), 10), _n((3, 5, 2), 11)             # x[a, b], y[a, d, e]
+
+    def f(x, y):
+        return _emit_einsum(x, [0, 1], y, [0, 2, 3], [0, 2, 1, 3]).materialize()   # (a, d, b, e)
+
+    prims = _prims(f, x, y)
+    assert prims == ["dot_general", "transpose"], prims
+    want = np.einsum("ab,ade->adbe", np.asarray(x), np.asarray(y))
+    np.testing.assert_array_equal(np.asarray(f(x, y)), want)
