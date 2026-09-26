@@ -233,14 +233,14 @@ def _transpose_elementals(primals, val_out, **params):
                 )
             counter += 1
 
-        return _swap_back_axes(
-            SparseTensor(
-                new_out_dims,
-                new_primal_dims,
-                pre.val,
-                scalar_mult=pre.scalar_mult,
-                fill_value=pre.fill_value,
-            )
+        # The dims point at their data; a consumer's view takes the
+        # permutation, so val is not transposed here (dsnn-dfw.252).
+        return SparseTensor(
+            new_out_dims,
+            new_primal_dims,
+            pre.val,
+            scalar_mult=pre.scalar_mult,
+            fill_value=pre.fill_value,
         )
 
     def inverse_transpose_transform(post):
@@ -281,14 +281,14 @@ def _transpose_elementals(primals, val_out, **params):
                 )
             counter += 1
 
-        return _swap_back_axes(
-            SparseTensor(
-                new_out_dims,
-                new_primal_dims,
-                post.val,
-                scalar_mult=post.scalar_mult,
-                fill_value=post.fill_value,
-            )
+        # The dims point at their data; a consumer's view takes the
+        # permutation, so val is not transposed here (dsnn-dfw.252).
+        return SparseTensor(
+            new_out_dims,
+            new_primal_dims,
+            post.val,
+            scalar_mult=post.scalar_mult,
+            fill_value=post.fill_value,
         )
 
     # Bijective axis relabel -> seed_drainable: alone it already preserves
@@ -921,17 +921,11 @@ def _squeeze_elementals(primals, val_out, **params):
         num_out = len(out_dims)
         val = post.val
 
-        # Each re-inserted size-1 primal axis gets a FRESH val axis appended at
-        # the end; _swap_back_axes then permutes val into canonical dim order.
-        # (Computing the exact insertion axis by hand is unsound because diagonal
-        # pairs share a val axis, so a dim-count overshoots val.ndim.)
+        # A re-inserted size-1 primal dim is stored implicitly: one value along
+        # it is all a size-1 axis holds, so no data moves and every existing
+        # axis keeps its place (dsnn-dfw.252).
         for dim in new_dims:
-            if val is not None:
-                new_ax = val.ndim
-                val = jnp.expand_dims(val, axis=new_ax)
-            else:
-                new_ax = None
-            primal_dims.insert(dim, DenseIndex(-1, 1, new_ax))  # id fixed below
+            primal_dims.insert(dim, DenseIndex(-1, 1, None))  # id fixed below
 
         old_to_new = {d.id: num_out + pos for pos, d in enumerate(primal_dims) if d.id != -1}
         new_primal = [replace(d, id=num_out + pos) for pos, d in enumerate(primal_dims)]
@@ -939,10 +933,10 @@ def _squeeze_elementals(primals, val_out, **params):
             replace(d, other_id=old_to_new[d.other_id]) if d.is_sparse else d
             for d in out_dims
         ]
-        return _swap_back_axes(SparseTensor(
+        return SparseTensor(
             new_out, new_primal, val,
             scalar_mult=post.scalar_mult, fill_value=post.fill_value,
-        ))
+        )
 
     # Bijective size-1 relabel -> seed_drainable (chains like transpose).
     transform = JacobianTransform(squeeze_transform, inverse_squeeze_transform,

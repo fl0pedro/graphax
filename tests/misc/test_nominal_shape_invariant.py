@@ -50,10 +50,11 @@ column for ``core._drain_transforms``:
   queued transform, and EVERY one of them drains to EXACTLY nominal.
 
 So ``SparseTensor.shape == out_edge.aval.shape + in_edge.aval.shape`` is not an
-invariant of a stored edge; it is an invariant of its DRAINED form. Draining is
-not free: ``transpose_transform`` ends in ``_swap_back_axes``, which physically
-transposes ``val``, so making the stored shape nominal costs equations, temp and
-flops -- it is not a metadata-only change.
+invariant of a stored edge; it is an invariant of its DRAINED form. Draining was
+not free when this was measured: ``transpose_transform`` ended in
+``_swap_back_axes``, which physically transposed ``val``. Since dsnn-dfw.252
+(2026-09-26) the relabel permutes only the dims, which point at their data, and
+the consumer's view takes the permutation.
 
 So the three approximation classes leave the LOGICAL shape alone, exactly as
 the API documents: ``Compress`` sets ``axis=None`` and keeps ``size``,
