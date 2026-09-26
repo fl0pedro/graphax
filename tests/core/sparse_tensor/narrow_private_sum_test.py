@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import pytest
 
 from graphax.sparse.ops.matmul import _emit_einsum
 
@@ -20,6 +21,10 @@ def _sum_of_quantized(p):
     return _emit_einsum(a, [0, 1], w, [1], [1]).materialize()
 
 
+@pytest.mark.xfail(strict=True, reason=(
+    "The barrier in _sum_private_axes is off by the owner's ruling of 2026-09-26 "
+    "(dsnn-dfw.294): XLA decides the fusion, and compress_e993 at 1.018 of core-v2 is "
+    "accepted. This case passes again, and fails as XPASS, if the barrier is turned on."))
 def test_the_private_sum_of_a_narrow_edge_reads_the_stored_edge():
     jaxpr = jax.make_jaxpr(_sum_of_quantized)(jnp.zeros((2, 3), jnp.float32)).jaxpr
     names = [e.primitive.name for e in jaxpr.eqns]
