@@ -208,3 +208,28 @@ def test_an_operand_that_stores_nothing_is_not_multiplied():
     res = ident @ _diag(A)
     np.testing.assert_array_equal(np.asarray(res.val), np.asarray(A))
     np.testing.assert_allclose(np.asarray(res.dense()), 3.0 * np.asarray(_diag(A).dense()), rtol=1e-6)
+
+
+@pytest.mark.parametrize("seed", range(30))
+def test_broadcasting_a_view_equals_broadcasting_the_array(seed):
+    rng = np.random.default_rng(1000 + seed)
+    base_shape = tuple(int(d) for d in rng.choice([1, 2, 3], size=int(rng.integers(1, 5))))
+    arr = jnp.asarray(rng.standard_normal(base_shape).astype(np.float32))
+    view, eager = _View(arr), arr
+    if rng.random() < 0.5:
+        perm = [int(p) for p in rng.permutation(eager.ndim)]
+        view, eager = view.transpose(perm), eager.transpose(perm)
+    if rng.random() < 0.5:
+        shape = list(eager.shape)
+        shape.insert(int(rng.integers(0, len(shape) + 1)), 1)
+        view, eager = view.reshape(shape), eager.reshape(shape)
+    target = tuple(int(rng.integers(1, 4)) if d == 1 else d for d in eager.shape)
+    got = view.broadcast_to(target).materialize()
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(jnp.broadcast_to(eager, target)))
+
+
+def test_a_stand_in_axis_broadcasts_without_a_reshape():
+    x = jnp.arange(12.0, dtype=jnp.float32).reshape(3, 1, 4)
+    f = lambda a: _View(a).broadcast_to((3, 5, 4)).materialize()
+    assert _prims(jax.make_jaxpr(f)(x)) == ["broadcast_in_dim"]
+    np.testing.assert_array_equal(np.asarray(f(x)), np.asarray(jnp.broadcast_to(x, (3, 5, 4))))

@@ -2107,8 +2107,14 @@ def _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub):
         return v.insert_units(len(out_sub), unit_out)
 
     if any(lbl in rhs_sub and lbl not in out_core for lbl in lhs_sub):
-        x, lhs_sub = _natural(a, lhs_sub)
-        y, rhs_sub = _natural(b, rhs_sub)
+        # A real reduction keeps the frame's operand layout, and the einsum is
+        # asked for exactly the dot_general it ran on that layout (jnp.einsum
+        # runs dot_general(first, second) when the output starts with the
+        # batch labels and the first operand's free labels, else
+        # dot_general(second, first), then transposes). XLA sees the same dot
+        # and sums in the same order; only the transpose after it moves onto
+        # the result view.
+        x, y = a.materialize(), b.materialize()
         if narrow:
             # jnp.einsum sums a private label in the preferred dtype, which
             # widens a bf16 operand to f32 before the dot; the private sum is
@@ -2116,8 +2122,13 @@ def _emit_einsum(a, lhs_sub, b, rhs_sub, out_sub):
             # so both operands reach the dot narrow.
             x, lhs_sub = _sum_private_axes_narrow(x, lhs_sub, rhs_sub, out_core)
             y, rhs_sub = _sum_private_axes_narrow(y, rhs_sub, lhs_sub, out_core)
-        out = _dot_order(lhs_sub, rhs_sub, out_core)
-        return done(jnp.einsum(x, lhs_sub, y, rhs_sub, out, **kw), out)
+        batch = [lbl for lbl in out_core if lbl in lhs_sub and lbl in rhs_sub]
+        free_x = [lbl for lbl in lhs_sub if lbl in out_core and lbl not in rhs_sub]
+        free_y = [lbl for lbl in rhs_sub if lbl in out_core and lbl not in lhs_sub]
+        if batch + free_x + free_y == out_core:
+            return done(jnp.einsum(x, lhs_sub, y, rhs_sub, out_core, **kw), out_core)
+        out = batch + free_y + free_x
+        return done(jnp.einsum(y, rhs_sub, x, lhs_sub, out, **kw), out)
     # Nothing is summed between the operands. A private label is a sum on its
     # own side, and what remains is a product: elementwise when both carry the
     # same axes or one is a scalar, an outer product otherwise.
@@ -2173,13 +2184,14 @@ def _sum_private_axes_narrow(x, sub, other_sub, out_sub):
 
 
 def _sum_private_axes(v, sub, other_sub, out_sub, narrow):
-    if not _private_axes(sub, other_sub, out_sub):
+    # A sum keeps the frame's layout, so it adds in the order it always did.
+    axes = _private_axes(sub, other_sub, out_sub)
+    if not axes:
         return v, sub
-    x, sub = _natural(v, sub)
+    x = v.materialize()
     if narrow:
         x, sub = _sum_private_axes_narrow(x, sub, other_sub, out_sub)
     else:
-        axes = _private_axes(sub, other_sub, out_sub)
         x = jnp.sum(x, axis=tuple(axes))
         sub = [lbl for i, lbl in enumerate(sub) if i not in axes]
     return _View(x), sub

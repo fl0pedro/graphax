@@ -394,8 +394,15 @@ def _promote_to_unified(value: Array, metrics, is_left: bool, fill: Array) -> Ar
         # Only the axes that carry data enter the pad; the unit axes are put
         # back on the view.
         value = _as_view(value)
-        core, keep = value.drop_units(list(range(value.ndim)))
-        padded = jax.lax.pad(_mat(core), fill, [(0, 0, interior[k]) for k in keep])
+        at = value.base_axes()
+        if at is not None:
+            slot_of = dict(at)
+            padded = jax.lax.pad(value.base, fill, [
+                (0, 0, interior[slot_of[k]] if k in slot_of else 0)
+                for k in range(value.base.ndim)])
+        else:
+            core, keep = value.drop_units(list(range(value.ndim)))
+            padded = jax.lax.pad(_mat(core), fill, [(0, 0, interior[k]) for k in keep])
         value = _View(padded).reshape(grid + rem)
     else:
         value = value.reshape(exp_shape)

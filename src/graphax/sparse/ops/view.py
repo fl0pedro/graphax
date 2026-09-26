@@ -165,10 +165,53 @@ class _View:
             v = v.insert_units(len(shape), range(len(shape) - v.ndim))
         if v.shape == shape:
             return v
-        keep = [i for i, s in enumerate(v.slots) if s]
-        core = v._clone([v.slots[i] for i in keep])._materialize()
-        out = jax.lax.broadcast_in_dim(core, shape, tuple(keep))
+        dims = v._base_dims()
+        if dims is not None:
+            out = jax.lax.broadcast_in_dim(v.base, shape, dims)
+        else:
+            keep = [i for i, s in enumerate(v.slots) if s]
+            core = v._clone([v.slots[i] for i in keep])._materialize()
+            out = jax.lax.broadcast_in_dim(core, shape, tuple(keep))
         return _View(out, one=self.one)
+
+    def base_axes(self):
+        """``{base axis: slot}`` when every non-unit slot is one whole base
+        axis and the slots keep the base's order, else ``None``: then an op
+        that maps axes can read the base as it is."""
+        base = tuple(int(n) for n in self.base.shape)
+        at = {}
+        for p, s in enumerate(self.slots):
+            if s:
+                if len(s) != 1 or s[0] >= len(base) or self.extent[s[0]] != base[s[0]]:
+                    return None
+                at[s[0]] = p
+        if [at[k] for k in sorted(at)] != sorted(at.values()):
+            return None
+        return at
+
+    def _base_dims(self):
+        """The slot of every base axis, strictly increasing, when each size-1
+        base axis can take a slot between its neighbours: then
+        ``broadcast_in_dim`` reads the base with no reshape or transpose."""
+        base = tuple(int(n) for n in self.base.shape)
+        at = self.base_axes()
+        if at is None:
+            return None
+        fixed = sorted(at.values())
+        dims, last = [], -1
+        for k, n in enumerate(base):
+            if n != 1:
+                p = at[k]
+            else:
+                nxt = min((at[j] for j in at if j > k), default=len(self.slots))
+                p = next((q for q in range(last + 1, nxt) if q not in fixed), None)
+                if p is None:
+                    return None
+            if p <= last:
+                return None
+            dims.append(p)
+            last = p
+        return tuple(dims)
 
     def sum_keepdims(self, axes):
         axes = tuple(sorted(set(int(a) for a in axes)))
@@ -207,17 +250,3 @@ def _bcast(x, shape):
     if isinstance(x, _View):
         return x.broadcast_to(shape)
     return jnp.broadcast_to(x, tuple(shape))
-
-
-def _stored(v):
-    """``(array, axis_of)`` for a view stored as an edge's ``val``: the
-    non-unit slots follow the base's own order, the unit slots come last, and
-    ``axis_of[k]`` is the stored axis of slot ``k``. The caller points its dims
-    at these axes, so the store emits no transpose."""
-    v = _as_view(v)
-    arr, rank = v.natural()
-    units = [i for i, s in enumerate(v.slots) if not s]
-    if units:
-        arr = arr.reshape(tuple(arr.shape) + (1,) * len(units))
-    axis_of = {s: k for k, s in enumerate(rank + units)}
-    return arr, [axis_of[k] for k in range(v.ndim)]
